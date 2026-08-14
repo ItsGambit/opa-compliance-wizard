@@ -1,0 +1,26 @@
+# Credentials -- never committed, see README "Security: encrypted credential storage"
+.env
+environments.json
+TestCreds.txt
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
+
+# This tool's own output
+folders_result_*.csv
+
+# Frontend build/deps (frontend/.gitignore also covers these for that subtree;
+# listed here too so a root-level `git status` never shows them as untracked)
+frontend/node_modules/
+frontend/dist/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log

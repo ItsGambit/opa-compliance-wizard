@@ -1,0 +1,7 @@
+# Normalize line endings for most text files, but force LF specifically for
+# scripts that Mac/Linux actually executes -- a CRLF shell script fails with
+# a cryptic "bad interpreter" error on those platforms.
+* text=auto
+
+*.sh text eol=lf
+*.py text eol=lf

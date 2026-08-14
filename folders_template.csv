@@ -1,0 +1,5 @@
+path,description
+Prod-Servers,Top-level prod credentials
+Prod-Servers/DB,DB tier creds
+Prod-Servers/DB/Postgres,Postgres-specific
+Prod-Servers/App,App tier creds
