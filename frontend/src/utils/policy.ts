@@ -67,3 +67,13 @@ export function rulesGrantedForProject(policies: AccessPolicy[], projectId: stri
 export function policiesForResourceGroup(policies: AccessPolicy[], resourceGroupId: string): AccessPolicy[] {
   return policies.filter(p => p.resource_group?.id === resourceGroupId)
 }
+
+/** Every policy whose principals.user_groups includes the given group id —
+ * the "blast radius" check before removing a user from a group: if more
+ * than the one policy you're currently looking at uses this same group,
+ * removing membership takes away access granted by all of them, not just
+ * the one you started from. Mirrors AssignAccessDialog's existing warning
+ * for the opposite direction (adding a group to a policy). */
+export function policiesUsingGroup(policies: AccessPolicy[], groupId: string): AccessPolicy[] {
+  return policies.filter(p => p.principals.user_groups.some(g => g.id === groupId))
+}

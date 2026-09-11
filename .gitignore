@@ -3,6 +3,16 @@
 environments.json
 TestCreds.txt
 
+# Locally-preserved Secrets Access Dashboard System Log history (opt-in,
+# see the "preserve logs locally" setting) -- audit metadata, not a
+# credential, but still local-machine-only state that shouldn't be committed
+secrets_log_cache.json
+
+# This tool's own write-action audit trail (see engine.log_audit_event) --
+# real operational data (who did what, when) specific to whichever
+# deployment produced it, not something to ship in the repo
+audit_log.jsonl
+
 # Python
 __pycache__/
 *.pyc

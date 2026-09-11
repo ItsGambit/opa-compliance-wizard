@@ -10,7 +10,13 @@ import { toast } from './useToast'
  *
  * onCreated only fires once the group is confirmed visible in OPA (i.e.
  * push has propagated) — if it hasn't yet, the caller sees a toast telling
- * them to refresh shortly instead. */
+ * them to refresh shortly instead.
+ *
+ * The server also tries to add this dashboard's own service account to
+ * every group it creates here (so the group is immediately usable by the
+ * dashboard without a manual step) — that's silent on success (the group's
+ * own success toast below is enough), surfaced as a second warning toast
+ * only if it failed, and never blocks group creation either way. */
 export function useCreateGroup(onCreated: (group: OpaGroup) => void) {
   const queryClient = useQueryClient()
 
@@ -21,6 +27,11 @@ export function useCreateGroup(onCreated: (group: OpaGroup) => void) {
       queryClient.invalidateQueries({ queryKey: ['groups'] })
       if (resp.visible_in_opa && resp.group) {
         toast({ title: `Group '${resp.group.name}' created and pushed from Okta`, variant: 'success' })
+        if (resp.service_account_added) {
+          queryClient.invalidateQueries({ queryKey: ['service_account'] })
+        } else if (resp.service_account_warning) {
+          toast({ title: 'Service account not added automatically', description: resp.service_account_warning, variant: 'default' })
+        }
         onCreated(resp.group)
       } else {
         toast({

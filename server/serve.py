@@ -27,9 +27,10 @@ import sys
 import threading
 import time
 import webbrowser
+from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -37,12 +38,75 @@ import create_secret_folders as engine  # noqa: E402
 
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 
-GROUP_PUSH_PROPAGATION_RETRIES = 5
+# Real-world Group Push/SCIM propagation can take well over the old 7.5s
+# window (5 x 1.5s) under load -- 20 x 1.5s = 30s gives real syncs more
+# room before the UI falls back to the "still propagating, refresh" message.
+GROUP_PUSH_PROPAGATION_RETRIES = 20
 GROUP_PUSH_PROPAGATION_DELAY_SECS = 1.5
 
-client = None  # OpaClient, set once an environment is successfully activated
-okta_client = None  # OktaClient, set only if the active environment has okta_url + okta_api_token
-active_env_name = None
+# Generous cap for this API's JSON bodies (the largest realistic payload is
+# a CSV-derived folder tree with a few thousand rows) -- rejecting anything
+# claiming to be bigger BEFORE reading it into memory is what actually
+# matters here; see _read_json_body.
+MAX_REQUEST_BODY_BYTES = 5 * 1024 * 1024
+
+# This dashboard's own frontend origins: the Vite dev server (proxies /api
+# to this server -- see frontend/vite.config.ts) and, in production, this
+# same server's own origin once it starts serving frontend/dist directly.
+# Requests with no Origin header at all (curl, scripts, same-process
+# tooling) are allowed through, same as CORS itself only ever constraining
+# browsers, never other HTTP clients.
+DEV_FRONTEND_ORIGIN = "http://localhost:5173"
+
+# When this app is reverse-proxied behind nginx on a real hostname/IP (see
+# server/nginx-opa-secrets-wizard.conf), the browser's Origin header is that
+# public origin (e.g. "https://192.168.15.139"), not 127.0.0.1/localhost --
+# neither of which this app can know in advance, since it's set by whoever
+# deploys it. EXTRA_ALLOWED_ORIGINS (comma-separated, e.g. in the systemd
+# unit's EnvironmentFile) adds those without hardcoding a specific
+# IP/hostname into source or touching local/direct-run behavior at all: if
+# this is empty (the default, e.g. any local Windows/Mac/Linux run), the
+# allowed-origins set is exactly what it always was.
+EXTRA_ALLOWED_ORIGINS = {o.strip() for o in os.environ.get("EXTRA_ALLOWED_ORIGINS", "").split(",") if o.strip()}
+
+# Per-owner session state, replacing what used to be three bare globals
+# (client/okta_client/active_env_name) shared by every request regardless
+# of who was asking. `owner_key` is the verified Okta `sub` from the
+# X-Auth-Sub header nginx forwards once behind the auth gate (see
+# server/nginx-opa-secrets-wizard.conf + server/auth_gate.py), or the
+# literal string "__local__" when that header is absent -- i.e. a direct
+# local run with no login gate in front of it at all. "__local__" is the
+# ONE owner this dashboard has ever had before this change, so a request
+# with no identity behaves byte-for-byte like it always did: one shared
+# session, matching engine.LOCAL_OWNER_KEY's storage-layer meaning exactly.
+LOCAL_OWNER_KEY_HEADER = "__local__"
+_sessions_lock = threading.Lock()
+_sessions = {}  # owner_key -> {"client": OpaClient, "okta_client": OktaClient|None, "env_name": str}
+_seen_owners = set()  # tracks who's already had a lazy auto-activate attempt this process
+
+
+def _owner_key_from_headers(headers):
+    return headers.get("X-Auth-Sub") or LOCAL_OWNER_KEY_HEADER
+
+
+def _engine_owner(owner_key):
+    """Maps an HTTP-layer owner_key back to what the engine's storage layer
+    expects: LOCAL_OWNER_KEY (None) for the local sentinel, the real Okta
+    sub otherwise."""
+    return engine.LOCAL_OWNER_KEY if owner_key == LOCAL_OWNER_KEY_HEADER else owner_key
+
+
+def _session_snapshot(owner_key):
+    """Returns (client, okta_client, env_name) for this owner, all None if
+    they have no active session yet. Snapshotting a dict lookup under the
+    lock, same spirit as the pre-existing single-global snapshot pattern:
+    a concurrent switch/delete for the SAME owner must not affect a request
+    already in flight for that owner."""
+    with _sessions_lock:
+        session = _sessions.get(owner_key)
+    if session is None:
+        return None, None, None
+    return session["client"], session["okta_client"], session["env_name"]
 
 # Access Explorer bootstrap job -- build_access_model takes real time
 # (~30s+ on a tenant with data), so it runs in a background thread and the
@@ -82,41 +146,45 @@ class StrictBindHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = False
 
 
-def _public_entry(name, meta):
+def _public_entry(name, meta, requesting_owner):
     """Non-secret fields only -- key_secret/okta_api_token never leave the
-    keychain, let alone reach the browser."""
+    keychain, let alone reach the browser. `requesting_owner` is the
+    engine-layer owner (see _engine_owner) of whoever is asking, used only
+    to compute `is_own` -- lets the frontend show "yours" vs. "shared with
+    you" without exposing anyone else's real owner id."""
+    storage_name = engine.environment_storage_name(meta.get("owner"), name)
     return {
         "name": name,
         "base_domain": meta.get("base_domain", ""),
         "team_name": meta.get("team_name", ""),
         "key_id": meta.get("key_id", ""),
         "okta_url": meta.get("okta_url", ""),
-        "has_okta_token": bool(engine.keyring_get(name, "okta_api_token")),
+        "has_okta_token": bool(engine.keyring_get(storage_name, "okta_api_token")),
+        "preserve_logs_locally": bool(meta.get("preserve_logs_locally", False)),
+        "shared": bool(meta.get("shared", False)),
+        "is_own": meta.get("owner") == requesting_owner,
     }
 
 
-def activate_environment(name):
-    """Loads `name` from the encrypted store, authenticates to OPA, and (if
-    Okta credentials are present) to Okta too. On success sets the
-    module-level client/okta_client/active_env_name. Raises KeyError
-    (unknown name) or engine.OpaApiError (OPA auth failed)."""
-    global client, okta_client, active_env_name
+def activate_environment(owner_key, name):
+    """Loads `name` (visible to this owner) from the encrypted store,
+    authenticates to OPA, and (if Okta credentials are present) to Okta
+    too. On success stores the new client/okta_client/env_name in this
+    owner's session slot. Raises KeyError (unknown/not visible to this
+    owner) or engine.OpaApiError (OPA auth failed)."""
+    engine_owner = _engine_owner(owner_key)
+    creds = engine.get_environment_credentials(name, owner=engine_owner)  # raises KeyError if unknown/not visible
 
-    creds = engine.get_environment_credentials(name)  # raises KeyError if unknown
     new_client = engine.OpaClient(creds["base_domain"], creds["team_name"], creds["key_id"], creds["key_secret"])
-
     new_okta_client = None
     if creds.get("okta_url") and creds.get("okta_api_token"):
         new_okta_client = engine.OktaClient(creds["okta_url"], creds["okta_api_token"])
 
-    client = new_client
-    okta_client = new_okta_client
-    active_env_name = name
+    with _sessions_lock:
+        _sessions[owner_key] = {"client": new_client, "okta_client": new_okta_client, "env_name": name}
 
-    data = engine.load_environments()
-    data["active"] = name
-    engine.save_environments(data)
-    print(f"Activated environment '{name}' ({creds['base_domain']}).")
+    engine.set_active_environment(engine_owner, name)
+    print(f"Activated environment '{name}' ({creds['base_domain']}) for owner '{owner_key}'.")
 
 
 # ---------------------------------------------------------------------------
@@ -145,10 +213,13 @@ def _safe_csv_path(filename):
     return PROJECT_ROOT / name
 
 
-def _run_pipeline(rows, resource_group_id, project_id):
+def _run_pipeline(active_client, rows, resource_group_id, project_id):
     """Shared by /api/preview and /api/execute: parse -> validate -> collision
     check -> existing-folder lookup. Returns (ordered_paths, descriptions,
-    existing, collisions, invalid_names)."""
+    existing, collisions, invalid_names). Takes the client explicitly
+    (a snapshot the caller took at the start of its request) rather than
+    reading the module-level `client` global itself -- see the note on
+    request-scoped client snapshots above do_GET."""
     ordered_paths, descriptions = engine.parse_rows(rows, warn=False)
     invalid_names = [
         {"path": "/".join(p), "name": p[-1]}
@@ -156,25 +227,31 @@ def _run_pipeline(rows, resource_group_id, project_id):
         if not engine.NAME_PATTERN.match(p[-1])
     ]
     collisions = engine.detect_name_collisions(ordered_paths)
-    existing = engine.resolve_existing_folders(client, resource_group_id, project_id, ordered_paths)
+    existing = engine.resolve_existing_folders(active_client, resource_group_id, project_id, ordered_paths)
     return ordered_paths, descriptions, existing, collisions, invalid_names
 
 
-def _require_client(send_json):
-    if client is None:
+def _require_client(send_json, active_client):
+    if active_client is None:
         send_json(409, {"error": "No active environment configured. Use the gear menu to set one up."})
         return False
     return True
 
 
-def _require_okta_client(send_json):
-    if okta_client is None:
+def _require_okta_client(send_json, active_okta_client):
+    if active_okta_client is None:
         send_json(
             409,
             {"error": "This environment has no Okta URL/API token configured. Add them via the gear menu to create groups."},
         )
         return False
     return True
+
+
+class _RequestAborted(Exception):
+    """Internal control-flow signal: a response (e.g. 413/403) was already
+    sent for this request, so the caller should stop processing without
+    sending anything else."""
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -185,7 +262,19 @@ class Handler(SimpleHTTPRequestHandler):
         pass  # keep console output to our own explicit prints
 
     def end_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "http://localhost:5173")
+        origin = self.headers.get("Origin")
+        # Echo back the real request Origin if it's one this app actually
+        # allows (see _allowed_origins) -- hardcoding the dev server's
+        # origin here meant every response claimed to be for
+        # http://localhost:5173 regardless of who was really asking, which
+        # is simply wrong once this app is reverse-proxied behind a real
+        # hostname/IP. Falls back to DEV_FRONTEND_ORIGIN when there's no
+        # Origin header at all (non-browser callers -- this header is
+        # meaningless to them anyway) to preserve the exact prior default.
+        self.send_header(
+            "Access-Control-Allow-Origin",
+            origin if origin and origin in self._allowed_origins() else DEV_FRONTEND_ORIGIN,
+        )
         super().end_headers()
 
     def _send_json(self, status, payload):
@@ -196,8 +285,38 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _allowed_origins(self):
+        port = self.server.server_address[1]
+        return {DEV_FRONTEND_ORIGIN, f"http://127.0.0.1:{port}", f"http://localhost:{port}"} | EXTRA_ALLOWED_ORIGINS
+
+    def _check_origin(self):
+        """Rejects mutating requests whose Origin doesn't match this
+        dashboard's own frontend. Browsers always attach an Origin header
+        to cross-origin (and most same-origin) fetch/XHR requests, so an
+        Origin that isn't one of this app's own is either a non-browser
+        caller impersonating one, another local process, or a malicious
+        page/DNS-rebinding attempt probing this credential-handling local
+        server. A request with NO Origin header at all (curl, scripts) is
+        let through -- Origin/CORS checks only ever constrain browsers to
+        begin with, so there's nothing to enforce against a client that
+        was never going to send it."""
+        origin = self.headers.get("Origin")
+        if origin is None or origin in self._allowed_origins():
+            return True
+        self._send_json(403, {"error": f"Origin '{origin}' is not allowed to call this API."})
+        return False
+
     def _read_json_body(self):
         length = int(self.headers.get("Content-Length", 0))
+        if length > MAX_REQUEST_BODY_BYTES:
+            self._send_json(413, {
+                "error": f"Request body too large (max {MAX_REQUEST_BODY_BYTES // (1024 * 1024)} MB)."
+            })
+            # Don't attempt to read/drain a body that claims to be this
+            # large -- close the connection instead of risking the next
+            # request on it being misread as leftover body bytes.
+            self.close_connection = True
+            raise _RequestAborted()
         raw = self.rfile.read(length) if length else b""
         return json.loads(raw.decode("utf-8")) if raw else {}
 
@@ -206,35 +325,58 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
+        # Snapshot this owner's active client(s) ONCE at the start of this
+        # request. Sessions are per-owner now (see _sessions above), but the
+        # same reasoning still applies: a concurrent request for the SAME
+        # owner (switching or deleting their active environment) can
+        # reassign their session slot at any time -- reading it repeatedly
+        # through a single request risks finishing against a different (or
+        # no) client than the one the request started with.
+        owner_key = _owner_key_from_headers(self.headers)
+        engine_owner = _engine_owner(owner_key)
+        _ensure_session_initialized(owner_key)
+        local_client, local_okta_client, local_env_name = _session_snapshot(owner_key)
 
         try:
+            if path == "/api/whoami":
+                # Lets the frontend show who's logged in without decoding
+                # anything itself -- just echoes the identity nginx already
+                # verified and forwarded (see nginx-opa-secrets-wizard.conf's
+                # auth_request_set/proxy_set_header bridge). is_local=True
+                # (no X-Auth-User header at all) means this is a direct/local
+                # run with no login gate in front of it -- there's no "log
+                # out" of that, so the frontend can hide the control instead
+                # of showing one that does nothing.
+                email = self.headers.get("X-Auth-User")
+                return self._send_json(200, {"email": email, "is_local": email is None})
+
             if path == "/api/environments":
-                data = engine.load_environments()
-                envs = [_public_entry(n, e) for n, e in data["environments"].items()]
-                return self._send_json(200, {"environments": envs, "active": data.get("active")})
+                visible = engine.list_environments_for(engine_owner)
+                envs = [_public_entry(n, m, engine_owner) for n, m in visible.items()]
+                return self._send_json(200, {"environments": envs, "active": local_env_name})
 
             if path == "/api/resource_groups":
-                if not _require_client(self._send_json):
+                if not _require_client(self._send_json, local_client):
                     return
-                return self._send_json(200, {"resource_groups": client.list_resource_groups()})
+                return self._send_json(200, {"resource_groups": local_client.list_resource_groups()})
 
             if path.startswith("/api/resource_groups/") and path.endswith("/projects"):
-                if not _require_client(self._send_json):
+                if not _require_client(self._send_json, local_client):
                     return
                 rg_id = path[len("/api/resource_groups/"):-len("/projects")]
                 if not rg_id:
                     return self._send_json(400, {"error": "missing resource_group_id"})
-                return self._send_json(200, {"projects": client.list_projects(rg_id)})
+                return self._send_json(200, {"projects": local_client.list_projects(rg_id)})
 
             if path == "/api/groups":
-                if not _require_client(self._send_json):
+                if not _require_client(self._send_json, local_client):
                     return
                 contains = (qs.get("contains") or [None])[0]
-                return self._send_json(200, {"groups": client.list_groups(contains=contains)})
+                return self._send_json(200, {"groups": local_client.list_groups(contains=contains)})
 
             if (path.startswith("/api/resource_groups/") and path.endswith("/folders")
                     and "/projects/" in path):
-                if not _require_client(self._send_json):
+                if not _require_client(self._send_json, local_client):
                     return
                 inner = path[len("/api/resource_groups/"):-len("/folders")]
                 rg_id, _, proj_id = inner.partition("/projects/")
@@ -246,42 +388,72 @@ class Handler(SimpleHTTPRequestHandler):
                 # parent chain, same convention the CSV `path` column already
                 # uses. treeFromRows() on the frontend needs no changes for
                 # this -- it already parses slash-delimited paths.
-                folders = engine.fetch_all_folders(client, rg_id, proj_id)
+                folders = engine.fetch_all_folders(local_client, rg_id, proj_id)
                 by_id = {f["id"]: f for f in folders if f.get("id")}
 
-                def _full_path(folder):
-                    names = []
-                    current = folder
-                    while current is not None:
-                        names.append(current["name"])
-                        parent_id = current.get("parent_id")
-                        current = by_id.get(parent_id) if parent_id else None
-                    return "/".join(reversed(names))
-
                 rows = [
-                    {"path": _full_path(f), "description": f.get("description", ""), "folder_id": f.get("id")}
+                    {"path": engine.full_path(f, by_id), "description": f.get("description", ""), "folder_id": f.get("id")}
                     for f in folders
                 ]
                 return self._send_json(200, {"rows": rows})
 
+            if (path.startswith("/api/resource_groups/") and path.endswith("/secrets_access_report")
+                    and "/projects/" in path):
+                if not _require_client(self._send_json, local_client):
+                    return
+                if not _require_okta_client(self._send_json, local_okta_client):
+                    return
+                inner = path[len("/api/resource_groups/"):-len("/secrets_access_report")]
+                rg_id, _, proj_id = inner.partition("/projects/")
+                if not rg_id or not proj_id:
+                    return self._send_json(400, {"error": "missing resource_group_id or project_id"})
+                preserve_locally = False
+                if local_env_name:
+                    try:
+                        env_meta = engine.get_environment_credentials(local_env_name, owner=engine_owner)
+                        preserve_locally = bool(env_meta.get("preserve_logs_locally", False))
+                    except KeyError:
+                        pass
+                report = engine.build_secrets_access_report(
+                    local_client, local_okta_client, rg_id, proj_id,
+                    preserve_locally=preserve_locally, env_name=local_env_name,
+                )
+                return self._send_json(200, report)
+
             if path.startswith("/api/resource_groups/") and path.endswith("/security_policies"):
-                if not _require_client(self._send_json):
+                if not _require_client(self._send_json, local_client):
                     return
                 rg_id = path[len("/api/resource_groups/"):-len("/security_policies")]
                 if not rg_id:
                     return self._send_json(400, {"error": "missing resource_group_id"})
                 policies = [
                     engine.summarize_security_policy(p)
-                    for p in client.list_security_policies()
+                    for p in local_client.list_security_policies()
                     if (p.get("resource_group") or {}).get("id") == rg_id
                 ]
                 return self._send_json(200, {"policies": policies})
 
             if path == "/api/workload_roles":
-                if not _require_client(self._send_json):
+                if not _require_client(self._send_json, local_client):
                     return
                 contains = (qs.get("contains") or [None])[0]
-                return self._send_json(200, {"workload_roles": client.list_workload_roles(contains=contains)})
+                return self._send_json(200, {"workload_roles": local_client.list_workload_roles(contains=contains)})
+
+            if path == "/api/service_account":
+                if not _require_client(self._send_json, local_client):
+                    return
+                current_user = local_client.get_current_user()
+                # `list_user_groups` already returns each group's real `id`
+                # (not just name) -- exposing that set directly is all the
+                # frontend needs to answer "is the service account already
+                # a member of group X" for any group ID it already has from
+                # /api/groups, with zero per-group round trips.
+                group_ids = [g["id"] for g in local_client.list_user_groups(current_user["name"]) if g.get("id")]
+                return self._send_json(200, {
+                    "id": current_user.get("id"),
+                    "name": current_user.get("name"),
+                    "group_ids": group_ids,
+                })
 
             if path == "/api/access/bootstrap/status":
                 with _access_job_lock:
@@ -309,6 +481,14 @@ class Handler(SimpleHTTPRequestHandler):
                 with open(csv_path, newline="", encoding="utf-8-sig") as f:
                     rows = list(_csv.DictReader(f))
                 return self._send_json(200, {"rows": rows})
+
+            if path == "/api/audit_log":
+                try:
+                    limit = min(int((qs.get("limit") or [200])[0]), 1000)
+                    offset = max(int((qs.get("offset") or [0])[0]), 0)
+                except ValueError:
+                    return self._send_json(400, {"error": "limit/offset must be integers"})
+                return self._send_json(200, {"entries": engine.read_audit_log(limit=limit, offset=offset)})
         except ValueError as exc:
             return self._send_json(400, {"error": str(exc)})
         except (engine.OpaApiError, engine.OktaApiError) as exc:
@@ -321,13 +501,28 @@ class Handler(SimpleHTTPRequestHandler):
     # -----------------------------------------------------------------
     def do_POST(self):
         path = urlparse(self.path).path
+        if not self._check_origin():
+            return
+        owner_key = _owner_key_from_headers(self.headers)
+        engine_owner = _engine_owner(owner_key)
+        actor_email = self.headers.get("X-Auth-User")
+        actor_sub = None if owner_key == LOCAL_OWNER_KEY_HEADER else owner_key
+        _ensure_session_initialized(owner_key)
+        # Snapshot ONCE at request start -- see the identical note in
+        # do_GET. This matters even more here: /api/preview and
+        # /api/execute can run for a while, and without this snapshot a
+        # concurrent environment switch/delete could make an in-flight
+        # execute silently continue against a different (or no) tenant
+        # partway through.
+        local_client, local_okta_client, _local_env_name = _session_snapshot(owner_key)
         try:
             payload = self._read_json_body()
 
             if path == "/api/environments":
-                name = engine.upsert_environment(payload.get("name"), payload)
+                name = engine.upsert_environment(payload.get("name"), payload, owner=engine_owner)
+                engine.log_audit_event(actor_email, actor_sub, "environment.upsert", {"name": name})
                 try:
-                    activate_environment(name)
+                    activate_environment(owner_key, name)
                 except engine.OpaApiError as exc:
                     return self._send_json(502, {"error": f"Saved, but could not connect: {exc}", "saved": True})
                 return self._send_json(200, {"activated": True, "active": name})
@@ -335,26 +530,48 @@ class Handler(SimpleHTTPRequestHandler):
             if path.startswith("/api/environments/") and path.endswith("/activate"):
                 name = path[len("/api/environments/"):-len("/activate")]
                 try:
-                    activate_environment(name)
+                    activate_environment(owner_key, name)
                 except KeyError as exc:
                     return self._send_json(404, {"error": str(exc)})
                 except engine.OpaApiError as exc:
                     return self._send_json(502, {"error": str(exc)})
+                engine.log_audit_event(actor_email, actor_sub, "environment.activate", {"name": name})
                 return self._send_json(200, {"activated": True, "active": name})
 
+            if path.startswith("/api/environments/") and path.endswith("/share"):
+                name = path[len("/api/environments/"):-len("/share")]
+                shared = bool(payload.get("shared", False))
+                try:
+                    engine.set_environment_shared(name, engine_owner, shared)
+                except KeyError as exc:
+                    return self._send_json(404, {"error": str(exc)})
+                except PermissionError as exc:
+                    return self._send_json(403, {"error": str(exc)})
+                engine.log_audit_event(actor_email, actor_sub, "environment.share", {"name": name, "shared": shared})
+                return self._send_json(200, {"name": name, "shared": shared})
+
+            if path.startswith("/api/environments/") and path.endswith("/preserve_logs_locally"):
+                name = path[len("/api/environments/"):-len("/preserve_logs_locally")]
+                enabled = bool(payload.get("enabled", False))
+                try:
+                    engine.set_preserve_logs_locally(name, enabled, owner=engine_owner)
+                except KeyError as exc:
+                    return self._send_json(404, {"error": str(exc)})
+                return self._send_json(200, {"name": name, "preserve_logs_locally": enabled})
+
             if path == "/api/access/bootstrap/start":
-                if not _require_client(self._send_json):
+                if not _require_client(self._send_json, local_client):
                     return
                 global _access_job
                 with _access_job_lock:
                     if _access_job["status"] == "running":
                         return self._send_json(200, {"started": False, "already_running": True})
                     _access_job = {"status": "running", "steps": [], "error": None}
-                threading.Thread(target=_run_access_job, args=(client,), daemon=True).start()
+                threading.Thread(target=_run_access_job, args=(local_client,), daemon=True).start()
                 return self._send_json(200, {"started": True, "steps": engine.ACCESS_MODEL_STEPS})
 
             if path == "/api/resource_groups":
-                if not _require_client(self._send_json):
+                if not _require_client(self._send_json, local_client):
                     return
                 name = (payload.get("name") or "").strip()
                 if not name:
@@ -364,24 +581,30 @@ class Handler(SimpleHTTPRequestHandler):
                     return self._send_json(
                         400, {"error": "At least one group is required to create a resource group in OPA."}
                     )
-                created = client.create_resource_group(
+                created = local_client.create_resource_group(
                     name, payload.get("description", ""), delegated_resource_admin_group_ids=group_ids
                 )
+                engine.log_audit_event(actor_email, actor_sub, "resource_group.create", {
+                    "env_name": _local_env_name, "name": name, "resource_group_id": created.get("id"),
+                })
                 return self._send_json(201, {"resource_group": created})
 
             if path.startswith("/api/resource_groups/") and path.endswith("/projects"):
-                if not _require_client(self._send_json):
+                if not _require_client(self._send_json, local_client):
                     return
                 rg_id = path[len("/api/resource_groups/"):-len("/projects")]
                 name = (payload.get("name") or "").strip()
                 if not rg_id or not name:
                     return self._send_json(400, {"error": "resource_group_id (in URL) and name are required"})
-                created = client.create_project(rg_id, name)
+                created = local_client.create_project(rg_id, name)
+                engine.log_audit_event(actor_email, actor_sub, "project.create", {
+                    "env_name": _local_env_name, "resource_group_id": rg_id, "name": name, "project_id": created.get("id"),
+                })
                 return self._send_json(201, {"project": created})
 
             if (path.startswith("/api/resource_groups/") and path.endswith("/policy")
                     and "/projects/" in path and "/folders/" in path):
-                if not _require_client(self._send_json):
+                if not _require_client(self._send_json, local_client):
                     return
                 inner = path[len("/api/resource_groups/"):-len("/policy")]
                 rg_id, _, rest = inner.partition("/projects/")
@@ -412,44 +635,55 @@ class Handler(SimpleHTTPRequestHandler):
                         "rules": [],
                     }
                     engine.upsert_folder_rule_in_policy(policy_body, folder_id, folder_name, rule_name, privileges, mfa=mfa)
-                    created = client.create_security_policy(policy_body)
+                    created = local_client.create_security_policy(policy_body)
+                    engine.log_audit_event(actor_email, actor_sub, "policy.create", {
+                        "env_name": _local_env_name, "resource_group_id": rg_id, "folder_id": folder_id,
+                        "policy_name": name, "policy_id": created.get("id"),
+                    })
                     return self._send_json(201, {"policy": engine.summarize_security_policy(created)})
 
                 if mode == "existing":
                     policy_id = payload.get("policy_id")
                     if not policy_id:
                         return self._send_json(400, {"error": "policy_id is required to attach to an existing policy"})
-                    current = client.get_security_policy(policy_id)
+                    current = local_client.get_security_policy(policy_id)
                     current["principals"] = engine.merge_principals(current.get("principals"), group_refs, workload_role_refs)
                     engine.upsert_folder_rule_in_policy(current, folder_id, folder_name, rule_name, privileges, mfa=mfa)
-                    client.update_security_policy(policy_id, current)
-                    updated = client.get_security_policy(policy_id)
+                    local_client.update_security_policy(policy_id, current)
+                    updated = local_client.get_security_policy(policy_id)
+                    engine.log_audit_event(actor_email, actor_sub, "policy.update", {
+                        "env_name": _local_env_name, "resource_group_id": rg_id, "folder_id": folder_id,
+                        "policy_id": policy_id,
+                    })
                     return self._send_json(200, {"policy": engine.summarize_security_policy(updated)})
 
                 return self._send_json(400, {"error": "mode must be 'new' or 'existing'"})
 
             if path == "/api/groups":
-                if not _require_client(self._send_json):
+                if not _require_client(self._send_json, local_client):
                     return
-                if not _require_okta_client(self._send_json):
+                if not _require_okta_client(self._send_json, local_okta_client):
                     return
                 name = (payload.get("name") or "").strip()
                 if not name:
                     return self._send_json(400, {"error": "name is required"})
 
-                app = okta_client.find_privileged_access_app()
-                okta_group = okta_client.create_group(name, payload.get("description", ""))
-                okta_client.create_group_push_mapping(app["id"], okta_group["id"], name)
+                app = local_okta_client.find_privileged_access_app()
+                okta_group = local_okta_client.create_group(name, payload.get("description", ""))
+                local_okta_client.create_group_push_mapping(app["id"], okta_group["id"], name)
 
                 opa_group = None
                 for _attempt in range(GROUP_PUSH_PROPAGATION_RETRIES):
-                    matches = client.list_groups(contains=name)
+                    matches = local_client.list_groups(contains=name)
                     opa_group = next((g for g in matches if g.get("name") == name), None)
                     if opa_group:
                         break
                     time.sleep(GROUP_PUSH_PROPAGATION_DELAY_SECS)
 
                 if not opa_group:
+                    engine.log_audit_event(actor_email, actor_sub, "group.create", {
+                        "env_name": _local_env_name, "name": name, "visible_in_opa": False,
+                    })
                     return self._send_json(202, {
                         "created_in_okta": True,
                         "pushed": True,
@@ -457,7 +691,55 @@ class Handler(SimpleHTTPRequestHandler):
                         "message": f"Group '{name}' was created in Okta and pushed, but hasn't appeared in "
                                    "OPA yet. Try refreshing the group list in a few seconds.",
                     })
-                return self._send_json(201, {"created_in_okta": True, "pushed": True, "visible_in_opa": True, "group": opa_group})
+
+                # Every group this dashboard creates is meant to be usable
+                # by the dashboard itself (as a resource-group's
+                # delegated_resource_admin_groups, or a policy principal)
+                # without an extra manual step -- add the service account
+                # running this dashboard to it now. Non-blocking: the group
+                # was still created successfully either way, so a failure
+                # here (e.g. this service account lacks the pam_admin role
+                # this write requires) is surfaced as a warning, not an
+                # error, and never undoes the group creation itself.
+                service_account_added = False
+                service_account_warning = None
+                try:
+                    me = local_client.get_current_user()
+                    local_client.add_user_to_group(name, me["name"])
+                    service_account_added = True
+                except engine.OpaApiError as exc:
+                    service_account_warning = (
+                        f"Group created, but couldn't automatically add the service account to it: {exc}"
+                    )
+
+                engine.log_audit_event(actor_email, actor_sub, "group.create", {
+                    "env_name": _local_env_name, "name": name, "visible_in_opa": True,
+                    "group_id": (opa_group or {}).get("id"),
+                })
+                return self._send_json(201, {
+                    "created_in_okta": True,
+                    "pushed": True,
+                    "visible_in_opa": True,
+                    "group": opa_group,
+                    "service_account_added": service_account_added,
+                    "service_account_warning": service_account_warning,
+                })
+
+            if path == "/api/service_account/groups":
+                if not _require_client(self._send_json, local_client):
+                    return
+                group_id = payload.get("group_id")
+                if not group_id:
+                    return self._send_json(400, {"error": "group_id is required"})
+                group = next((g for g in local_client.list_groups() if g.get("id") == group_id), None)
+                if not group:
+                    return self._send_json(404, {"error": f"Unknown group id '{group_id}'"})
+                me = local_client.get_current_user()
+                local_client.add_user_to_group(group["name"], me["name"])
+                engine.log_audit_event(actor_email, actor_sub, "service_account.join_group", {
+                    "env_name": _local_env_name, "group_id": group_id,
+                })
+                return self._send_json(200, {"added": True, "group_id": group_id})
 
             if path == "/api/csv":
                 csv_path = _safe_csv_path(payload.get("file"))
@@ -468,47 +750,76 @@ class Handler(SimpleHTTPRequestHandler):
                     for row in rows:
                         writer.writerow({"path": row.get("path", ""), "description": row.get("description", "")})
                 print(f"Saved {len(rows)} row(s) to {csv_path.name}")
+                engine.log_audit_event(actor_email, actor_sub, "csv.save", {
+                    "file": csv_path.name, "row_count": len(rows),
+                })
                 return self._send_json(200, {"saved": True, "file": csv_path.name, "row_count": len(rows)})
 
             if path == "/api/preview":
-                if not _require_client(self._send_json):
+                if not _require_client(self._send_json, local_client):
                     return
                 rg_id = payload.get("resource_group_id")
                 proj_id = payload.get("project_id")
                 if not rg_id or not proj_id:
                     return self._send_json(400, {"error": "resource_group_id and project_id are required"})
                 ordered_paths, _descriptions, existing, collisions, invalid_names = _run_pipeline(
-                    payload.get("rows") or [], rg_id, proj_id
+                    local_client, payload.get("rows") or [], rg_id, proj_id
                 )
                 result = _plan_dict(ordered_paths, existing, collisions)
                 result["invalid_names"] = invalid_names
                 return self._send_json(200, result)
 
             if path == "/api/execute":
-                if not _require_client(self._send_json):
+                if not _require_client(self._send_json, local_client):
                     return
                 rg_id = payload.get("resource_group_id")
                 proj_id = payload.get("project_id")
                 if not rg_id or not proj_id:
                     return self._send_json(400, {"error": "resource_group_id and project_id are required"})
                 ordered_paths, descriptions, existing, collisions, invalid_names = _run_pipeline(
-                    payload.get("rows") or [], rg_id, proj_id
+                    local_client, payload.get("rows") or [], rg_id, proj_id
                 )
                 if invalid_names:
                     return self._send_json(
                         400, {"error": "Invalid folder name(s); fix and retry.", "invalid_names": invalid_names}
                     )
-                results = engine.execute_plan(client, rg_id, proj_id, ordered_paths, descriptions, existing)
-                output_path = PROJECT_ROOT / f"folders_result_{engine.datetime.now(engine.timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
+                results = engine.execute_plan(local_client, rg_id, proj_id, ordered_paths, descriptions, existing)
+                output_path = PROJECT_ROOT / f"folders_result_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
                 engine.write_results_csv(output_path, results)
                 print(f"Execute complete: results written to {output_path.name}")
+                engine.log_audit_event(actor_email, actor_sub, "folders.execute", {
+                    "env_name": _local_env_name, "resource_group_id": rg_id, "project_id": proj_id,
+                    "output_file": output_path.name, "folder_count": len(results),
+                })
                 return self._send_json(200, {
                     "results": [_row_dict(*r) for r in results],
                     "collisions": {name: ["/".join(p) for p in paths] for name, paths in collisions.items()},
                     "output_file": output_path.name,
                 })
 
+            if path.startswith("/api/access/users/") and path.endswith("/resource_access"):
+                if not _require_okta_client(self._send_json, local_okta_client):
+                    return
+                user_id = path[len("/api/access/users/"):-len("/resource_access")]
+                if not user_id:
+                    return self._send_json(400, {"error": "missing user_id"})
+                resources = payload.get("resources") or []
+                if not resources:
+                    return self._send_json(200, {"results": {}})
+                if _access_job_result is None:
+                    return self._send_json(409, {"error": "Access model not loaded yet -- run the Access Explorer bootstrap first."})
+                opa_user = next((u for u in _access_job_result["users"] if u.get("id") == user_id), None)
+                if not opa_user:
+                    return self._send_json(404, {"error": f"Unknown user id '{user_id}'"})
+                # System Log's actor.id is the Okta identity id, not this PAM
+                # user's own (OPA-internal) id -- see resolve_okta_actor_id.
+                actor_id = engine.resolve_okta_actor_id(local_okta_client, (opa_user.get("details") or {}).get("email"))
+                results = engine.find_last_access_for_user(local_okta_client, actor_id, resources)
+                return self._send_json(200, {"results": results})
+
             return self._send_json(404, {"error": "not found"})
+        except _RequestAborted:
+            return
         except ValueError as exc:
             return self._send_json(400, {"error": str(exc)})
         except (engine.OpaApiError, engine.OktaApiError) as exc:
@@ -518,21 +829,35 @@ class Handler(SimpleHTTPRequestHandler):
 
     # -----------------------------------------------------------------
     def do_DELETE(self):
-        global client, okta_client, active_env_name
         path = urlparse(self.path).path
+        if not self._check_origin():
+            return
+        owner_key = _owner_key_from_headers(self.headers)
+        engine_owner = _engine_owner(owner_key)
+        actor_email = self.headers.get("X-Auth-User")
+        actor_sub = None if owner_key == LOCAL_OWNER_KEY_HEADER else owner_key
+        _ensure_session_initialized(owner_key)
+        # Snapshot for the folder-delete branch below -- see the identical
+        # note in do_GET/do_POST. The environment-delete branch legitimately
+        # clears this owner's session slot itself (that's the whole point
+        # of that branch).
+        local_client, _local_okta_client, local_env_name = _session_snapshot(owner_key)
         try:
             if path.startswith("/api/environments/"):
                 name = path[len("/api/environments/"):]
-                was_active = engine.delete_environment(name)
+                try:
+                    was_active = engine.delete_environment(name, owner=engine_owner)
+                except PermissionError as exc:
+                    return self._send_json(403, {"error": str(exc)})
                 if was_active:
-                    client = None
-                    okta_client = None
-                    active_env_name = None
+                    with _sessions_lock:
+                        _sessions.pop(owner_key, None)
+                engine.log_audit_event(actor_email, actor_sub, "environment.delete", {"name": name})
                 return self._send_json(200, {"deleted": name})
 
             if (path.startswith("/api/resource_groups/") and "/projects/" in path
                     and "/folders/" in path):
-                if not _require_client(self._send_json):
+                if not _require_client(self._send_json, local_client):
                     return
                 inner = path[len("/api/resource_groups/"):]
                 rg_id, _, rest = inner.partition("/projects/")
@@ -544,14 +869,35 @@ class Handler(SimpleHTTPRequestHandler):
                 # folder (see engine delete_folder docstring), so this
                 # dashboard refuses to delete one rather than risk
                 # orphaning or mass-deleting its contents.
-                items = client.list_folder_items(rg_id, proj_id, folder_id)
+                items = local_client.list_folder_items(rg_id, proj_id, folder_id)
                 if items:
                     return self._send_json(409, {
                         "error": f"Folder is not empty ({len(items)} item(s) inside) -- "
                                  "remove or move its contents first, then delete it."
                     })
-                client.delete_folder(rg_id, proj_id, folder_id)
+                local_client.delete_folder(rg_id, proj_id, folder_id)
+                engine.log_audit_event(actor_email, actor_sub, "folder.delete", {
+                    "env_name": local_env_name, "resource_group_id": rg_id, "project_id": proj_id,
+                    "folder_id": folder_id,
+                })
                 return self._send_json(200, {"deleted": folder_id})
+
+            if path.startswith("/api/groups/") and "/members/" in path:
+                if not _require_client(self._send_json, local_client):
+                    return
+                inner = path[len("/api/groups/"):]
+                group_id, _, user_name = inner.partition("/members/")
+                user_name = unquote(user_name.rstrip("/"))
+                if not group_id or not user_name:
+                    return self._send_json(400, {"error": "missing group_id or user_name"})
+                group = next((g for g in local_client.list_groups() if g.get("id") == group_id), None)
+                if not group:
+                    return self._send_json(404, {"error": f"Unknown group id '{group_id}'"})
+                local_client.remove_user_from_group(group["name"], user_name)
+                engine.log_audit_event(actor_email, actor_sub, "group.remove_member", {
+                    "env_name": local_env_name, "group_id": group_id, "user_name": user_name,
+                })
+                return self._send_json(200, {"removed": True, "group_id": group_id, "user_name": user_name})
 
             return self._send_json(404, {"error": "not found"})
         except KeyError as exc:
@@ -562,20 +908,35 @@ class Handler(SimpleHTTPRequestHandler):
             return self._send_json(500, {"error": str(exc)})
 
 
-def _try_activate_saved_environment():
-    """On startup, if the encrypted store already has an active environment
-    (e.g. from a previous run), try to reconnect automatically. Failure here
-    is NOT fatal -- the server still starts, and the dashboard UI will show
-    the setup screen since `client` stays None."""
-    data = engine.load_environments()
-    name = data.get("active")
-    if not name or name not in data.get("environments", {}):
+def _try_activate_saved_environment(owner_key):
+    """If this owner has a persisted active environment (from a previous
+    run/request) and no live session yet this process, try to reconnect
+    automatically. Failure here is NOT fatal -- the request/boot continues,
+    and the dashboard UI will show the setup screen since this owner's
+    session stays empty. Called both at process boot (for
+    LOCAL_OWNER_KEY_HEADER, matching this dashboard's original one-shared-
+    environment boot behavior exactly) and lazily, the first time any given
+    logged-in owner is ever seen by a request in this process."""
+    engine_owner = _engine_owner(owner_key)
+    name = engine.get_active_environment_name(engine_owner)
+    if not name:
         return
     try:
-        activate_environment(name)
+        activate_environment(owner_key, name)
     except Exception as exc:
-        print(f"Could not auto-activate saved environment '{name}': {exc}")
-        print("The dashboard will start anyway -- fix or re-select an environment from the gear menu.")
+        print(f"Could not auto-activate saved environment '{name}' for owner '{owner_key}': {exc}")
+
+
+def _ensure_session_initialized(owner_key):
+    """Lazily runs _try_activate_saved_environment for an owner the first
+    time any request from them arrives in this process -- avoids requiring
+    every logged-in user to explicitly re-activate an environment they'd
+    already set active in a previous session/process."""
+    with _sessions_lock:
+        already_seen = owner_key in _sessions or owner_key in _seen_owners
+        _seen_owners.add(owner_key)
+    if not already_seen:
+        _try_activate_saved_environment(owner_key)
 
 
 def main():
@@ -584,7 +945,8 @@ def main():
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
 
-    _try_activate_saved_environment()
+    _seen_owners.add(LOCAL_OWNER_KEY_HEADER)
+    _try_activate_saved_environment(LOCAL_OWNER_KEY_HEADER)
 
     if not FRONTEND_DIST.exists():
         print(f"Warning: {FRONTEND_DIST} does not exist yet -- run 'npm run build' in frontend/ first.")
@@ -599,7 +961,7 @@ def main():
 
     url = f"http://127.0.0.1:{args.port}/"
     print(f"Serving OPA Secrets Wizard at {url}")
-    if client is None:
+    if LOCAL_OWNER_KEY_HEADER not in _sessions:
         print("No environment configured yet -- the dashboard will prompt you to set one up.")
     print("Press Ctrl+C to stop.")
 

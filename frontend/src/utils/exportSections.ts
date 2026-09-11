@@ -1,6 +1,15 @@
-import type { AccessModel, AccessPolicy, AccessProject, PolicyRule } from '../types'
+import type {
+  AccessModel,
+  AccessPolicy,
+  AccessProject,
+  AuditEntry,
+  FolderAccessRow,
+  PolicyRule,
+  RevealEntry,
+  SecretAccessRow,
+} from '../types'
 import type { ExportSection } from './export'
-import { cellValue, labelize } from './format'
+import { cellValue, formatDateTime, labelize } from './format'
 import type { GrantedRule } from './policy'
 import { describeCondition } from './policy'
 
@@ -89,5 +98,50 @@ export function accessModelExportSections(model: AccessModel): ExportSection[] {
       title: 'Groups',
       rows: model.groups.map(g => ({ Group: g.name, Roles: g.roles.join(', ') })),
     },
+  ]
+}
+
+// ── Secrets Access Dashboard ──────────────────────────────────────────────
+
+function auditCell(entry: AuditEntry | null | undefined): string {
+  if (!entry) return ''
+  return `${entry.by ?? 'unknown'} — ${formatDateTime(entry.at)}`
+}
+
+function auditHistoryCell(entries: AuditEntry[]): string {
+  return entries.map(e => auditCell(e)).join('; ')
+}
+
+function revealsCell(reveals: RevealEntry[]): string {
+  return reveals.map(r => auditCell(r)).join('; ')
+}
+
+function secretAccessRow(row: SecretAccessRow): Record<string, string> {
+  return {
+    Secret: row.name,
+    Path: row.path,
+    Status: labelize(row.status),
+    Created: auditCell(row.created),
+    'Updated (most recent first)': auditHistoryCell(row.updated),
+    Deleted: auditCell(row.deleted),
+    'Retrieved (most recent first)': revealsCell(row.reveals),
+  }
+}
+
+function folderAccessRow(row: FolderAccessRow): Record<string, string> {
+  return {
+    Folder: row.name,
+    Path: row.path,
+    Status: labelize(row.status),
+    Created: auditCell(row.created),
+    'Updated (most recent first)': auditHistoryCell(row.updated),
+    Deleted: auditCell(row.deleted),
+  }
+}
+
+export function secretsAccessReportExportSections(secrets: SecretAccessRow[], folders: FolderAccessRow[]): ExportSection[] {
+  return [
+    { title: 'Secrets', rows: secrets.map(secretAccessRow) },
+    { title: 'Folders', rows: folders.map(folderAccessRow) },
   ]
 }

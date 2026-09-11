@@ -11,7 +11,10 @@ import type {
   OpaGroup,
   PreviewResponse,
   Project,
+  ResourceAccessInfo,
   ResourceGroup,
+  SecretsAccessReport,
+  ServiceAccountInfo,
   WorkloadRole,
 } from '../types'
 
@@ -38,6 +41,10 @@ export function fetchEnvironments(): Promise<EnvironmentsResponse> {
   return apiFetch('/api/environments')
 }
 
+export function fetchWhoami(): Promise<{ email: string | null; is_local: boolean }> {
+  return apiFetch('/api/whoami')
+}
+
 export function saveEnvironment(values: EnvironmentFormValues): Promise<{ activated: boolean; active: string }> {
   return apiFetch('/api/environments', { method: 'POST', body: JSON.stringify(values) })
 }
@@ -48,6 +55,13 @@ export function activateEnvironment(name: string): Promise<{ activated: boolean;
 
 export function deleteEnvironment(name: string): Promise<{ deleted: string }> {
   return apiFetch(`/api/environments/${encodeURIComponent(name)}`, { method: 'DELETE' })
+}
+
+export function setPreserveLogsLocally(name: string, enabled: boolean): Promise<{ name: string; preserve_logs_locally: boolean }> {
+  return apiFetch(`/api/environments/${encodeURIComponent(name)}/preserve_logs_locally`, {
+    method: 'POST',
+    body: JSON.stringify({ enabled }),
+  })
 }
 
 export function fetchResourceGroups(): Promise<{ resource_groups: ResourceGroup[] }> {
@@ -96,6 +110,18 @@ export function fetchGroups(contains?: string): Promise<{ groups: OpaGroup[] }> 
 
 export function createGroup(name: string, description: string): Promise<CreateGroupResponse> {
   return apiFetch('/api/groups', { method: 'POST', body: JSON.stringify({ name, description }) })
+}
+
+export function fetchServiceAccount(): Promise<ServiceAccountInfo> {
+  return apiFetch('/api/service_account')
+}
+
+export function addServiceAccountToGroup(groupId: string): Promise<{ added: boolean; group_id: string }> {
+  return apiFetch('/api/service_account/groups', { method: 'POST', body: JSON.stringify({ group_id: groupId }) })
+}
+
+export function removeUserFromGroup(groupId: string, userName: string): Promise<{ removed: boolean; group_id: string; user_name: string }> {
+  return apiFetch(`/api/groups/${encodeURIComponent(groupId)}/members/${encodeURIComponent(userName)}`, { method: 'DELETE' })
 }
 
 export function fetchCsvFiles(): Promise<{ files: string[] }> {
@@ -189,5 +215,23 @@ export function assignFolderPolicy(
   return apiFetch(
     `/api/resource_groups/${encodeURIComponent(resourceGroupId)}/projects/${encodeURIComponent(projectId)}/folders/${encodeURIComponent(folderId)}/policy`,
     { method: 'POST', body: JSON.stringify(payload) }
+  )
+}
+
+export function fetchUserResourceAccess(
+  userId: string,
+  resources: { resource_kind: string; resource_id: string }[]
+): Promise<{ results: Record<string, ResourceAccessInfo> }> {
+  return apiFetch(`/api/access/users/${encodeURIComponent(userId)}/resource_access`, {
+    method: 'POST',
+    body: JSON.stringify({ resources }),
+  })
+}
+
+// ── Secrets Access Dashboard ──────────────────────────────────────────────
+
+export function fetchSecretsAccessReport(resourceGroupId: string, projectId: string): Promise<SecretsAccessReport> {
+  return apiFetch(
+    `/api/resource_groups/${encodeURIComponent(resourceGroupId)}/projects/${encodeURIComponent(projectId)}/secrets_access_report`
   )
 }

@@ -1,6 +1,6 @@
 interface Props {
   label: string
-  variant: 'neutral' | 'exists' | 'new' | 'created' | 'error'
+  variant: 'neutral' | 'exists' | 'new' | 'created' | 'error' | 'active' | 'deleted' | 'unknown'
 }
 
 const VARIANT_CLASSES: Record<Props['variant'], string> = {
@@ -9,6 +9,9 @@ const VARIANT_CLASSES: Record<Props['variant'], string> = {
   new: 'bg-bg-hover text-text-dim border-border',
   created: 'bg-win/10 text-win border-win/40',
   error: 'bg-loss/10 text-loss border-loss/40',
+  active: 'bg-win/10 text-win border-win/40',
+  deleted: 'bg-loss/10 text-loss border-loss/40',
+  unknown: 'bg-bg-hover text-text-faint border-border',
 }
 
 export function StatusBadge({ label, variant }: Props) {

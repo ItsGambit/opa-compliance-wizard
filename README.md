@@ -77,11 +77,18 @@ credential store via the `keyring` package:
 Install with `pip install -r requirements.txt` (just `keyring`). The
 CLI resolves credentials in this order: (1) OS environment variables,
 (2) a local `.env` file (legacy, plaintext, fully opt-in — only used if
-you create one yourself; nothing in this tool writes one anymore), (3)
-the dashboard's encrypted environment store — whichever environment is
-active there. This means the CLI automatically follows whatever
-environment you last activated in the dashboard, with zero plaintext
-involved.
+you create one yourself; nothing in this tool writes one anymore, and
+it's already excluded via `.gitignore` if you do), (3) the dashboard's
+encrypted environment store — whichever environment is active there.
+This means the CLI automatically follows whatever environment you last
+activated in the dashboard, with zero plaintext involved.
+
+This only protects the secrets at rest on disk. The OS keychain
+backends above unlock with your OS login session — on an unlocked,
+logged-in workstation, any process running as you (including this
+tool itself) can read what's stored there, the same as any other app
+using your OS's native credential store. Lock your workstation like
+you would for any other credential-bearing session.
 
 ## Interactive Dashboard
 
@@ -230,6 +237,79 @@ resolve to one project, so the condition itself is shown as readable
 text (e.g. "Servers labeled `system.os_type=linux`") at the
 resource-group level.
 
+### Secrets Access Dashboard
+
+A third top-level tab: pick a resource group and project, see every
+secret and secret folder in it — including ones since deleted — with
+who created, updated, retrieved (secrets only, up to 5 most recent),
+and deleted each one, and when.
+
+Two sources merged into one report: the live folder/secret tree (same
+walk Folder Builder's "Load Current Structure" uses) for what exists
+right now, plus a single Okta System Log query scoped to the project
+(`pam.secret.create/.update/.delete/.reveal` and
+`pam.secret_folder.create/.update/.delete` — see "Confirmed tenant
+behavior" below) for the full history, including resources that no
+longer exist and therefore aren't in the live tree at all. A row
+absent from the live tree is only ever marked **deleted** when the log
+actually contains a delete event for it — otherwise it's **unknown**
+(most likely just older than the 90-day System Log retention window),
+never guessed. Requires an Okta API token configured on the active
+environment (same requirement as Access Explorer's "last accessed"
+lookup), since the audit trail comes entirely from Okta's System Log,
+not OPA's own API.
+
+Has its own **Export CSV** / **Export MD** buttons, covering both the
+Secrets and Folders sections of whatever resource group/project is
+currently selected, plus a **Refresh** button to re-pull the report
+on demand without changing the resource group/project selection.
+
+**Preserving history past Okta's 90-day retention.** Okta's System Log
+only ever retains 90 days — this tool can't extend that on Okta's side,
+but each saved environment (gear icon → environment row) can opt in to
+**"preserve logs locally"**: once enabled, every report fetch for that
+environment merges newly-seen System Log events into a local cache file
+(`secrets_log_cache.json`, next to `environments.json`, git-ignored like
+it) instead of discarding them once Okta ages them out. A clear
+shield icon (green "Preserving logs locally" / grey "Local log
+preservation off") appears both in the environment manager and on the
+Secrets Access Dashboard itself, so it's never ambiguous whether a given
+report's history is capped at 90 days or extended locally. This cannot
+retroactively recover events that were already older than 90 days the
+first time the toggle is turned on for a given project — only what's
+captured from that point forward accumulates; the dashboard's own
+"based on the last N days" note is replaced with the actual local
+coverage start date once enabled, rather than continuing to imply a
+hard 90-day ceiling.
+
+`secrets_log_cache.json` is **encrypted at rest** (Fernet/AES128-CBC via
+the `cryptography` package) — it's audit metadata (who/what/when, secret
+*names/paths*), never secret values, but it's still local history worth
+protecting from casual disk access. The encryption key itself is never
+written to disk in plaintext, and is resolved the same "server override,
+desktop fallback" way this tool already resolves OPA/Okta credentials
+(see "CLI Setup" below):
+
+- **Standalone (desktop) use** — the key is generated once and stored in
+  the OS keychain (Windows Credential Locker / macOS Keychain / Linux
+  Secret Service), exactly like `key_secret`/`okta_api_token`. Nothing to
+  configure.
+- **Server-hosted use** — set `OPA_SECRETS_WIZARD_LOG_CACHE_KEY` to a
+  Fernet key (`python -c "from cryptography.fernet import Fernet;
+  print(Fernet.generate_key().decode())"`) via whatever your deployment
+  already uses to inject secrets (systemd `LoadCredential=`, a secrets
+  manager, etc.) — checked *before* the OS keychain, since a headless
+  Linux server has no desktop secret-service session for `keyring` to use
+  at all. Only the server process ever sees this key; it's never sent to
+  the browser.
+
+A cache file that fails to decrypt under whichever key is active (lost/
+rotated key, or none configured) is treated as unreadable history and
+started fresh — logged as a warning, never a crash. A pre-encryption
+plaintext cache file from an older version of this tool is read once as
+plaintext and transparently re-encrypted on its next write, with no data
+loss and no manual migration step.
+
 ### Policy assignment (Folder Builder)
 
 Every folder row in the tree editor carries a small access badge
@@ -257,6 +337,74 @@ Assigning a folder that a policy *already* has a rule for edits that
 rule in place rather than adding a duplicate — matched by the rule's
 `secret_folder` ID, confirmed live (create → attach-with-different-
 privileges → refetch showed one updated rule, not two).
+
+## Hosting on a server (optional)
+
+The dashboard can also run as a persistent, centrally-reachable service
+instead of only on someone's own machine, for a small team sharing access
+to the same OPA/Okta tenants. This is deliberately optional -- the default
+experience (`launch.py`, described above) needs none of this.
+
+**Architecture:** `server/serve.py` still only ever binds `127.0.0.1` --
+it is never directly reachable from the network, hosted or not. A
+reverse proxy (nginx, see `server/nginx-opa-secrets-wizard.conf` as a
+starting template) terminates TLS and gates access with real **Okta OIDC
+login** (`server/auth_gate.py`) before anything reaches the app. Plain
+HTTP Basic Auth was tried first and abandoned -- some managed
+Edge/Chromium browser policies restrict `AuthSchemes` to
+`ntlm`/`negotiate`, which silently swallows Basic Auth's login popup
+entirely (the server sends a correct 401 challenge; the browser just never
+shows it). OIDC's own hosted login page sidesteps that failure mode
+completely.
+
+**Setup, at a high level** (see `server/*.service`, `server/start-headless.sh`,
+and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
+1. Register a **Web Application** OIDC integration in your Okta org
+   (Admin Console -> Applications -> Create App Integration -> OIDC ->
+   Web Application). Grant type: Authorization Code only. Sign-in
+   redirect URI: `https://<your-dashboard-origin>/authorization-code/callback`.
+   Sign-out redirect URI: `https://<your-dashboard-origin>/login`. Note the
+   resulting **Client ID** and **Client secret**.
+2. If using a **custom** Okta authorization server (not the org
+   authorization server), confirm it actually has an access policy + rule
+   granting your new app's client access -- a brand-new custom
+   authorization server can have zero policies, which silently denies
+   every token request (`access_denied — Policy evaluation failed`) and
+   looks like an MFA/access problem rather than a missing-setup-step one.
+3. Store the client secret in the OS keyring under this project's existing
+   per-environment convention:
+   `keyring.set_password(f"opa-secrets-wizard:{env_name}", "okta_client_secret", "<secret>")`
+   (`env_name` matches whatever `OKTA_ENV_NAME` you set in step 4).
+4. Set these environment variables for `server/auth_gate.py` (e.g. in the
+   systemd unit's `EnvironmentFile`) -- the process refuses to start
+   without all three, rather than silently pointing at the wrong org:
+   - `OKTA_ORG_URL` — e.g. `https://your-org.oktapreview.com`
+   - `OKTA_OIDC_CLIENT_ID` — the Client ID from step 1 (not secret, but
+     still specific to your deployment)
+   - `DASHBOARD_ORIGIN` — the public origin this dashboard is reachable
+     at, e.g. `https://192.168.1.10` or `https://opa.example.com`
+   - `OKTA_ENV_NAME` (optional, defaults to `"default"`)
+5. If `server/serve.py` itself will be reached through a hostname/IP other
+   than `127.0.0.1`/`localhost` (true for any reverse-proxied deployment),
+   also set `EXTRA_ALLOWED_ORIGINS` (comma-separated) to that public
+   origin -- otherwise every write request is rejected with `403 Origin
+   '...' is not allowed to call this API"` once real browser traffic
+   arrives from that origin.
+6. Install and enable the two systemd units (`opa-secrets-wizard.service`,
+   `opa-auth-gate.service`) and the nginx site config, adjusting paths/IPs
+   for your own server.
+
+**Per-user environments.** Once behind the login gate, each logged-in
+Okta identity gets their own private set of environments by default (an
+environment created by user A is invisible to user B) -- opt an
+environment into being visible to every other logged-in user via
+`PUT /api/environments/{name}/share`. Every write action (environment
+changes, folder/resource-group/policy/group creates and deletes) is
+appended to `audit_log.jsonl`, attributed to the real logged-in identity.
+Running the CLI or `launch.py` directly (no login gate in front of them at
+all) is entirely unaffected by any of this -- there's exactly one shared,
+unscoped environment list, matching this tool's original single-user
+design.
 
 ## CLI Setup
 
@@ -448,6 +596,44 @@ for every path. When run with `--execute`, also writes a results CSV
     folder — remove or move its contents first. This is a deliberate
     safety choice, not a confirmed cascade/orphan finding either way.
 
+14. **A security policy's `user_groups` principal can only ever be an
+    Okta-sourced group, but group MEMBERSHIP isn't exclusively Okta's
+    domain the way group CREATION is.** `GET /current_user` (whoami)
+    confirms this dashboard's own service-user API key is an OPA-native
+    **Service User** — `GET /service_users` shows `user_type: "service"`
+    with no Okta linkage at all, so it can never itself be a real Okta
+    group member. But OPA exposes its own direct group-membership API,
+    entirely separate from Okta Group Push: `POST
+    /groups/{group_name}/users` (`AddUserToGroup`) and `DELETE
+    /groups/{group_name}/users/{user_name}` (`RemoveUserFromGroup`),
+    confirmed live to work for a service user on a real Okta-sourced/
+    pushed group, not just OPA's own local groups. Both require the
+    caller to hold the `pam_admin` role — this tenant's service account
+    already has it (via membership in a group whose own `roles` include
+    `pam_admin`), so it can grant itself membership elsewhere without
+    any human intervention; a service account without `pam_admin`
+    anywhere would need a human to run this once first.
+
+15. **Secret/folder create/update/delete/reveal all show up as real,
+    distinct System Log eventTypes** — `pam.secret.create`,
+    `pam.secret.update`, `pam.secret.delete`, `pam.secret.reveal`,
+    `pam.secret_folder.create`, `pam.secret_folder.update`,
+    `pam.secret_folder.delete` — confirmed via a full unfiltered
+    90-day `eventType sw "pam."` scan against a real tenant with
+    genuine history (a shallower 5-page scan initially looked like
+    these events didn't exist at all; they were just further back).
+    Every one of these events' `target[]` already carries the
+    resource's own id + name (`Secret` / `Secret Folder`), its full
+    path (`Secret Path`), and its Resource Group/Project as co-targets
+    — so a single System Log query filtered by `target.id eq
+    "{project_id}"` (a project-scoped event's target array always
+    includes the project as a co-target — also confirmed live) is all
+    the Secrets Access Dashboard needs, no per-secret calls. For a
+    service-account actor, `alternateId` is an opaque `users/<uuid>`
+    with no human-readable value at all — `displayName` is the only
+    field that's readable for both service accounts and real humans,
+    so it's what the dashboard attributes actions to.
+
 ## Idempotency
 
 Existing folders are detected by recursively walking the full folder
@@ -458,14 +644,430 @@ already exists is skipped, not duplicated.
 
 ## Version
 
-5.7.0 — first public testing release. The launcher now checks (and can
-guide you through installing/upgrading) Python, Node.js, and this
-project's own dependencies before building/starting anything; the
-dashboard has an ⓘ "about / no warranty" dialog next to the gear icon;
-and the repo itself is packaged for GitHub (MIT license, cleaned-up
-`.gitignore`, no test artifacts).
+5.16.0 — The dashboard can now be **hosted centrally** (Ubuntu server,
+systemd + nginx + TLS) instead of only run locally per-user, gated by
+**real Okta OIDC login** (not HTTP Basic Auth — see changelog for why),
+with **per-user environments** (private by default, opt-in shared) and
+an **audit log** attributing every write action to the logged-in
+identity. See the changelog entry below for exactly what changed and why.
 
 ### Changelog
+- **5.16.0**:
+  - **Hosted deployment**: the dashboard can now run as a persistent,
+    centrally-reachable service instead of only `launch.py` on someone's
+    own machine. New `server/opa-secrets-wizard.service` (systemd unit,
+    `Restart=on-failure`, enabled at boot) + `server/start-headless.sh`
+    (unlocks a headless `gnome-keyring` Secret Service before `exec`'ing
+    `serve.py`, since a hosted Linux box has no desktop/login session for
+    `keyring`'s SecretService backend to attach to — `--login` mode is
+    what actually persists the unlock across restarts, plain `--unlock`
+    was not sufficient) + `server/nginx-opa-secrets-wizard.conf` (TLS
+    termination with a self-signed cert, reverse-proxies to `serve.py`
+    on `127.0.0.1:8766`, which keeps binding to localhost-only exactly as
+    before — nginx is what's actually reachable on the network, not the
+    app itself).
+  - **Okta OIDC login gate, not HTTP Basic Auth.** Basic Auth was the
+    original plan (`nginx auth_basic` + `.htpasswd`), but a real-world
+    gap killed it: a managed Chromium/Edge policy on the machine used to
+    test this restricted `AuthSchemes` to `ntlm`/`negotiate`, so the
+    browser silently swallowed the Basic Auth challenge (server sent a
+    correct `401` + `WWW-Authenticate`, browser never showed the login
+    popup) — a real, hard-to-diagnose failure mode worth remembering for
+    any future "gate a local tool with Basic Auth" plan. Replaced with a
+    real Okta Authorization Code + PKCE flow: new standalone
+    `server/auth_gate.py` (`127.0.0.1:8767`, fronted by nginx's
+    `auth_request` module) exchanges a code for tokens, verifies the ID
+    token's RS256 signature via Okta's JWKS (`pyjwt[crypto]`, new
+    dependency — chosen over hand-rolling JWT/JWKS verification for this
+    security-sensitive path), and sets a signed (HMAC-SHA256) session
+    cookie. `/logout` clears the local session AND redirects through
+    Okta's own logout endpoint, so it doesn't just forget the user
+    locally while Okta's own SSO session silently logs them back in on
+    the next visit.
+  - **Real Okta org gotcha, worth remembering for any future OIDC work**:
+    a brand-new custom authorization server's access policy list can be
+    completely empty — with zero policies, every token request is denied
+    by default (`access_denied — Policy evaluation failed`), which reads
+    like an MFA/access problem but is actually just "nobody ever told
+    this authorization server any client is allowed to use it." Fixed by
+    adding a policy (`ALL_CLIENTS`) + a rule (all grant types, all
+    scopes) — a normal one-time setup step for a fresh authorization
+    server, not a bug in this tool.
+  - **Per-user environments, not one shared list.** `environments.json`
+    entries gained `owner` (Okta `sub`, `null` for local/CLI use) and
+    `shared` (bool, default `false`); `"active"` became a dict keyed by
+    owner instead of one global string. Every pre-existing environment
+    migrates automatically on first load (`owner: null, shared: true` —
+    preserves "everyone could already use these" instead of silently
+    hiding them). Storage/keyring keys are now `owner::name`-namespaced so
+    two different users can each have their own "dev" without colliding;
+    a same-named environment a user actually owns always takes precedence
+    over a same-named one merely shared by someone else. New
+    `PUT /api/environments/{name}/share` lets an owner opt an environment
+    into being visible (read/use, not edit/delete) to every other user.
+    `serve.py`'s three module-level globals (`client`/`okta_client`/
+    `active_env_name` — one shared session for the entire process) became
+    a per-owner session table instead. **Local/direct runs and the CLI are
+    completely unaffected** — no verified identity present means every
+    call resolves through one fixed local sentinel, which is exactly
+    today's original single-shared-environment behavior; this was the
+    explicit hard constraint driving the whole design, not an
+    afterthought.
+  - **Audit log**, per explicit request: every write action (environment
+    create/activate/share/delete, resource group/project/policy/group
+    create, folder execute/delete, group membership changes) now appends
+    to `audit_log.jsonl` via a new `engine.log_audit_event`, attributed to
+    the real logged-in Okta identity when one is present (`null` for
+    local/CLI-triggered actions, so those stay auditable too, just without
+    a real identity attached). New `GET /api/audit_log` route, viewable by
+    any logged-in user for now.
+  - **Identity bridge, the missing piece that took real debugging to get
+    right**: nginx's `auth_request` module does NOT forward the auth
+    subrequest's response headers into the main proxied request by
+    default — `auth_gate.py`'s `/verify` response sets `X-Auth-Sub`/
+    `X-Auth-User`, but without `auth_request_set` + `proxy_set_header` in
+    nginx, `serve.py` never saw them at all. Also: **the real Okta `sub`
+    claim did NOT match this authorization server's documented claim
+    override** (`(appuser != null) ? appuser.userName : app.clientId`,
+    which reads like it should return the login/email) — live capture via
+    a temporary debug log showed the real token's `sub` was actually the
+    internal Okta user ID (e.g. `00uyqm6...`), not the login string. Cost
+    real back-and-forth (private per-user environments were briefly
+    created under the wrong, guessed owner key before this was caught and
+    fixed) — the concrete lesson: verify a claim's real runtime value
+    directly rather than trusting its configured expression, the same
+    "live-verify over trust the config/docs" principle this project has
+    hit before with the OPA API itself.
+  - **Origin-check bug, real and would have blocked every write in the
+    hosted deployment**: `serve.py`'s CORS/Origin allowlist
+    (`_allowed_origins`) and its hardcoded `Access-Control-Allow-Origin`
+    response header both predated hosting entirely — written when this
+    app only ever ran at `127.0.0.1`/`localhost`. Once reverse-proxied
+    behind nginx on a real LAN IP, the browser's real `Origin` header was
+    never in the allowlist, so every mutating request (environment
+    switch, preserve-logs toggle, etc.) failed with `403 Origin '...' is
+    not allowed to call this API` — caught via live testing in the actual
+    browser, not assumed from reading the code. Fixed with a new
+    `EXTRA_ALLOWED_ORIGINS` env var (comma-separated, set via the
+    systemd unit's `EnvironmentFile`) rather than hardcoding any specific
+    IP/hostname into source — local/direct runs are unaffected since the
+    var is empty by default there.
+  - **Who's logged in + logout, in the UI.** New `GET /api/whoami`
+    (echoes the same `X-Auth-User` header the identity bridge above
+    established — `is_local: true` when absent, so the frontend can hide
+    login-specific UI for local/direct runs instead of showing a
+    logout button that does nothing) + new `UserMenu.tsx`, placed next to
+    the existing About/gear icons per explicit request. Logout is a plain
+    link to `/logout` (already routed to `auth_gate.py`'s real
+    Okta-session-ending logic above), not a new mutation.
+  - Live-verified end-to-end against the real hosted deployment and a
+    real `patlabusp` Okta login throughout, not just locally: TLS
+    handshake (including a real self-signed-cert SAN gap that broke Edge
+    outright with a scrambled-credentials error, fixed by regenerating
+    the cert with a proper `IP:` SAN), the full OIDC redirect/callback
+    round trip, per-user environment isolation (two different owners each
+    with their own same-named "dev", confirmed neither could see or
+    delete the other's), the origin-check fix, and real folder/resource
+    group API calls succeeding post-login.
+- **5.15.0**:
+  - **Refresh button on the Secrets Access Dashboard.** Re-pulls the
+    report on demand (spinner via `isFetching`, same convention as
+    `GroupPicker`'s existing refresh) without touching the RG/Project
+    selection — previously the only way to re-fetch was reselecting
+    the project.
+  - **Opt-in local preservation of Secrets Access Dashboard history
+    past Okta's 90-day System Log retention.** New per-environment
+    `preserve_logs_locally` flag (toggled via a new
+    `POST /api/environments/{name}/preserve_logs_locally` route,
+    `engine.set_preserve_logs_locally`) — when on, every report fetch
+    merges newly-seen System Log events into a local, git-ignored
+    `secrets_log_cache.json` (keyed by environment → project → event
+    uuid, deduped) via `engine._merge_system_log_events`, so events
+    already captured survive Okta aging them out of its own 90-day
+    window. `build_secrets_access_report` now returns
+    `local_retention_enabled` and `oldest_captured_at` so the UI can
+    say exactly how far back local coverage actually goes, rather than
+    implying a hard 90-day ceiling once enabled. Cannot retroactively
+    recover events already older than 90 days the first time this is
+    turned on for a project — only forward accumulation.
+  - New `LogRetentionIndicator` component: a shield icon + label
+    (never color-alone) shown read-only next to the dashboard's
+    "based on the last N days" note, and as a click-to-toggle in each
+    environment's row in the environment manager dialog.
+  - **`secrets_log_cache.json` is encrypted at rest** (new `cryptography`
+    dependency, Fernet/AES128-CBC). Key resolution mirrors this tool's
+    existing "server override, desktop fallback" pattern for credentials:
+    `OPA_SECRETS_WIZARD_LOG_CACHE_KEY` env var checked first (server-
+    hosted use, since a headless Linux box has no desktop secret-service
+    session for `keyring` to use), falling back to a key generated once
+    and stored in the OS keychain (standalone/desktop use, same as
+    `key_secret`/`okta_api_token`). A pre-encryption plaintext cache file
+    is read once and transparently re-encrypted on its next write — no
+    manual migration, no data loss. A file that fails to decrypt under
+    whichever key is active is logged as a warning and started fresh
+    rather than crashing the dashboard.
+  - Also fixed a pre-existing dead `return results` immediately after
+    `build_secrets_access_report`'s real `return` — unreachable
+    leftover from before the function's current return shape,
+    unrelated to this feature but trivial to clean up while touching
+    the function.
+- **5.14.0**:
+  - **New Secrets Access Dashboard tab.** `build_secrets_access_report`
+    merges the live folder/secret walk ("what exists now") with one
+    System Log query per report, scoped to the project and filtered to
+    7 confirmed real eventTypes (`pam.secret.create/.update/.delete/
+    .reveal`, `pam.secret_folder.create/.update/.delete` — see
+    "Confirmed tenant behavior" #15). A resource missing from the live
+    walk is only marked "deleted" with direct log evidence (a real
+    delete event); otherwise it's "unknown" rather than guessed —
+    most likely just older than the 90-day System Log retention
+    window than it is truly untouched.
+  - **`full_path` promoted from `serve.py` into the engine** so the new
+    report and the pre-existing `/folders` route share one
+    path-reconstruction walk instead of two copies of the same logic —
+    verified the existing route's behavior is unchanged after the move.
+  - New route `GET /api/resource_groups/{rg}/projects/{proj}/
+    secrets_access_report`, guarded by both the OPA and Okta client
+    requirements (same pair Access Explorer's "last accessed" lookup
+    already needs) since the entire audit trail comes from Okta's
+    System Log, not OPA's own API.
+  - Frontend: `SecretsAccessDashboard.tsx` (new top-level tab, plain RG
+    + Project `Select`s — deliberately not `ResourceGroupSelect`/
+    `ProjectSelect`, whose "+ Create new" affordance doesn't belong in
+    a read-only audit view), reusing the existing expand/collapse
+    history interaction from `PolicyRuleCard`'s reveal-history display
+    for both "updated" and "retrieved" columns. `StatusBadge` gained
+    `active`/`deleted`/`unknown` variants.
+  - Live-verified end-to-end: real create/update/reveal history from
+    this project's own past sessions rendered correctly; a fresh
+    throwaway secret was created and deleted live mid-session to
+    confirm the "deleted" status path works for a brand-new event, not
+    just historical data (and cleaned up immediately after). Full
+    Playwright pass — tab navigation, RG/Project selection, both
+    tables rendering with real active + deleted rows, reveal-history
+    expand/collapse, CSV export, MD export (both downloaded and their
+    contents spot-checked, not just "a file appeared") — zero console
+    errors throughout.
+- **5.13.0**:
+  - **Service accounts now appear in Access Explorer.** `list_users()`
+    wasn't passing `include_service_users=true` — confirmed live that
+    the exact same `/users` endpoint (not a separate one) returns both
+    kinds unified with that one flag, and every other part of the
+    existing per-user resolution pipeline (group membership, policy
+    matching) already worked correctly for a service user with zero
+    changes once it's in the list at all. All 4 real service accounts
+    in this tenant now show up, not just this dashboard's own — that's
+    correct (they're real principals with real access; hiding them was
+    the actual gap), not scope creep.
+  - **Visually distinct, not just present.** A service account's name
+    renders in `text-warn` (already `#fb923c` — literally Tailwind's
+    orange-400 — reused as-is, no new color token) everywhere it
+    appears in the Users tab, plus an explicit "Service account" tag
+    next to it — color alone isn't relied on to carry the meaning.
+  - **"Remove access" on any group-backed grant, for any user.** Every
+    group shown as the reason a selected user (service or human) has a
+    given policy's access now has a small remove action, confirm-first
+    (same inline-banner pattern as the existing folder delete), with a
+    blast-radius warning if that same group also backs other policies
+    — removing it takes that access away too, not just the one you
+    started from. New `DELETE /api/groups/{group_id}/members/{user_name}`
+    (wraps `OpaClient.remove_user_from_group`, added but unused in the
+    previous release). A removal patches the already-loaded Access
+    Explorer model locally instead of forcing the ~30s+ full
+    re-bootstrap, consistent with this feature's existing "fetch once,
+    Refresh button" design.
+  - **Skips a lookup known to fail instead of erroring visibly.** A
+    service account has no Okta identity/email, so "last accessed"
+    (System Log) can never resolve for it — the server already handled
+    that gracefully (a clear message, not a crash), but the Users tab
+    now skips firing that request at all for a service-type user
+    rather than let it fail every time.
+- **5.12.0**:
+  - **Service account group membership.** A security policy can only
+    grant a privilege (like the `folder_create` behind fact #12) to an
+    Okta-sourced `user_group` principal — and this dashboard's own
+    service-user API key has no Okta identity, so it was never a
+    candidate for one. Turns out OPA has its own group-membership API,
+    independent of Okta Group Push (`POST /groups/{name}/users`,
+    confirmed live), that works for exactly this case: adding any user
+    — service or human — to any group, Okta-sourced or not.
+    - Any group this dashboard **creates itself** (as a resource
+      group's admin group, or a policy principal) now automatically
+      adds the running service account as a member the moment the
+      group is confirmed visible in OPA — no manual step afterward.
+      Non-blocking: if this fails (the account needs the `pam_admin`
+      role for this specific write), the group is still created; you
+      just get a warning toast instead of a silent gap.
+    - For a group that **already existed** before the dashboard
+      touched it (so there was never an automatic moment to do this),
+      every group shown in the Group(s) picker (new-resource-group
+      flow, Assign Access) and every principal group already on a
+      policy you're about to reuse now shows "service account" if
+      it's already a member, or a one-click "Add service account" if
+      not — surfaced exactly where you'd want to notice it, before it
+      turns into a 404 later.
+    - New: `OpaClient.get_current_user()` (whoami — confirmed this
+      returns the OPA-native Service User identity, not an Okta one),
+      `.add_user_to_group()` / `.remove_user_from_group()`; server
+      routes `GET /api/service_account`, `POST
+      /api/service_account/groups`; frontend `ServiceAccountGroupStatus`.
+  - **Rate-limit retries hardened for large tenants / shared
+    credentials.** Checked live against this tenant:
+    `x-ratelimit-limit: 2000` per short window — the wait mechanism
+    itself was already correctness-safe at any tenant size (never
+    crashes, always waits the authoritative amount), but two real gaps
+    for actual large-scale use: 429 retries shared the same low budget
+    as genuine 5xx/network error retries, even though a 429 isn't a
+    failure in the same sense (the response says exactly how long to
+    wait, so retrying is always correct) — 429s now get their own,
+    much higher retry allowance, independent of the error-retry cap.
+    Separately, the proactive throttle used to cruise right up to the
+    last request in a window before pausing, which is fine for a
+    single client but leaves no margin if this same service-user
+    credential is used concurrently (multiple dashboard/CLI instances,
+    or several people on a large team sharing one credential) — the
+    safety margin is now wider. Flagged honestly in the same breath:
+    this doesn't change the fact that a few code paths (the recursive
+    folder-tree walk, Access Explorer's per-user group lookups) make
+    roughly one API call per item, so wall-clock time on a very large
+    tenant scales with its size — that's proportional, not a rate-limit
+    bug, and out of scope for this pass.
+- **5.11.0** (fixes from a full code review — see PR/review notes):
+  - **Concurrency: request-scoped client snapshots.** `/api/preview`,
+    `/api/execute`, and every other API route were reading the
+    module-level `client`/`okta_client` globals directly, mid-request.
+    Since the server is threaded, switching or deleting the active
+    environment while a long `execute` was still running could make
+    that in-flight request silently continue against a stale, `None`,
+    or (worse) a *different* tenant partway through. Every request
+    now snapshots `client`/`okta_client` into a local variable once at
+    the start and uses only that snapshot for its entire duration.
+  - **`.env` inline comments no longer corrupt values.**
+    `OPA_KEY_SECRET="mysecret" # prod key` used to load the literal
+    string `mysecret" # prod key` into the environment. The parser now
+    takes a quoted value verbatim between its quotes (discarding
+    anything after the closing quote) and only strips an *unquoted*
+    trailing comment when the `#` is preceded by whitespace — a
+    secret that legitimately contains `#` with no space before it
+    (quoted or not) is left untouched either way.
+  - **Rate-limit wait math is now immune to local clock skew.** The
+    proactive pre-429 wait and the reactive 429 retry both used to
+    compute `x-ratelimit-reset - time.time()`, which is wrong by
+    however much this machine's clock is skewed from Okta's. Both now
+    anchor the countdown to the response's own `Date` header (the
+    server's clock, not this machine's) and track elapsed time via
+    `time.monotonic()`, which can't be affected by wall-clock skew or
+    adjustment. `Retry-After` (already a relative delta) is unaffected
+    and remains the first choice on an actual 429.
+  - **Local API hardening:** `_read_json_body` now rejects any request
+    whose `Content-Length` exceeds 5 MB with a `413` *before* reading
+    it into memory, instead of trusting an attacker-controlled header
+    to size a buffer. Mutating requests (`POST`/`DELETE`) now check the
+    `Origin` header against this dashboard's own frontend origins (the
+    Vite dev server, or this same server's own origin in production)
+    and reject anything else with a `403` — protects the credential-
+    handling local API against another local process or a malicious
+    page/DNS-rebinding attempt; requests with no `Origin` at all (curl,
+    scripts) are still allowed, matching how CORS itself only
+    constrains browsers.
+  - **Group Push propagation window widened** from 5 retries x 1.5s
+    (7.5s total) to 20 x 1.5s (30s) — real Okta Group Push/SCIM
+    propagation can take longer than the old window under load.
+  - **Code quality:** `server/serve.py` no longer reaches through the
+    imported engine module for `datetime`/`timezone`
+    (`engine.datetime.now(engine.timezone.utc)`) — it imports them
+    directly, so it's no longer silently dependent on exactly how
+    `create_secret_folders.py` happens to import them. The frontend's
+    client-side ID fallback (used only if `crypto.randomUUID()` is
+    unavailable, which requires a non-secure context — never true for
+    this app, which only ever runs on `localhost`) now also mixes in a
+    monotonic counter, so even that unreachable-in-practice path can't
+    collide.
+- **5.10.0**:
+  - **"Last accessed" now covers SaaS app accounts and Okta service
+    accounts.** These resource kinds resolve to an Okta-side
+    identifier (an AppUser ID or Okta user ID) for display, but that
+    ID is never logged as a System Log target for any account, in any
+    tenant — confirmed against a full, unpaginated 90-day export
+    (65,972 rows) after a live API scan had come up empty and looked
+    like a dead end. The account's own internal ID (fetched from the
+    same OPA API calls that already list these accounts) does show up,
+    on `pam.service_account.password.reveal` and `pam.resource.checkout`
+    — both consistently actor'd by the real requesting person, unlike
+    `pam.resource.checkin.end`'s mostly-system actor. Resolved grants of
+    these kinds now carry a separate `access_tracking_id` alongside
+    their displayed `id`, used transparently for the lookup.
+  - **Found this by reading a full CSV export instead of re-querying
+    live.** A live, paginated System Log scan for these account IDs
+    found nothing and risked more rate-limit exhaustion chasing a
+    dead end. Given a full 90-day CSV export instead, the same search
+    took seconds, with no API calls and no ambiguity about whether
+    "found nothing" meant "doesn't exist" or "got rate-limited before
+    finding it." A handful of individual `transaction.id`/event-based
+    lookups (not broad rescans) filled in the raw JSON detail the CSV's
+    flattened columns didn't carry.
+- **5.9.0**:
+  - **"Last accessed" now covers individual server-account grants.**
+    Validated against a second, busier tenant with a richer resource
+    mix. `pam.server.ssh_login` looked like the obvious mapping (its
+    `target[]` does include the server's own ID) but its `actor.id` is
+    the OS-level SSH username (e.g. `rootadmin`, or a per-user
+    provisioned name), never the Okta identity ID this feature filters
+    by — wiring it up as-is would have silently matched nothing for
+    any real user. `pam.gateway_creds.issue` is the real fix: its
+    `actor.id` is a genuine Okta identity, and the server being
+    connected to is recoverable from
+    `debugContext.debugData.nextHopServerIds` instead of `target[]`.
+    The access-event matching logic is now pluggable per resource kind
+    to support this (`extract_ids` per entry in
+    `RESOURCE_ACCESS_EVENT_TYPES`, not just a fixed `target[]` lookup).
+  - **Fixed silent System Log pagination truncation.** `get_system_log`
+    only ever fetched one page; found because the second test tenant
+    has far higher log volume (needed just to establish this) and a
+    real one-off discovery query truncated at a hard 50-page safety
+    cap. Also fixed a related bug in the pagination itself: this Okta
+    org sends the `Link` response header as multiple separate header
+    lines (one per `rel`) rather than one comma-joined value, so
+    reading it with `.get("Link")` (which only returns the first line)
+    silently dropped the `rel="next"` link whenever `rel="self"`
+    happened to come first — `get_all("Link")` is required to see all
+    of them. This same fix applies to the OPA API list-pagination
+    helper too, in case any OPA endpoint sends Link the same way.
+  - **SaaS and Okta service accounts remain unmapped, confirmed not
+    just unlucky.** Real grants of both kinds exist in the second
+    tenant's policies, but a full 90-day System Log scan (unfiltered
+    and filtered) found zero events of any type referencing those
+    specific resource IDs — the one Okta-account grant only shows up
+    in password-rotation/lifecycle noise. These are left as
+    `supported: false` rather than guessed.
+- **5.8.0**:
+  - **"Last accessed" for secret grants, backed by Okta's System
+    Log.** For each policy grant that resolves to a secret (or a
+    secret folder — see below), the Users tab now shows up to the 5
+    most recent times the selected user revealed it, each with its
+    Okta request ID, sourced from `pam.secret.reveal` events in the
+    last 90 days (Okta's System Log retention window — confirmed live
+    against the real tenant, not assumed). Grants with no matching
+    event show "not accessed (or not within the last 90 days)"; grants
+    of a resource kind with no verified, ID-matchable System Log event
+    (servers, SaaS/Okta service accounts) show "access tracking not
+    available for this resource type" instead of guessing.
+  - **Folder-level grants are expanded to their underlying secrets.**
+    Almost every real secret-based policy grant in a typical tenant is
+    to a *folder*, not an individual secret — and a reveal event only
+    ever references the secret's own ID, never its parent folder's. So
+    a folder grant now lists (behind a collapsed "N secrets in this
+    folder" toggle) the last-accessed status of every secret nested
+    anywhere in that folder's subtree, resolved during the same
+    bootstrap pass that already walks the folder tree.
+  - **Fixed the identity mismatch between OPA and Okta.** A PAM user's
+    own ID has no relationship to the Okta identity ID that System Log
+    events are actually recorded against — this was found and fixed
+    during live end-to-end testing, where it initially caused every
+    lookup to silently return zero events. The server now resolves the
+    PAM user's email against Okta's Users API (`GET
+    /api/v1/users/{id|login|email}`) to get the real actor ID before
+    querying the log.
 - **5.7.0**:
   - **Packaged for a public GitHub release.** Added an MIT
     [LICENSE](LICENSE); expanded `.gitignore` to also exclude

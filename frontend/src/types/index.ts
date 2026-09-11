@@ -5,6 +5,7 @@ export interface Environment {
   key_id: string
   okta_url: string
   has_okta_token: boolean
+  preserve_logs_locally: boolean
 }
 
 export interface EnvironmentsResponse {
@@ -45,6 +46,17 @@ export interface CreateGroupResponse {
   visible_in_opa: boolean
   group?: OpaGroup
   message?: string
+  // Only present once visible_in_opa is true -- the server tries to add
+  // the dashboard's own service account to every group it creates, so
+  // callers don't have to do it manually. See ServiceAccountGroupStatus.
+  service_account_added?: boolean
+  service_account_warning?: string | null
+}
+
+export interface ServiceAccountInfo {
+  id: string
+  name: string
+  group_ids: string[]
 }
 
 export interface FolderNode {
@@ -140,6 +152,9 @@ export interface AccessUser {
   id: string
   name: string
   status?: string
+  // "service" for an OPA-native Service User (e.g. this dashboard's own API
+  // key) -- no Okta identity behind it, so no email/first/last name either.
+  user_type?: 'human' | 'service'
   details?: { email?: string | null; first_name?: string | null; last_name?: string | null; full_name?: string | null }
   groups: NamedRef[]
 }
@@ -154,9 +169,25 @@ export type PolicyRuleResolution =
       kind: 'resolved'
       id: string
       name: string
+      /** Raw selector_type (e.g. "secret" vs "secret_folder") -- resource_type
+       * alone can't distinguish these, but System Log access-tracking only
+       * works for one of them. See useUserResourceAccess. */
+      resource_kind: string
       project_id: string | null
       project_name: string | null
       resource_group_id: string | null
+      /** Only present for resource_kind "secret_folder" -- every secret
+       * nested anywhere in this folder's subtree (any depth). A folder grant
+       * covers all of these, but System Log access is only attributable per
+       * secret, so the UI expands this list to query/report access. */
+      child_secrets?: { id: string; name: string }[]
+      /** Only present for SaaS/Okta account kinds -- their displayed `id`
+       * is the Okta-side identifier (AppUser id / Okta user id), but System
+       * Log access events reference the account's separate OPA-internal id
+       * instead (that Okta-side id is never logged as a target at all).
+       * Query/look up access info by this id when present, falling back
+       * to `id` otherwise. */
+      access_tracking_id?: string
     }
   | { kind: 'condition'; description: string }
 
@@ -196,6 +227,27 @@ export interface AccessModel {
   groups: AccessGroup[]
   users: AccessUser[]
   policies: AccessPolicy[]
+}
+
+// ── Access Explorer: System Log last-accessed lookup ─────────────────────
+// On-demand only (see UsersTab) -- querying this for every user/resource up
+// front would be slow and could hit Okta rate limits for no benefit, since
+// nobody looks at most of it.
+
+export interface ResourceAccessEvent {
+  published: string
+  request_id: string | null
+  outcome: string | null
+}
+
+export interface ResourceAccessInfo {
+  resource_kind: string
+  /** False for any resource_kind with no verified, ID-matchable System Log
+   * event (see create_secret_folders.py's RESOURCE_ACCESS_EVENT_TYPES
+   * comment) -- distinct from "supported but zero events found", which
+   * means genuinely not accessed (or not within the last 90 days). */
+  supported: boolean
+  events: ResourceAccessEvent[]
 }
 
 // ── Folder Builder: policy assignment ────────────────────────────────────
@@ -244,4 +296,60 @@ export interface FolderAccessEntry {
   groups: NamedRef[]
   workloadRoles: NamedRef[]
   privileges: FolderPolicyRulePrivilege[]
+}
+
+// ── Secrets Access Dashboard ──────────────────────────────────────────────
+// Merges the live folder/secret walk ("what exists now") with a System Log
+// query ("what happened, including to things since deleted") -- see
+// create_secret_folders.py's build_secrets_access_report.
+
+export interface AuditEntry {
+  by: string | null
+  at: string | null
+}
+
+export interface RevealEntry extends AuditEntry {
+  request_id: string | null
+}
+
+export type SecretsAccessStatus = 'active' | 'deleted' | 'unknown'
+
+interface SecretsAccessRowBase {
+  id: string
+  name: string
+  path: string
+  /** "active" = present in the live walk right now. "deleted" = absent
+   * live but a real delete event was found in the log. "unknown" = absent
+   * live with no delete event either (e.g. older than the 90-day log
+   * window) -- never inferred, only ever set from direct log evidence. */
+  status: SecretsAccessStatus
+  created: AuditEntry | null
+  /** Most-recent-first. */
+  updated: AuditEntry[]
+  deleted: AuditEntry | null
+}
+
+export interface SecretAccessRow extends SecretsAccessRowBase {
+  /** Most-recent-first, capped server-side (see reveal_limit). */
+  reveals: RevealEntry[]
+}
+
+export type FolderAccessRow = SecretsAccessRowBase
+
+export interface SecretsAccessReport {
+  secrets: SecretAccessRow[]
+  folders: FolderAccessRow[]
+  /** The System Log lookback window actually used -- surfaced so the UI
+   * can be honest about "no record" possibly meaning "older than this,"
+   * not "never happened." */
+  since_days: number
+  /** True if the active environment has "preserve logs locally" on --
+   * history below is supplemented from secrets_log_cache.json, not just
+   * Okta's live 90-day window. */
+  local_retention_enabled: boolean
+  /** Earliest event timestamp actually available (merged cache + live
+   * query if local_retention_enabled, else just the live query) -- null
+   * if no history exists at all. Never further back than whenever local
+   * retention was first turned on for this project. */
+  oldest_captured_at: string | null
 }

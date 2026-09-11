@@ -2,6 +2,16 @@ export function labelize(key: string): string {
   return key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
 }
 
+/** Renders an ISO timestamp (e.g. a System Log `published` field) in the
+ * viewer's local timezone, falling back to the raw string for anything
+ * that doesn't parse as a date rather than showing "Invalid Date". */
+export function formatDateTime(iso: string | null | undefined): string {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+}
+
 /** Renders a value for on-screen display — empty/null/undefined become an
  * em dash so a field reads as "known to be empty" rather than looking
  * broken. Use `cellValue` instead for exports, where a plain empty string

@@ -4,6 +4,7 @@ import { useGroups } from '../api/hooks'
 import { useCreateGroup } from '../hooks/useCreateGroup'
 import { GroupCreateForm } from './GroupCreateForm'
 import { Select } from './Select'
+import { ServiceAccountGroupStatus } from './ServiceAccountGroupStatus'
 
 interface Props {
   value: string | undefined
@@ -26,7 +27,7 @@ export function GroupPicker({ value, onChange }: Props) {
   return (
     <div className="flex flex-col gap-1">
       <span className="section-label">Group (required — grants access to the new resource group)</span>
-      <div className="flex gap-2">
+      <div className="flex gap-2 items-center">
         <Select
           value={value}
           onValueChange={onChange}
@@ -41,6 +42,7 @@ export function GroupPicker({ value, onChange }: Props) {
           <Plus size={13} /> New Group
         </button>
       </div>
+      {value && <ServiceAccountGroupStatus groupId={value} />}
     </div>
   )
 }

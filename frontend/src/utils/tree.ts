@@ -1,7 +1,16 @@
 import type { CsvRow, FolderNode } from '../types'
 
+// crypto.randomUUID() needs a secure context (https, or localhost -- which
+// this app always runs on), so this fallback is essentially unreachable in
+// practice. It still gets a monotonic counter on top of the random string
+// so that even many IDs generated within the same millisecond (e.g. a CSV
+// with hundreds of rows loaded at once) can never collide as React keys.
+let fallbackIdCounter = 0
+
 function newId(): string {
-  return (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : Math.random().toString(36).slice(2)
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID()
+  fallbackIdCounter += 1
+  return `${Date.now().toString(36)}-${fallbackIdCounter}-${Math.random().toString(36).slice(2)}`
 }
 
 export function newNode(name = '', description = ''): FolderNode {

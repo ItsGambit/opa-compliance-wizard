@@ -4,6 +4,10 @@ import { Check, ChevronDown } from 'lucide-react'
 export interface SelectOption {
   value: string
   label: string
+  // Optional extra class(es) for this option's label text -- e.g. calling
+  // out a service account among human users. Every existing caller leaves
+  // this unset and is unaffected.
+  labelClassName?: string
 }
 
 interface SelectProps {
@@ -42,7 +46,9 @@ export function Select({ value, onValueChange, options, placeholder, disabled, l
                 <RadixSelect.ItemIndicator className="absolute left-2 top-1/2 -translate-y-1/2">
                   <Check size={13} className="text-accent" />
                 </RadixSelect.ItemIndicator>
-                <RadixSelect.ItemText>{opt.label}</RadixSelect.ItemText>
+                <RadixSelect.ItemText>
+                  <span className={opt.labelClassName}>{opt.label}</span>
+                </RadixSelect.ItemText>
               </RadixSelect.Item>
             ))}
           </RadixSelect.Viewport>

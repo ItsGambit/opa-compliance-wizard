@@ -9,6 +9,7 @@ import { toast } from '../hooks/useToast'
 import type { ApiErrorBody, FolderSecurityPolicy, NamedRef } from '../types'
 import { GroupCreateForm } from './GroupCreateForm'
 import { Select } from './Select'
+import { ServiceAccountGroupStatus } from './ServiceAccountGroupStatus'
 
 const PRIVILEGE_GROUPS: { label: string; fields: { key: string; label: string }[] }[] = [
   { label: 'Access', fields: [{ key: 'list', label: 'List contents' }] },
@@ -188,6 +189,21 @@ export function AssignAccessDialog({ open, onOpenChange, resourceGroupId, projec
                   placeholder="Select a policy"
                   options={(policies ?? []).map(p => ({ value: p.id, label: p.name }))}
                 />
+                {selectedPolicy && selectedPolicy.principals.user_groups.length > 0 && (
+                  <div className="flex flex-col gap-1 mt-1">
+                    <span className="text-xs text-text-faint">
+                      This policy's current principal group{selectedPolicy.principals.user_groups.length === 1 ? '' : 's'}:
+                    </span>
+                    <div className="flex flex-wrap gap-2">
+                      {selectedPolicy.principals.user_groups.map(g => (
+                        <div key={g.id} className="flex items-center gap-1.5 text-xs text-text-dim bg-bg-hover rounded px-1.5 py-1">
+                          {g.name}
+                          <ServiceAccountGroupStatus groupId={g.id} />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             ) : (
               <>
@@ -212,6 +228,16 @@ export function AssignAccessDialog({ open, onOpenChange, resourceGroupId, projec
                 )}
               </div>
               <MultiSelect options={groups} selectedIds={groupIds} onToggle={toggleGroup} emptyText="No groups found" />
+              {groupIds.size > 0 && (
+                <div className="flex flex-wrap gap-2 mt-1">
+                  {groups.filter(g => groupIds.has(g.id)).map(g => (
+                    <div key={g.id} className="flex items-center gap-1.5 text-xs text-text-dim bg-bg-hover rounded px-1.5 py-1">
+                      {g.name}
+                      <ServiceAccountGroupStatus groupId={g.id} />
+                    </div>
+                  ))}
+                </div>
+              )}
               {creatingGroup && (
                 <GroupCreateForm mutation={createGroupMutation} onCancel={() => setCreatingGroup(false)} />
               )}

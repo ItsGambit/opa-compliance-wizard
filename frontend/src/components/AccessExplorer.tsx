@@ -72,7 +72,23 @@ export function AccessExplorer() {
       {subTab === 'resource_groups' && <ResourceGroupsTab model={displayedModel} />}
       {subTab === 'projects' && <ProjectsTab model={displayedModel} />}
       {subTab === 'policies' && <PoliciesTab model={displayedModel} />}
-      {subTab === 'users' && <UsersTab model={displayedModel} />}
+      {subTab === 'users' && (
+        <UsersTab
+          model={displayedModel}
+          onUserGroupRemoved={(userId, groupId) =>
+            setDisplayedModel(prev =>
+              prev
+                ? {
+                    ...prev,
+                    users: prev.users.map(u =>
+                      u.id === userId ? { ...u, groups: u.groups.filter(g => g.id !== groupId) } : u
+                    ),
+                  }
+                : prev
+            )
+          }
+        />
+      )}
       {subTab === 'groups' && <GroupsTab model={displayedModel} />}
 
       {isRefreshing && (

@@ -6,6 +6,7 @@ import { activateEnvironment, deleteEnvironment, saveEnvironment } from '../api/
 import { toast } from '../hooks/useToast'
 import type { ApiErrorBody, Environment, EnvironmentFormValues, EnvironmentsResponse } from '../types'
 import { EnvironmentForm } from './EnvironmentForm'
+import { LogRetentionIndicator } from './LogRetentionIndicator'
 import { StatusBadge } from './StatusBadge'
 
 interface Props {
@@ -114,6 +115,7 @@ export function EnvironmentManagerDialog({ data }: Props) {
                   {env.base_domain} · team {env.team_name} · key {env.key_id.slice(0, 8)}…
                   {env.has_okta_token ? ' · Okta connected' : ' · no Okta token (can\'t create groups)'}
                 </div>
+                <LogRetentionIndicator enabled={env.preserve_logs_locally} envName={env.name} />
                 {confirmingDelete === env.name && (
                   <div className="flex items-center gap-2 text-xs text-loss">
                     Delete "{env.name}"?
