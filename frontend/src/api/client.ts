@@ -45,6 +45,10 @@ export function fetchWhoami(): Promise<{ email: string | null; is_local: boolean
   return apiFetch('/api/whoami')
 }
 
+export function fetchVersion(): Promise<{ version: string }> {
+  return apiFetch('/api/version')
+}
+
 export function saveEnvironment(values: EnvironmentFormValues): Promise<{ activated: boolean; active: string }> {
   return apiFetch('/api/environments', { method: 'POST', body: JSON.stringify(values) })
 }

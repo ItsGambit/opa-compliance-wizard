@@ -4,6 +4,7 @@ import { AboutDialog } from './components/AboutDialog'
 import { AccessExplorer } from './components/AccessExplorer'
 import { EnvironmentManagerDialog } from './components/EnvironmentManagerDialog'
 import { EnvironmentSetup } from './components/EnvironmentSetup'
+import { Footer } from './components/Footer'
 import { FolderBuilder } from './components/FolderBuilder'
 import { SecretsAccessDashboard } from './components/SecretsAccessDashboard'
 import { TabBar } from './components/TabBar'
@@ -26,8 +27,11 @@ export default function App() {
 
   if (!isConfigured) {
     return (
-      <div className="max-w-4xl mx-auto px-6 py-8">
-        <EnvironmentSetup />
+      <div className="px-6 py-8">
+        <div className="max-w-4xl mx-auto">
+          <EnvironmentSetup />
+        </div>
+        <Footer />
       </div>
     )
   }
@@ -77,6 +81,8 @@ export default function App() {
           <SecretsAccessDashboard />
         </div>
       )}
+
+      <Footer />
     </div>
   )
 }

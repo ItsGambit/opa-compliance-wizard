@@ -9,6 +9,7 @@ import {
   fetchSecretsAccessReport,
   fetchServiceAccount,
   fetchUserResourceAccess,
+  fetchVersion,
   fetchWhoami,
   fetchWorkloadRoles,
 } from './client'
@@ -27,6 +28,18 @@ export function useWhoami() {
     // Identity for a given browser session never changes mid-session (a
     // change means a real re-login, which reloads the page anyway) --
     // no point refetching on focus/reconnect like data-bearing queries do.
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  })
+}
+
+export function useVersion() {
+  return useQuery({
+    queryKey: ['version'],
+    queryFn: fetchVersion,
+    // Version only changes on a real deploy, which restarts the server --
+    // same no-refetch reasoning as useWhoami above.
     staleTime: Infinity,
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,

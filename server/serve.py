@@ -338,6 +338,14 @@ class Handler(SimpleHTTPRequestHandler):
         local_client, local_okta_client, local_env_name = _session_snapshot(owner_key)
 
         try:
+            if path == "/api/version":
+                # Lets the frontend show which version is actually running
+                # without duplicating the number anywhere in frontend
+                # source -- engine.SCRIPT_VERSION is this project's one
+                # place version is bumped (see the "bump both together"
+                # convention in the engine's header comment).
+                return self._send_json(200, {"version": engine.SCRIPT_VERSION})
+
             if path == "/api/whoami":
                 # Lets the frontend show who's logged in without decoding
                 # anything itself -- just echoes the identity nginx already
