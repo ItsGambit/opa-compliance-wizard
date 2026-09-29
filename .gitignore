@@ -2,6 +2,7 @@
 .env
 environments.json
 TestCreds.txt
+ubuntuserver.txt
 
 # Locally-preserved Secrets Access Dashboard System Log history (opt-in,
 # see the "preserve logs locally" setting) -- audit metadata, not a

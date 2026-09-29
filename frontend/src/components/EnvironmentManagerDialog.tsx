@@ -11,10 +11,18 @@ import { StatusBadge } from './StatusBadge'
 
 interface Props {
   data: EnvironmentsResponse | undefined
+  // Both optional -- omit for the existing self-contained gear-icon trigger
+  // (falls back to internal state, unchanged behavior). Pass both when
+  // something else (e.g. SideNav's "Environments" nav item) needs to open
+  // this same dialog without duplicating its content.
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
 }
 
-export function EnvironmentManagerDialog({ data }: Props) {
-  const [open, setOpen] = useState(false)
+export function EnvironmentManagerDialog({ data, open: openProp, onOpenChange }: Props) {
+  const [openState, setOpenState] = useState(false)
+  const open = openProp ?? openState
+  const setOpen = onOpenChange ?? setOpenState
   const [editing, setEditing] = useState<Environment | 'new' | null>(null)
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null)
   const queryClient = useQueryClient()

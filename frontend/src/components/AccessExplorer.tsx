@@ -7,12 +7,15 @@ import { GroupsTab } from './GroupsTab'
 import { PoliciesTab } from './PoliciesTab'
 import { ProjectsTab } from './ProjectsTab'
 import { ResourceGroupsTab } from './ResourceGroupsTab'
-import { TabBar } from './TabBar'
 import { UsersTab } from './UsersTab'
 import { ExportButtons } from './ExportButtons'
 import { accessModelExportSections } from '../utils/exportSections'
 
-const SUB_TABS = [
+// Exported so App.tsx / SideNav can render these as sidebar sub-nav items
+// (this used to be an internal TabBar rendered inside this component --
+// moved to the sidebar per the Okta-console-style redesign, see the
+// "splendid-floating-moth" plan).
+export const ACCESS_SUB_TABS = [
   { value: 'resource_groups', label: 'Resource Groups' },
   { value: 'projects', label: 'Projects' },
   { value: 'policies', label: 'Policies' },
@@ -20,8 +23,11 @@ const SUB_TABS = [
   { value: 'groups', label: 'Groups' },
 ]
 
-export function AccessExplorer() {
-  const [subTab, setSubTab] = useState('resource_groups')
+interface Props {
+  subTab: string
+}
+
+export function AccessExplorer({ subTab }: Props) {
   const job = useAccessBootstrapJob()
   const startedOnce = useRef(false)
   // The last successfully loaded model stays visible during a refresh
@@ -58,8 +64,7 @@ export function AccessExplorer() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex items-center justify-between">
-        <TabBar tabs={SUB_TABS} value={subTab} onChange={setSubTab} />
+      <div className="flex items-center justify-end">
         <div className="flex items-center gap-2">
           <ExportButtons sections={accessModelExportSections(displayedModel)} filenameBase="opa-access-explorer-all" />
           <button type="button" className="btn-secondary shrink-0" onClick={job.start} disabled={isRefreshing}>

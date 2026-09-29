@@ -644,13 +644,59 @@ already exists is skipped, not duplicated.
 
 ## Version
 
-5.17.0 — Admins can now configure a dashboard-wide **announcement
-banner** (info/warning/danger, optionally dismissible), shown to every
-user at the top of every page — for planned maintenance, a known
-incident, or any org-wide notice. See the changelog entry below for
-exactly what changed and why.
+5.18.0 — The dashboard's UI now visually matches the **Okta Admin
+Console** (Odyssey design system look): a persistent left sidebar with
+an icon rail + expandable nav replaces the old top tab bar, and a new
+light/dark theme toggle lets anyone switch away from the previous
+dark-only look. See the changelog entry below for exactly what changed
+and why.
 
 ### Changelog
+- **5.18.0**:
+  - **Okta Admin Console-style redesign.** New `SideNav` component
+    replaces the top `TabBar` for all top-level navigation (Folder
+    Builder / Access Explorer / Secrets Access Dashboard), rendered as
+    a 48px icon rail + a 256px sidebar panel — matches the real Okta
+    admin console's layout, confirmed against real screenshots of it
+    rather than guessed. Access Explorer's 5 sub-tabs (Resource Groups/
+    Projects/Policies/Users/Groups) now render as nested sidebar items
+    under "Access Explorer" instead of their own separate tab row — sub-
+    tab state moved from `AccessExplorer`'s internal `useState` up to
+    `App.tsx` (`ACCESS_SUB_TABS` is now exported from `AccessExplorer`
+    for `SideNav` to render). "Environments" in the sidebar opens the
+    same `EnvironmentManagerDialog` as the existing gear icon rather than
+    duplicating it as a page — the dialog gained optional `open`/
+    `onOpenChange` props (falls back to its own internal state when
+    omitted, so the gear-icon trigger is completely unaffected).
+  - **Light/dark theme toggle**, docked directly under the nav items in
+    the sidebar. Dark stays the default (unchanged from every prior
+    version); light is opt-in and persists via `localStorage`. Implemented
+    as a `html[data-theme="light"]` CSS override block in `index.css`
+    with light-palette values for every existing `--color-*`/`--shadow-*`
+    token — zero component-level changes were needed for this, since
+    every component already routed all color through these Tailwind v4
+    `@theme` variables rather than hardcoded hex values (confirmed via a
+    full-codebase grep before starting: zero hardcoded hex colors existed
+    in any `.tsx`/`.ts` file outside `index.css` itself).
+  - Content areas lost their old `max-w-4xl`/`max-w-6xl mx-auto` centering
+    wrappers and now stretch to fill the width beside the sidebar,
+    matching Okta's own admin console layout, per explicit user
+    preference over keeping a centered column.
+  - Preceded by a standalone HTML mockup (three static screens: Folder
+    Builder, Access Explorer/Policies, Environment Manager + user menu)
+    built and iterated on with the user first — dark-mode contrast bug
+    (buttons/inputs/dialogs hardcoded to `background: #fff`, invisible
+    against a dark page) and toggle placement/transparency feedback were
+    both fixed in the mockup before any real app code was touched.
+  - Live-verified end-to-end via Playwright against the real running app
+    (not just a clean build): sidebar renders, all 3 top-level tabs
+    switch, Access Explorer's 5 sub-tabs switch from the sidebar, theme
+    toggle flips `data-theme` and the actual computed background color,
+    theme choice persists across a full page reload, the Environments
+    dialog opens correctly from the new sidebar item, and zero browser
+    console errors throughout. Scratch Playwright project (not a
+    permanent dependency), deleted after — same pattern as prior
+    Playwright verification passes on this project.
 - **5.17.0**:
   - **Announcement banner.** New `engine.get_banner_config`/
     `set_banner_config`, backed by a standalone `banner_config.json`

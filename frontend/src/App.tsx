@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useEnvironments } from './api/hooks'
 import { AboutDialog } from './components/AboutDialog'
-import { AccessExplorer } from './components/AccessExplorer'
+import { AccessExplorer, ACCESS_SUB_TABS } from './components/AccessExplorer'
 import { AnnouncementBanner } from './components/AnnouncementBanner'
 import { BannerSettingsDialog } from './components/BannerSettingsDialog'
 import { EnvironmentManagerDialog } from './components/EnvironmentManagerDialog'
@@ -9,17 +9,13 @@ import { EnvironmentSetup } from './components/EnvironmentSetup'
 import { Footer } from './components/Footer'
 import { FolderBuilder } from './components/FolderBuilder'
 import { SecretsAccessDashboard } from './components/SecretsAccessDashboard'
-import { TabBar } from './components/TabBar'
+import { SideNav } from './components/SideNav'
 import { UserMenu } from './components/UserMenu'
-
-const TABS = [
-  { value: 'builder', label: 'Folder Builder' },
-  { value: 'access', label: 'Access Explorer' },
-  { value: 'secrets_access', label: 'Secrets Access Dashboard' },
-]
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('builder')
+  const [accessSubTab, setAccessSubTab] = useState(ACCESS_SUB_TABS[0].value)
+  const [environmentsOpen, setEnvironmentsOpen] = useState(false)
   const { data: environments, isLoading: environmentsLoading } = useEnvironments()
   const isConfigured = !!environments?.active
 
@@ -47,13 +43,26 @@ export default function App() {
   }
 
   return (
-    <>
+    <div className="flex flex-col h-dvh">
       <AnnouncementBanner />
-      <div className="px-6 py-8 flex flex-col gap-5">
-        <div className="max-w-4xl mx-auto w-full flex flex-col gap-5">
+      <div className="flex flex-1 min-h-0">
+        <SideNav
+          activeTab={activeTab}
+          onTabChange={setActiveTab}
+          accessSubTabs={ACCESS_SUB_TABS}
+          accessSubTab={accessSubTab}
+          onAccessSubTabChange={setAccessSubTab}
+          onOpenEnvironments={() => setEnvironmentsOpen(true)}
+        />
+
+        <main className="flex-1 overflow-y-auto px-8 py-6 flex flex-col gap-5">
           <header className="flex items-start justify-between">
             <div>
-              <h1 className="text-lg font-semibold text-text">OPA Secrets Wizard</h1>
+              <h1 className="text-lg font-semibold text-text">
+                {activeTab === 'builder' && 'Folder Builder'}
+                {activeTab === 'access' && 'Access Explorer'}
+                {activeTab === 'secrets_access' && 'Secrets Access Dashboard'}
+              </h1>
               <p className="text-xs text-text-faint mt-1">
                 {activeTab === 'builder' &&
                   'Pick or create a resource group and project, build the folder tree, then preview and create.'}
@@ -71,32 +80,22 @@ export default function App() {
               <div className="flex items-center gap-2">
                 <BannerSettingsDialog />
                 <AboutDialog />
-                <EnvironmentManagerDialog data={environments} />
+                <EnvironmentManagerDialog
+                  data={environments}
+                  open={environmentsOpen}
+                  onOpenChange={setEnvironmentsOpen}
+                />
               </div>
             </div>
           </header>
 
-          <TabBar tabs={TABS} value={activeTab} onChange={setActiveTab} />
-        </div>
+          {activeTab === 'builder' && <FolderBuilder />}
+          {activeTab === 'access' && <AccessExplorer subTab={accessSubTab} />}
+          {activeTab === 'secrets_access' && <SecretsAccessDashboard />}
 
-        {activeTab === 'builder' && (
-          <div className="max-w-4xl mx-auto w-full">
-            <FolderBuilder />
-          </div>
-        )}
-        {activeTab === 'access' && (
-          <div className="max-w-6xl mx-auto w-full">
-            <AccessExplorer />
-          </div>
-        )}
-        {activeTab === 'secrets_access' && (
-          <div className="max-w-6xl mx-auto w-full">
-            <SecretsAccessDashboard />
-          </div>
-        )}
-
-        <Footer />
+          <Footer />
+        </main>
       </div>
-    </>
+    </div>
   )
 }
