@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import {
+  fetchBanner,
   fetchCsvFiles,
   fetchEnvironments,
   fetchGroups,
@@ -18,6 +19,17 @@ export function useEnvironments() {
   return useQuery({
     queryKey: ['environments'],
     queryFn: fetchEnvironments,
+  })
+}
+
+export function useBanner() {
+  return useQuery({
+    queryKey: ['banner'],
+    queryFn: fetchBanner,
+    // Refetch on focus/reconnect (not staleTime: Infinity like
+    // useWhoami/useVersion above) -- unlike identity/version, a banner is
+    // meant to change while the page is already open (an admin flips it
+    // on mid-incident) and should show up without a manual reload.
   })
 }
 

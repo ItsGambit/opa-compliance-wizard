@@ -13,6 +13,11 @@ secrets_log_cache.json
 # deployment produced it, not something to ship in the repo
 audit_log.jsonl
 
+# Admin-configured announcement banner (see engine.get/set_banner_config) --
+# deployment-specific content (an org's own maintenance/incident notice),
+# not something to ship in the repo template
+banner_config.json
+
 # Python
 __pycache__/
 *.pyc

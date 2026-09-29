@@ -644,14 +644,32 @@ already exists is skipped, not duplicated.
 
 ## Version
 
-5.16.0 — The dashboard can now be **hosted centrally** (Ubuntu server,
-systemd + nginx + TLS) instead of only run locally per-user, gated by
-**real Okta OIDC login** (not HTTP Basic Auth — see changelog for why),
-with **per-user environments** (private by default, opt-in shared) and
-an **audit log** attributing every write action to the logged-in
-identity. See the changelog entry below for exactly what changed and why.
+5.17.0 — Admins can now configure a dashboard-wide **announcement
+banner** (info/warning/danger, optionally dismissible), shown to every
+user at the top of every page — for planned maintenance, a known
+incident, or any org-wide notice. See the changelog entry below for
+exactly what changed and why.
 
 ### Changelog
+- **5.17.0**:
+  - **Announcement banner.** New `engine.get_banner_config`/
+    `set_banner_config`, backed by a standalone `banner_config.json`
+    (gitignored — deployment-specific content, not credentials, but
+    still local instance state). `GET /api/banner` is unauthenticated
+    (same reasoning as `/api/whoami`/`/api/version` — it has to render
+    even before an environment is configured) and `POST /api/banner`
+    writes + audits the change (`banner.update`). New
+    `BannerSettingsDialog` (megaphone icon, next to the ⓘ/⚙ header
+    icons) lets an admin toggle it on/off, edit the message, pick a
+    style (info/warning/danger), and choose whether viewers can dismiss
+    it. New `AnnouncementBanner` renders it above everything else,
+    including the loading and first-run setup screens — matches Okta's
+    own admin console pattern (its "Preview Sandbox"/incident banners
+    are one announcement for the whole org, not per-admin). Dismissal is
+    per-browser-tab-session (`sessionStorage`) and keyed by the message
+    text itself, so editing the message (even with the same
+    enabled/style) reaches everyone again instead of staying hidden for
+    anyone who'd dismissed the previous wording.
 - **5.16.0**:
   - **Hosted deployment**: the dashboard can now run as a persistent,
     centrally-reachable service instead of only `launch.py` on someone's

@@ -1,6 +1,7 @@
 import type {
   AccessModel,
   ApiErrorBody,
+  BannerConfig,
   CreateGroupResponse,
   CsvRow,
   EnvironmentFormValues,
@@ -47,6 +48,14 @@ export function fetchWhoami(): Promise<{ email: string | null; is_local: boolean
 
 export function fetchVersion(): Promise<{ version: string }> {
   return apiFetch('/api/version')
+}
+
+export function fetchBanner(): Promise<BannerConfig> {
+  return apiFetch('/api/banner')
+}
+
+export function saveBanner(config: BannerConfig): Promise<BannerConfig> {
+  return apiFetch('/api/banner', { method: 'POST', body: JSON.stringify(config) })
 }
 
 export function saveEnvironment(values: EnvironmentFormValues): Promise<{ activated: boolean; active: string }> {

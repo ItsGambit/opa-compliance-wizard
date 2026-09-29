@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.16.0
+# Version     : 5.17.0
 # =============================================================================
 
 import argparse
@@ -77,7 +77,7 @@ import urllib.request
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.16.0"
+SCRIPT_VERSION = "5.17.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -395,6 +395,48 @@ def load_environments():
 def save_environments(data):
     with open(_environments_file_path(), "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Announcement banner
+# ---------------------------------------------------------------------------
+# A single, dashboard-wide banner (not per-environment/per-owner) shown at
+# the top of every page -- mirrors Okta's own admin console banners
+# ("Preview Sandbox", incident notices) which are one announcement for the
+# whole org, not one per admin. Stored in its own file since it holds no
+# secrets and has nothing to do with which environment is active.
+BANNER_VARIANTS = ("info", "warning", "danger")
+_BANNER_DEFAULTS = {"enabled": False, "message": "", "variant": "warning", "dismissible": True}
+
+
+def _banner_config_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "banner_config.json")
+
+
+def get_banner_config():
+    path = _banner_config_path()
+    if not os.path.isfile(path):
+        return dict(_BANNER_DEFAULTS)
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return {
+        "enabled": bool(data.get("enabled", False)),
+        "message": data.get("message", ""),
+        "variant": data.get("variant") if data.get("variant") in BANNER_VARIANTS else "warning",
+        "dismissible": bool(data.get("dismissible", True)),
+    }
+
+
+def set_banner_config(enabled, message, variant, dismissible):
+    if variant not in BANNER_VARIANTS:
+        raise ValueError(f"variant must be one of {', '.join(BANNER_VARIANTS)}")
+    message = (message or "").strip()
+    if enabled and not message:
+        raise ValueError("message is required when the banner is enabled")
+    config = {"enabled": bool(enabled), "message": message, "variant": variant, "dismissible": bool(dismissible)}
+    with open(_banner_config_path(), "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+    return config
 
 
 def _keyring_service(storage_name):

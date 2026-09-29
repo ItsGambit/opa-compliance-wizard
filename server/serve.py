@@ -363,6 +363,13 @@ class Handler(SimpleHTTPRequestHandler):
                 envs = [_public_entry(n, m, engine_owner) for n, m in visible.items()]
                 return self._send_json(200, {"environments": envs, "active": local_env_name})
 
+            if path == "/api/banner":
+                # No client/auth requirement -- this has to render even
+                # before an environment is configured (same reasoning as
+                # /api/whoami and /api/version above), and it holds no
+                # tenant data of its own.
+                return self._send_json(200, engine.get_banner_config())
+
             if path == "/api/resource_groups":
                 if not _require_client(self._send_json, local_client):
                     return
@@ -525,6 +532,16 @@ class Handler(SimpleHTTPRequestHandler):
         local_client, local_okta_client, _local_env_name = _session_snapshot(owner_key)
         try:
             payload = self._read_json_body()
+
+            if path == "/api/banner":
+                config = engine.set_banner_config(
+                    payload.get("enabled", False),
+                    payload.get("message", ""),
+                    payload.get("variant", "warning"),
+                    payload.get("dismissible", True),
+                )
+                engine.log_audit_event(actor_email, actor_sub, "banner.update", config)
+                return self._send_json(200, config)
 
             if path == "/api/environments":
                 name = engine.upsert_environment(payload.get("name"), payload, owner=engine_owner)

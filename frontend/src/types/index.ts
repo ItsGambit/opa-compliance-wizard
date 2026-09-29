@@ -13,6 +13,15 @@ export interface EnvironmentsResponse {
   active: string | null
 }
 
+export type BannerVariant = 'info' | 'warning' | 'danger'
+
+export interface BannerConfig {
+  enabled: boolean
+  message: string
+  variant: BannerVariant
+  dismissible: boolean
+}
+
 export interface EnvironmentFormValues {
   name: string
   base_domain: string
