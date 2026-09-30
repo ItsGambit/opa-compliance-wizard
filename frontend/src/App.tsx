@@ -4,6 +4,7 @@ import { AboutDialog } from './components/AboutDialog'
 import { AccessExplorer, ACCESS_SUB_TABS } from './components/AccessExplorer'
 import { AnnouncementBanner } from './components/AnnouncementBanner'
 import { BannerSettingsDialog } from './components/BannerSettingsDialog'
+import { ComplianceReports } from './components/ComplianceReports'
 import { EnvironmentManagerDialog } from './components/EnvironmentManagerDialog'
 import { EnvironmentSetup } from './components/EnvironmentSetup'
 import { Footer } from './components/Footer'
@@ -61,6 +62,7 @@ export default function App() {
               <h1 className="text-lg font-semibold text-text">
                 {activeTab === 'builder' && 'Folder Builder'}
                 {activeTab === 'access' && 'Access Explorer'}
+                {activeTab === 'reports' && 'Compliance Reports'}
                 {activeTab === 'secrets_access' && 'Secrets Access Dashboard'}
               </h1>
               <p className="text-xs text-text-faint mt-1">
@@ -68,6 +70,8 @@ export default function App() {
                   'Pick or create a resource group and project, build the folder tree, then preview and create.'}
                 {activeTab === 'access' &&
                   'Explore who has access to what, across resource groups, projects, policies, users, and groups.'}
+                {activeTab === 'reports' &&
+                  'SOC 2 / SOX / ISO 27001 evidence, generated from OPA + core Okta audit history.'}
                 {activeTab === 'secrets_access' &&
                   'See who created, updated, retrieved, or deleted each secret and folder in a resource group/project.'}
               </p>
@@ -91,6 +95,7 @@ export default function App() {
 
           {activeTab === 'builder' && <FolderBuilder />}
           {activeTab === 'access' && <AccessExplorer subTab={accessSubTab} />}
+          {activeTab === 'reports' && <ComplianceReports />}
           {activeTab === 'secrets_access' && <SecretsAccessDashboard />}
 
           <Footer />

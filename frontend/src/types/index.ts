@@ -1,3 +1,13 @@
+export type IngestionScope = 'curated' | 'all'
+
+export interface SyncSchedule {
+  enabled: boolean
+  run_time: string // "HH:MM", UTC
+  ingestion_scope: IngestionScope
+  retention_days: number | null
+  retention_max_size_mb: number | null
+}
+
 export interface Environment {
   name: string
   base_domain: string
@@ -6,11 +16,74 @@ export interface Environment {
   okta_url: string
   has_okta_token: boolean
   preserve_logs_locally: boolean
+  sync_schedule: SyncSchedule
 }
 
 export interface EnvironmentsResponse {
   environments: Environment[]
   active: string | null
+}
+
+export interface SyncStepEvent {
+  key: string
+  status: 'start' | 'progress' | 'done'
+  detail: string | null
+}
+
+export interface SyncState {
+  environment: string
+  last_synced_at: string | null
+  last_sync_completed_at: string | null
+  last_sync_status: string | null
+  last_sync_error: string | null
+  total_events_ingested: number
+  ingestion_scope: IngestionScope
+}
+
+export interface SyncStatusResponse {
+  status: 'idle' | 'running' | 'done' | 'error'
+  steps: SyncStepEvent[]
+  error: string | null
+  result?: { inserted: number; scanned: number; since: string; chunks: number; pruned: number; cutoff: string | null }
+  sync_state: SyncState | null
+  is_first_sync: boolean
+}
+
+export type ComplianceControl = 'CC6' | 'CC7' | 'CC8'
+
+export interface ComplianceReportDef {
+  key: string
+  label: string
+  control: ComplianceControl
+  description: string
+  event_types: string[]
+  count?: number
+}
+
+export interface ComplianceReportTarget {
+  id: string
+  type: string
+  alternateId: string
+  displayName: string
+}
+
+export interface ComplianceReportRow {
+  uuid: string
+  user: string
+  actor_alternate_id: string | null
+  action: string
+  event_type: string
+  timestamp: string
+  resource: string
+  resource_type: string
+  outcome: string
+  targets: ComplianceReportTarget[]
+}
+
+export interface ComplianceReportResponse {
+  report: string
+  environment: string
+  rows: ComplianceReportRow[]
 }
 
 export type BannerVariant = 'info' | 'warning' | 'danger'

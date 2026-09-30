@@ -5,6 +5,7 @@ import {
   fetchEnvironments,
   fetchGroups,
   fetchProjects,
+  fetchReportDefs,
   fetchResourceGroupSecurityPolicies,
   fetchResourceGroups,
   fetchSecretsAccessReport,
@@ -13,6 +14,7 @@ import {
   fetchVersion,
   fetchWhoami,
   fetchWorkloadRoles,
+  runReport,
 } from './client'
 
 export function useEnvironments() {
@@ -147,5 +149,21 @@ export function useSecretsAccessReport(resourceGroupId: string | undefined, proj
     queryFn: () => fetchSecretsAccessReport(resourceGroupId!, projectId!),
     enabled: !!resourceGroupId && !!projectId,
     retry: false, // a 409 (no Okta token configured) won't resolve by retrying
+  })
+}
+
+export function useReportDefs(environment: string | undefined, from?: string, to?: string) {
+  return useQuery({
+    queryKey: ['report_defs', environment, from, to],
+    queryFn: async () => (await fetchReportDefs(environment, from, to)).reports,
+    enabled: !!environment,
+  })
+}
+
+export function useReport(reportKey: string | undefined, environment: string | undefined, from?: string, to?: string) {
+  return useQuery({
+    queryKey: ['report', reportKey, environment, from, to],
+    queryFn: () => runReport(reportKey!, environment, from, to),
+    enabled: !!reportKey && !!environment,
   })
 }

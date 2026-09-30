@@ -1,15 +1,29 @@
 # OPA Secrets Wizard
 
-Creates a tree of Okta Privileged Access (OPA) vault **secret folders**
-(root / sub / sub-sub / ... any depth) — and, if needed, the resource
-group / project / access group they live under — from a CSV file or an
-interactive dashboard.
+A tool for managing **Okta Privileged Access (OPA)** secret folders and
+for **auditing and reporting** on both OPA and core Okta activity — built
+as a CLI for scripting and an interactive dashboard for everyday use, so
+whether you're a security engineer wiring this into a pipeline or an
+admin who just wants a clean UI, there's a path that fits.
+
+At its core, it does two things:
+
+1. **Creates a tree of OPA vault secret folders** (root / sub / sub-sub /
+   ... any depth) — and, if needed, the resource group / project / access
+   group they live under — from a CSV file or the dashboard's visual tree
+   editor.
+2. **Generates compliance-ready audit reports** (SOC 2 / SOX / ISO 27001
+   evidence: MFA enforcement, provisioning, privileged access, policy
+   changes, and more) by continuously archiving Okta System Log history
+   beyond Okta's own 90-day retention window — see
+   [Compliance Reports Dashboard](#compliance-reports-dashboard) below.
 
 - **CLI** (`create_secret_folders.py`) — scriptable, CSV in, CSV out.
 - **Interactive dashboard** ("OPA Secrets Wizard", `frontend/` + `server/`)
   — pick or create the resource group/project/group from live dropdowns,
   build the folder tree visually, save it to a CSV, then Preview/Create
-  right from the page. See "Interactive Dashboard" below.
+  right from the page, plus the full reporting/audit feature set. See
+  [Interactive Dashboard](#interactive-dashboard) below.
 
 Both share the exact same engine code (`create_secret_folders.py` is
 imported by the dashboard server, not reimplemented) — no logic is
@@ -19,17 +33,43 @@ Model: **Resource Group -> Project -> Folder** (folders can nest under
 other folders via `parent_folder_id`). Resource groups require at least
 one **group** for access delegation; per this tool's design, groups are
 always created in **Okta** (core API) and synced into OPA via **Group
-Push** — never via OPA's own local-group endpoint. See "Groups" below.
+Push** — never via OPA's own local-group endpoint. See
+[Resource Groups, Projects, and Groups](#resource-groups-projects-and-groups)
+below.
 
 All endpoints, auth flows, and field names in this tool were
 **live-verified** against a real tenant (not just inferred from
-documentation) — see "Confirmed tenant behavior" below.
+documentation) — see
+[Confirmed tenant behavior](#confirmed-tenant-behavior-found-via-live-testing-not-docs)
+below.
 
 > **This is an early, community-testing release.** It has been used and
 > live-tested against a real OPA tenant throughout development, but it
 > is not an official Okta product and comes with no support commitment.
-> See "No warranty" below, and please open a GitHub issue with any
-> feedback or problems you run into.
+> See [No warranty](#no-warranty) below, and please open a GitHub issue
+> with any feedback or problems you run into.
+
+## Table of Contents
+
+- [Prerequisites](#prerequisites)
+- [No warranty](#no-warranty)
+- [Security: encrypted credential storage](#security-encrypted-credential-storage)
+- [Interactive Dashboard](#interactive-dashboard)
+  - [Environments](#environments-dev--uat--prod-etc)
+  - [Resource Groups, Projects, and Groups](#resource-groups-projects-and-groups)
+  - [Building the folder tree](#building-the-folder-tree)
+  - [Access Explorer](#access-explorer)
+  - [Compliance Reports Dashboard](#compliance-reports-dashboard)
+  - [Secrets Access Dashboard](#secrets-access-dashboard)
+  - [Policy assignment (Folder Builder)](#policy-assignment-folder-builder)
+- [Hosting on a server (optional)](#hosting-on-a-server-optional)
+- [CLI Setup](#cli-setup)
+- [CSV format](#csv-format)
+- [CLI Usage](#cli-usage)
+- [Confirmed tenant behavior](#confirmed-tenant-behavior-found-via-live-testing-not-docs)
+- [Idempotency](#idempotency)
+- [Version](#version)
+  - [Changelog](#changelog)
 
 ## Prerequisites
 
@@ -237,40 +277,132 @@ resolve to one project, so the condition itself is shown as readable
 text (e.g. "Servers labeled `system.os_type=linux`") at the
 resource-group level.
 
+### Compliance Reports Dashboard
+
+The tab most admins will live in day-to-day if you're using this tool
+for audit prep. It answers the question auditors actually ask —
+*"prove that X happened, for every occurrence, over the period we're
+auditing"* — for both OPA and core Okta activity, without you needing
+to know Okta's System Log event-type names or write a single query.
+
+**Why this exists, in plain terms:** Okta's own System Log only keeps
+90 days of history. Most audits (SOC 2, SOX, ISO 27001) cover a
+12-month period. Without something standing between "Okta's 90-day
+window" and "your auditor's 12-month ask," you simply can't produce
+the evidence — no amount of clicking around the Okta Admin Console
+fixes that gap. This dashboard closes it by continuously archiving
+System Log events into a local, indefinitely-retained store (SQLite —
+see [Hosting on a server](#hosting-on-a-server-optional) for why that
+choice, not a bigger database, is the right one here), then serving
+14 pre-built reports on top of that archive.
+
+**The 14 reports, grouped by SOC 2 Trust Services Criteria** (each maps
+to a specific, live-verified set of real Okta/OPA event types — nothing
+here is a guess or a report card that will silently always read zero):
+
+- **CC6 — Access Controls:** MFA Enforcement, Session Activity,
+  Provisioning & De-provisioning, Role/Group Changes, Admin Privilege
+  Grants, JIT Access Requests
+- **CC7 — System Operations:** Threat Detection, API Token Lifecycle
+- **CC8 — Change Management:** Policy Modifications
+- **Privileged Access (OPA/PAM):** Secrets Activity, PAM JIT
+  Checkout/Checkin, Session Logins, Credential Reveals, PAM Policy
+  Modifications
+
+Click any report card to open its detail view: a date-range filter and
+a results table in the **four-field audit standard** — **User**,
+**Action**, **Timestamp**, **Affected Resource** — plus a color-coded
+outcome (success/failure/denied) column, which is the shape most audit
+evidence requests are written around. Every report supports
+**Export CSV** (via the same export mechanism used throughout the rest
+of this tool) both from its detail view and directly from its card on
+the picker screen (hover to reveal the export icon) — there's also a
+single **Export all reports** button at the top of the picker for
+pulling the entire evidence set in one pass.
+
+**Getting data into the archive — the sync settings dialog** (gear
+icon → environment row → sync settings, next to the existing local log
+retention indicator):
+
+- **Ingestion scope** — a real either/or choice made at the point data
+  is written in, not a filter applied afterward:
+  - *Curated only* — store just the ~20 event types the 14 reports
+    above actually use. Smallest footprint; the right default for most
+    deployments, especially larger tenants with high daily event
+    volume.
+  - *Everything* — store every System Log event type, for teams who
+    want the full tenant history available for ad-hoc investigation
+    beyond these 14 reports. Bigger archive, same reports.
+- **Retention** — a separate setting layered on top of whichever scope
+  you picked: a time window (e.g. "keep 2 years"), a size cap, or both.
+  Curated events are the evidence trail itself, so they're **never**
+  auto-pruned by this setting regardless of scope — retention only
+  ever prunes non-curated ("everything" scope) events past the
+  configured window/size.
+- **Schedule** — enable a daily sync, choose the run time (shown in
+  UTC), and the background job keeps the archive current with
+  delta-only pulls (it only asks Okta for events published after the
+  last successful sync — never a full re-fetch). This runs as a
+  server-side background thread, so it works unattended on a hosted
+  deployment; see [Hosting on a server](#hosting-on-a-server-optional).
+- **First run, three ways in** — the first time sync is enabled for an
+  environment, you're asked how to seed the archive:
+  1. **Backfill the last 90 days** via the live Okta API (chunked
+     day-by-day under the hood so it works reliably even on tenants
+     with thousands of events/day, without hitting API pagination
+     limits).
+  2. **Import a System Log CSV** you've already exported from the Okta
+     Admin Console — useful if you want to seed the archive from a
+     specific date range, or simply avoid the API calls entirely.
+  3. **Start fresh** — no backfill; the archive just grows from today
+     forward.
+
+A manual **Sync now** action is always available alongside the
+schedule, for kicking off an out-of-band sync without waiting for the
+next scheduled run.
+
 ### Secrets Access Dashboard
 
-A third top-level tab: pick a resource group and project, see every
-secret and secret folder in it — including ones since deleted — with
-who created, updated, retrieved (secrets only, up to 5 most recent),
+A tab for a single, focused question: pick a resource group and
+project, see every secret and secret folder in it — including ones
+since deleted — with who created, updated, retrieved (secrets only),
 and deleted each one, and when.
 
 Two sources merged into one report: the live folder/secret tree (same
 walk Folder Builder's "Load Current Structure" uses) for what exists
-right now, plus a single Okta System Log query scoped to the project
-(`pam.secret.create/.update/.delete/.reveal` and
+right now, plus the project's history from the compliance archive
+above (`pam.secret.create/.update/.delete/.reveal` and
 `pam.secret_folder.create/.update/.delete` — see "Confirmed tenant
 behavior" below) for the full history, including resources that no
 longer exist and therefore aren't in the live tree at all. A row
-absent from the live tree is only ever marked **deleted** when the log
-actually contains a delete event for it — otherwise it's **unknown**
-(most likely just older than the 90-day System Log retention window),
-never guessed. Requires an Okta API token configured on the active
-environment (same requirement as Access Explorer's "last accessed"
-lookup), since the audit trail comes entirely from Okta's System Log,
-not OPA's own API.
+absent from the live tree is only ever marked **deleted** when the
+archive actually contains a delete event for it — otherwise it's
+**unknown** (most likely just older than however far back the archive
+goes for that environment), never guessed.
+
+Once an environment has run its first compliance sync (above), this
+report reads from the archive with no 90-day ceiling and no cap on how
+many reveal events are shown. Until then, it transparently falls back
+to a live, on-demand Okta System Log query scoped to the project
+(capped at 90 days and the 5 most recent reveals, same as this tool's
+earlier versions) — so nothing regresses for an environment that hasn't
+opted into compliance sync yet. Either way, it requires an Okta API
+token configured on the active environment, since the audit trail
+comes from Okta's System Log (live or archived), not OPA's own API.
 
 Has its own **Export CSV** / **Export MD** buttons, covering both the
 Secrets and Folders sections of whatever resource group/project is
 currently selected, plus a **Refresh** button to re-pull the report
 on demand without changing the resource group/project selection.
 
-**Preserving history past Okta's 90-day retention.** Okta's System Log
-only ever retains 90 days — this tool can't extend that on Okta's side,
-but each saved environment (gear icon → environment row) can opt in to
-**"preserve logs locally"**: once enabled, every report fetch for that
-environment merges newly-seen System Log events into a local cache file
-(`secrets_log_cache.json`, next to `environments.json`, git-ignored like
-it) instead of discarding them once Okta ages them out. A clear
+**Preserving history past Okta's 90-day retention (pre-compliance-sync
+environments).** For an environment that hasn't yet enabled compliance
+sync, each saved environment (gear icon → environment row) can still
+opt in to the older, lighter-weight **"preserve logs locally"**
+toggle: once enabled, every report fetch for that environment merges
+newly-seen System Log events into a local cache file
+(`secrets_log_cache.json`, next to `environments.json`, git-ignored
+like it) instead of discarding them once Okta ages them out. A clear
 shield icon (green "Preserving logs locally" / grey "Local log
 preservation off") appears both in the environment manager and on the
 Secrets Access Dashboard itself, so it's never ambiguous whether a given
@@ -280,7 +412,11 @@ first time the toggle is turned on for a given project — only what's
 captured from that point forward accumulates; the dashboard's own
 "based on the last N days" note is replaced with the actual local
 coverage start date once enabled, rather than continuing to imply a
-hard 90-day ceiling.
+hard 90-day ceiling. **If you're setting up a new environment today,
+enable compliance sync instead** (previous section) — it supersedes
+this toggle with a single, tenant-wide archive rather than a
+per-project cache file, and everything below in this section still
+applies to it (encryption, key resolution, corrupt-cache handling).
 
 `secrets_log_cache.json` is **encrypted at rest** (Fernet/AES128-CBC via
 the `cryptography` package) — it's audit metadata (who/what/when, secret
@@ -356,6 +492,33 @@ Edge/Chromium browser policies restrict `AuthSchemes` to
 entirely (the server sends a correct 401 challenge; the browser just never
 shows it). OIDC's own hosted login page sidesteps that failure mode
 completely.
+
+**Why hosting matters for Compliance Reports specifically:** the daily
+sync job that keeps the audit archive current (see
+[Compliance Reports Dashboard](#compliance-reports-dashboard)) runs as a
+background thread inside `server/serve.py` — it only fires while that
+process is running. On the desktop/standalone path (`launch.py`), that
+means sync only happens while the app is open on someone's machine.
+Hosting this on a server that stays up around the clock is what makes
+"scheduled daily sync, unattended" actually mean unattended. The
+scheduler is also restart-safe by design: it re-checks each
+environment's persisted sync state on every poll rather than keeping an
+in-memory countdown, so a `systemctl restart` (from a deploy, a crash
+recovery, or a manual restart) never causes a missed or duplicate sync.
+
+**Why SQLite, not a "real" database server, for the audit archive:**
+this came up explicitly during design — wouldn't MySQL or Postgres
+scale better for a growing, multi-year archive? For this tool's actual
+usage pattern, no: SQLite's write path is single-writer by design,
+which is exactly what one background sync thread per server process
+needs, and its read performance on an indexed, mostly-append table
+(this archive's actual shape) is not meaningfully different from a
+client-server database at the row counts a single tenant's audit trail
+realistically reaches. Standing up and operating MySQL/Postgres would
+add a second service to install, patch, back up, and secure, for a
+workload that doesn't need it — the honest tradeoff isn't "SQLite vs.
+a faster database," it's "one file vs. a whole extra service," and for
+this tool's single-server-process design, the file wins.
 
 **Setup, at a high level** (see `server/*.service`, `server/start-headless.sh`,
 and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
@@ -634,6 +797,27 @@ for every path. When run with `--execute`, also writes a results CSV
     field that's readable for both service accounts and real humans,
     so it's what the dashboard attributes actions to.
 
+16. **Several of Okta's own guide-documented System Log eventType
+    names don't actually exist on a real tenant, or exist under a
+    different exact spelling** — found while building the Compliance
+    Reports Dashboard's event-type mapping, and confirmed against two
+    real tenants (not just one, to rule out a per-tenant fluke).
+    `app.oauth2.authorize.success` doesn't exist; the real event is
+    `app.oauth2.authorize.code`. `access.request.resolved` doesn't
+    exist; the real event drops the trailing "d" —
+    `access.request.resolve`. PAM security-policy events use the
+    `pam.security_policy.create`/`.update` prefix, not `pam.policy.*`.
+    There is no `policy.rule.delete` — rule removal isn't journaled as
+    its own distinct event on this tenant. Genuinely absent from both
+    test tenants entirely (not just low-volume): `user.account.lock`,
+    `security.threat.detected`, `pam.session.start`/`.end`,
+    `pam.policy.create`/`.update`. **Lesson generalized:** never ship a
+    report or filter against a guessed/documented eventType name
+    without confirming it against real System Log data first — the
+    Compliance Reports Dashboard's entire event-type mapping
+    (`COMPLIANCE_EVENT_TYPES` in `audit_store.py`) was built this way,
+    one exact name at a time, not copied from any external guide.
+
 ## Idempotency
 
 Existing folders are detected by recursively walking the full folder
@@ -644,14 +828,90 @@ already exists is skipped, not duplicated.
 
 ## Version
 
-5.18.0 — The dashboard's UI now visually matches the **Okta Admin
-Console** (Odyssey design system look): a persistent left sidebar with
-an icon rail + expandable nav replaces the old top tab bar, and a new
-light/dark theme toggle lets anyone switch away from the previous
-dark-only look. See the changelog entry below for exactly what changed
-and why.
+5.19.0 — A new **Compliance Reports Dashboard** turns this tool into a
+general OPA + Okta audit-evidence generator, not just a secret-folder
+builder: 14 pre-built SOC 2/SOX/ISO 27001-mapped reports, backed by a
+continuously-syncing local archive that outlives Okta's 90-day System
+Log retention window. The old Secrets Access Dashboard now draws on
+that same archive once an environment opts in, with zero regression
+for environments that haven't. See the changelog entry below for the
+full breakdown, including the real event-type and timezone bugs found
+and fixed along the way.
 
 ### Changelog
+- **5.19.0**:
+  - **New: Compliance Reports Dashboard.** A new top-level tab
+    generates 14 audit-ready reports (grouped by SOC 2 CC6/CC7/CC8,
+    plus a Privileged Access/PAM group) from a local, indefinitely-
+    retained archive of Okta System Log + OPA PAM events — closing the
+    gap between Okta's 90-day log retention and the 12-month-plus
+    windows most audits actually cover. See
+    [Compliance Reports Dashboard](#compliance-reports-dashboard) for
+    the full feature description.
+  - **New archive engine (`audit_store.py`).** SQLite-backed (see
+    [Hosting on a server](#hosting-on-a-server-optional) for why SQLite
+    over a client-server database), with an admin-configurable
+    **ingestion scope** (curated ~20 event types vs. everything) that
+    governs what's written at ingest time, and a separately-configurable
+    **retention** policy (time window and/or size cap) layered on top —
+    curated events are never auto-pruned regardless of retention
+    settings. Supports both live-API delta sync (chunked day-by-day to
+    stay well under Okta's pagination safety cap on high-volume
+    tenants) and direct import from an already-exported System Log CSV.
+  - **New restart-safe background scheduler.** A daemon thread in
+    `server/serve.py`, started once at boot, polls every saved
+    environment's persisted sync schedule/state rather than keeping an
+    in-memory timer — survives `systemd` restarts and redeploys with no
+    missed or duplicate runs (see the timezone bug below for how this
+    was verified).
+  - **First-run choice.** Enabling sync for an environment for the
+    first time offers three paths: backfill the last 90 days live,
+    import a CSV, or start fresh with no backfill.
+  - **Secrets Access Dashboard merged into the same archive.** A new
+    `build_project_secrets_report_from_archive` function serves this
+    report from the compliance archive once an environment has synced
+    at least once, removing the old 90-day/5-reveal caps entirely; any
+    environment that hasn't opted in falls back to the exact original
+    live-Okta-query behavior, unchanged. Verified byte-identical output
+    between old and new for the same real project before switching the
+    route over.
+  - **CSV export everywhere.** Every report supports CSV export from
+    its detail view, from its card on the picker (hover to reveal), and
+    in bulk via a single "Export all reports" action — reusing the
+    existing export utilities used throughout the rest of the app.
+  - **Corrected several eventType names inherited from an external
+    audit-requirements guide** that don't match real Okta System Log
+    data — see finding #16 in
+    ["Confirmed tenant behavior"](#confirmed-tenant-behavior-found-via-live-testing-not-docs)
+    for the specifics (`app.oauth2.authorize.code`, not `.success`;
+    `access.request.resolve`, not `.resolved`; `pam.security_policy.*`,
+    not `pam.policy.*`; several guide-listed events confirmed genuinely
+    absent from two real tenants). Every one of the 14 reports' event
+    types was individually verified against live tenant data before
+    being wired into a report definition.
+  - **Two real bugs found and fixed via live testing, not caught by
+    typecheck/build alone:**
+    1. A timezone mismatch between the archive's UTC-stored sync
+       timestamps and the scheduler's original local-time due-check
+       could cause a duplicate same-day sync to queue right after a
+       real one completed, once local time and UTC crossed a calendar-
+       day boundary at different moments. Fixed by making the entire
+       due-check UTC end-to-end; the sync schedule's run-time field is
+       now explicitly labeled "(UTC)" in the UI.
+    2. A bare date string from an HTML date picker (e.g.
+       `"2026-09-29"`) compared directly against a full ISO timestamp
+       column via plain string comparison silently excluded every
+       event on that day from a report's date-range filter. Fixed by
+       normalizing a bare date to end-of-day before comparing.
+  - Preceded by a standalone HTML mockup, reviewed and iterated on
+    (ingestion-scope choice, CSV-import option) before any real
+    backend code was written — same process used for the 5.18.0 UI
+    redesign.
+  - Live-verified end-to-end: a full regression pass across all 5
+    build phases together against fresh data, including deliberately
+    deleting the archive's last 24 hours and re-syncing to confirm
+    delta-sync correctly re-fetches exactly what was removed with no
+    data loss.
 - **5.18.0**:
   - **Okta Admin Console-style redesign.** New `SideNav` component
     replaces the top `TabBar` for all top-level navigation (Folder

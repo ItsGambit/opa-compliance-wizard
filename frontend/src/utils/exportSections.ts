@@ -3,6 +3,7 @@ import type {
   AccessPolicy,
   AccessProject,
   AuditEntry,
+  ComplianceReportRow,
   FolderAccessRow,
   PolicyRule,
   RevealEntry,
@@ -144,4 +145,23 @@ export function secretsAccessReportExportSections(secrets: SecretAccessRow[], fo
     { title: 'Secrets', rows: secrets.map(secretAccessRow) },
     { title: 'Folders', rows: folders.map(folderAccessRow) },
   ]
+}
+
+// ── Compliance Reports ─────────────────────────────────────────────────────
+
+/** The "four-field standard" the audit-requirements guide calls for on
+ * every exported row: User, Action, Timestamp, Affected Resource. */
+export function complianceReportRow(row: ComplianceReportRow): Record<string, string> {
+  return {
+    User: row.user,
+    Action: row.action,
+    Timestamp: formatDateTime(row.timestamp),
+    'Affected Resource': row.resource || '—',
+    Outcome: row.outcome || '',
+    'Event Type': row.event_type,
+  }
+}
+
+export function complianceReportExportSections(reportLabel: string, rows: ComplianceReportRow[]): ExportSection[] {
+  return [{ title: reportLabel, rows: rows.map(complianceReportRow) }]
 }

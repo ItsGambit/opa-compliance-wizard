@@ -19,6 +19,14 @@ audit_log.jsonl
 # not something to ship in the repo template
 banner_config.json
 
+# Compliance reporting dashboard's Okta+OPA audit archive (see
+# audit_store.py) -- real ingested tenant event history, plus SQLite's
+# own WAL/journal sidecar files, all deployment-specific local instance
+# data, same treatment as environments.json/secrets_log_cache.json
+audit_store.db
+audit_store.db-wal
+audit_store.db-shm
+
 # Python
 __pycache__/
 *.pyc

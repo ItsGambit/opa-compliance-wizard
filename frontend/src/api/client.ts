@@ -2,12 +2,15 @@ import type {
   AccessModel,
   ApiErrorBody,
   BannerConfig,
+  ComplianceReportDef,
+  ComplianceReportResponse,
   CreateGroupResponse,
   CsvRow,
   EnvironmentFormValues,
   EnvironmentsResponse,
   ExecuteResponse,
   FolderSecurityPolicy,
+  IngestionScope,
   NamedRef,
   OpaGroup,
   PreviewResponse,
@@ -16,6 +19,8 @@ import type {
   ResourceGroup,
   SecretsAccessReport,
   ServiceAccountInfo,
+  SyncSchedule,
+  SyncStatusResponse,
   WorkloadRole,
 } from '../types'
 
@@ -74,6 +79,35 @@ export function setPreserveLogsLocally(name: string, enabled: boolean): Promise<
   return apiFetch(`/api/environments/${encodeURIComponent(name)}/preserve_logs_locally`, {
     method: 'POST',
     body: JSON.stringify({ enabled }),
+  })
+}
+
+export function saveSyncSchedule(name: string, schedule: SyncSchedule): Promise<{ name: string; sync_schedule: SyncSchedule }> {
+  return apiFetch(`/api/environments/${encodeURIComponent(name)}/sync_schedule`, {
+    method: 'POST',
+    body: JSON.stringify(schedule),
+  })
+}
+
+export function startSync(name: string, ingestionScope?: IngestionScope): Promise<{ started: boolean; already_running: boolean }> {
+  return apiFetch(`/api/environments/${encodeURIComponent(name)}/sync/start`, {
+    method: 'POST',
+    body: JSON.stringify(ingestionScope ? { ingestion_scope: ingestionScope } : {}),
+  })
+}
+
+export function fetchSyncStatus(name: string): Promise<SyncStatusResponse> {
+  return apiFetch(`/api/environments/${encodeURIComponent(name)}/sync/status`)
+}
+
+export function importSyncCsv(
+  name: string,
+  csvPath: string,
+  ingestionScope: IngestionScope
+): Promise<{ inserted: number; scanned: number }> {
+  return apiFetch(`/api/environments/${encodeURIComponent(name)}/sync/import_csv`, {
+    method: 'POST',
+    body: JSON.stringify({ csv_path: csvPath, ingestion_scope: ingestionScope }),
   })
 }
 
@@ -247,4 +281,29 @@ export function fetchSecretsAccessReport(resourceGroupId: string, projectId: str
   return apiFetch(
     `/api/resource_groups/${encodeURIComponent(resourceGroupId)}/projects/${encodeURIComponent(projectId)}/secrets_access_report`
   )
+}
+
+// ── Compliance Reports ────────────────────────────────────────────────────
+
+export function fetchReportDefs(environment?: string, from?: string, to?: string): Promise<{ reports: ComplianceReportDef[] }> {
+  const params = new URLSearchParams()
+  if (environment) params.set('environment', environment)
+  if (from) params.set('from', from)
+  if (to) params.set('to', to)
+  const qs = params.toString()
+  return apiFetch(`/api/reports${qs ? `?${qs}` : ''}`)
+}
+
+export function runReport(
+  reportKey: string,
+  environment?: string,
+  from?: string,
+  to?: string
+): Promise<ComplianceReportResponse> {
+  const params = new URLSearchParams()
+  if (environment) params.set('environment', environment)
+  if (from) params.set('from', from)
+  if (to) params.set('to', to)
+  const qs = params.toString()
+  return apiFetch(`/api/reports/${encodeURIComponent(reportKey)}${qs ? `?${qs}` : ''}`)
 }

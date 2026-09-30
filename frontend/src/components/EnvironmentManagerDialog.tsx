@@ -8,6 +8,7 @@ import type { ApiErrorBody, Environment, EnvironmentFormValues, EnvironmentsResp
 import { EnvironmentForm } from './EnvironmentForm'
 import { LogRetentionIndicator } from './LogRetentionIndicator'
 import { StatusBadge } from './StatusBadge'
+import { SyncScheduleDialog } from './SyncScheduleDialog'
 
 interface Props {
   data: EnvironmentsResponse | undefined
@@ -123,7 +124,13 @@ export function EnvironmentManagerDialog({ data, open: openProp, onOpenChange }:
                   {env.base_domain} · team {env.team_name} · key {env.key_id.slice(0, 8)}…
                   {env.has_okta_token ? ' · Okta connected' : ' · no Okta token (can\'t create groups)'}
                 </div>
-                <LogRetentionIndicator enabled={env.preserve_logs_locally} envName={env.name} />
+                <div className="flex items-center gap-1.5">
+                  <LogRetentionIndicator enabled={env.preserve_logs_locally} envName={env.name} />
+                  <SyncScheduleDialog env={env} />
+                  {env.sync_schedule.enabled && (
+                    <span className="text-[0.6875rem] text-win">Compliance sync on</span>
+                  )}
+                </div>
                 {confirmingDelete === env.name && (
                   <div className="flex items-center gap-2 text-xs text-loss">
                     Delete "{env.name}"?

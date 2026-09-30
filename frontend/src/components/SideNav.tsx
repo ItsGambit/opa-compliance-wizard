@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { FolderTree, KeyRound, Moon, Search, Settings, Sun } from 'lucide-react'
+import { ClipboardCheck, FolderTree, KeyRound, Moon, Search, Settings, Sun } from 'lucide-react'
 
 const THEME_STORAGE_KEY = 'opa-secrets-wizard-theme'
 
@@ -41,6 +41,7 @@ interface Props {
 const TOP_LEVEL_ICON: Record<string, typeof FolderTree> = {
   builder: FolderTree,
   access: Search,
+  reports: ClipboardCheck,
   secrets_access: KeyRound,
 }
 
@@ -74,7 +75,7 @@ export function SideNav({
     <div className="flex h-full shrink-0">
       {/* Icon rail */}
       <div className="w-12 bg-bg-elevated border-r border-border flex flex-col items-center pt-3 gap-1.5">
-        {(['builder', 'access', 'secrets_access'] as const).map(tab => {
+        {(['builder', 'access', 'reports', 'secrets_access'] as const).map(tab => {
           const Icon = TOP_LEVEL_ICON[tab]
           const isActive = activeTab === tab
           return (
@@ -122,6 +123,13 @@ export function SideNav({
               ))}
             </div>
           )}
+
+          <NavItem
+            active={activeTab === 'reports'}
+            label="Compliance Reports"
+            icon={ClipboardCheck}
+            onClick={() => onTabChange('reports')}
+          />
 
           <NavItem
             active={activeTab === 'secrets_access'}

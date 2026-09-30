@@ -137,6 +137,130 @@ def _run_access_job(job_client):
             _access_job["error"] = str(exc)
 
 
+# Compliance-reporting daily sync job -- one job per environment (not a
+# single global job like _access_job above, since multiple environments
+# can each have their own schedule running independently). Same
+# lock+dict+thread shape, keyed by environment name.
+_sync_jobs_lock = threading.Lock()
+_sync_jobs = {}  # env_name -> {"status": "idle"|"running"|"done"|"error", "steps": [...], "error": str|None}
+
+# Background scheduler thread state -- started once at server boot (see
+# main()), NOT per-request. Every iteration re-reads sync_schedule +
+# sync_state from disk rather than trusting any in-memory countdown, so a
+# systemd restart (confirmed in this project: happens on every crash AND
+# every `deploy.sh` run) never causes a missed or duplicate daily run --
+# "was today's run already done" is answered from persisted state, not
+# from an object that stopped existing when the process died.
+SCHEDULER_POLL_INTERVAL_SECS = 300  # 5 min -- frequent enough that "run at HH:MM" feels accurate,
+                                     # cheap enough to not matter running forever in the background
+_scheduler_stop_event = threading.Event()
+
+
+def _sync_job_progress(env_name):
+    def _progress(key, status, detail=None):
+        with _sync_jobs_lock:
+            _sync_jobs.setdefault(env_name, {"status": "running", "steps": [], "error": None})
+            _sync_jobs[env_name]["steps"].append({"key": key, "status": status, "detail": detail})
+    return _progress
+
+
+def _run_sync_job(env_name, okta_client, ingestion_scope):
+    import audit_store
+    with _sync_jobs_lock:
+        _sync_jobs[env_name] = {"status": "running", "steps": [], "error": None}
+    try:
+        result = audit_store.sync_okta_events(
+            okta_client, env_name, ingestion_scope, on_progress=_sync_job_progress(env_name)
+        )
+        schedule = engine.get_sync_schedule(env_name)
+        prune_result = audit_store.prune_events(
+            env_name,
+            retention_days=schedule.get("retention_days"),
+            max_size_mb=schedule.get("retention_max_size_mb"),
+        )
+        with _sync_jobs_lock:
+            _sync_jobs[env_name]["status"] = "done"
+            _sync_jobs[env_name]["result"] = {**result, **prune_result}
+    except Exception as exc:
+        with _sync_jobs_lock:
+            _sync_jobs[env_name]["status"] = "error"
+            _sync_jobs[env_name]["error"] = str(exc)
+
+
+def _start_sync_job(env_name, ingestion_scope):
+    """Starts (or no-ops if already running) a background sync for one
+    environment. Returns True if actually started. Builds a fresh
+    OktaClient directly from stored credentials -- deliberately NOT
+    reusing any per-request session client, since this runs from the
+    scheduler loop with no HTTP request/owner context at all."""
+    with _sync_jobs_lock:
+        if _sync_jobs.get(env_name, {}).get("status") == "running":
+            return False
+    creds = engine.get_environment_credentials(env_name, owner=engine.LOCAL_OWNER_KEY)
+    if not creds.get("okta_url") or not creds.get("okta_api_token"):
+        with _sync_jobs_lock:
+            _sync_jobs[env_name] = {"status": "error", "steps": [], "error": "No Okta URL/API token configured for this environment."}
+        return False
+    okta_client = engine.OktaClient(creds["okta_url"], creds["okta_api_token"])
+    threading.Thread(target=_run_sync_job, args=(env_name, okta_client, ingestion_scope), daemon=True).start()
+    return True
+
+
+def _scheduler_loop():
+    """Runs forever in a daemon thread, started once at server boot.
+    Every SCHEDULER_POLL_INTERVAL_SECS, checks every saved environment's
+    sync_schedule -- if enabled and today's run hasn't completed yet
+    (per audit_store.get_sync_state, on disk, not in-memory), starts one.
+
+    Both `run_time` and "today" are interpreted in UTC, not local time --
+    a REAL bug caught live during this feature's own testing: comparing
+    last_sync_completed_at (always stored in UTC, via
+    datetime.now(timezone.utc) in audit_store.py) against a NAIVE
+    datetime.now() (local time) meant "already ran today" could never
+    match whenever UTC's calendar date had already rolled over past
+    local midnight but local time hadn't -- e.g. 5:04pm PDT is already
+    12:04am the next UTC day, so a sync that just completed got its
+    completion date stamped as "tomorrow" from local time's perspective,
+    and the scheduler immediately re-triggered a duplicate run on its
+    very next poll. Keeping everything in one timezone end-to-end (UTC)
+    is what actually fixes this, not a smarter date-math routine --
+    admins configuring run_time should be told it's UTC in the UI."""
+    import audit_store
+    while not _scheduler_stop_event.is_set():
+        try:
+            now_utc = datetime.now(timezone.utc)
+            environments = engine.list_environments_for(engine.LOCAL_OWNER_KEY)
+            for env_name, meta in environments.items():
+                try:
+                    schedule = engine.get_sync_schedule(env_name, owner=meta.get("owner"))
+                except KeyError:
+                    continue
+                if not schedule.get("enabled"):
+                    continue
+
+                run_time_str = schedule.get("run_time") or "02:00"
+                try:
+                    run_hour, run_minute = (int(x) for x in run_time_str.split(":"))
+                except (ValueError, AttributeError):
+                    run_hour, run_minute = 2, 0
+                if (now_utc.hour, now_utc.minute) < (run_hour, run_minute):
+                    continue  # not time yet today (UTC)
+
+                state = audit_store.get_sync_state(env_name)
+                last_completed = state.get("last_sync_completed_at") if state else None
+                if last_completed:
+                    last_completed_date = last_completed[:10]  # "YYYY-MM-DD" prefix of the ISO (UTC) timestamp
+                    if last_completed_date == now_utc.strftime("%Y-%m-%d"):
+                        continue  # already ran today (UTC)
+
+                log_msg = f"[scheduler] Starting daily sync for '{env_name}' (scope={schedule.get('ingestion_scope')})"
+                print(log_msg, flush=True)
+                _start_sync_job(env_name, schedule.get("ingestion_scope", "curated"))
+        except Exception as exc:
+            print(f"[scheduler] Unexpected error in scheduler loop: {exc}", flush=True)
+        _scheduler_stop_event.wait(SCHEDULER_POLL_INTERVAL_SECS)
+
+
 class StrictBindHTTPServer(ThreadingHTTPServer):
     # http.server.HTTPServer sets allow_reuse_address=True, which on Windows
     # (unlike POSIX) lets a second process silently bind to a port that
@@ -163,6 +287,7 @@ def _public_entry(name, meta, requesting_owner):
         "preserve_logs_locally": bool(meta.get("preserve_logs_locally", False)),
         "shared": bool(meta.get("shared", False)),
         "is_own": meta.get("owner") == requesting_owner,
+        "sync_schedule": meta.get("sync_schedule", dict(engine.SYNC_SCHEDULE_DEFAULTS)),
     }
 
 
@@ -370,6 +495,44 @@ class Handler(SimpleHTTPRequestHandler):
                 # tenant data of its own.
                 return self._send_json(200, engine.get_banner_config())
 
+            if path.startswith("/api/environments/") and path.endswith("/sync/status"):
+                name = path[len("/api/environments/"):-len("/sync/status")]
+                import audit_store
+                with _sync_jobs_lock:
+                    job = dict(_sync_jobs.get(name, {"status": "idle", "steps": [], "error": None}))
+                job["sync_state"] = audit_store.get_sync_state(name)
+                job["is_first_sync"] = audit_store.is_first_sync(name)
+                return self._send_json(200, job)
+
+            if path == "/api/reports":
+                import audit_store
+                environment = (qs.get("environment") or [local_env_name])[0]
+                reports = audit_store.list_reports()
+                if environment:
+                    since = (qs.get("from") or [None])[0]
+                    until = (qs.get("to") or [None])[0]
+                    for r in reports:
+                        r["count"] = audit_store.count_events(environment, event_types=r["event_types"], since=since, until=until)
+                return self._send_json(200, {"reports": reports})
+
+            if path.startswith("/api/reports/"):
+                import audit_store
+                report_key = path[len("/api/reports/"):]
+                environment = (qs.get("environment") or [local_env_name])[0]
+                if not environment:
+                    return self._send_json(400, {"error": "No active environment and none specified via ?environment="})
+                since = (qs.get("from") or [None])[0]
+                until = (qs.get("to") or [None])[0]
+                try:
+                    limit = min(int((qs.get("limit") or [1000])[0]), 5000)
+                except ValueError:
+                    return self._send_json(400, {"error": "limit must be an integer"})
+                try:
+                    rows = audit_store.run_report(report_key, environment, since=since, until=until, limit=limit)
+                except KeyError as exc:
+                    return self._send_json(404, {"error": str(exc)})
+                return self._send_json(200, {"report": report_key, "environment": environment, "rows": rows})
+
             if path == "/api/resource_groups":
                 if not _require_client(self._send_json, local_client):
                     return
@@ -416,12 +579,32 @@ class Handler(SimpleHTTPRequestHandler):
                     and "/projects/" in path):
                 if not _require_client(self._send_json, local_client):
                     return
-                if not _require_okta_client(self._send_json, local_okta_client):
-                    return
                 inner = path[len("/api/resource_groups/"):-len("/secrets_access_report")]
                 rg_id, _, proj_id = inner.partition("/projects/")
                 if not rg_id or not proj_id:
                     return self._send_json(400, {"error": "missing resource_group_id or project_id"})
+                # Phase 5 of the compliance-reporting-dashboard plan: once an
+                # environment has a real compliance-sync archive (audit_store.py),
+                # this report is sourced from THAT instead of a bounded live
+                # Okta call + the bespoke secrets_log_cache.json -- strictly
+                # more complete (whole history ever ingested, no 90-day/
+                # reveal_limit cap), confirmed to produce identical bucketing
+                # output on real data before this switch. This path needs no
+                # Okta client at all (unlike the fallback below), so an
+                # environment with compliance sync set up but no live Okta
+                # token configured still works. Environments that have never
+                # run a compliance sync keep the exact original live-query
+                # behavior (and its Okta-client requirement) -- zero
+                # regression for anyone not using the new feature yet.
+                import audit_store
+                if local_env_name and not audit_store.is_first_sync(local_env_name):
+                    report = engine.build_project_secrets_report_from_archive(
+                        local_client, local_env_name, rg_id, proj_id
+                    )
+                    return self._send_json(200, report)
+
+                if not _require_okta_client(self._send_json, local_okta_client):
+                    return
                 preserve_locally = False
                 if local_env_name:
                     try:
@@ -583,6 +766,42 @@ class Handler(SimpleHTTPRequestHandler):
                 except KeyError as exc:
                     return self._send_json(404, {"error": str(exc)})
                 return self._send_json(200, {"name": name, "preserve_logs_locally": enabled})
+
+            if path.startswith("/api/environments/") and path.endswith("/sync_schedule"):
+                name = path[len("/api/environments/"):-len("/sync_schedule")]
+                try:
+                    saved = engine.set_sync_schedule(name, payload, owner=engine_owner)
+                except KeyError as exc:
+                    return self._send_json(404, {"error": str(exc)})
+                except ValueError as exc:
+                    return self._send_json(400, {"error": str(exc)})
+                engine.log_audit_event(actor_email, actor_sub, "sync_schedule.update", {"name": name, **saved})
+                return self._send_json(200, {"name": name, "sync_schedule": saved})
+
+            if path.startswith("/api/environments/") and path.endswith("/sync/start"):
+                name = path[len("/api/environments/"):-len("/sync/start")]
+                try:
+                    schedule = engine.get_sync_schedule(name, owner=engine_owner)
+                except KeyError as exc:
+                    return self._send_json(404, {"error": str(exc)})
+                ingestion_scope = payload.get("ingestion_scope") or schedule.get("ingestion_scope", "curated")
+                started = _start_sync_job(name, ingestion_scope)
+                engine.log_audit_event(actor_email, actor_sub, "sync.manual_start", {"name": name, "ingestion_scope": ingestion_scope})
+                return self._send_json(200, {"started": started, "already_running": not started})
+
+            if path.startswith("/api/environments/") and path.endswith("/sync/import_csv"):
+                name = path[len("/api/environments/"):-len("/sync/import_csv")]
+                import audit_store
+                csv_path = payload.get("csv_path")
+                ingestion_scope = payload.get("ingestion_scope", "curated")
+                if not csv_path or not os.path.isfile(csv_path):
+                    return self._send_json(400, {"error": f"csv_path not found on server filesystem: {csv_path!r}"})
+                try:
+                    result = audit_store.import_from_csv(csv_path, name, ingestion_scope)
+                except ValueError as exc:
+                    return self._send_json(400, {"error": str(exc)})
+                engine.log_audit_event(actor_email, actor_sub, "sync.import_csv", {"name": name, "csv_path": csv_path, **result})
+                return self._send_json(200, result)
 
             if path == "/api/access/bootstrap/start":
                 if not _require_client(self._send_json, local_client):
@@ -972,6 +1191,10 @@ def main():
 
     _seen_owners.add(LOCAL_OWNER_KEY_HEADER)
     _try_activate_saved_environment(LOCAL_OWNER_KEY_HEADER)
+
+    import audit_store
+    audit_store.init_db()
+    threading.Thread(target=_scheduler_loop, daemon=True).start()
 
     if not FRONTEND_DIST.exists():
         print(f"Warning: {FRONTEND_DIST} does not exist yet -- run 'npm run build' in frontend/ first.")

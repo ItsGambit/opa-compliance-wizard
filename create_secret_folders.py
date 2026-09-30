@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.18.0
+# Version     : 5.19.0
 # =============================================================================
 
 import argparse
@@ -77,7 +77,7 @@ import urllib.request
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.18.0"
+SCRIPT_VERSION = "5.19.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -1270,7 +1270,7 @@ class OktaClient:
         identity id, not the PAM one."""
         return self.request("GET", f"/api/v1/users/{urllib.parse.quote(identifier, safe='')}")
 
-    def get_system_log(self, filter_expr=None, since=None, limit=1000, sort_order="DESCENDING", max_pages=50):
+    def get_system_log(self, filter_expr=None, since=None, until=None, limit=1000, sort_order="DESCENDING", max_pages=50):
         """GET /api/v1/logs, following the Link: rel="next" header until
         exhausted (or max_pages, as a runaway-query backstop -- logged, not
         silent, if actually hit). Confirmed live 2026-08-14: this org's
@@ -1279,7 +1279,14 @@ class OktaClient:
         `since`) -- matches Okta's documented System Log retention, not
         assumed. `filter` uses the same SCIM-ish expression syntax as other
         Okta management APIs (e.g. 'actor.id eq "..." and eventType eq
-        "..."').
+        "..."'). `until` is Okta's own documented `/api/v1/logs` query
+        param -- added so callers doing a day-by-day chunked walk (see
+        audit_store.sync_okta_events) can bound each chunk instead of
+        relying solely on max_pages, confirmed live 2026-09-29: a genuinely
+        busy tenant's automatic OPA credential-rotation traffic alone can
+        exceed max_pages=200 (200k events) within a single 90-day window,
+        which would otherwise truncate a first-run backfill silently short
+        of "now" even though the underlying API call succeeded every time.
 
         Single-page (limit<=1000) was fine against a low-volume tenant, but
         a busier one (e.g. high service-account rotation traffic) can
@@ -1293,6 +1300,8 @@ class OktaClient:
             params["filter"] = filter_expr
         if since:
             params["since"] = since
+        if until:
+            params["until"] = until
         query = urllib.parse.urlencode(params)
         events = []
         next_path = f"{SYSTEM_LOG_PATH}?{query}"
@@ -2025,6 +2034,48 @@ def set_preserve_logs_locally(name, enabled, owner=LOCAL_OWNER_KEY):
     save_environments(data)
 
 
+SYNC_SCHEDULE_DEFAULTS = {
+    "enabled": False,
+    "run_time": "02:00",  # 24h local HH:MM
+    "ingestion_scope": "curated",  # "curated" or "all" -- see audit_store.py
+    "retention_days": None,  # None = no time-based prune
+    "retention_max_size_mb": None,  # None = no size-based prune
+}
+
+
+def get_sync_schedule(name, owner=LOCAL_OWNER_KEY):
+    """Returns the environment's sync_schedule dict, filled in with
+    SYNC_SCHEDULE_DEFAULTS for any field never explicitly set (so callers
+    never have to guess at partial/legacy shapes). Raises KeyError if
+    `name` isn't a saved environment owned by `owner`."""
+    storage_name = environment_storage_name(owner, name)
+    data = load_environments()
+    if storage_name not in data["environments"]:
+        raise KeyError(f"No saved environment named '{name}'")
+    stored = data["environments"][storage_name].get("sync_schedule", {})
+    return {**SYNC_SCHEDULE_DEFAULTS, **stored}
+
+
+def set_sync_schedule(name, config, owner=LOCAL_OWNER_KEY):
+    """Saves the environment's daily-sync configuration (enabled, run
+    time, ingestion scope, retention). Own dedicated setter, deliberately
+    NOT folded into upsert_environment's metadata-field loop -- same
+    reasoning as set_preserve_logs_locally above: this is a settings
+    object, not part of the credential form. Raises KeyError if `name`
+    isn't a saved environment owned by `owner`, ValueError if
+    ingestion_scope isn't a real choice."""
+    if config.get("ingestion_scope", "curated") not in ("curated", "all"):
+        raise ValueError('ingestion_scope must be "curated" or "all"')
+    storage_name = environment_storage_name(owner, name)
+    data = load_environments()
+    if storage_name not in data["environments"]:
+        raise KeyError(f"No saved environment named '{name}'")
+    merged = {**SYNC_SCHEDULE_DEFAULTS, **data["environments"][storage_name].get("sync_schedule", {}), **config}
+    data["environments"][storage_name]["sync_schedule"] = merged
+    save_environments(data)
+    return merged
+
+
 def _merge_system_log_events(env_name, project_id, events):
     """Upserts freshly-fetched System Log events (keyed by their own uuid,
     always present) into secrets_log_cache.json under
@@ -2207,6 +2258,132 @@ def build_secrets_access_report(client, okta_client, resource_group_id, project_
         "folders": _build_rows("secret_folder", folders_by_id),
         "since_days": since_days,
         "local_retention_enabled": bool(preserve_locally and env_name),
+        "oldest_captured_at": oldest_captured_at,
+    }
+
+
+def build_project_secrets_report_from_archive(client, environment, resource_group_id, project_id):
+    """Phase 5 of the compliance-reporting-dashboard plan: the same report
+    as build_secrets_access_report above, but sourced from the unified
+    audit_store.py SQLite archive instead of a live Okta System Log call
+    + the bespoke secrets_log_cache.json. Requires `audit_store` to have
+    already been populated for `environment` (via a sync or CSV import) --
+    this function does not itself call Okta at all, so it works even with
+    no Okta API token configured, unlike the original.
+
+    Deliberately reuses the EXACT SAME bucketing/status logic as
+    build_secrets_access_report (verbatim-copied, not refactored to share
+    code) -- that function's active/deleted/unknown honesty rules took
+    several iterations to get right (see this project's own history), and
+    the risk of a shared-code refactor introducing a subtle regression in
+    the already-working live-query path outweighs the small duplication.
+    Only the EVENT SOURCE differs: audit_store.query_events (all history
+    ever ingested, no 90-day/1000-row cap) instead of one bounded
+    okta_client.get_system_log call.
+
+    Returns the exact same shape as build_secrets_access_report, with
+    `local_retention_enabled` always True (the whole point of sourcing
+    from the archive) and `oldest_captured_at` reflecting the archive's
+    real earliest event for this project, not a live-query artifact."""
+    import audit_store
+
+    folders, secrets = fetch_all_folders_and_secrets(client, resource_group_id, project_id)
+    folders_by_id = {f["id"]: f for f in folders if f.get("id")}
+    secrets_by_id = {s["id"]: s for s in secrets if s.get("id")}
+
+    all_event_types = [t for types in SECRETS_ACCESS_REPORT_EVENT_TYPES.values() for t in types]
+    archived_rows = audit_store.query_events(environment, event_types=all_event_types, limit=100000)
+    # audit_store stores the raw Okta event dict under "raw" -- filter to
+    # this project client-side (confirmed live: a project-scoped event's
+    # target[] always includes the project itself as a co-target, same
+    # fact the original function's server-side `target.id eq` filter
+    # relies on -- just applied here instead of in the query, since the
+    # archive has no per-project index and doesn't need one at this
+    # realistic scale, see plan for the real row-count check behind this).
+    events = [
+        r["raw"] for r in archived_rows
+        if any(t.get("type") == "Project" and t.get("id") == project_id for t in (r["raw"].get("target") or []))
+    ]
+    events = sorted(events, key=lambda e: e.get("published") or "", reverse=True)
+    oldest_captured_at = min((e.get("published") for e in events if e.get("published")), default=None)
+
+    buckets = {"secret": {}, "secret_folder": {}}
+    target_type_for_kind = {"secret": "Secret", "secret_folder": "Secret Folder"}
+    event_type_to_kind = {
+        t: kind for kind, types in SECRETS_ACCESS_REPORT_EVENT_TYPES.items() for t in types
+    }
+
+    for event in events:  # already sorted DESCENDING (most-recent-first) above
+        kind = event_type_to_kind.get(event.get("eventType"))
+        if kind is None:
+            continue
+        target = _access_report_target(event, target_type_for_kind[kind])
+        if target is None or not target.get("id"):
+            continue
+        rid = target["id"]
+        bucket = buckets[kind].setdefault(rid, {
+            "name": target.get("displayName") or "",
+            "path": "",
+            "created": None,
+            "updated": [],
+            "deleted": None,
+            "reveals": [],
+        })
+        path_target = next((t for t in (event.get("target") or []) if t.get("type") == "Secret Path"), None)
+        if path_target and not bucket["path"]:
+            bucket["path"] = (path_target.get("displayName") or "").lstrip("/")
+
+        actor = event.get("actor") or {}
+        entry = {"by": actor.get("displayName") or actor.get("alternateId"), "at": event.get("published")}
+        event_type = event.get("eventType")
+        if event_type.endswith(".create"):
+            if bucket["created"] is None:
+                bucket["created"] = entry
+        elif event_type.endswith(".update"):
+            bucket["updated"].append(entry)
+        elif event_type.endswith(".delete"):
+            if bucket["deleted"] is None:
+                bucket["deleted"] = entry
+        elif event_type.endswith(".reveal"):
+            bucket["reveals"].append({**entry, "request_id": _extract_request_id(event)})
+
+    def _build_rows(kind, live_by_id):
+        rows = []
+        seen_ids = set()
+        for rid, resource in live_by_id.items():
+            seen_ids.add(rid)
+            b = buckets[kind].get(rid, {})
+            rows.append({
+                "id": rid,
+                "name": resource.get("name", ""),
+                "path": full_path(resource, folders_by_id),
+                "status": "active",
+                "created": b.get("created"),
+                "updated": b.get("updated", []),
+                "deleted": b.get("deleted"),
+                **({"reveals": b.get("reveals", [])} if kind == "secret" else {}),
+            })
+        for rid, b in buckets[kind].items():
+            if rid in seen_ids:
+                continue
+            status = "deleted" if b.get("deleted") else "unknown"
+            rows.append({
+                "id": rid,
+                "name": b.get("name", ""),
+                "path": b.get("path", ""),
+                "status": status,
+                "created": b.get("created"),
+                "updated": b.get("updated", []),
+                "deleted": b.get("deleted"),
+                **({"reveals": b.get("reveals", [])} if kind == "secret" else {}),
+            })
+        return rows
+
+    return {
+        "secrets": _build_rows("secret", secrets_by_id),
+        "folders": _build_rows("secret_folder", folders_by_id),
+        "since_days": None,  # archive has no fixed window -- whole history ever ingested
+        "local_retention_enabled": True,
         "oldest_captured_at": oldest_captured_at,
     }
 

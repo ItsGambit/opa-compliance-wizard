@@ -56,8 +56,22 @@ rsync -a --delete \
   --exclude 'banner_config.json' \
   --exclude 'audit_log.jsonl' \
   --exclude 'secrets_log_cache.json' \
+  --exclude 'audit_store.db' \
+  --exclude 'audit_store.db-wal' \
+  --exclude 'audit_store.db-shm' \
   --exclude '.env' \
   "$SRC/" "$APP_DIR/"
+
+# git-for-windows checkouts of this repo commonly have core.fileMode=false,
+# which silently drops the executable bit on *.sh files whenever they're
+# edited/committed from Windows (chmod succeeds on disk but git never
+# records it, so the tree's tracked mode stays 100644) -- confirmed as the
+# real cause of a service crash-loop the first time this script ran
+# (start-headless.sh landed non-executable, systemd failed with
+# "203/EXEC ... Permission denied"). Restoring the bit here is a
+# belt-and-suspenders fix independent of ever getting every .sh file's
+# git-tracked mode right at commit time.
+find "$APP_DIR" -maxdepth 3 -name '*.sh' -exec chmod +x {} +
 
 echo "==> Reinstalling Python dependencies"
 "$APP_DIR/.venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
@@ -66,9 +80,14 @@ echo "==> Rebuilding frontend"
 (cd "$APP_DIR/frontend" && npm ci --silent && npx vite build)
 
 echo "==> Restarting $SERVICE_NAME"
-sudo systemctl restart "$SERVICE_NAME"
+# -n (non-interactive): without a pseudo-TTY (e.g. run via `ssh host "cmd"`
+# rather than an interactive shell), plain `sudo` can still try to prompt
+# for a password even when a matching NOPASSWD rule exists, and then hang
+# or fail with "a terminal is required to authenticate". -n makes it fail
+# fast instead if the rule ever stops matching, rather than hanging.
+sudo -n systemctl restart "$SERVICE_NAME"
 sleep 1
-sudo systemctl status "$SERVICE_NAME" --no-pager -l
+systemctl status "$SERVICE_NAME" --no-pager -l
 
 echo "==> Done. Deployed version:"
 grep -m1 'SCRIPT_VERSION = ' "$APP_DIR/create_secret_folders.py"
