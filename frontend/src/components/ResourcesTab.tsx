@@ -20,11 +20,15 @@ import { Select } from './Select'
 // Every kind here is live-verified (2026-09-30) against a real tenant --
 // see the "splendid-floating-moth" plan for the exact API paths. Windows/
 // Linux/Gateway-as-server are three VIEWS over the same servers[] list
-// (split client-side below), not three separate API calls -- a gateway is
-// a server whose services[] includes "broker"; the standalone
-// "Gateways" kind further down is the actual gateway CONFIG resource
-// (access_address/infrastructure_orchestrator), a different thing from
-// the server object hosting it.
+// (split client-side below), not three separate API calls -- a gateway
+// server is identified by hostname matching a real Gateway resource's
+// name (see gatewayHostnames below; EVERY OPA-managed server has
+// "broker" in services[], confirmed live, so that field can't
+// distinguish a gateway from a regular server -- an earlier version of
+// this file wrongly assumed it could). The standalone "Gateways" kind
+// further down is the actual gateway CONFIG resource (access_address/
+// infrastructure_orchestrator), a different thing from the server
+// object hosting it.
 const RESOURCE_KINDS = [
   { value: 'windows_servers', label: 'Windows Servers' },
   { value: 'linux_servers', label: 'Linux Servers' },
@@ -80,12 +84,22 @@ function Table({ headers, rows }: { headers: string[]; rows: (string | number)[]
 export function ResourcesTab({ model }: Props) {
   const [kind, setKind] = useState(RESOURCE_KINDS[0].value)
 
+  // Real bug found and fixed 2026-09-30: EVERY OPA-managed server has
+  // "broker" in services[] (confirmed live -- it's the always-present
+  // client/connectivity agent, not a gateway-specific marker), so the
+  // original "services includes broker" gateway check matched every
+  // Linux server, showing zero real Linux servers and every Linux
+  // server misfiled as a gateway. The real signal (confirmed live by
+  // comparing model.gateways against model.servers) is that a gateway
+  // server's hostname exactly matches a real Gateway resource's name --
+  // gatewayHostnames below is that set.
+  const gatewayHostnames = useMemo(() => new Set(model.gateways.map(g => g.name)), [model.gateways])
   const windowsServers = useMemo(() => model.servers.filter(s => s.os_type === 'windows'), [model.servers])
   const linuxServers = useMemo(
-    () => model.servers.filter(s => s.os_type === 'linux' && !(s.services ?? []).includes('broker')),
-    [model.servers]
+    () => model.servers.filter(s => s.os_type === 'linux' && !gatewayHostnames.has(s.hostname)),
+    [model.servers, gatewayHostnames]
   )
-  const gatewayServers = useMemo(() => model.servers.filter(s => (s.services ?? []).includes('broker')), [model.servers])
+  const gatewayServers = useMemo(() => model.servers.filter(s => gatewayHostnames.has(s.hostname)), [model.servers, gatewayHostnames])
 
   const { headers, rows, exportRows }: { headers: string[]; rows: (string | number)[][]; exportRows: Record<string, string>[] } =
     useMemo(() => {
