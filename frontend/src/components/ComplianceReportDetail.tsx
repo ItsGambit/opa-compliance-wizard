@@ -1,7 +1,7 @@
-import { useState } from 'react'
-import { ArrowLeft, RefreshCw } from 'lucide-react'
+import { useMemo, useState } from 'react'
+import { ArrowLeft, RefreshCw, X } from 'lucide-react'
 import { useReport } from '../api/hooks'
-import type { ComplianceReportDef } from '../types'
+import type { ComplianceReportDef, ComplianceReportRow } from '../types'
 import { formatDateTime } from '../utils/format'
 import { complianceReportExportSections } from '../utils/exportSections'
 import { ExportButtons } from './ExportButtons'
@@ -48,7 +48,11 @@ function resourceIdentifierLine(row: { resource: string; resource_id: string; re
   if (row.resource_alternate_id && row.resource_alternate_id !== 'unknown' && row.resource_alternate_id !== row.resource) {
     parts.push(row.resource_alternate_id)
   }
-  if (row.resource_id) parts.push(row.resource_id)
+  // Many resource types have no separate "alternate id"/email at all -- the
+  // API just repeats the same id in both fields (confirmed live 2026-09-30,
+  // e.g. a Service Account target) -- showing it twice is noise, not a real
+  // second identifier, so it's only added here when actually distinct.
+  if (row.resource_id && row.resource_id !== row.resource_alternate_id) parts.push(row.resource_id)
   return parts.join(' · ')
 }
 
@@ -68,6 +72,44 @@ export function ComplianceReportDetail({ def, environment, onBack }: Props) {
   const { data, isLoading, refetch, isFetching } = useReport(def.key, environment, from, to)
   const rows = data?.rows ?? []
 
+  // Per-column filters -- client-side against the already-fetched rows
+  // (the date range above is the only filter that actually re-queries the
+  // backend; User/Action/Resource/Outcome only ever need to narrow what's
+  // already on screen, same reasoning ExportButtons already applies to
+  // "export whatever's currently shown"). Text filters match case-
+  // insensitively as a substring; Outcome is a dropdown since its real
+  // values are a small, fixed set (confirmed from actual report data).
+  const [userFilter, setUserFilter] = useState('')
+  const [actionFilter, setActionFilter] = useState('')
+  const [resourceFilter, setResourceFilter] = useState('')
+  const [outcomeFilter, setOutcomeFilter] = useState('')
+
+  const outcomeOptions = useMemo(
+    () => [...new Set(rows.map(r => r.outcome).filter(Boolean))].sort(),
+    [rows]
+  )
+
+  const filteredRows = useMemo(() => {
+    const u = userFilter.trim().toLowerCase()
+    const a = actionFilter.trim().toLowerCase()
+    const r = resourceFilter.trim().toLowerCase()
+    return rows.filter((row: ComplianceReportRow) => {
+      if (u && !`${row.user} ${row.actor_alternate_id ?? ''}`.toLowerCase().includes(u)) return false
+      if (a && !row.action.toLowerCase().includes(a)) return false
+      if (r && !`${row.resource} ${row.resource_alternate_id} ${row.resource_id}`.toLowerCase().includes(r)) return false
+      if (outcomeFilter && row.outcome !== outcomeFilter) return false
+      return true
+    })
+  }, [rows, userFilter, actionFilter, resourceFilter, outcomeFilter])
+
+  const hasActiveFilter = !!(userFilter || actionFilter || resourceFilter || outcomeFilter)
+  const clearFilters = () => {
+    setUserFilter('')
+    setActionFilter('')
+    setResourceFilter('')
+    setOutcomeFilter('')
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between">
@@ -75,7 +117,7 @@ export function ComplianceReportDetail({ def, environment, onBack }: Props) {
           <ArrowLeft size={12} /> Back to reports
         </button>
         <div className="flex items-center gap-2">
-          <ExportButtons sections={complianceReportExportSections(def.label, rows)} filenameBase={`opa-report-${def.key}`} />
+          <ExportButtons sections={complianceReportExportSections(def.label, filteredRows)} filenameBase={`opa-report-${def.key}`} />
           <button type="button" className="btn-secondary text-xs" onClick={() => refetch()} disabled={isFetching}>
             <RefreshCw size={12} className={isFetching ? 'animate-spin' : ''} /> Refresh
           </button>
@@ -116,11 +158,64 @@ export function ComplianceReportDetail({ def, environment, onBack }: Props) {
                 <th className="text-left font-semibold text-text-faint uppercase text-[0.625rem] tracking-wide px-3 py-2">Action</th>
                 <th className="text-left font-semibold text-text-faint uppercase text-[0.625rem] tracking-wide px-3 py-2">Timestamp</th>
                 <th className="text-left font-semibold text-text-faint uppercase text-[0.625rem] tracking-wide px-3 py-2">Affected Resource</th>
-                <th className="text-left font-semibold text-text-faint uppercase text-[0.625rem] tracking-wide px-3 py-2">Outcome</th>
+                <th className="text-left font-semibold text-text-faint uppercase text-[0.625rem] tracking-wide px-3 py-2">
+                  <div className="flex items-center justify-between gap-2">
+                    Outcome
+                    {hasActiveFilter && (
+                      <button
+                        type="button"
+                        onClick={clearFilters}
+                        title="Clear all filters"
+                        className="text-text-faint hover:text-text-dim normal-case font-normal"
+                      >
+                        <X size={11} />
+                      </button>
+                    )}
+                  </div>
+                </th>
+              </tr>
+              <tr className="border-b border-border bg-bg-hover/50">
+                <th className="px-3 py-1.5">
+                  <input
+                    type="text" placeholder="Filter…" value={userFilter} onChange={e => setUserFilter(e.target.value)}
+                    className="text-input w-full !py-1 text-[0.6875rem] font-normal normal-case"
+                  />
+                </th>
+                <th className="px-3 py-1.5">
+                  <input
+                    type="text" placeholder="Filter…" value={actionFilter} onChange={e => setActionFilter(e.target.value)}
+                    className="text-input w-full !py-1 text-[0.6875rem] font-normal normal-case"
+                  />
+                </th>
+                <th className="px-3 py-1.5" />
+                <th className="px-3 py-1.5">
+                  <input
+                    type="text" placeholder="Filter…" value={resourceFilter} onChange={e => setResourceFilter(e.target.value)}
+                    className="text-input w-full !py-1 text-[0.6875rem] font-normal normal-case"
+                  />
+                </th>
+                <th className="px-3 py-1.5">
+                  <select
+                    value={outcomeFilter} onChange={e => setOutcomeFilter(e.target.value)}
+                    className="text-input w-full !py-1 text-[0.6875rem] font-normal normal-case"
+                  >
+                    <option value="">All</option>
+                    {outcomeOptions.map(o => (
+                      <option key={o} value={o}>{o}</option>
+                    ))}
+                  </select>
+                </th>
               </tr>
             </thead>
             <tbody>
-              {rows.map(row => (
+              {filteredRows.length === 0 && (
+                <tr>
+                  <td colSpan={5} className="px-3 py-4 text-center text-text-faint">
+                    No rows match the current filters.
+                  </td>
+                </tr>
+              )}
+              {filteredRows.map(row => (
                 <tr key={row.uuid} className="border-b border-border-sub hover:bg-bg-hover">
                   <td className="px-3 py-2 text-text-dim">
                     {row.user}
