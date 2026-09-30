@@ -21,6 +21,16 @@
 #      built frontend/dist, so a deploy without this step ships new backend
 #      code against a stale UI.
 #   5. Restarts the systemd service and prints its status.
+#   6. Warns (does NOT auto-apply) if the repo's nginx config differs from
+#      what's actually loaded at /etc/nginx/sites-available/opa-secrets-wizard
+#      -- confirmed as a real gap 2026-09-30: nginx's config is a plain file
+#      copy, not a symlink into this repo, so a real nginx change (e.g. a
+#      new header this app now depends on) can sit committed and deployed
+#      here for a long time while nginx keeps serving the OLD config,
+#      with zero error/warning anywhere. This script has no sudo access to
+#      copy it into place or reload nginx itself (rparikh's NOPASSWD rule
+#      is scoped to opa-secrets-wizard only, deliberately) -- it just tells
+#      you loudly so you don't have to rediscover this the hard way again.
 #
 # Safe to re-run any time; every step is idempotent.
 
@@ -91,3 +101,15 @@ systemctl status "$SERVICE_NAME" --no-pager -l
 
 echo "==> Done. Deployed version:"
 grep -m1 'SCRIPT_VERSION = ' "$APP_DIR/create_secret_folders.py"
+
+NGINX_LIVE="/etc/nginx/sites-available/opa-secrets-wizard"
+NGINX_REPO="$APP_DIR/server/nginx-opa-secrets-wizard.conf"
+if [ -f "$NGINX_LIVE" ] && ! diff -q "$NGINX_REPO" "$NGINX_LIVE" > /dev/null 2>&1; then
+  echo ""
+  echo "!!! WARNING: nginx config has drifted from what's actually live. !!!"
+  echo "    Repo copy (just deployed): $NGINX_REPO"
+  echo "    Live copy (still serving): $NGINX_LIVE"
+  echo "    This script cannot fix this itself (no sudo for nginx)."
+  echo "    If the repo copy has a real change, run:"
+  echo "      sudo cp '$NGINX_REPO' '$NGINX_LIVE' && sudo nginx -t && sudo systemctl reload nginx"
+fi

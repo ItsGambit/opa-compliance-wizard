@@ -110,6 +110,24 @@ export function SyncScheduleDialog({ env }: Props) {
   const state = job.status?.sync_state
   const isRunning = job.phase === 'running' || job.phase === 'starting'
 
+  // A backfill walks day-by-day (see audit_store.sync_okta_events) --
+  // each "fetch"/"progress" step's detail is "<chunk_since> .. <chunk_until>"
+  // ISO timestamps. Real percentage = how far the chunk_until of the most
+  // recent step has advanced from the very first step's chunk_since,
+  // relative to now -- not a fake/animated bar, an actual measure of the
+  // real date window this sync has to cover.
+  const fetchSteps = (job.status?.steps ?? []).filter(s => s.key === 'fetch' && s.detail)
+  const syncProgressPercent = (() => {
+    if (fetchSteps.length === 0) return null
+    const firstSince = fetchSteps[0].detail!.split(' .. ')[0]
+    const lastUntil = fetchSteps[fetchSteps.length - 1].detail!.split(' .. ')[1]
+    const start = new Date(firstSince).getTime()
+    const current = new Date(lastUntil).getTime()
+    const end = Date.now()
+    if (!Number.isFinite(start) || !Number.isFinite(current) || end <= start) return null
+    return Math.min(100, Math.round(((current - start) / (end - start)) * 100))
+  })()
+
   return (
     <Dialog.Root open={open} onOpenChange={setOpen}>
       <Dialog.Trigger asChild>
@@ -190,19 +208,24 @@ export function SyncScheduleDialog({ env }: Props) {
                 )}
 
                 {isRunning && (
-                  <div className="card p-2.5 text-xs text-text-dim flex flex-col gap-1">
-                    <div className="flex items-center gap-2 text-text">
-                      <span className="inline-block w-3 h-3 rounded-full border-2 border-accent border-t-transparent animate-spin" />
-                      Syncing…
+                  <div className="card p-2.5 flex flex-col gap-1.5">
+                    <div className="flex items-center justify-between text-xs text-text">
+                      <span className="flex items-center gap-2">
+                        <span className="inline-block w-3 h-3 rounded-full border-2 border-accent border-t-transparent animate-spin" />
+                        Syncing…
+                      </span>
+                      {syncProgressPercent !== null && <span className="text-text-faint">{syncProgressPercent}%</span>}
                     </div>
-                    {(job.status?.steps ?? []).length === 0 ? (
-                      <div className="text-text-faint">Starting…</div>
-                    ) : (
-                      (job.status?.steps ?? []).map((step, i) => (
-                        <div key={i} className="text-text-faint">
-                          {step.detail ?? step.key} — {step.status}
-                        </div>
-                      ))
+                    <div className="h-1.5 w-full rounded-full bg-bg-hover overflow-hidden">
+                      <div
+                        className="h-full rounded-full bg-accent transition-[width] duration-300"
+                        style={{ width: `${syncProgressPercent ?? 8}%` }}
+                      />
+                    </div>
+                    {fetchSteps.length > 0 && (
+                      <div className="text-[0.6875rem] text-text-faint truncate">
+                        {fetchSteps[fetchSteps.length - 1].detail}
+                      </div>
                     )}
                   </div>
                 )}
