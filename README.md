@@ -907,18 +907,35 @@ already exists is skipped, not duplicated.
 
 ## Version
 
-5.20.0 — **Renamed to OPA Compliance Wizard**, reflecting what this tool
-is actually for now: compliance evidence generation is the primary use
-case, with OPA secret-folder management as a supporting feature rather
-than the other way around (this README is restructured to match — see
-[Compliance Reports Dashboard](#compliance-reports-dashboard) right
-after Environments, ahead of the secrets-management sections). Also
-ships **Okta-group-based admin roles**, a **per-environment Shared /
-Private indicator**, and an **admin-only audit log viewer** — see
-[Admin roles and the audit log](#admin-roles-and-the-audit-log-hosted-deployments).
-See the changelog entry below for the full breakdown.
+5.22.0 — **Relationships & Assignments are now directly browsable**, a
+mobile-friendlier UI pass (collapsible sidebar drawer, dialogs that fit
+a phone-width viewport, stacked two-column tabs), and a real progress
+bar on the footer's "Sync now" (previously spinner-only). See the
+changelog entry below for the full breakdown.
 
 ### Changelog
+- **5.22.0**:
+  - **New: Relationships tab (Access Explorer).** Browse every
+    relationship → its assignments → the policies that use them, in one
+    dedicated drill-down (previously this data was only visible indirectly,
+    folded into ordinary policy rules with no way to inspect the
+    relationship/assignment config itself). Shows each assignment's real
+    principal(s) and resolved resource(s) by name, not raw IDs.
+  - **New: "via {relationship} → {assignment}" annotation on relationship-
+    derived grants**, wherever they render — Projects, Resource Groups,
+    Policies, Users, and Groups tabs all pick this up automatically
+    through the shared `PolicyRuleCard`, with zero per-tab changes needed.
+  - **Mobile-friendlier UI.** Sidebar collapses to a hamburger-triggered
+    overlay drawer below tablet width (unchanged above it); every dialog
+    (Environments, Sync settings, Assign Access, Banner, About, delete
+    confirmations) now caps to the viewport width instead of overflowing;
+    two-column tabs (Policies, Relationships) stack vertically on narrow
+    screens; the footer wraps instead of clipping. Not a full redesign —
+    dense tables still scroll horizontally, as before.
+  - **Fixed: footer's "Sync now" showed only a spinner**, no indication of
+    how far along a sync actually was. Now shows the same real (date-
+    window-derived, not animated) progress bar the Sync Settings dialog
+    already had — extracted into a shared helper so both stay in sync.
 - **5.21.0**:
   - **Split into its own standalone repo.** No longer nested inside the
     `ItsGambit/Okta` monorepo — now `github.com/ItsGambit/opa-compliance-wizard`,

@@ -6,6 +6,7 @@ import {
   KeyRound,
   ListChecks,
   Megaphone,
+  Menu,
   Moon,
   Search,
   Settings,
@@ -129,11 +130,28 @@ export function SideNav({
   const topLevelTabs = isAdmin
     ? (['reports', 'access', 'builder', 'audit_log'] as const)
     : (['reports', 'access', 'builder'] as const)
+  // Below md, the labeled panel (w-64) doesn't fit alongside real content
+  // on a phone-width viewport -- it's hidden by default and toggled open
+  // as a fixed overlay drawer instead (closes itself on any nav click, or
+  // the backdrop, so it never lingers open over the page underneath).
+  // Above md, this is pixel-identical to the original always-visible
+  // panel -- drawerOpen is simply never consulted there.
+  const [drawerOpen, setDrawerOpen] = useState(false)
+
+  const closeDrawer = () => setDrawerOpen(false)
 
   return (
     <div className="flex h-full shrink-0">
       {/* Icon rail */}
       <div className="w-12 bg-bg-elevated border-r border-border flex flex-col items-center pt-3 gap-1.5">
+        <button
+          type="button"
+          onClick={() => setDrawerOpen(o => !o)}
+          className="md:hidden w-8 h-8 flex items-center justify-center rounded-md text-text-faint hover:bg-bg-hover hover:text-text-dim mb-1"
+          title="Toggle menu"
+        >
+          <Menu size={16} />
+        </button>
         {topLevelTabs.map(tab => {
           const Icon = TOP_LEVEL_ICON[tab]
           const isActive = activeTab === tab
@@ -152,8 +170,16 @@ export function SideNav({
         })}
       </div>
 
-      {/* Sidebar panel */}
-      <div className="w-64 bg-bg-elevated border-r border-border flex flex-col p-3">
+      {/* Mobile-only backdrop, closes the drawer on outside click */}
+      {drawerOpen && (
+        <div className="md:hidden fixed inset-0 bg-black/50 z-30" onClick={closeDrawer} />
+      )}
+
+      {/* Sidebar panel -- fixed overlay drawer below md when open, ordinary
+          flex sibling (unchanged from before) at md and above. */}
+      <div
+        className={`${drawerOpen ? 'flex' : 'hidden'} md:flex w-64 bg-bg-elevated border-r border-border flex-col p-3 fixed md:relative top-0 left-12 h-full z-40`}
+      >
         <div className="text-sm font-semibold text-text px-2 mb-3">OPA Compliance Wizard</div>
 
         <div className="flex flex-col gap-0.5">
@@ -161,7 +187,7 @@ export function SideNav({
             active={activeTab === 'reports'}
             label="Compliance Reports"
             icon={ClipboardCheck}
-            onClick={() => onTabChange('reports')}
+            onClick={() => { onTabChange('reports'); closeDrawer() }}
           />
           {activeTab === 'reports' && (
             <div className="pl-6 flex flex-col gap-0.5 mb-1">
@@ -171,7 +197,7 @@ export function SideNav({
                   active={reportsSubTab === sub.value}
                   label={sub.label}
                   icon={sub.value === 'secrets_access' ? KeyRound : undefined}
-                  onClick={() => onReportsSubTabChange(sub.value)}
+                  onClick={() => { onReportsSubTabChange(sub.value); closeDrawer() }}
                 />
               ))}
             </div>
@@ -181,7 +207,7 @@ export function SideNav({
             active={activeTab === 'access'}
             label="Access Explorer"
             icon={Search}
-            onClick={() => onTabChange('access')}
+            onClick={() => { onTabChange('access'); closeDrawer() }}
           />
           {activeTab === 'access' && (
             <div className="pl-6 flex flex-col gap-0.5 mb-1">
@@ -190,7 +216,7 @@ export function SideNav({
                   key={sub.value}
                   active={accessSubTab === sub.value}
                   label={sub.label}
-                  onClick={() => onAccessSubTabChange(sub.value)}
+                  onClick={() => { onAccessSubTabChange(sub.value); closeDrawer() }}
                 />
               ))}
             </div>
@@ -200,7 +226,7 @@ export function SideNav({
             active={activeTab === 'builder'}
             label="Folder Builder"
             icon={FolderTree}
-            onClick={() => onTabChange('builder')}
+            onClick={() => { onTabChange('builder'); closeDrawer() }}
           />
 
           {isAdmin && (
@@ -208,7 +234,7 @@ export function SideNav({
               active={activeTab === 'audit_log'}
               label="Audit Log"
               icon={ListChecks}
-              onClick={() => onTabChange('audit_log')}
+              onClick={() => { onTabChange('audit_log'); closeDrawer() }}
             />
           )}
         </div>
@@ -222,9 +248,9 @@ export function SideNav({
             this group 2026-09-30 -- it's a full top-level nav item/page
             now, not a dialog trigger. */}
         <div className="flex flex-col gap-1 pt-2 border-t border-border-sub">
-          <UtilityPill label="Environments" icon={Settings} onClick={onOpenEnvironments} />
-          <UtilityPill label="Announcement banner" icon={Megaphone} onClick={onOpenBanner} />
-          <UtilityPill label="About" icon={Info} onClick={onOpenAbout} />
+          <UtilityPill label="Environments" icon={Settings} onClick={() => { onOpenEnvironments(); closeDrawer() }} />
+          <UtilityPill label="Announcement banner" icon={Megaphone} onClick={() => { onOpenBanner(); closeDrawer() }} />
+          <UtilityPill label="About" icon={Info} onClick={() => { onOpenAbout(); closeDrawer() }} />
           <UtilityPill
             label={theme === 'light' ? 'Light mode' : 'Dark mode'}
             icon={theme === 'light' ? Sun : Moon}

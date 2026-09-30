@@ -6,6 +6,7 @@ import { BootstrapProgressPanel } from './BootstrapProgressPanel'
 import { GroupsTab } from './GroupsTab'
 import { PoliciesTab } from './PoliciesTab'
 import { ProjectsTab } from './ProjectsTab'
+import { RelationshipsTab } from './RelationshipsTab'
 import { ResourceGroupsTab } from './ResourceGroupsTab'
 import { ResourcesTab } from './ResourcesTab'
 import { UsersTab } from './UsersTab'
@@ -21,6 +22,7 @@ export const ACCESS_SUB_TABS = [
   { value: 'projects', label: 'Projects' },
   { value: 'resources', label: 'Resources' },
   { value: 'policies', label: 'Policies' },
+  { value: 'relationships', label: 'Relationships' },
   { value: 'users', label: 'Users' },
   { value: 'groups', label: 'Groups' },
 ]
@@ -80,6 +82,7 @@ export function AccessExplorer({ subTab }: Props) {
       {subTab === 'projects' && <ProjectsTab model={displayedModel} />}
       {subTab === 'resources' && <ResourcesTab model={displayedModel} />}
       {subTab === 'policies' && <PoliciesTab model={displayedModel} />}
+      {subTab === 'relationships' && <RelationshipsTab model={displayedModel} />}
       {subTab === 'users' && (
         <UsersTab
           model={displayedModel}

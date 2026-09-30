@@ -6,6 +6,7 @@ import { importSyncCsv, saveSyncSchedule } from '../api/client'
 import { useSyncJob } from '../hooks/useSyncJob'
 import { toast } from '../hooks/useToast'
 import type { Environment, IngestionScope, SyncSchedule } from '../types'
+import { getSyncProgressPercent } from '../utils/syncProgress'
 
 interface Props {
   env: Environment
@@ -110,23 +111,11 @@ export function SyncScheduleDialog({ env }: Props) {
   const state = job.status?.sync_state
   const isRunning = job.phase === 'running' || job.phase === 'starting'
 
-  // A backfill walks day-by-day (see audit_store.sync_okta_events) --
-  // each "fetch"/"progress" step's detail is "<chunk_since> .. <chunk_until>"
-  // ISO timestamps. Real percentage = how far the chunk_until of the most
-  // recent step has advanced from the very first step's chunk_since,
-  // relative to now -- not a fake/animated bar, an actual measure of the
-  // real date window this sync has to cover.
+  // A backfill walks day-by-day (see audit_store.sync_okta_events) -- see
+  // getSyncProgressPercent's own docstring for the real (not animated)
+  // percent computation, shared with Footer.tsx's own "Sync now" trigger.
   const fetchSteps = (job.status?.steps ?? []).filter(s => s.key === 'fetch' && s.detail)
-  const syncProgressPercent = (() => {
-    if (fetchSteps.length === 0) return null
-    const firstSince = fetchSteps[0].detail!.split(' .. ')[0]
-    const lastUntil = fetchSteps[fetchSteps.length - 1].detail!.split(' .. ')[1]
-    const start = new Date(firstSince).getTime()
-    const current = new Date(lastUntil).getTime()
-    const end = Date.now()
-    if (!Number.isFinite(start) || !Number.isFinite(current) || end <= start) return null
-    return Math.min(100, Math.round(((current - start) / (end - start)) * 100))
-  })()
+  const syncProgressPercent = getSyncProgressPercent(job.status?.steps ?? [])
 
   return (
     <Dialog.Root open={open} onOpenChange={setOpen}>
@@ -137,7 +126,7 @@ export function SyncScheduleDialog({ env }: Props) {
       </Dialog.Trigger>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
-        <Dialog.Content className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[30rem] max-h-[85vh] overflow-y-auto p-5">
+        <Dialog.Content className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[30rem] max-h-[85vh] overflow-y-auto p-5">
           <div className="flex items-center justify-between mb-3">
             <Dialog.Title className="text-sm font-semibold text-text">Compliance sync — {env.name}</Dialog.Title>
             <Dialog.Close asChild>

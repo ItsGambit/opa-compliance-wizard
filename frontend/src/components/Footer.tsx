@@ -5,6 +5,7 @@ import { useEnvironments, useSyncStatus, useVersion } from '../api/hooks'
 import { useSyncJob } from '../hooks/useSyncJob'
 import { toast } from '../hooks/useToast'
 import { formatDateTime } from '../utils/format'
+import { getSyncProgressPercent } from '../utils/syncProgress'
 
 // This project split out of the ItsGambit/Okta monorepo into its own
 // standalone repo 2026-09-30 -- these were left pointing at the old
@@ -31,6 +32,11 @@ export function Footer() {
   // change a user's chosen curated/all setting.
   const syncJob = useSyncJob(activeEnv)
   const isSyncing = syncJob.phase === 'starting' || syncJob.phase === 'running'
+  // Same real (not animated) percent SyncScheduleDialog's own manual-sync
+  // trigger already shows -- see getSyncProgressPercent's docstring. Falls
+  // back to the same small fixed value that dialog uses (8%) before the
+  // first "fetch" step has landed, rather than showing a stuck 0%.
+  const syncProgressPercent = getSyncProgressPercent(syncJob.status?.steps ?? [])
   const prevSyncPhase = useRef(syncJob.phase)
   useEffect(() => {
     if (prevSyncPhase.current !== 'done' && syncJob.phase === 'done') {
@@ -50,7 +56,7 @@ export function Footer() {
   }, [syncJob.phase, syncJob.error, queryClient])
 
   return (
-    <footer className="max-w-4xl mx-auto w-full mt-4 pt-3 border-t border-border text-xs text-text-faint flex items-center justify-center gap-3">
+    <footer className="max-w-4xl mx-auto w-full mt-4 pt-3 border-t border-border text-xs text-text-faint flex flex-wrap items-center justify-center gap-3">
       <span>OPA Compliance Wizard{version && ` v${version.version}`}</span>
       {activeEnv && (
         <>
@@ -72,6 +78,14 @@ export function Footer() {
             <RefreshCw size={11} className={isSyncing ? 'animate-spin' : ''} />
             {isSyncing ? 'Syncing…' : 'Sync now'}
           </button>
+          {isSyncing && (
+            <span className="h-1 w-16 rounded-full bg-bg-hover overflow-hidden" title={syncProgressPercent !== null ? `${syncProgressPercent}%` : undefined}>
+              <span
+                className="h-full block rounded-full bg-accent transition-[width] duration-300"
+                style={{ width: `${syncProgressPercent ?? 8}%` }}
+              />
+            </span>
+          )}
         </>
       )}
       <span aria-hidden="true">·</span>

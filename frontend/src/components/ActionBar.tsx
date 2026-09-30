@@ -63,7 +63,7 @@ export function ActionBar({ nodes, resourceGroup, project, onPreviewResult, onEx
         </AlertDialog.Trigger>
         <AlertDialog.Portal>
           <AlertDialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
-          <AlertDialog.Content className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-96 p-5">
+          <AlertDialog.Content className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-96 p-5">
             <AlertDialog.Title className="text-sm font-semibold text-text">Create folders in OPA?</AlertDialog.Title>
             <AlertDialog.Description className="text-xs text-text-faint mt-2 leading-relaxed">
               This will create up to <strong className="text-text-dim">{countNodes(nodes)}</strong> folder(s) in project{' '}

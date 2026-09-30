@@ -29,7 +29,7 @@ const TRACKABLE_KINDS = new Set([
   'individual_okta_account',
 ])
 
-function Tag({ children }: { children: ReactNode }) {
+export function Tag({ children }: { children: ReactNode }) {
   return (
     <span className="text-[0.6875rem] font-medium px-1.5 py-0.5 rounded border bg-bg-hover text-text-dim border-border whitespace-nowrap">
       {children}
@@ -152,6 +152,9 @@ export function PolicyRuleCard({ rule, policyName, accessInfoByResourceId }: Pro
                   : res.resource_kind.startsWith('relationship_assignment:')
                     ? ''
                     : ' (project unknown)'}
+                {res.relationship_name && res.assignment_name && (
+                  <span className="text-text-faint"> · via {res.relationship_name} → {res.assignment_name}</span>
+                )}
               </Tag>
             ) : (
               <span key={i} className="text-xs text-text-faint italic">

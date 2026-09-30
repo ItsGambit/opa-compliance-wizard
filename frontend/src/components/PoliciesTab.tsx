@@ -49,8 +49,8 @@ export function PoliciesTab({ model }: Props) {
           filenameBase={policy ? `opa-policy-${policy.name}` : 'opa-policies'}
         />
       </div>
-      <div className="flex gap-4">
-      <div className="card p-2 flex flex-col gap-1 w-64 shrink-0 max-h-[70vh] overflow-y-auto">
+      <div className="flex flex-col md:flex-row gap-4">
+      <div className="card p-2 flex flex-col gap-1 w-full md:w-64 shrink-0 max-h-[70vh] overflow-y-auto">
         <span className="section-label px-1 py-1">Scoped to a resource group ({scoped.length})</span>
         {scoped.map(p => (
           <button

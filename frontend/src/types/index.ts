@@ -306,6 +306,14 @@ export type PolicyRuleResolution =
        * Query/look up access info by this id when present, falling back
        * to `id` otherwise. */
       access_tracking_id?: string
+      /** Only present on relationship-derived resolutions (resource_kind
+       * starts with "relationship_assignment:") -- WHICH relationship/
+       * assignment produced this grant, so PolicyRuleCard can show it
+       * wherever this resolution renders (Projects/ResourceGroups/
+       * Policies/Users/Groups tabs all reuse that one card). See
+       * create_secret_folders.py's _resolve_relationship_assignment_resources. */
+      relationship_name?: string
+      assignment_name?: string
     }
   | { kind: 'condition'; description: string }
 
@@ -337,6 +345,11 @@ export interface AccessPolicy {
   resource_group: NamedRef | null
   principals: PolicyPrincipals
   rules: PolicyRule[]
+  /** Raw policy -> relationship link (see AccessRelationship below) --
+   * empty for the vast majority of policies, which don't use the
+   * relationship/assignment mechanism at all. Lets the Relationships tab
+   * answer "which policies use this relationship" directly. */
+  relationship_ids: string[]
 }
 
 // ── Access Explorer: tenant-wide resource inventory (Resources sub-tab) ──
@@ -508,6 +521,12 @@ export interface AccessAssignment {
   // _RELATIONSHIP_ASSIGNMENT_ID_NAME_FIELDS comment).
   resource_assignments: Record<string, unknown> | null
   relationship_assignments: AccessRelationshipAssignment[]
+  /** Pre-resolved by build_access_model (same helper used to splice
+   * relationship-derived grants into ordinary policy rules) -- real
+   * resource names/kinds for this assignment's resource_assignments,
+   * ready to render directly (e.g. via the same Tag treatment
+   * PolicyRuleCard uses) without the frontend re-deriving anything. */
+  resolved_resources: PolicyRuleResolution[]
 }
 
 export interface AccessModel {

@@ -70,6 +70,37 @@ export function policySummaryRows(policies: AccessPolicy[]): Record<string, stri
   }))
 }
 
+/** One row per (relationship, assignment) pair -- flattens the relationship
+ * -> assignment -> policy chain the Relationships tab browses interactively. */
+export function relationshipAssignmentRows(model: AccessModel): Record<string, string>[] {
+  const rows: Record<string, string>[] = []
+  for (const relationship of model.relationships) {
+    const assignments = model.assignments.filter(a =>
+      a.relationship_assignments.some(ra => ra.relationship.id === relationship.id)
+    )
+    if (assignments.length === 0) {
+      rows.push({ Relationship: relationship.name, Assignment: '', Principals: '', 'Resolved Resources': '', 'Policies Using This': '' })
+      continue
+    }
+    for (const assignment of assignments) {
+      const principals = assignment.relationship_assignments
+        .filter(ra => ra.relationship.id === relationship.id)
+        .map(ra => ra.principal?.name)
+        .filter((v): v is string => !!v)
+      const relIds = new Set(assignment.relationship_assignments.map(ra => ra.relationship.id))
+      const policiesUsing = model.policies.filter(p => p.relationship_ids.some(id => relIds.has(id)))
+      rows.push({
+        Relationship: relationship.name,
+        Assignment: assignment.name,
+        Principals: [...new Set(principals)].join(', '),
+        'Resolved Resources': assignment.resolved_resources.map(r => (r.kind === 'resolved' ? r.name : r.description)).join(', '),
+        'Policies Using This': policiesUsing.map(p => p.name).join(', '),
+      })
+    }
+  }
+  return rows
+}
+
 /** The "export everything" report — one section per category, covering
  * the whole access model regardless of what's currently selected on
  * screen. */
@@ -99,6 +130,7 @@ export function accessModelExportSections(model: AccessModel): ExportSection[] {
       title: 'Groups',
       rows: model.groups.map(g => ({ Group: g.name, Roles: g.roles.join(', ') })),
     },
+    { title: 'Relationships & Assignments', rows: relationshipAssignmentRows(model) },
   ]
 }
 

@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.21.0
+# Version     : 5.22.0
 # =============================================================================
 
 import argparse
@@ -77,7 +77,7 @@ import urllib.request
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.21.0"
+SCRIPT_VERSION = "5.22.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -2109,7 +2109,7 @@ _RELATIONSHIP_ASSIGNMENT_ID_NAME_FIELDS = {
 }
 
 
-def _resolve_relationship_assignment_resources(resource_assignments):
+def _resolve_relationship_assignment_resources(resource_assignments, relationship_name=None, assignment_name=None):
     """Resolves one assignment's `resource_assignments` (confirmed live to
     vary in shape by which real resource kind was granted -- see
     _RELATIONSHIP_ASSIGNMENT_ID_NAME_FIELDS above) into the same
@@ -2117,7 +2117,15 @@ def _resolve_relationship_assignment_resources(resource_assignments):
     produces for ordinary policy-rule selectors, so the frontend renders
     both identically with zero special-casing. Generic over unrecognized
     future keys (falls back to whatever "id"/"name" fields the item
-    happens to have) rather than dropping them."""
+    happens to have) rather than dropping them.
+
+    `relationship_name`/`assignment_name`, when given, are attached to
+    every resolution so a caller (Users/Groups/Projects/etc. tabs, via
+    PolicyRuleCard) can show WHICH relationship/assignment produced a
+    relationship-derived grant -- omitted (not just None) when the caller
+    doesn't have them yet, e.g. the assignment-level `resolved_resources`
+    attached directly in build_access_model, which has no single
+    relationship in scope (one assignment can span several)."""
     if not resource_assignments:
         return []
     out = []
@@ -2128,13 +2136,18 @@ def _resolve_relationship_assignment_resources(resource_assignments):
         # the dict key itself for any kind with no such field.
         for item in items or []:
             inner_kind = item.get("type") or key
-            out.append({
+            resolved = {
                 "kind": "resolved",
                 "id": item.get(id_field),
                 "name": item.get(name_field),
                 "resource_kind": f"relationship_assignment:{inner_kind}",
                 "project_id": None, "project_name": None, "resource_group_id": None,
-            })
+            }
+            if relationship_name is not None:
+                resolved["relationship_name"] = relationship_name
+            if assignment_name is not None:
+                resolved["assignment_name"] = assignment_name
+            out.append(resolved)
     return out
 
 
@@ -2784,6 +2797,14 @@ def build_access_model(client, on_progress=None):
     # this doesn't scale badly even as the feature grows.
     assignment_summaries = client.list_assignments()
     assignments = [client.get_assignment(a["id"]) for a in assignment_summaries if a.get("id")]
+    # Resolved once here (reusing the SAME helper the policy-splice below
+    # uses) so the Relationships tab can show real resource names/kinds
+    # for an assignment directly, without re-deriving this resolution
+    # itself or waiting on a policy to reference it.
+    for assignment in assignments:
+        assignment["resolved_resources"] = _resolve_relationship_assignment_resources(
+            assignment.get("resource_assignments")
+        )
     relationships = client.list_relationships()
     # relationship id -> LIST of (assignment, its matching
     # relationship_assignment) pairs -- built once here, used by the
@@ -2955,7 +2976,11 @@ def build_access_model(client, on_progress=None):
                         seen_principal_ids.add(principal["id"])
                         effective_principals_list.append(principal)
                     relationship_resolutions.extend(
-                        _resolve_relationship_assignment_resources(assignment.get("resource_assignments"))
+                        _resolve_relationship_assignment_resources(
+                            assignment.get("resource_assignments"),
+                            relationship_name=(ra.get("relationship") or {}).get("name"),
+                            assignment_name=assignment.get("name"),
+                        )
                     )
                 # Matches this codebase's existing principals shape
                 # (user_groups is a plain list of {id,name,type} refs) --
@@ -2996,6 +3021,11 @@ def build_access_model(client, on_progress=None):
             "resource_group": policy.get("resource_group"),
             "principals": effective_principals if effective_principals is not None else policy.get("principals", {}),
             "rules": rules_out,
+            # Raw policy -> relationship link (already computed above as
+            # policy_relationships, just also exposed here) -- lets the
+            # Relationships tab answer "which policies use this
+            # relationship" without re-deriving the match itself.
+            "relationship_ids": [r["id"] for r in policy_relationships if r.get("id")],
         })
     _report(on_progress, "resolve", "done", f"{len(policies_out)} polic(ies) resolved")
 
