@@ -189,6 +189,36 @@ export function SyncScheduleDialog({ env }: Props) {
                   </div>
                 )}
 
+                {isRunning && (
+                  <div className="card p-2.5 text-xs text-text-dim flex flex-col gap-1">
+                    <div className="flex items-center gap-2 text-text">
+                      <span className="inline-block w-3 h-3 rounded-full border-2 border-accent border-t-transparent animate-spin" />
+                      Syncing…
+                    </div>
+                    {(job.status?.steps ?? []).length === 0 ? (
+                      <div className="text-text-faint">Starting…</div>
+                    ) : (
+                      (job.status?.steps ?? []).map((step, i) => (
+                        <div key={i} className="text-text-faint">
+                          {step.detail ?? step.key} — {step.status}
+                        </div>
+                      ))
+                    )}
+                  </div>
+                )}
+
+                {job.phase === 'error' && (
+                  <div className="card p-2.5 text-xs text-loss">
+                    Sync failed: {job.error ?? job.status?.error ?? 'Unknown error'}
+                  </div>
+                )}
+
+                {job.phase === 'done' && (
+                  <div className="card p-2.5 text-xs text-win">
+                    Sync complete — {job.status?.result?.inserted ?? 0} new event(s) archived.
+                  </div>
+                )}
+
                 <button
                   type="button"
                   className="btn-secondary self-start"
