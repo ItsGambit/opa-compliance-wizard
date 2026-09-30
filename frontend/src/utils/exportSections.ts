@@ -154,9 +154,11 @@ export function secretsAccessReportExportSections(secrets: SecretAccessRow[], fo
 export function complianceReportRow(row: ComplianceReportRow): Record<string, string> {
   return {
     User: row.user,
+    'User Email/ID': row.actor_alternate_id || '',
     Action: row.action,
     Timestamp: formatDateTime(row.timestamp),
     'Affected Resource': row.resource || '—',
+    'Resource Email/ID': [row.resource_alternate_id, row.resource_id].filter(v => v && v !== 'unknown').join(' / '),
     'Resource Type': row.resource_type_detail || row.resource_type || '',
     Outcome: row.outcome || '',
     'Event Type': row.event_type,

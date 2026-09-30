@@ -36,6 +36,22 @@ function resourceTypeLabel(row: { resource_type: string; resource_type_detail: s
   return row.resource_type
 }
 
+// Email + Okta resource ID, shown together under the resource's display
+// name -- a display name alone isn't a unique identifier (two real users/
+// resources in the same tenant can share one), which matters most for
+// exactly the reports where "prove who was specifically affected" is the
+// point (Provisioning & De-provisioning, Role/Group Changes, Admin
+// Privilege Grants). "unknown" is a real Okta-emitted placeholder value
+// (e.g. on a UserGroup target), not a real identifier -- excluded.
+function resourceIdentifierLine(row: { resource: string; resource_id: string; resource_alternate_id: string }): string {
+  const parts: string[] = []
+  if (row.resource_alternate_id && row.resource_alternate_id !== 'unknown' && row.resource_alternate_id !== row.resource) {
+    parts.push(row.resource_alternate_id)
+  }
+  if (row.resource_id) parts.push(row.resource_id)
+  return parts.join(' · ')
+}
+
 function outcomeVariant(outcome: string): string {
   const o = outcome.toUpperCase()
   if (o === 'SUCCESS' || o === 'ALLOW') return 'bg-win/10 text-win'
@@ -117,6 +133,15 @@ export function ComplianceReportDetail({ def, environment, onBack }: Props) {
                   <td className="px-3 py-2 text-text-dim">
                     {row.resource || <span className="text-text-faint">—</span>}
                     {resourceTypeLabel(row) && <span className="text-text-faint text-[0.6875rem]"> ({resourceTypeLabel(row)})</span>}
+                    {/* Display name alone isn't a unique identifier -- two people/resources can share
+                        one. Email + Okta ID disambiguate; "unknown" is a real Okta-emitted placeholder
+                        value (e.g. on a UserGroup target), not a real identifier, so it's excluded
+                        rather than shown as if it were. */}
+                    {(resourceIdentifierLine(row)) && (
+                      <div className="text-text-faint text-[0.6875rem]" title="Email / Okta resource ID">
+                        {resourceIdentifierLine(row)}
+                      </div>
+                    )}
                   </td>
                   <td className="px-3 py-2">
                     {row.outcome ? (

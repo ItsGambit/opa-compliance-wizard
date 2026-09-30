@@ -95,6 +95,8 @@ export interface ComplianceReportRow {
   resource: string
   resource_type: string
   resource_type_detail: string
+  resource_id: string
+  resource_alternate_id: string
   outcome: string
   targets: ComplianceReportTarget[]
 }

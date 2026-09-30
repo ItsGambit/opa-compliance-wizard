@@ -140,7 +140,14 @@ COMPLIANCE_REPORTS = {
     "jit_access_requests": {
         "label": "JIT Access Requests",
         "control": "CC6",
-        "description": "Access-request lifecycle (create/update/resolve/expire) — proves elevated access was explicitly approved.",
+        "description": (
+            "Access-request lifecycle (create/update/resolve/expire) -- proves an access request was "
+            "made and resolved. Known limitation, confirmed live 2026-09-30 against a real denied "
+            "request: Okta's own System Log does not capture the actual approve/deny DECISION anywhere "
+            "on the resolve event (debugContext.debugData.decisions is always the literal string \"[]\", "
+            "and outcome.result is always SUCCESS regardless of the decision -- this is a real gap in "
+            "Okta's own audit trail, not something this tool can surface by picking a different field)."
+        ),
     },
     "threat_detection": {
         "label": "Threat Detection",
@@ -709,18 +716,56 @@ def count_events(environment, event_types=None, since=None, until=None):
     return conn.execute(sql, params).fetchone()[0]
 
 
-def _primary_target(targets):
-    """The first target that isn't the enclosing Team -- for almost every
-    event type target[0] already IS the primary affected resource (Secret,
-    Security Policy, User, etc, confirmed live 2026-09-30 across several
-    event types), but pam.resource.checkout/checkin.start/checkin.end are a
-    real, confirmed exception: target[0] is ALWAYS the Team
-    ("opa-patlabs-usp"), with the actual resource (a Service Account /
-    Server Account / etc) at target[1] -- so a naive targets[0] pick on
-    those specific events showed the team name as "the resource" instead
-    of the real one. Skipping a leading Team entry fixes that case without
-    reordering anything for every other event type, where target[0] was
-    already correct."""
+# Full per-event-type audit, 2026-09-30, against two real 90-day System
+# Log CSV exports from patlabs (55,857 + 56,478 rows -- far higher sample
+# size than a live API pull for every event type at once). "Skip a
+# leading Team" was the ORIGINAL fix, but a full audit of every mapped
+# event type's real target-type ordering found it's genuinely
+# event-type-specific, not just "skip Team" -- several events have a
+# non-Team target ahead of the real resource too:
+#   pam.server_account.password_change.update: Team, Server, SERVER
+#     ACCOUNT, Resource Group -- skip-Team picked Server (the host), but
+#     Server Account (index 2) is the actual credential that changed.
+#   pam.user_creds.issue: Project, Team, USER -- skip-Team picked Project
+#     (context), but User (index 2) is who the credential was issued to.
+#   pam.gateway_creds.issue: Client, GATEWAY, Team -- skip-Team picked
+#     Client (the requesting device), but Gateway (index 1) is the real
+#     resource being accessed.
+#   user.account.privilege.grant: User, ROLE_ASSIGNED, ROLE -- the User
+#     (index 0) is who RECEIVED the grant (useful, but not "the
+#     resource" for a Trust Services report), the ROLE (index 2, e.g.
+#     "Super Organization Administrator") is what was actually granted.
+#   user.session.start: AuthenticatorEnrollment, APPINSTANCE -- the MFA
+#     method (index 0) was being shown as "the resource," when the real
+#     point of a session-activity report is which app was accessed
+#     (index 1).
+# Every other mapped event type's target[0] (after skipping a leading
+# Team, still the common case) was CONFIRMED correct in this same audit
+# -- see the plan file's own audit table for the full per-event-type
+# breakdown, not just these five corrected cases.
+_PRIMARY_TARGET_TYPE_BY_EVENT = {
+    "pam.server_account.password_change.update": "Server Account",
+    "pam.user_creds.issue": "User",
+    "pam.gateway_creds.issue": "Gateway",
+    "user.account.privilege.grant": "ROLE",
+    "user.session.start": "AppInstance",
+}
+
+
+def _primary_target(event_type, targets):
+    """Picks the target entry that's actually "the affected resource" for
+    this specific event type -- see _PRIMARY_TARGET_TYPE_BY_EVENT above
+    for the handful of event types where that ISN'T simply "the first
+    non-Team target" (the general-case fallback below, still correct for
+    every other mapped event type per the same audit)."""
+    wanted_type = _PRIMARY_TARGET_TYPE_BY_EVENT.get(event_type)
+    if wanted_type:
+        for t in targets:
+            if t.get("type") == wanted_type:
+                return t
+        # Real event existed but didn't have the expected target shape
+        # (e.g. an older/differently-shaped event) -- fall through to the
+        # general case rather than returning nothing.
     for t in targets:
         if t.get("type") != "Team":
             return t
@@ -743,12 +788,24 @@ def _four_field_row(event_row):
     PAM_DATABASE_ACCOUNT, SERVER_ACCOUNT on pam.resource.checkout/
     checkin.* events), which is what actually distinguishes checking out
     a database account from checking out a server account -- the target's
-    own generic "Service Account" type alone can't tell those apart."""
+    own generic "Service Account" type alone can't tell those apart.
+
+    `resource_id`/`resource_alternate_id` (real Okta user id / email,
+    confirmed live 2026-09-30 on e.g. user.lifecycle.create's target) are
+    ALSO surfaced now for the same reason `actor_id`/`actor_alternate_id`
+    already were for the "User" column -- displayName alone is not a
+    unique identifier (a real tenant can have two people who share a
+    display name but have distinct Okta user ids/emails), which matters
+    most for exactly the reports where "prove who was specifically
+    affected" is the whole point (Provisioning & De-provisioning, Role/
+    Group Changes, Admin Privilege Grants)."""
     raw = event_row["raw"]
     targets = raw.get("target") or []
-    primary = _primary_target(targets)
+    primary = _primary_target(event_row["event_type"], targets)
     resource = primary.get("displayName") if primary else None
     resource_type = primary.get("type") if primary else None
+    resource_id = primary.get("id") if primary else None
+    resource_alternate_id = primary.get("alternateId") if primary else None
     resource_type_detail = ((raw.get("debugContext") or {}).get("debugData") or {}).get("resourceType")
     return {
         "uuid": event_row["uuid"],
@@ -760,6 +817,8 @@ def _four_field_row(event_row):
         "resource": resource or "",
         "resource_type": resource_type or "",
         "resource_type_detail": resource_type_detail or "",
+        "resource_id": resource_id or "",
+        "resource_alternate_id": resource_alternate_id or "",
         "outcome": event_row["outcome_result"] or "",
         "targets": targets,  # full target list -- some reports need target1/2 too, e.g. PAM's Team/Server
     }
