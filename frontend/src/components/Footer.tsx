@@ -6,10 +6,11 @@ import { useSyncJob } from '../hooks/useSyncJob'
 import { toast } from '../hooks/useToast'
 import { formatDateTime } from '../utils/format'
 
-// Points at this project's real GitHub location (OPA/Secrets-Wizard/ inside
-// the ItsGambit/Okta repo, not a dedicated repo of its own) -- keep this in
-// sync if the project ever moves to its own repo.
-const REPO_README_URL = 'https://github.com/ItsGambit/Okta/blob/main/OPA/Secrets-Wizard/README.md'
+// This project split out of the ItsGambit/Okta monorepo into its own
+// standalone repo 2026-09-30 -- these were left pointing at the old
+// OPA/Secrets-Wizard/ monorepo path (a real dead link found live, since
+// nothing deletes an old repo's README on a split) until fixed here.
+const REPO_README_URL = 'https://github.com/ItsGambit/opa-compliance-wizard/blob/main/README.md'
 const REPO_CHANGELOG_URL = `${REPO_README_URL}#changelog`
 
 export function Footer() {

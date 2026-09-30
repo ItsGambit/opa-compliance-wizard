@@ -919,6 +919,79 @@ Private indicator**, and an **admin-only audit log viewer** — see
 See the changelog entry below for the full breakdown.
 
 ### Changelog
+- **5.21.0**:
+  - **Split into its own standalone repo.** No longer nested inside the
+    `ItsGambit/Okta` monorepo — now `github.com/ItsGambit/opa-compliance-wizard`,
+    full history preserved. `server/deploy.sh` now clones from the repo
+    root instead of a monorepo subdirectory. (Left the footer's
+    README/Changelog links pointing at the old monorepo path when this
+    happened — fixed in this same release, see below.)
+  - **New: tenant-wide resource inventory (Access Explorer → Resources).**
+    Every resource kind OPA manages, live-verified against a real tenant:
+    Windows/Linux/Gateway servers, Okta and SaaS service accounts, Active
+    Directory accounts, database accounts, workload roles/connections,
+    gateways, and the database/SaaS-app/AD "connections" (integration
+    configs) each account family is discovered through — 13 kinds total,
+    several via undocumented API paths found live rather than in any
+    published spec.
+  - **New: per-resource compliance-report history.** Click any resource in
+    the Resources tab to see its full compliance-report history — every
+    report row where that resource was involved, not just one report at a
+    time. Backed by new indexed `resource_id`/`resource_alternate_id` and
+    a normalized `event_targets` table on the compliance archive (so "was
+    this resource ANY target on this event" is a fast indexed lookup, not
+    a full-table scan), plus an exact-display-name fallback match for
+    database accounts and individual Active Directory accounts, which
+    (confirmed live) have no discoverable log-side id at all — Okta's
+    System Log references a different, internal id for those two kinds
+    with no API lookup back to the account object.
+  - **New: relationship-based policy grants resolve correctly.** A small
+    number of real security policies specify their principal and resource
+    target through OPA's newer "relationships/assignments" feature instead
+    of the ordinary principals/resource-selector fields — previously
+    invisible to every tab (a policy like this showed no real
+    principal or resource at all). Now resolved into the exact same shape
+    every other policy already renders, including the case where one
+    relationship is shared across multiple assignments with different
+    principals and different granted resources.
+  - **New: Active Directory discovery-rules panel.** Click an Active
+    Directory Connection in the Resources tab to see exactly which
+    discovery rules and matching criteria caused a given AD account to be
+    found and matched to an Okta identity in the first place (e.g. "matches
+    by username, partial match: starts with 'a1'") — previously no way to
+    answer "why does this AD account exist as a managed resource at all."
+  - **New: fuzzy, typo-tolerant search everywhere.** Every dropdown picker
+    and every report/resource filter now does typo-tolerant matching with
+    highlighted match text showing why a result matched, instead of plain
+    exact-substring filtering.
+  - **New: one global "Sync now," not a Refresh button per screen.**
+    Every report and resource-history view reads the same shared
+    compliance archive, so pulling fresh data from live Okta is now one
+    action (in the footer, next to a new "Last Okta import" timestamp)
+    that updates every open view at once — replacing several previous
+    per-view Refresh buttons that, on inspection, only ever re-queried the
+    already-archived data and never actually talked to Okta.
+  - **New: Audit Log is a full page, not a pop-up**, with real per-field
+    rendering (was a raw JSON dump) and the same fuzzy search as everywhere
+    else. Also now captures client IP and user agent on every logged
+    action (Okta's own System Log always has; this log never did) — older
+    entries predate this and show as "—", not backfilled.
+  - **Fixed: gateway servers misclassified as Linux servers.** Every
+    OPA-managed server carries `"broker"` in its services list (the
+    always-present connectivity agent), which an earlier version of the
+    gateway-detection logic wrongly treated as gateway-specific — every
+    real Linux server was showing up as a gateway instead. Now matched by
+    hostname against the real Gateway resource list instead.
+  - **Fixed: Okta/SaaS service accounts showed a raw ID instead of a
+    name.** The resource list read a field that doesn't exist on the real
+    account object; now reads the real name/username fields.
+  - **Fixed: broken README/Changelog links in the footer** after the
+    standalone-repo split above left them pointing at the old monorepo
+    path.
+  - Nav restructure: Compliance Reports is now the default landing tab
+    (was Folder Builder); Secrets Access Dashboard moved under Compliance
+    Reports as a sub-item instead of its own top-level tab; Folder Builder
+    moved to last.
 - **5.20.0**:
   - **Renamed the project** from "OPA Secrets Wizard" to **"OPA
     Compliance Wizard"** throughout (page title, sidebar, About dialog,
