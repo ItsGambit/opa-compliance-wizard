@@ -49,13 +49,31 @@ any are missing, rather than silently pointing at a wrong/no org):
                        application" in the main README)
   DASHBOARD_ORIGIN   the public origin this dashboard is reachable at,
                      e.g. https://192.168.1.10 or https://opa.example.com
+  OKTA_ADMIN_GROUP_ID  the Okta GROUP ID (not name) whose members get
+                       admin/"see + manage every environment" rights in
+                       the dashboard -- see "Admin access" in the main
+                       README for how to create this group and find its
+                       ID. A group ID (not name) is required specifically
+                       so this check is one direct API call, not a
+                       name-to-id lookup on every single login.
   OKTA_ENV_NAME      (optional, defaults to "default") -- keyring service
-                     suffix; client_secret is resolved via the OS keyring
-                     at startup using this project's existing
+                     suffix; client_secret AND the admin-group-check API
+                     token (see below) are both resolved via the OS
+                     keyring at startup using this project's existing
                      per-environment secret-storage convention (see
                      create_secret_folders.py -- service name
                      f"opa-secrets-wizard:{OKTA_ENV_NAME}"), not a separate
                      mechanism.
+
+Also requires an Okta API token stored in the keyring under
+f"opa-secrets-wizard:{OKTA_ENV_NAME}" / "okta_admin_check_token" -- a
+read-only, org-wide token (Users + Groups read scope is enough) used
+solely to check "/api/v1/users/{sub}/groups" at login time. This is
+deliberately separate from any per-environment `okta_api_token` this
+project's other credentials use (create_secret_folders.py) -- this check
+must work for every logged-in user regardless of which environment(s)
+they've configured, so it can't depend on any one environment's own
+token existing at all.
 """
 
 import argparse
@@ -98,6 +116,7 @@ OKTA_TOKEN_URL = f"{OKTA_ISSUER}/v1/token"
 OKTA_JWKS_URL = f"{OKTA_ISSUER}/v1/keys"
 OKTA_LOGOUT_URL = f"{OKTA_ISSUER}/v1/logout"
 OKTA_CLIENT_ID = _require_env("OKTA_OIDC_CLIENT_ID")  # not secret, but still deployment-specific
+OKTA_ADMIN_GROUP_ID = _require_env("OKTA_ADMIN_GROUP_ID")  # Okta group ID -- members get admin rights
 OKTA_ENV_NAME = os.environ.get("OKTA_ENV_NAME", "default")  # keyring service suffix -- see create_secret_folders.py convention
 
 DASHBOARD_ORIGIN = _require_env("DASHBOARD_ORIGIN")  # e.g. https://192.168.1.10 or https://opa-wizard.example.com
@@ -135,8 +154,44 @@ def _load_client_secret() -> str:
     return secret
 
 
+def _load_admin_check_token() -> str:
+    import keyring
+
+    token = keyring.get_password(f"opa-secrets-wizard:{OKTA_ENV_NAME}", "okta_admin_check_token")
+    if not token:
+        raise RuntimeError(
+            f"No okta_admin_check_token in keyring for opa-secrets-wizard:{OKTA_ENV_NAME} -- "
+            "store a read-only, org-wide Okta API token (Users + Groups read scope) via "
+            "`keyring.set_password('opa-secrets-wizard:{OKTA_ENV_NAME}', 'okta_admin_check_token', "
+            "'<token>')`. See \"Admin access\" in the main README."
+        )
+    return token
+
+
 OKTA_CLIENT_SECRET = _load_client_secret()
+OKTA_ADMIN_CHECK_TOKEN = _load_admin_check_token()
 _JWKS_CLIENT = PyJWKClient(OKTA_JWKS_URL)
+
+
+def _is_member_of_admin_group(user_sub: str) -> bool:
+    """GET /api/v1/users/{id}/groups, checked once at login (see the module
+    docstring for why this is a direct API call rather than a groups claim
+    on the ID token) -- SSWS token auth, same scheme as
+    create_secret_folders.py's OktaClient, but this file deliberately
+    doesn't import that module (this is a standalone auth-gate process with
+    its own minimal dependency footprint, not part of the dashboard app)."""
+    url = f"{OKTA_ORG_URL}/api/v1/users/{urllib.parse.quote(user_sub, safe='')}/groups"
+    req = urllib.request.Request(url, headers={"Authorization": f"SSWS {OKTA_ADMIN_CHECK_TOKEN}", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            groups = json.loads(r.read())
+    except (urllib.error.HTTPError, urllib.error.URLError, ValueError):
+        # Fails closed -- a broken/expired admin-check token or a transient
+        # Okta API error must never silently grant admin rights. Worst case,
+        # a real admin's login gets treated as non-admin until this is
+        # fixed, which is the safe direction for this failure to fall in.
+        return False
+    return any(g.get("id") == OKTA_ADMIN_GROUP_ID for g in groups)
 
 
 def _sign_payload(payload: dict, ttl_seconds: int) -> str:
@@ -287,8 +342,15 @@ class Handler(BaseHTTPRequestHandler):
             self._respond_text(401, f"Login failed during token verification: {exc}")
             return
 
+        # Checked once here, not on every request -- consistent with how
+        # email/sub already work for the life of a session. A group
+        # membership change takes effect on next login/session refresh
+        # (SESSION_TTL_SECONDS), not instantly -- an accepted tradeoff of
+        # this session model, not an oversight.
+        is_admin = _is_member_of_admin_group(claims["sub"])
+
         session_token = _sign_payload(
-            {"sub": claims["sub"], "email": claims.get("email"), "id_token": tokens["id_token"]},
+            {"sub": claims["sub"], "email": claims.get("email"), "id_token": tokens["id_token"], "is_admin": is_admin},
             SESSION_TTL_SECONDS,
         )
 
@@ -312,6 +374,7 @@ class Handler(BaseHTTPRequestHandler):
             # used as a storage/permission key downstream.
             self.send_header("X-Auth-Sub", session.get("sub", ""))
             self.send_header("X-Auth-User", session.get("email") or session.get("sub", ""))
+            self.send_header("X-Auth-Is-Admin", "true" if session.get("is_admin") else "false")
             self.end_headers()
         else:
             self.send_response(401)

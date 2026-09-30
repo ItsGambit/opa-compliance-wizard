@@ -1,8 +1,9 @@
 import { useState } from 'react'
-import { useEnvironments } from './api/hooks'
+import { useEnvironments, useWhoami } from './api/hooks'
 import { AboutDialog } from './components/AboutDialog'
 import { AccessExplorer, ACCESS_SUB_TABS } from './components/AccessExplorer'
 import { AnnouncementBanner } from './components/AnnouncementBanner'
+import { AuditLogDialog } from './components/AuditLogDialog'
 import { BannerSettingsDialog } from './components/BannerSettingsDialog'
 import { ComplianceReports } from './components/ComplianceReports'
 import { EnvironmentManagerDialog } from './components/EnvironmentManagerDialog'
@@ -17,7 +18,9 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('builder')
   const [accessSubTab, setAccessSubTab] = useState(ACCESS_SUB_TABS[0].value)
   const [environmentsOpen, setEnvironmentsOpen] = useState(false)
+  const [auditLogOpen, setAuditLogOpen] = useState(false)
   const { data: environments, isLoading: environmentsLoading } = useEnvironments()
+  const { data: whoami } = useWhoami()
   const isConfigured = !!environments?.active
 
   if (environmentsLoading) {
@@ -54,6 +57,8 @@ export default function App() {
           accessSubTab={accessSubTab}
           onAccessSubTabChange={setAccessSubTab}
           onOpenEnvironments={() => setEnvironmentsOpen(true)}
+          onOpenAuditLog={() => setAuditLogOpen(true)}
+          isAdmin={whoami?.is_admin}
         />
 
         <main className="flex-1 overflow-y-auto px-8 py-6 flex flex-col gap-5">
@@ -88,7 +93,9 @@ export default function App() {
                   data={environments}
                   open={environmentsOpen}
                   onOpenChange={setEnvironmentsOpen}
+                  isAdmin={whoami?.is_admin}
                 />
+                {whoami?.is_admin && <AuditLogDialog open={auditLogOpen} onOpenChange={setAuditLogOpen} />}
               </div>
             </div>
           </header>

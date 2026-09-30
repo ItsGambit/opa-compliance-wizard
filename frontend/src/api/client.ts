@@ -1,6 +1,7 @@
 import type {
   AccessModel,
   ApiErrorBody,
+  AuditLogEntry,
   BannerConfig,
   ComplianceReportDef,
   ComplianceReportResponse,
@@ -47,7 +48,7 @@ export function fetchEnvironments(): Promise<EnvironmentsResponse> {
   return apiFetch('/api/environments')
 }
 
-export function fetchWhoami(): Promise<{ email: string | null; is_local: boolean }> {
+export function fetchWhoami(): Promise<{ email: string | null; is_local: boolean; is_admin: boolean }> {
   return apiFetch('/api/whoami')
 }
 
@@ -79,6 +80,13 @@ export function setPreserveLogsLocally(name: string, enabled: boolean): Promise<
   return apiFetch(`/api/environments/${encodeURIComponent(name)}/preserve_logs_locally`, {
     method: 'POST',
     body: JSON.stringify({ enabled }),
+  })
+}
+
+export function setEnvironmentShared(name: string, shared: boolean): Promise<{ name: string; shared: boolean }> {
+  return apiFetch(`/api/environments/${encodeURIComponent(name)}/share`, {
+    method: 'POST',
+    body: JSON.stringify({ shared }),
   })
 }
 
@@ -306,4 +314,14 @@ export function runReport(
   if (to) params.set('to', to)
   const qs = params.toString()
   return apiFetch(`/api/reports/${encodeURIComponent(reportKey)}${qs ? `?${qs}` : ''}`)
+}
+
+// ── Audit log (admin-only, see server/serve.py's /api/audit_log) ─────────
+
+export function fetchAuditLog(limit?: number, offset?: number): Promise<{ entries: AuditLogEntry[] }> {
+  const params = new URLSearchParams()
+  if (limit != null) params.set('limit', String(limit))
+  if (offset != null) params.set('offset', String(offset))
+  const qs = params.toString()
+  return apiFetch(`/api/audit_log${qs ? `?${qs}` : ''}`)
 }

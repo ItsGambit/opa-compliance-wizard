@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ClipboardCheck, FolderTree, KeyRound, Moon, Search, Settings, Sun } from 'lucide-react'
+import { ClipboardCheck, FolderTree, KeyRound, ListChecks, Moon, Search, Settings, Sun } from 'lucide-react'
 
 const THEME_STORAGE_KEY = 'opa-secrets-wizard-theme'
 
@@ -36,6 +36,12 @@ interface Props {
   // EnvironmentManagerDialog (gear icon in the topbar). This just opens that
   // same dialog from the sidebar instead of duplicating its content as a tab.
   onOpenEnvironments: () => void
+  // Same "open an existing dialog" pattern as onOpenEnvironments above.
+  // Only rendered when isAdmin is true -- undefined/omitted for a non-admin
+  // viewer rather than always present but disabled, so a non-admin sees no
+  // trace of an audit log existing at all.
+  onOpenAuditLog?: () => void
+  isAdmin?: boolean
 }
 
 const TOP_LEVEL_ICON: Record<string, typeof FolderTree> = {
@@ -68,6 +74,8 @@ export function SideNav({
   accessSubTab,
   onAccessSubTabChange,
   onOpenEnvironments,
+  onOpenAuditLog,
+  isAdmin,
 }: Props) {
   const { theme, toggle } = useTheme()
 
@@ -154,6 +162,9 @@ export function SideNav({
 
         <div className="flex-1" />
 
+        {isAdmin && onOpenAuditLog && (
+          <NavItem active={false} label="Audit Log" icon={ListChecks} onClick={onOpenAuditLog} />
+        )}
         <NavItem active={false} label="Environments" icon={Settings} onClick={onOpenEnvironments} />
       </div>
     </div>

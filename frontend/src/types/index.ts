@@ -17,6 +17,16 @@ export interface Environment {
   has_okta_token: boolean
   preserve_logs_locally: boolean
   sync_schedule: SyncSchedule
+  // Per-user environment scoping (server-hosted, logged-in deployments only --
+  // both are always true for a local/standalone run, since there's only ever
+  // one unscoped owner). `shared` = visible to every other logged-in user;
+  // `is_own` = owned by whichever identity is asking right now. A saved
+  // environment can be private to one owner (is_own=true, shared=false, only
+  // that owner ever sees it), shared by its owner (is_own=true, shared=true),
+  // or someone else's shared environment (is_own=false, shared=true) -- the
+  // backend never reveals WHO another owner is, just whether it's yours.
+  shared: boolean
+  is_own: boolean
 }
 
 export interface EnvironmentsResponse {
@@ -47,6 +57,14 @@ export interface SyncStatusResponse {
   result?: { inserted: number; scanned: number; since: string; chunks: number; pruned: number; cutoff: string | null }
   sync_state: SyncState | null
   is_first_sync: boolean
+}
+
+export interface AuditLogEntry {
+  timestamp: string
+  actor_email: string | null
+  actor_sub: string | null
+  action: string
+  details: Record<string, unknown>
 }
 
 export type ComplianceControl = 'CC6' | 'CC7' | 'CC8'

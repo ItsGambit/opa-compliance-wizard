@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { Pencil, Plus, Settings, Trash2, X } from 'lucide-react'
-import { activateEnvironment, deleteEnvironment, saveEnvironment } from '../api/client'
+import { Globe, Lock, Pencil, Plus, Settings, Trash2, X } from 'lucide-react'
+import { activateEnvironment, deleteEnvironment, saveEnvironment, setEnvironmentShared } from '../api/client'
 import { toast } from '../hooks/useToast'
 import type { ApiErrorBody, Environment, EnvironmentFormValues, EnvironmentsResponse } from '../types'
 import { EnvironmentForm } from './EnvironmentForm'
@@ -18,9 +18,18 @@ interface Props {
   // this same dialog without duplicating its content.
   open?: boolean
   onOpenChange?: (open: boolean) => void
+  // True only for a verified Okta-admin-group member (see
+  // server/auth_gate.py's OKTA_ADMIN_GROUP_ID check + serve.py's
+  // _is_admin_from_headers). When true, Edit/Delete/Share are enabled on
+  // EVERY environment, not just this user's own -- the backend already
+  // enforces the real permission boundary (upsert_environment/
+  // delete_environment/set_environment_shared's is_admin bypass); this is
+  // purely about not showing disabled controls to someone who can
+  // actually use them.
+  isAdmin?: boolean
 }
 
-export function EnvironmentManagerDialog({ data, open: openProp, onOpenChange }: Props) {
+export function EnvironmentManagerDialog({ data, open: openProp, onOpenChange, isAdmin }: Props) {
   const [openState, setOpenState] = useState(false)
   const open = openProp ?? openState
   const setOpen = onOpenChange ?? setOpenState
@@ -62,6 +71,15 @@ export function EnvironmentManagerDialog({ data, open: openProp, onOpenChange }:
     onError: (err: Error) => toast({ title: 'Could not delete', description: err.message, variant: 'error' }),
   })
 
+  const shareMutation = useMutation({
+    mutationFn: ({ name, shared }: { name: string; shared: boolean }) => setEnvironmentShared(name, shared),
+    onSuccess: (resp) => {
+      toast({ title: resp.shared ? `'${resp.name}' is now shared` : `'${resp.name}' is now private`, variant: 'success' })
+      invalidateAll()
+    },
+    onError: (err: Error) => toast({ title: 'Could not change sharing', description: err.message, variant: 'error' }),
+  })
+
   const saveApiError = (saveMutation.error as (Error & { body?: ApiErrorBody }) | null)?.body?.error
 
   return (
@@ -92,6 +110,37 @@ export function EnvironmentManagerDialog({ data, open: openProp, onOpenChange }:
                 <div className="flex items-center gap-2">
                   <span className="text-sm font-medium text-text">{env.name}</span>
                   {data?.active === env.name && <StatusBadge label="active" variant="exists" />}
+                  {env.is_own || isAdmin ? (
+                    <button
+                      type="button"
+                      title={env.shared ? 'Shared — click to make private' : 'Private — click to share with every other logged-in user'}
+                      disabled={shareMutation.isPending}
+                      onClick={() => shareMutation.mutate({ name: env.name, shared: !env.shared })}
+                      className={`flex items-center gap-1 text-[0.6875rem] font-medium px-1.5 py-0.5 rounded border whitespace-nowrap ${
+                        env.shared
+                          ? 'bg-accent-dim text-accent border-accent/40'
+                          : 'bg-bg-hover text-text-faint border-border'
+                      }`}
+                    >
+                      {env.shared ? <Globe size={11} /> : <Lock size={11} />}
+                      {env.shared ? 'Shared' : 'Private'}
+                    </button>
+                  ) : (
+                    <span
+                      title="Shared with you by another user — you can use it, but only its owner can change sharing or delete it"
+                      className="flex items-center gap-1 text-[0.6875rem] font-medium px-1.5 py-0.5 rounded border whitespace-nowrap bg-bg-hover text-text-faint border-border"
+                    >
+                      <Globe size={11} /> Shared with you
+                    </span>
+                  )}
+                  {!env.is_own && isAdmin && (
+                    <span
+                      title="You're viewing/managing this via admin override — it's owned by another user"
+                      className="text-[0.6875rem] font-medium px-1.5 py-0.5 rounded border whitespace-nowrap bg-warn/10 text-warn border-warn/40"
+                    >
+                      Admin
+                    </span>
+                  )}
                   <div className="flex-1" />
                   {data?.active !== env.name && (
                     <button
@@ -106,7 +155,8 @@ export function EnvironmentManagerDialog({ data, open: openProp, onOpenChange }:
                   <button
                     type="button"
                     className="btn-secondary !px-1.5 !py-1"
-                    title="Edit"
+                    title={env.is_own || isAdmin ? 'Edit' : "Owned by another user — you can't edit it"}
+                    disabled={!env.is_own && !isAdmin}
                     onClick={() => setEditing(env)}
                   >
                     <Pencil size={12} />
@@ -114,7 +164,8 @@ export function EnvironmentManagerDialog({ data, open: openProp, onOpenChange }:
                   <button
                     type="button"
                     className="btn-secondary !px-1.5 !py-1 hover:!text-loss"
-                    title="Delete"
+                    title={env.is_own || isAdmin ? 'Delete' : "Owned by another user — you can't delete it"}
+                    disabled={!env.is_own && !isAdmin}
                     onClick={() => setConfirmingDelete(env.name)}
                   >
                     <Trash2 size={12} />

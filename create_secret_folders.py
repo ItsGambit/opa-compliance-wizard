@@ -534,6 +534,29 @@ def list_environments_for(owner):
     return visible
 
 
+def list_all_environments():
+    """Returns {name: meta} for EVERY stored environment, across every
+    owner -- unlike list_environments_for(owner), which deliberately
+    scopes to what one requesting identity is allowed to see. This
+    exists for server-side background work with no requesting identity
+    of its own (the daily sync scheduler): it needs to find and run
+    every saved environment's sync schedule, including a non-shared
+    environment privately owned by some other logged-in user, not just
+    LOCAL_OWNER_KEY's own/shared ones. Never expose this dict directly
+    to an HTTP response -- it carries every owner's metadata (though
+    still no secrets; those stay in the keychain either way).
+
+    On a genuine owner collision (two different owners each have an
+    environment named the same, e.g. two users both naming one "dev"),
+    both are still returned -- keyed by their real storage_name (which
+    is already owner-namespaced), not the bare display name, so a
+    caller here always disambiguates by storage_name and never
+    silently drops one like list_environments_for's flat {name: meta}
+    would if collapsed the same way."""
+    data = load_environments()
+    return dict(data["environments"])
+
+
 def get_active_environment_name(owner):
     data = load_environments()
     return data["active"].get(_owner_storage_key(owner))
@@ -545,7 +568,7 @@ def set_active_environment(owner, name):
     save_environments(data)
 
 
-def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY):
+def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False):
     """Saves non-secret metadata to environments.json and secret fields to
     the OS keychain. Blank secret fields on an update leave the previously
     stored secret untouched (so editing metadata doesn't force re-entering
@@ -555,16 +578,35 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY):
     existing call site -- the CLI, and any code that doesn't know about
     per-user scoping -- keeps working unchanged. Creating a new environment
     always sets its `owner` to this value; updating an EXISTING environment
-    owned by someone else is refused (PermissionError) rather than silently
-    letting a different owner overwrite it."""
+    owned by someone else is refused (PermissionError) unless `is_admin`
+    is True -- an admin override edits the environment IN PLACE under its
+    own existing owner, it does not transfer ownership to the admin (an
+    admin fixing another user's broken credentials shouldn't silently
+    become that environment's new owner)."""
     if not name or not name.strip():
         raise ValueError("Environment name is required (e.g. dev, uat, prod).")
     name = name.strip()
-    storage_name = environment_storage_name(owner, name)
-
     data = load_environments()
+
+    # Resolve which storage_name/owner this update actually targets. A
+    # normal (non-admin) call always targets the CALLING owner's own copy
+    # -- environment_storage_name(owner, name) is correct even if no such
+    # environment exists yet (a create). An admin override, though, must
+    # target whichever owner's copy actually already exists (there's no
+    # such thing as an admin "creating" someone else's environment --
+    # only editing one that's already there), found by name across every
+    # stored owner rather than assumed to be the admin's own.
+    target_owner = owner
+    if is_admin:
+        for storage_key, meta in data["environments"].items():
+            _, _, stored_name = storage_key.partition("::")
+            if stored_name == name:
+                target_owner = meta.get("owner")
+                break
+    storage_name = environment_storage_name(target_owner, name)
+
     existing_meta = data["environments"].get(storage_name)
-    if existing_meta is not None and existing_meta.get("owner") != owner:
+    if existing_meta is not None and existing_meta.get("owner") != owner and not is_admin:
         raise PermissionError(f"Environment '{name}' is not owned by this user.")
 
     meta = dict(existing_meta or {})
@@ -573,7 +615,7 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY):
     for field in ENVIRONMENT_METADATA_FIELDS:
         if field in fields:
             meta[field] = (fields.get(field) or "").strip()
-    meta["owner"] = owner
+    meta["owner"] = target_owner
     meta.setdefault("shared", False)
 
     for field in ENVIRONMENT_SECRET_FIELDS:
@@ -593,34 +635,66 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY):
     return name
 
 
-def set_environment_shared(name, owner, shared):
-    """Toggles an environment's `shared` flag. Only its owner may do this --
-    raises PermissionError otherwise. Raises KeyError if unknown."""
-    storage_name = environment_storage_name(owner, name)
+def _find_environment_by_name(data, name):
+    """Returns (storage_name, meta) for the first stored environment whose
+    display name matches, across every owner, or (None, None) if none
+    exists. Used by the admin-override paths below, which must locate an
+    environment by name regardless of who owns it -- ownership isn't known
+    up front the way it is for a normal, own-storage-name lookup."""
+    for storage_key, meta in data["environments"].items():
+        _, _, stored_name = storage_key.partition("::")
+        if stored_name == name:
+            return storage_key, meta
+    return None, None
+
+
+def set_environment_shared(name, owner, shared, is_admin=False):
+    """Toggles an environment's `shared` flag. Only its owner may do this
+    unless `is_admin` is True, in which case any stored environment by
+    this name can be found and toggled regardless of who owns it (see
+    _find_environment_by_name -- an admin override doesn't know the
+    target's real owner up front the way a normal call does). Raises
+    PermissionError if not the owner and not an admin, KeyError if
+    unknown."""
     data = load_environments()
-    meta = data["environments"].get(storage_name)
-    if meta is None:
-        raise KeyError(f"No environment named '{name}' owned by this user.")
-    if meta.get("owner") != owner:
-        raise PermissionError(f"Environment '{name}' is not owned by this user.")
+    if is_admin:
+        storage_name, meta = _find_environment_by_name(data, name)
+        if meta is None:
+            raise KeyError(f"No environment named '{name}'.")
+    else:
+        storage_name = environment_storage_name(owner, name)
+        meta = data["environments"].get(storage_name)
+        if meta is None:
+            raise KeyError(f"No environment named '{name}' owned by this user.")
+        if meta.get("owner") != owner:
+            raise PermissionError(f"Environment '{name}' is not owned by this user.")
     meta["shared"] = bool(shared)
     save_environments(data)
 
 
-def delete_environment(name, owner=LOCAL_OWNER_KEY):
+def delete_environment(name, owner=LOCAL_OWNER_KEY, is_admin=False):
     """Removes an environment's metadata and both keychain secrets. Returns
-    True if it was the active environment for THIS owner (caller should
+    True if it was the active environment for THIS caller (caller should
     clear any live client for this owner). Raises KeyError if the name
-    doesn't exist for this owner, PermissionError if it exists but is
-    owned by someone else."""
-    storage_name = environment_storage_name(owner, name)
+    doesn't exist (for this owner, unless `is_admin`), PermissionError if
+    it exists but is owned by someone else and `is_admin` is False."""
     data = load_environments()
-    meta = data["environments"].get(storage_name)
-    if meta is None:
-        raise KeyError(f"No saved environment named '{name}'")
-    if meta.get("owner") != owner:
-        raise PermissionError(f"Environment '{name}' is not owned by this user.")
+    if is_admin:
+        storage_name, meta = _find_environment_by_name(data, name)
+        if meta is None:
+            raise KeyError(f"No saved environment named '{name}'")
+    else:
+        storage_name = environment_storage_name(owner, name)
+        meta = data["environments"].get(storage_name)
+        if meta is None:
+            raise KeyError(f"No saved environment named '{name}'")
+        if meta.get("owner") != owner:
+            raise PermissionError(f"Environment '{name}' is not owned by this user.")
     del data["environments"][storage_name]
+    # "Was it active" is checked against the CALLING owner's own active
+    # slot, not the environment's real owner -- an admin deleting someone
+    # else's environment should never accidentally read/clear that other
+    # person's active-environment pointer.
     owner_key = _owner_storage_key(owner)
     was_active = data["active"].get(owner_key) == name
     if was_active:

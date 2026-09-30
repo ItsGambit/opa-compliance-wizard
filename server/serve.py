@@ -96,6 +96,16 @@ def _engine_owner(owner_key):
     return engine.LOCAL_OWNER_KEY if owner_key == LOCAL_OWNER_KEY_HEADER else owner_key
 
 
+def _is_admin_from_headers(headers):
+    """True only when auth_gate.py's verified /verify subrequest set
+    X-Auth-Is-Admin: true (see nginx-opa-secrets-wizard.conf) -- a direct/
+    local run (no login gate in front at all) has no such header and is
+    never treated as admin, since local mode already sees/manages every
+    environment unscoped anyway (see list_environments_for's LOCAL_OWNER_KEY
+    handling); there's nothing further an admin flag would unlock there."""
+    return headers.get("X-Auth-Is-Admin") == "true"
+
+
 def _session_snapshot(owner_key):
     """Returns (client, okta_client, env_name) for this owner, all None if
     they have no active session yet. Snapshotting a dict lookup under the
@@ -164,7 +174,7 @@ def _sync_job_progress(env_name):
     return _progress
 
 
-def _run_sync_job(env_name, okta_client, ingestion_scope):
+def _run_sync_job(env_name, okta_client, ingestion_scope, owner):
     import audit_store
     with _sync_jobs_lock:
         _sync_jobs[env_name] = {"status": "running", "steps": [], "error": None}
@@ -172,7 +182,7 @@ def _run_sync_job(env_name, okta_client, ingestion_scope):
         result = audit_store.sync_okta_events(
             okta_client, env_name, ingestion_scope, on_progress=_sync_job_progress(env_name)
         )
-        schedule = engine.get_sync_schedule(env_name)
+        schedule = engine.get_sync_schedule(env_name, owner=owner)
         prune_result = audit_store.prune_events(
             env_name,
             retention_days=schedule.get("retention_days"),
@@ -187,22 +197,39 @@ def _run_sync_job(env_name, okta_client, ingestion_scope):
             _sync_jobs[env_name]["error"] = str(exc)
 
 
-def _start_sync_job(env_name, ingestion_scope):
+def _start_sync_job(env_name, ingestion_scope, owner=engine.LOCAL_OWNER_KEY):
     """Starts (or no-ops if already running) a background sync for one
     environment. Returns True if actually started. Builds a fresh
     OktaClient directly from stored credentials -- deliberately NOT
-    reusing any per-request session client, since this runs from the
-    scheduler loop with no HTTP request/owner context at all."""
+    reusing any per-request session client, since a request-triggered
+    sync and a scheduler-triggered sync both need their own client
+    rather than sharing one that could be reassigned/closed mid-sync.
+
+    `owner` MUST be the real owner that environment is actually stored
+    under (the requesting session's identity for a manual "Sync now",
+    or whatever the scheduler loop found it under) -- this environment
+    can be a per-user, non-shared copy (e.g. a logged-in Okta identity's
+    own `patlabs`, distinct from a shared `__local__::patlabs`), and its
+    Okta API token lives in the OS keychain under that exact owner's
+    storage key. Silently defaulting to LOCAL_OWNER_KEY here previously
+    caused a real bug: an admin's token, saved onto their own per-user
+    environment copy, was invisible to sync because credential lookup
+    always checked the LOCAL_OWNER_KEY-owned copy instead."""
     with _sync_jobs_lock:
         if _sync_jobs.get(env_name, {}).get("status") == "running":
             return False
-    creds = engine.get_environment_credentials(env_name, owner=engine.LOCAL_OWNER_KEY)
+    try:
+        creds = engine.get_environment_credentials(env_name, owner=owner)
+    except KeyError as exc:
+        with _sync_jobs_lock:
+            _sync_jobs[env_name] = {"status": "error", "steps": [], "error": str(exc)}
+        return False
     if not creds.get("okta_url") or not creds.get("okta_api_token"):
         with _sync_jobs_lock:
             _sync_jobs[env_name] = {"status": "error", "steps": [], "error": "No Okta URL/API token configured for this environment."}
         return False
     okta_client = engine.OktaClient(creds["okta_url"], creds["okta_api_token"])
-    threading.Thread(target=_run_sync_job, args=(env_name, okta_client, ingestion_scope), daemon=True).start()
+    threading.Thread(target=_run_sync_job, args=(env_name, okta_client, ingestion_scope, owner), daemon=True).start()
     return True
 
 
@@ -229,10 +256,21 @@ def _scheduler_loop():
     while not _scheduler_stop_event.is_set():
         try:
             now_utc = datetime.now(timezone.utc)
-            environments = engine.list_environments_for(engine.LOCAL_OWNER_KEY)
-            for env_name, meta in environments.items():
+            # list_all_environments(), NOT list_environments_for(LOCAL_OWNER_KEY):
+            # a per-user, non-shared environment (e.g. a logged-in Okta
+            # identity's own private copy of "patlabs") owns its own
+            # sync_schedule and Okta token just like a shared one does, and
+            # the scheduler must still find and run it -- list_environments_for
+            # deliberately hides another owner's non-shared environments from
+            # a single requesting identity, which is correct for a live HTTP
+            # request but was silently starving this background loop of any
+            # environment that wasn't LOCAL_OWNER_KEY's own or shared=True.
+            environments = engine.list_all_environments()
+            for storage_name, meta in environments.items():
+                _, _, env_name = storage_name.partition("::")
+                owner = meta.get("owner")
                 try:
-                    schedule = engine.get_sync_schedule(env_name, owner=meta.get("owner"))
+                    schedule = engine.get_sync_schedule(env_name, owner=owner)
                 except KeyError:
                     continue
                 if not schedule.get("enabled"):
@@ -246,6 +284,11 @@ def _scheduler_loop():
                 if (now_utc.hour, now_utc.minute) < (run_hour, run_minute):
                     continue  # not time yet today (UTC)
 
+                # audit_store's archive is keyed by env_name alone, not by
+                # (owner, env_name) -- two different owners' same-named
+                # environment ("dev") intentionally share one archive/
+                # sync_state row if they point at the same real tenant, same
+                # as this project's other env_name-only archive lookups.
                 state = audit_store.get_sync_state(env_name)
                 last_completed = state.get("last_sync_completed_at") if state else None
                 if last_completed:
@@ -253,9 +296,9 @@ def _scheduler_loop():
                     if last_completed_date == now_utc.strftime("%Y-%m-%d"):
                         continue  # already ran today (UTC)
 
-                log_msg = f"[scheduler] Starting daily sync for '{env_name}' (scope={schedule.get('ingestion_scope')})"
+                log_msg = f"[scheduler] Starting daily sync for '{env_name}' (owner={owner!r}, scope={schedule.get('ingestion_scope')})"
                 print(log_msg, flush=True)
-                _start_sync_job(env_name, schedule.get("ingestion_scope", "curated"))
+                _start_sync_job(env_name, schedule.get("ingestion_scope", "curated"), owner=owner)
         except Exception as exc:
             print(f"[scheduler] Unexpected error in scheduler loop: {exc}", flush=True)
         _scheduler_stop_event.wait(SCHEDULER_POLL_INTERVAL_SECS)
@@ -481,10 +524,24 @@ class Handler(SimpleHTTPRequestHandler):
                 # out" of that, so the frontend can hide the control instead
                 # of showing one that does nothing.
                 email = self.headers.get("X-Auth-User")
-                return self._send_json(200, {"email": email, "is_local": email is None})
+                return self._send_json(200, {"email": email, "is_local": email is None, "is_admin": _is_admin_from_headers(self.headers)})
 
             if path == "/api/environments":
-                visible = engine.list_environments_for(engine_owner)
+                is_admin = _is_admin_from_headers(self.headers)
+                if is_admin:
+                    # Admins see EVERY stored environment, not just their
+                    # own/shared ones -- list_all_environments() (added for
+                    # the scheduler, see its own docstring) returns
+                    # {storage_name: meta} across every owner; unpack the
+                    # display name back out rather than reusing
+                    # list_environments_for's normal own-or-shared filter.
+                    all_envs = engine.list_all_environments()
+                    visible = {}
+                    for storage_key, meta in all_envs.items():
+                        _, _, disp_name = storage_key.partition("::")
+                        visible[disp_name] = meta
+                else:
+                    visible = engine.list_environments_for(engine_owner)
                 envs = [_public_entry(n, m, engine_owner) for n, m in visible.items()]
                 return self._send_json(200, {"environments": envs, "active": local_env_name})
 
@@ -681,6 +738,17 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_json(200, {"rows": rows})
 
             if path == "/api/audit_log":
+                # Admin-only -- this is every user's activity across every
+                # environment, for compliance visibility, not a per-user
+                # operational log. A direct/local run (owner_key ==
+                # LOCAL_OWNER_KEY_HEADER, i.e. no login gate in front at
+                # all) is exempt -- local mode already sees/manages every
+                # environment unscoped anyway (same reasoning as the
+                # /api/environments admin branch above), so it gets the
+                # same access here rather than being permanently locked
+                # out of its own audit log.
+                if owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers(self.headers):
+                    return self._send_json(403, {"error": "Admin access required to view the audit log."})
                 try:
                     limit = min(int((qs.get("limit") or [200])[0]), 1000)
                     offset = max(int((qs.get("offset") or [0])[0]), 0)
@@ -727,8 +795,12 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_json(200, config)
 
             if path == "/api/environments":
-                name = engine.upsert_environment(payload.get("name"), payload, owner=engine_owner)
-                engine.log_audit_event(actor_email, actor_sub, "environment.upsert", {"name": name})
+                is_admin = _is_admin_from_headers(self.headers)
+                try:
+                    name = engine.upsert_environment(payload.get("name"), payload, owner=engine_owner, is_admin=is_admin)
+                except PermissionError as exc:
+                    return self._send_json(403, {"error": str(exc)})
+                engine.log_audit_event(actor_email, actor_sub, "environment.upsert", {"name": name, "admin_override": is_admin})
                 try:
                     activate_environment(owner_key, name)
                 except engine.OpaApiError as exc:
@@ -749,13 +821,14 @@ class Handler(SimpleHTTPRequestHandler):
             if path.startswith("/api/environments/") and path.endswith("/share"):
                 name = path[len("/api/environments/"):-len("/share")]
                 shared = bool(payload.get("shared", False))
+                is_admin = _is_admin_from_headers(self.headers)
                 try:
-                    engine.set_environment_shared(name, engine_owner, shared)
+                    engine.set_environment_shared(name, engine_owner, shared, is_admin=is_admin)
                 except KeyError as exc:
                     return self._send_json(404, {"error": str(exc)})
                 except PermissionError as exc:
                     return self._send_json(403, {"error": str(exc)})
-                engine.log_audit_event(actor_email, actor_sub, "environment.share", {"name": name, "shared": shared})
+                engine.log_audit_event(actor_email, actor_sub, "environment.share", {"name": name, "shared": shared, "admin_override": is_admin})
                 return self._send_json(200, {"name": name, "shared": shared})
 
             if path.startswith("/api/environments/") and path.endswith("/preserve_logs_locally"):
@@ -785,7 +858,7 @@ class Handler(SimpleHTTPRequestHandler):
                 except KeyError as exc:
                     return self._send_json(404, {"error": str(exc)})
                 ingestion_scope = payload.get("ingestion_scope") or schedule.get("ingestion_scope", "curated")
-                started = _start_sync_job(name, ingestion_scope)
+                started = _start_sync_job(name, ingestion_scope, owner=engine_owner)
                 engine.log_audit_event(actor_email, actor_sub, "sync.manual_start", {"name": name, "ingestion_scope": ingestion_scope})
                 return self._send_json(200, {"started": started, "already_running": not started})
 
@@ -1089,14 +1162,17 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             if path.startswith("/api/environments/"):
                 name = path[len("/api/environments/"):]
+                is_admin = _is_admin_from_headers(self.headers)
                 try:
-                    was_active = engine.delete_environment(name, owner=engine_owner)
+                    was_active = engine.delete_environment(name, owner=engine_owner, is_admin=is_admin)
                 except PermissionError as exc:
                     return self._send_json(403, {"error": str(exc)})
+                except KeyError as exc:
+                    return self._send_json(404, {"error": str(exc)})
                 if was_active:
                     with _sessions_lock:
                         _sessions.pop(owner_key, None)
-                engine.log_audit_event(actor_email, actor_sub, "environment.delete", {"name": name})
+                engine.log_audit_event(actor_email, actor_sub, "environment.delete", {"name": name, "admin_override": is_admin})
                 return self._send_json(200, {"deleted": name})
 
             if (path.startswith("/api/resource_groups/") and "/projects/" in path
