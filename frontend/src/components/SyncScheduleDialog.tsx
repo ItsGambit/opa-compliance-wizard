@@ -14,6 +14,21 @@ interface Props {
 
 type FirstRunChoice = 'backfill' | 'csv' | 'fresh'
 
+/** "14:00" (UTC, as the form stores/sends it) -> "= 7:00 AM in your local
+ * timezone" -- or a plain explanation if the field is empty/malformed,
+ * never a raw "Invalid Date". Recomputed on every render so it always
+ * reflects whatever's currently typed, not just the value at mount. */
+function formatLocalEquivalent(utcHHMM: string): string {
+  const match = /^(\d{2}):(\d{2})$/.exec(utcHHMM)
+  if (!match) return 'Enter a time to see your local equivalent.'
+  const [, hh, mm] = match
+  const today = new Date()
+  const utcDate = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate(), Number(hh), Number(mm)))
+  const local = utcDate.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone
+  return `= ${local} in your local time (${tz})`
+}
+
 /** Per-environment compliance-sync settings: enable/disable the daily
  * background sync, ingestion scope (curated vs. everything -- governs
  * what's actually WRITTEN on ingest, not a later filter, see
@@ -168,6 +183,16 @@ export function SyncScheduleDialog({ env }: Props) {
                   <div className="field">
                     <label className="section-label block mb-1">Run time (UTC)</label>
                     <input type="time" className="text-input w-full" value={runTime} onChange={e => setRunTime(e.target.value)} />
+                    {/* Directly addresses a real mix-up: the "(UTC)" label
+                        alone was easy to miss on a native time picker,
+                        confirmed live when a 14:00 UTC schedule was
+                        entered assuming local time -- showing the
+                        equivalent in the viewer's own timezone right next
+                        to the input makes the UTC framing impossible to
+                        miss without requiring any mental math. */}
+                    <p className="text-[0.6875rem] text-text-faint mt-1">
+                      {formatLocalEquivalent(runTime)}
+                    </p>
                   </div>
                   <div className="field">
                     <label className="section-label block mb-1">Retention (days)</label>

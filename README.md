@@ -590,6 +590,15 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
      at, e.g. `https://192.168.1.10` or `https://opa.example.com`
    - `OKTA_ADMIN_GROUP_ID` — see "Admin access" below.
    - `OKTA_ENV_NAME` (optional, defaults to `"default"`)
+   - `INTERNAL_API_SHARED_SECRET` (optional) — a random string, set
+     identically in the SAME `EnvironmentFile` used by both
+     `server/serve.py` and `server/auth_gate.py` (they already share one,
+     `/etc/opa-compliance-wizard.env`). Enables the Audit Log page's
+     Refresh button to backfill Okta MFA System Log corroboration for
+     `access_control.update` entries that missed it at save time (Okta
+     indexing lag) — without it, `POST /api/audit_log/backfill_mfa`
+     silently no-ops (0 updated) rather than erroring, so this is safe to
+     leave unset. Generate one with e.g. `openssl rand -hex 32`.
 5. If `server/serve.py` itself will be reached through a hostname/IP other
    than `127.0.0.1`/`localhost` (true for any reverse-proxied deployment),
    also set `EXTRA_ALLOWED_ORIGINS` (comma-separated) to that public
@@ -955,14 +964,47 @@ already exists is skipped, not duplicated.
 
 ## Version
 
-5.23.1 — **Fixed a silent-failure bug on the Audit Log page**: a failed
-refresh (expired session, network blip) previously showed no error at
-all, indistinguishable from the button "doing nothing." Also, the
-step-up MFA audit entry now carries Okta's own System Log corroboration
-of the MFA challenge, not just this tool's self-reported marker. See the
-changelog entries below for the full breakdown.
+5.23.2 — **Scheduled compliance syncs now have a real audit trail** —
+previously a scheduled sync's start, success, failure, or even a genuine
+miss (e.g. the server was down at the scheduled time) left NO trace
+anywhere. Also: a local-time equivalent next to the sync schedule's
+"Run time (UTC)" field, a step-up MFA lookup retry (closes a real Okta
+System Log indexing-lag race), and the Audit Log's Refresh button now
+also backfills any older entry whose Okta MFA corroboration was still
+missing. See the changelog entries below for the full breakdown.
 
 ### Changelog
+- **5.23.2**:
+  - **New: scheduled sync audit trail.** `sync.scheduled_start` /
+    `_completed` / `_failed` / `_skipped` entries now exist — previously
+    only a manual "Sync now" click was logged at all; a scheduled run had
+    zero audit trail regardless of outcome. A catch-up run (the server
+    was down past the scheduled time) gets an explicit `minutes_late`
+    field once it's more than one poll cycle late, distinguishing "the
+    scheduler correctly caught up" from "the scheduler is broken." An
+    unexpected exception in the scheduler loop itself is now also logged
+    as `sync.scheduler_error`, not just printed to a log that's easy to
+    miss.
+  - **New: local-time equivalent on the sync schedule's Run Time field.**
+    The field was already labeled "(UTC)," but that was easy to miss on a
+    native time picker — confirmed live when a 2:00 PM UTC schedule was
+    entered assuming local time. Now shows e.g. "= 7:00 AM in your local
+    time (America/Los_Angeles)" directly under the input, updating live
+    as you type.
+  - **Fixed: step-up MFA corroboration could miss a real, existing Okta
+    event.** Confirmed live: a single immediate System Log query right at
+    step-up completion missed an event that Okta had published only ~2
+    seconds earlier — the event existed, but Okta's own indexing hadn't
+    caught up yet. Now retries a few times with a short delay before
+    giving up (still fails open — a miss never blocks the save).
+  - **New: Audit Log's Refresh also backfills missing MFA corroboration.**
+    Clicking Refresh now also re-queries Okta for any older
+    `access_control.update` entry whose `okta_mfa_log_event` is still
+    `null`, closing the gap for entries that missed corroboration at save
+    time. Requires the new optional `INTERNAL_API_SHARED_SECRET` env var
+    (see "Register an OIDC application," step 4) — safely a no-op without
+    it. A toast reports how many entries were found and backfilled, if
+    any.
 - **5.23.1**:
   - **Fixed: Audit Log's Refresh button failed silently.** `useQuery`'s
     `isError`/`error` were never checked, so a failed fetch (expired

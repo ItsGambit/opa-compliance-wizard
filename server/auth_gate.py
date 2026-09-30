@@ -52,6 +52,16 @@ Runs standalone on 127.0.0.1:8767, fronted by nginx's auth_request module
                                              gate forgets you but Okta's own
                                              SSO session silently logs you
                                              back in on the next /login)
+  - GET  /internal/mfa_log_lookup        -> LOOPBACK-ONLY (not proxied by
+                                             nginx at all), gated by
+                                             INTERNAL_API_SHARED_SECRET (see
+                                             that constant). Lets serve.py
+                                             backfill Okta MFA log
+                                             corroboration for an existing
+                                             audit_log.jsonl entry when an
+                                             admin clicks Refresh on the
+                                             Audit Log page -- see
+                                             _mfa_log_lookup.
 
 Session cookie is a signed ("<expiry>.<hmac>") token, same scheme as this
 project's other short-lived signed tokens conceptually -- HMAC-SHA256 over a
@@ -186,6 +196,16 @@ OKTA_LOGOUT_URL = f"{OKTA_ISSUER}/v1/logout"
 OKTA_CLIENT_ID = _require_env("OKTA_OIDC_CLIENT_ID")  # not secret, but still deployment-specific
 OKTA_ADMIN_GROUP_ID = _require_env("OKTA_ADMIN_GROUP_ID")  # Okta group ID -- members get admin rights
 OKTA_ENV_NAME = os.environ.get("OKTA_ENV_NAME", "default")  # keyring service suffix -- see create_secret_folders.py convention
+# Optional -- gates /internal/mfa_log_lookup (see _mfa_log_lookup), the
+# loopback-only endpoint serve.py calls to backfill Okta MFA corroboration
+# on Audit Log refresh. Both processes read the SAME EnvironmentFile
+# (/etc/opa-compliance-wizard.env), so this is a genuinely shared secret,
+# not something serve.py has to be separately told. Left unset by default
+# -- the endpoint responds 404 (not 401/403, so its very existence isn't
+# revealed) until an operator opts in, since this is a real Okta System
+# Log query surface and shouldn't be reachable by anything on this
+# machine without an explicit, deliberate setup step.
+INTERNAL_API_SHARED_SECRET = os.environ.get("INTERNAL_API_SHARED_SECRET")
 
 DASHBOARD_ORIGIN = _require_env("DASHBOARD_ORIGIN")  # e.g. https://192.168.1.10 or https://opa-wizard.example.com
 REDIRECT_URI = f"{DASHBOARD_ORIGIN}/authorization-code/callback"
@@ -203,6 +223,13 @@ STEPUP_TTL_SECONDS = 120  # short-lived on purpose -- proof of a JUST-completed 
 # lag plus clock skew between this process and Okta, not just the OIDC
 # round trip itself, which is normally only a few seconds.
 STEPUP_LOG_LOOKBACK_SECONDS = 120
+# Confirmed live 2026-09-30: a single immediate query can miss an event
+# that's only ~2s away from being indexed -- 4 attempts x 2s = up to 6s of
+# added latency in the worst case (0 extra if the first attempt already
+# hits), acceptable since this runs during a redirect the user is already
+# waiting through, not on a hot request path.
+STEPUP_LOG_RETRY_ATTEMPTS = 4
+STEPUP_LOG_RETRY_DELAY_SECONDS = 2
 
 # access_control.json lives at the repo root, same place as
 # environments.json/banner_config.json -- read directly here (own plain
@@ -327,6 +354,35 @@ def _resolve_membership(group_ids: list[str] | None, admin_group_id: str | None,
     return is_admin, is_allowed
 
 
+def _query_mfa_log_event(user_sub: str, since_dt) -> dict | None:
+    """One-shot System Log query, no retry -- the actual HTTP call shared by
+    _find_stepup_mfa_log_event's retry loop (fresh step-up, event may not
+    be indexed YET) and _handle_backfill_mfa_log's on-demand lookup
+    (already-past event, plenty of time to have indexed by now, no point
+    retrying). Returns the same small dict shape as the callers already
+    expect, or None on any miss/error."""
+    since = since_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    filter_expr = f'actor.id eq "{user_sub}" and eventType eq "user.authentication.auth_via_mfa"'
+    params = {"filter": filter_expr, "since": since, "sortOrder": "DESCENDING", "limit": "5"}
+    url = f"{OKTA_ORG_URL}/api/v1/logs?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"Authorization": f"SSWS {OKTA_ADMIN_CHECK_TOKEN}", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            events = json.loads(r.read())
+    except (urllib.error.HTTPError, urllib.error.URLError, ValueError):
+        return None
+    if not events:
+        return None
+    event = events[0]
+    outcome = event.get("outcome") or {}
+    return {
+        "published": event.get("published"),
+        "eventType": event.get("eventType"),
+        "outcome_result": outcome.get("result"),
+        "display_message": event.get("displayMessage"),
+    }
+
+
 def _find_stepup_mfa_log_event(user_sub: str) -> dict | None:
     """Looks up the real Okta System Log event(s) that corroborate a just-
     completed step-up MFA challenge, so the audit trail this project keeps
@@ -353,33 +409,32 @@ def _find_stepup_mfa_log_event(user_sub: str) -> dict | None:
     corroboration rather than blocking or delaying the save.
 
     Returns a small dict (published/eventType/outcome/displayMessage) or
-    None if no matching event was found (fails open here, unlike group
-    membership checks above -- absence of a corroborating log line must
-    never block a real, already-verified step-up from completing; it
-    only means the audit entry won't carry Okta's own confirmation)."""
+    None if no matching event was found after retrying (fails open here,
+    unlike group membership checks above -- absence of a corroborating
+    log line must never block a real, already-verified step-up from
+    completing; it only means the audit entry won't carry Okta's own
+    confirmation).
+
+    Retries a few times with a short sleep between attempts -- confirmed
+    live 2026-09-30 against a real tenant that a single immediate query
+    right at step-up completion can genuinely miss: the MFA event was
+    published ~2s BEFORE this function's own query ran (i.e. Okta hadn't
+    finished indexing it into /api/v1/logs yet), even though the event
+    already existed and a query moments later found it. A wider `since`
+    window doesn't help this -- the event isn't in the index at all yet,
+    not merely outside the queried range -- so a short retry loop is the
+    right fix, not a longer lookback. This runs synchronously inside the
+    step-up callback while the user is already mid-redirect from Okta, so
+    a few seconds of added latency here is not user-visible in the same
+    way an unexplained delay elsewhere in the UI would be."""
     since_dt = datetime.now(timezone.utc) - timedelta(seconds=STEPUP_LOG_LOOKBACK_SECONDS)
-    since = since_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    filter_expr = (
-        f'actor.id eq "{user_sub}" and eventType eq "user.authentication.auth_via_mfa"'
-    )
-    params = {"filter": filter_expr, "since": since, "sortOrder": "DESCENDING", "limit": "5"}
-    url = f"{OKTA_ORG_URL}/api/v1/logs?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers={"Authorization": f"SSWS {OKTA_ADMIN_CHECK_TOKEN}", "Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            events = json.loads(r.read())
-    except (urllib.error.HTTPError, urllib.error.URLError, ValueError):
-        return None
-    if not events:
-        return None
-    event = events[0]  # DESCENDING -- most recent first, i.e. closest to "now"
-    outcome = event.get("outcome") or {}
-    return {
-        "published": event.get("published"),
-        "eventType": event.get("eventType"),
-        "outcome_result": outcome.get("result"),
-        "display_message": event.get("displayMessage"),
-    }
+    for attempt in range(STEPUP_LOG_RETRY_ATTEMPTS):
+        if attempt > 0:
+            time.sleep(STEPUP_LOG_RETRY_DELAY_SECONDS)
+        result = _query_mfa_log_event(user_sub, since_dt)
+        if result is not None:
+            return result
+    return None
 
 
 def _sign_payload(payload: dict, ttl_seconds: int) -> str:
@@ -485,6 +540,8 @@ class Handler(BaseHTTPRequestHandler):
             self._verify_session(require_stepup=query.get("require_stepup", ["0"])[0] == "1")
         elif path == "/logout":
             self._logout()
+        elif path == "/internal/mfa_log_lookup":
+            self._mfa_log_lookup(query)
         else:
             self.send_response(404)
             self.end_headers()
@@ -645,6 +702,61 @@ class Handler(BaseHTTPRequestHandler):
             encoded = base64.urlsafe_b64encode(json.dumps(mfa_log_event, separators=(",", ":")).encode()).decode()
             self.send_header("X-Auth-Mfa-Log-Event", encoded)
         self.end_headers()
+
+    def _mfa_log_lookup(self, query):
+        """Loopback-only endpoint (see INTERNAL_API_SHARED_SECRET) letting
+        serve.py backfill Okta MFA corroboration for an audit_log.jsonl
+        entry that missed it at save time (System Log indexing lag -- see
+        _find_stepup_mfa_log_event's docstring for a real example of this
+        happening). Triggered by an admin clicking Refresh on the Audit Log
+        page, NOT run automatically/periodically -- an explicit user action
+        each time, same as this project's existing Sync/Refresh buttons
+        elsewhere never auto-run on a timer either.
+
+        No retry here (unlike the step-up flow) -- by the time an admin
+        clicks Refresh, the triggering event is at least seconds old, often
+        much older, so if Okta's indexing was ever going to catch up, it
+        already has; a single query is enough, and a genuine miss (event
+        expired past retention, or truly never indexed) shouldn't cost
+        every future refresh a multi-second retry loop for nothing.
+
+        Disabled entirely (404, not 401/403) unless
+        INTERNAL_API_SHARED_SECRET is configured -- see that constant."""
+        if not INTERNAL_API_SHARED_SECRET:
+            self.send_response(404)
+            self.end_headers()
+            return
+        if self.headers.get("X-Internal-Secret") != INTERNAL_API_SHARED_SECRET:
+            self.send_response(403)
+            self.end_headers()
+            return
+
+        user_sub = query.get("sub", [None])[0]
+        near_iso = query.get("near", [None])[0]
+        if not user_sub or not near_iso:
+            self.send_response(400)
+            self.end_headers()
+            return
+        try:
+            near_dt = datetime.fromisoformat(near_iso.replace("Z", "+00:00"))
+        except ValueError:
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        # Same narrow-window-around-the-moment approach as the step-up
+        # flow's correlation (see _find_stepup_mfa_log_event) -- `near` is
+        # the audit entry's own timestamp, so querying from just before it
+        # (clock-skew slop) covers the real event even though this is a
+        # single shot, not a retry loop.
+        since_dt = near_dt - timedelta(seconds=STEPUP_LOG_LOOKBACK_SECONDS)
+        result = _query_mfa_log_event(user_sub, since_dt)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        body = json.dumps(result).encode()
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _logout(self):
         token = _get_cookie(self.headers, SESSION_COOKIE)

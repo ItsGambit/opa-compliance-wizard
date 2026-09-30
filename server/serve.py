@@ -27,11 +27,13 @@ import os
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import webbrowser
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, urlencode
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -69,6 +71,18 @@ DEV_FRONTEND_ORIGIN = "http://localhost:5173"
 # this is empty (the default, e.g. any local Windows/Mac/Linux run), the
 # allowed-origins set is exactly what it always was.
 EXTRA_ALLOWED_ORIGINS = {o.strip() for o in os.environ.get("EXTRA_ALLOWED_ORIGINS", "").split(",") if o.strip()}
+
+# Shared with server/auth_gate.py via the SAME EnvironmentFile
+# (/etc/opa-compliance-wizard.env) -- gates POST /api/audit_log/backfill_mfa
+# (see that route below), which calls auth_gate.py's loopback-only
+# GET /internal/mfa_log_lookup to backfill Okta MFA System Log
+# corroboration for older access_control.update entries. Both sides no-op
+# safely if this is unset: auth_gate.py's endpoint 404s, and this route
+# below reports zero backfilled rather than erroring, so a hosted-only
+# deployment that never configures this just sees "no new corroboration
+# found" instead of a failure.
+INTERNAL_API_SHARED_SECRET = os.environ.get("INTERNAL_API_SHARED_SECRET")
+AUTH_GATE_INTERNAL_URL = "http://127.0.0.1:8767"
 
 # Per-owner session state, replacing what used to be three bare globals
 # (client/okta_client/active_env_name) shared by every request regardless
@@ -119,6 +133,27 @@ def _mfa_log_event_from_headers(headers):
     try:
         return json.loads(base64.urlsafe_b64decode(raw).decode())
     except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def _lookup_mfa_log_event(actor_sub, near_iso_timestamp):
+    """The `lookup_fn` engine.backfill_mfa_log_events expects (see that
+    function's docstring for why the actual Okta call is injected rather
+    than made by create_secret_folders.py directly) -- calls
+    auth_gate.py's loopback-only GET /internal/mfa_log_lookup. Returns
+    None on ANY failure (secret not configured, auth_gate.py unreachable,
+    bad response) -- same fail-open reasoning as everywhere else this
+    corroboration is best-effort, never something a backfill attempt
+    should error out over."""
+    if not INTERNAL_API_SHARED_SECRET:
+        return None
+    params = urlencode({"sub": actor_sub, "near": near_iso_timestamp})
+    url = f"{AUTH_GATE_INTERNAL_URL}/internal/mfa_log_lookup?{params}"
+    req = urllib.request.Request(url, headers={"X-Internal-Secret": INTERNAL_API_SHARED_SECRET})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read())
+    except (urllib.error.HTTPError, urllib.error.URLError, ValueError):
         return None
 
 
@@ -179,6 +214,12 @@ _sync_jobs = {}  # env_name -> {"status": "idle"|"running"|"done"|"error", "step
 # from an object that stopped existing when the process died.
 SCHEDULER_POLL_INTERVAL_SECS = 300  # 5 min -- frequent enough that "run at HH:MM" feels accurate,
                                      # cheap enough to not matter running forever in the background
+# A catch-up run within one poll interval of its scheduled time is normal
+# jitter, not worth flagging -- only tag minutes_late on the audit entry
+# once a run is late by more than this (e.g. the server was down, or a
+# poll got skipped) so the common on-time case doesn't get a "late" label
+# for a few minutes of ordinary poll-cycle slack.
+SCHEDULER_LATE_THRESHOLD_MINUTES = SCHEDULER_POLL_INTERVAL_SECS // 60
 _scheduler_stop_event = threading.Event()
 
 
@@ -190,8 +231,22 @@ def _sync_job_progress(env_name):
     return _progress
 
 
-def _run_sync_job(env_name, okta_client, ingestion_scope, owner):
+def _run_sync_job(env_name, okta_client, ingestion_scope, owner, trigger="manual", actor_email=None, actor_sub=None, client_ip=None, user_agent=None):
+    """Previously, a sync's actual outcome (success -- how many events,
+    how long it took -- or failure -- what broke) lived ONLY in the
+    ephemeral in-memory _sync_jobs dict, visible only while polling
+    /sync/status from an open browser tab. Nothing was ever written to
+    audit_log.jsonl either way -- confirmed live 2026-09-30 alongside the
+    scheduled-sync-never-fired gap this same session found. Now logs
+    sync.scheduled_completed/sync.manual_completed (or
+    _failed) so the outcome survives past this process's own memory and
+    shows up in the Audit Log page like every other write action.
+    client_ip/user_agent are naturally None for a scheduler trigger (no
+    request exists), threaded through from the ORIGINAL request for a
+    manual trigger (this function runs in its own background thread, so
+    it can't read self.client_address/self.headers itself)."""
     import audit_store
+    action_prefix = "sync.scheduled" if trigger == "scheduled" else "sync.manual"
     with _sync_jobs_lock:
         _sync_jobs[env_name] = {"status": "running", "steps": [], "error": None}
     try:
@@ -207,13 +262,21 @@ def _run_sync_job(env_name, okta_client, ingestion_scope, owner):
         with _sync_jobs_lock:
             _sync_jobs[env_name]["status"] = "done"
             _sync_jobs[env_name]["result"] = {**result, **prune_result}
+        engine.log_audit_event(
+            actor_email, actor_sub, f"{action_prefix}_completed", {"name": env_name, **result, **prune_result},
+            client_ip=client_ip, user_agent=user_agent,
+        )
     except Exception as exc:
         with _sync_jobs_lock:
             _sync_jobs[env_name]["status"] = "error"
             _sync_jobs[env_name]["error"] = str(exc)
+        engine.log_audit_event(
+            actor_email, actor_sub, f"{action_prefix}_failed", {"name": env_name, "error": str(exc)},
+            client_ip=client_ip, user_agent=user_agent,
+        )
 
 
-def _start_sync_job(env_name, ingestion_scope, owner=engine.LOCAL_OWNER_KEY):
+def _start_sync_job(env_name, ingestion_scope, owner=engine.LOCAL_OWNER_KEY, trigger="manual", actor_email=None, actor_sub=None, client_ip=None, user_agent=None, minutes_late=None):
     """Starts (or no-ops if already running) a background sync for one
     environment. Returns True if actually started. Builds a fresh
     OktaClient directly from stored credentials -- deliberately NOT
@@ -230,22 +293,53 @@ def _start_sync_job(env_name, ingestion_scope, owner=engine.LOCAL_OWNER_KEY):
     storage key. Silently defaulting to LOCAL_OWNER_KEY here previously
     caused a real bug: an admin's token, saved onto their own per-user
     environment copy, was invisible to sync because credential lookup
-    always checked the LOCAL_OWNER_KEY-owned copy instead."""
+    always checked the LOCAL_OWNER_KEY-owned copy instead.
+
+    `trigger` is "manual" (a logged action, e.g. from serve.py's own
+    /sync/start route caller) or "scheduled" (from _scheduler_loop, no
+    HTTP request/actor at all). Logging lives HERE, not at each call
+    site, so every path that can fail to even START a sync -- bad/missing
+    credentials, already running -- is captured too, not just a
+    successful kickoff. Previously, a scheduled sync had ZERO audit trail
+    at all (confirmed live 2026-09-30: a configured daily sync silently
+    never fired because the server was down at its scheduled time, and
+    there was no log entry anywhere -- success, failure, OR miss -- to
+    show that). client_ip/user_agent are naturally None for a scheduled
+    trigger, same as any other CLI/background-triggered audit entry in
+    this project's existing convention."""
     with _sync_jobs_lock:
         if _sync_jobs.get(env_name, {}).get("status") == "running":
+            if trigger == "scheduled":
+                engine.log_audit_event(actor_email, actor_sub, "sync.scheduled_skipped", {"name": env_name, "reason": "already running"}, client_ip=client_ip, user_agent=user_agent)
             return False
+    action_prefix = "sync.scheduled" if trigger == "scheduled" else "sync.manual"
     try:
         creds = engine.get_environment_credentials(env_name, owner=owner)
     except KeyError as exc:
         with _sync_jobs_lock:
             _sync_jobs[env_name] = {"status": "error", "steps": [], "error": str(exc)}
+        engine.log_audit_event(actor_email, actor_sub, f"{action_prefix}_failed", {"name": env_name, "error": str(exc)}, client_ip=client_ip, user_agent=user_agent)
         return False
     if not creds.get("okta_url") or not creds.get("okta_api_token"):
+        error_msg = "No Okta URL/API token configured for this environment."
         with _sync_jobs_lock:
-            _sync_jobs[env_name] = {"status": "error", "steps": [], "error": "No Okta URL/API token configured for this environment."}
+            _sync_jobs[env_name] = {"status": "error", "steps": [], "error": error_msg}
+        engine.log_audit_event(actor_email, actor_sub, f"{action_prefix}_failed", {"name": env_name, "error": error_msg}, client_ip=client_ip, user_agent=user_agent)
         return False
     okta_client = engine.OktaClient(creds["okta_url"], creds["okta_api_token"])
-    threading.Thread(target=_run_sync_job, args=(env_name, okta_client, ingestion_scope, owner), daemon=True).start()
+    start_details = {"name": env_name, "ingestion_scope": ingestion_scope}
+    if minutes_late is not None:
+        # Only ever set for trigger="scheduled" (see _scheduler_loop) --
+        # a real, human-readable signal that this run was a catch-up, not
+        # an on-time fire, distinguishing "the scheduler is broken" from
+        # "the scheduler correctly caught up after the server was down."
+        start_details["minutes_late"] = minutes_late
+    engine.log_audit_event(actor_email, actor_sub, f"{action_prefix}_start", start_details, client_ip=client_ip, user_agent=user_agent)
+    threading.Thread(
+        target=_run_sync_job, args=(env_name, okta_client, ingestion_scope, owner),
+        kwargs={"trigger": trigger, "actor_email": actor_email, "actor_sub": actor_sub, "client_ip": client_ip, "user_agent": user_agent},
+        daemon=True,
+    ).start()
     return True
 
 
@@ -267,7 +361,23 @@ def _scheduler_loop():
     and the scheduler immediately re-triggered a duplicate run on its
     very next poll. Keeping everything in one timezone end-to-end (UTC)
     is what actually fixes this, not a smarter date-math routine --
-    admins configuring run_time should be told it's UTC in the UI."""
+    admins configuring run_time should be told it's UTC in the UI.
+
+    Self-heals from a server that was simply down at the scheduled time
+    (confirmed live 2026-09-30: a real deployment restart meant the
+    process, and therefore this loop, didn't exist yet at the configured
+    run time) -- there's no separate "did today's run happen on time"
+    check; the very next poll after the process comes back up sees
+    "today hasn't completed yet" and starts one immediately, however late.
+    Previously this had NO audit trail at all either way -- confirmed live
+    the same day: no log entry showed the run ever kicking off (on time or
+    late), failing, or being skipped, which is exactly what made a missed
+    run indistinguishable from a silently-broken scheduler. Every outcome
+    below is now logged via _start_sync_job/_run_sync_job (start/skip/
+    fail there) or directly here (a catch-up run gets an explicit
+    `minutes_late` in its start event; an unexpected exception in this
+    loop itself, previously only a print() that's easy to miss in
+    systemd's journal, now also gets a real audit_log.jsonl entry)."""
     import audit_store
     while not _scheduler_stop_event.is_set():
         try:
@@ -312,11 +422,14 @@ def _scheduler_loop():
                     if last_completed_date == now_utc.strftime("%Y-%m-%d"):
                         continue  # already ran today (UTC)
 
-                log_msg = f"[scheduler] Starting daily sync for '{env_name}' (owner={owner!r}, scope={schedule.get('ingestion_scope')})"
-                print(log_msg, flush=True)
-                _start_sync_job(env_name, schedule.get("ingestion_scope", "curated"), owner=owner)
+                minutes_late = (now_utc.hour * 60 + now_utc.minute) - (run_hour * 60 + run_minute)
+                _start_sync_job(
+                    env_name, schedule.get("ingestion_scope", "curated"), owner=owner, trigger="scheduled",
+                    minutes_late=minutes_late if minutes_late > SCHEDULER_LATE_THRESHOLD_MINUTES else None,
+                )
         except Exception as exc:
             print(f"[scheduler] Unexpected error in scheduler loop: {exc}", flush=True)
+            engine.log_audit_event(None, None, "sync.scheduler_error", {"error": str(exc)})
         _scheduler_stop_event.wait(SCHEDULER_POLL_INTERVAL_SECS)
 
 
@@ -910,6 +1023,21 @@ class Handler(SimpleHTTPRequestHandler):
                 self._log_audit_event(actor_email, actor_sub, "access_control.update", details)
                 return self._send_json(200, config)
 
+            if path == "/api/audit_log/backfill_mfa":
+                # Same admin gate as GET /api/audit_log -- this both READS
+                # and rewrites audit_log.jsonl, so it deserves at least the
+                # same protection as viewing it. Triggered by an admin
+                # clicking Refresh on the Audit Log page (see
+                # engine.backfill_mfa_log_events's docstring for why this
+                # exists: Okta System Log indexing lag can mean an
+                # access_control.update entry's corroboration was still
+                # missing at save time, even though the real event existed
+                # in Okta moments later).
+                if owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers(self.headers):
+                    return self._send_json(403, {"error": "Admin access required to refresh MFA log corroboration."})
+                updated_count = engine.backfill_mfa_log_events(_lookup_mfa_log_event)
+                return self._send_json(200, {"updated_count": updated_count})
+
             if path == "/api/environments":
                 is_admin = _is_admin_from_headers(self.headers)
                 try:
@@ -974,8 +1102,19 @@ class Handler(SimpleHTTPRequestHandler):
                 except KeyError as exc:
                     return self._send_json(404, {"error": str(exc)})
                 ingestion_scope = payload.get("ingestion_scope") or schedule.get("ingestion_scope", "curated")
-                started = _start_sync_job(name, ingestion_scope, owner=engine_owner)
-                self._log_audit_event(actor_email, actor_sub, "sync.manual_start", {"name": name, "ingestion_scope": ingestion_scope})
+                # Logging (start, and later completion/failure) now happens
+                # INSIDE _start_sync_job/_run_sync_job themselves -- see
+                # those functions' docstrings -- so it's captured
+                # uniformly for both this manual trigger and the
+                # scheduler's own trigger, including every way a sync can
+                # fail to even start (bad credentials, already running),
+                # which previously had no audit trail at all.
+                started = _start_sync_job(
+                    name, ingestion_scope, owner=engine_owner, trigger="manual",
+                    actor_email=actor_email, actor_sub=actor_sub,
+                    client_ip=self.client_address[0] if self.client_address else None,
+                    user_agent=self.headers.get("User-Agent"),
+                )
                 return self._send_json(200, {"started": started, "already_running": not started})
 
             if path.startswith("/api/environments/") and path.endswith("/sync/import_csv"):

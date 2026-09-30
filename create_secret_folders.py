@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.23.1
+# Version     : 5.23.2
 # =============================================================================
 
 import argparse
@@ -77,7 +77,7 @@ import urllib.request
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.23.1"
+SCRIPT_VERSION = "5.23.2"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -913,6 +913,77 @@ def read_audit_log(limit=200, offset=0):
                 continue
     entries.reverse()
     return entries[offset:offset + limit]
+
+
+def backfill_mfa_log_events(lookup_fn, max_lookups=20):
+    """Closes the Okta System-Log-indexing-lag gap confirmed live 2026-09-30
+    (see server/auth_gate.py's _find_stepup_mfa_log_event docstring):
+    access_control.update entries whose okta_mfa_log_event is still None
+    (the corroborating event hadn't been indexed by Okta yet at save time)
+    get a fresh lookup attempt every time an admin clicks Refresh on the
+    Audit Log page, not just once at save time.
+
+    `lookup_fn(actor_sub, near_iso_timestamp) -> dict | None` is injected
+    (see server/serve.py's caller) rather than this module calling
+    auth_gate.py directly -- this module has no Okta org URL/token of its
+    own for this purpose (that lives in auth_gate.py's separate process/
+    keyring entry, see this project's existing deliberate isolation
+    between the two), so the actual Okta call is always made by whichever
+    caller HAS that access; this function only knows how to find/rewrite
+    audit_log.jsonl rows.
+
+    `max_lookups` bounds how many entries get a fresh Okta call in one
+    Refresh click -- a real cap, not just a nice-to-have: someone
+    repeatedly clicking Refresh while several old entries are all still
+    missing corroboration (e.g. after a period this feature was down)
+    shouldn't be able to trigger unbounded Okta API calls per click.
+
+    Returns the number of entries actually updated (0 if none needed it or
+    every lookup came back empty) -- rewrites the whole file only if at
+    least one entry changed, using the same lock as log_audit_event so a
+    concurrent append from a live save can't be lost mid-rewrite."""
+    path = _audit_log_path()
+    if not os.path.isfile(path):
+        return 0
+
+    with _audit_log_lock:
+        lines = []
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                stripped = line.rstrip("\n")
+                if stripped:
+                    lines.append(stripped)
+
+        updated_count = 0
+        lookups_used = 0
+        for i, line in enumerate(lines):
+            if lookups_used >= max_lookups:
+                break
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get("action") != "access_control.update":
+                continue
+            details = entry.get("details") or {}
+            if details.get("okta_mfa_log_event") is not None:
+                continue
+            actor_sub = entry.get("actor_sub")
+            timestamp = entry.get("timestamp")
+            if not actor_sub or not timestamp:
+                continue
+            lookups_used += 1
+            found = lookup_fn(actor_sub, timestamp)
+            if found is not None:
+                details["okta_mfa_log_event"] = found
+                entry["details"] = details
+                lines[i] = json.dumps(entry, separators=(",", ":"))
+                updated_count += 1
+
+        if updated_count:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+    return updated_count
 
 
 REQUEST_TIMEOUT_SECS = 30

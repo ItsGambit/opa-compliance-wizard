@@ -376,3 +376,12 @@ export function fetchAuditLog(limit?: number, offset?: number): Promise<{ entrie
   const qs = params.toString()
   return apiFetch(`/api/audit_log${qs ? `?${qs}` : ''}`)
 }
+
+// Re-queries Okta's System Log for any access_control.update entries still
+// missing MFA corroboration (indexing lag at save time -- see
+// engine.backfill_mfa_log_events) and rewrites them in place. Called from
+// AuditLogPage's Refresh button, right before re-fetching the log itself,
+// so a delayed corroboration shows up without a separate action.
+export function backfillMfaLogEvents(): Promise<{ updated_count: number }> {
+  return apiFetch('/api/audit_log/backfill_mfa', { method: 'POST' })
+}

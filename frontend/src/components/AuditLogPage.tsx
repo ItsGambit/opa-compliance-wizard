@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { RefreshCw, Search } from 'lucide-react'
-import { fetchAuditLog } from '../api/client'
+import { backfillMfaLogEvents, fetchAuditLog } from '../api/client'
 import { toast } from '../hooks/useToast'
 import { cellValue, formatDateTime, labelize } from '../utils/format'
 import { HighlightedText, useFuzzyFilter } from '../utils/fuzzySearch'
@@ -39,6 +39,40 @@ export function AuditLogPage() {
     }
   }, [isError, error])
 
+  // Same gap on the SUCCESS side, reported directly by the user: clicking
+  // Refresh when there's genuinely nothing new looks identical to the
+  // button doing nothing at all -- no visible change, no message either
+  // way. This only fires for an explicit click (not the initial mount
+  // fetch, which has nothing to "compare" against yet), and always says
+  // something -- either how many new entries arrived or that there
+  // weren't any -- so every outcome of clicking Refresh is visible.
+  //
+  // Also triggers a backfill attempt for any access_control.update entry
+  // still missing Okta MFA corroboration (see engine.backfill_mfa_log_events)
+  // BEFORE re-fetching, so a late-indexed Okta event shows up in the same
+  // click rather than requiring a separate action -- directly requested:
+  // "when refresh is pressed it goes out and looks for items it needs from
+  // Okta logs... deltas from system log lag is also captured." A failure
+  // here is swallowed, not surfaced as an error -- it's a best-effort
+  // enhancement to the refresh, not the refresh's own success/failure.
+  const handleRefresh = async () => {
+    const previousTopTimestamp = entries[0]?.timestamp
+    const previousTopAction = entries[0]?.action
+    const backfill = await backfillMfaLogEvents().catch(() => null)
+    const result = await refetch()
+    if (result.error) return // isError effect above already handles this
+    const freshEntries = result.data?.entries ?? []
+    const isNew = freshEntries[0] && (freshEntries[0].timestamp !== previousTopTimestamp || freshEntries[0].action !== previousTopAction)
+    const backfillNote = backfill && backfill.updated_count > 0
+      ? ` Found Okta MFA corroboration for ${backfill.updated_count} earlier ${backfill.updated_count === 1 ? 'entry' : 'entries'}.`
+      : ''
+    toast({
+      title: 'Audit log refreshed',
+      description: (isNew ? 'New activity loaded.' : 'No new entries since last refresh.') + backfillNote,
+      variant: 'default',
+    })
+  }
+
   // Fuzzy-matches action/actor/client_ip/user_agent AND every value inside
   // `details` (flattened to a real searchable field, _detailsText, since
   // useFuzzyFilter needs an actual property on each item -- not just a
@@ -64,7 +98,7 @@ export function AuditLogPage() {
             className="flex-1 bg-transparent outline-none placeholder:text-text-faint"
           />
         </div>
-        <button type="button" className="btn-secondary text-xs" onClick={() => refetch()} disabled={isFetching}>
+        <button type="button" className="btn-secondary text-xs" onClick={handleRefresh} disabled={isFetching}>
           <RefreshCw size={12} className={isFetching ? 'animate-spin' : ''} /> Refresh
         </button>
       </div>
