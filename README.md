@@ -676,7 +676,15 @@ step-up from your existing session without ever prompting for MFA; check
 this in the Okta Admin Console (Security -> Authentication Policies) if
 step-up doesn't seem to be challenging you. Every save is logged as
 `access_control.update` with a `step_up_verified: true` marker, alongside
-the usual `admin_override` marker convention for admin actions.
+the usual `admin_override` marker convention for admin actions -- and,
+where Okta's own System Log has already indexed it (usually within
+seconds, but not guaranteed instant), an `okta_mfa_log_event` field
+carrying Okta's own `user.authentication.auth_via_mfa` record for that
+exact challenge, so the audit trail isn't just this tool's self-reported
+marker. A `null` value there means Okta hadn't indexed the event yet at
+save time (or the lookup failed transiently) -- it does NOT mean the MFA
+challenge itself didn't happen; the save was already gated by a verified,
+short-lived step-up cookie before this lookup ever ran.
 
 As with the admin-group check, a change to either group ID or to
 `restrict_login` takes effect on each affected user's next login/session
@@ -947,14 +955,36 @@ already exists is skipped, not duplicated.
 
 ## Version
 
-5.23.0 — **A second Okta group can now restrict who's allowed to log in
-at all**, not just who gets admin rights, and both group IDs are
-editable from a new admin-only Access Control panel in the dashboard
-instead of only via a systemd env var + manual restart. Saving a change
-there requires a fresh Okta MFA challenge (step-up), completed right
-before the save. See the changelog entry below for the full breakdown.
+5.23.1 — **Fixed a silent-failure bug on the Audit Log page**: a failed
+refresh (expired session, network blip) previously showed no error at
+all, indistinguishable from the button "doing nothing." Also, the
+step-up MFA audit entry now carries Okta's own System Log corroboration
+of the MFA challenge, not just this tool's self-reported marker. See the
+changelog entries below for the full breakdown.
 
 ### Changelog
+- **5.23.1**:
+  - **Fixed: Audit Log's Refresh button failed silently.** `useQuery`'s
+    `isError`/`error` were never checked, so a failed fetch (expired
+    session, transient network error) just left the last-successful data
+    on screen with zero indication anything went wrong. Now shows both a
+    toast and a persistent inline error card (matching the pattern
+    `SecretsAccessDashboard` already uses), with a note that what's shown
+    may be stale.
+  - **New: Okta System Log corroboration on step-up MFA audit entries.**
+    `access_control.update` entries now carry an `okta_mfa_log_event`
+    field — Okta's own `user.authentication.auth_via_mfa` System Log
+    record for that exact challenge (published time, outcome, display
+    message), looked up by `auth_gate.py` at the moment step-up completes
+    and carried through to the audit write via a new `X-Auth-Mfa-Log-
+    Event` header. Correlated by actor + tight timing proximity, since
+    Okta's own step-up sequence has no shared transaction/request ID to
+    join on (confirmed live against a real tenant — see
+    `api_event_type_reference.md`). A `null` value means Okta hadn't
+    indexed the event yet (or the lookup failed transiently) — it does
+    NOT mean the MFA challenge didn't happen; the save was already gated
+    by a verified step-up cookie before this lookup ever runs, so a miss
+    here never blocks or invalidates a save.
 - **5.23.0**:
   - **New: User Group + "Restrict login to these groups."** Previously,
     `OKTA_ADMIN_GROUP_ID` only gated admin *rights* — any authenticated

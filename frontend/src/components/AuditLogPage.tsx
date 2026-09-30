@@ -1,7 +1,8 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { RefreshCw, Search } from 'lucide-react'
 import { fetchAuditLog } from '../api/client'
+import { toast } from '../hooks/useToast'
 import { cellValue, formatDateTime, labelize } from '../utils/format'
 import { HighlightedText, useFuzzyFilter } from '../utils/fuzzySearch'
 
@@ -20,11 +21,23 @@ export function AuditLogPage() {
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
   const [query, setQuery] = useState('')
 
-  const { data, isLoading, isFetching, refetch } = useQuery({
+  const { data, isLoading, isFetching, isError, error, refetch } = useQuery({
     queryKey: ['audit_log', visibleCount],
     queryFn: () => fetchAuditLog(visibleCount, 0),
   })
   const entries = data?.entries ?? []
+
+  // A failed fetch (network blip, expired session, a 403 if admin status
+  // lapsed mid-session) previously left the page showing whatever it last
+  // successfully loaded with ZERO indication anything went wrong -- the
+  // Refresh button's spinner would stop and nothing else would happen,
+  // which is indistinguishable from "the button doesn't do anything."
+  // Surface it the same way every mutation in this app already does.
+  useEffect(() => {
+    if (isError) {
+      toast({ title: 'Could not refresh audit log', description: (error as Error)?.message, variant: 'error' })
+    }
+  }, [isError, error])
 
   // Fuzzy-matches action/actor/client_ip/user_agent AND every value inside
   // `details` (flattened to a real searchable field, _detailsText, since
@@ -55,6 +68,13 @@ export function AuditLogPage() {
           <RefreshCw size={12} className={isFetching ? 'animate-spin' : ''} /> Refresh
         </button>
       </div>
+
+      {isError && (
+        <div className="card p-3 text-sm text-loss">
+          Could not load the audit log: {(error as Error)?.message ?? 'unknown error'}. What's shown
+          below (if anything) may be stale — click Refresh to try again.
+        </div>
+      )}
 
       {isLoading ? (
         <div className="text-xs text-text-faint py-6 text-center">Loading…</div>

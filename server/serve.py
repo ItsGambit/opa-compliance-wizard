@@ -20,6 +20,7 @@ saves it via POST /api/environments.
 """
 
 import argparse
+import base64
 import csv as _csv
 import json
 import os
@@ -104,6 +105,21 @@ def _is_admin_from_headers(headers):
     environment unscoped anyway (see list_environments_for's LOCAL_OWNER_KEY
     handling); there's nothing further an admin flag would unlock there."""
     return headers.get("X-Auth-Is-Admin") == "true"
+
+
+def _mfa_log_event_from_headers(headers):
+    """Decodes the Okta System Log event auth_gate.py's /verify_stepup
+    attached (base64 JSON, see that file's _find_stepup_mfa_log_event) --
+    None if absent (no step-up in this request at all) or malformed rather
+    than raising, since this is corroborating detail for the audit trail,
+    never something a save should fail over."""
+    raw = headers.get("X-Auth-Mfa-Log-Event")
+    if not raw:
+        return None
+    try:
+        return json.loads(base64.urlsafe_b64decode(raw).decode())
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
 
 
 def _session_snapshot(owner_key):
@@ -878,7 +894,20 @@ class Handler(SimpleHTTPRequestHandler):
                 # this specific change was MFA-gated, not just admin-gated,
                 # matching this project's existing admin_override: true
                 # marker convention for admin-override actions.
-                self._log_audit_event(actor_email, actor_sub, "access_control.update", {**config, "step_up_verified": True})
+                #
+                # mfa_log_event is Okta's OWN System Log record of the
+                # user.authentication.auth_via_mfa event that satisfied this
+                # step-up (see auth_gate.py's _find_stepup_mfa_log_event) --
+                # None if Okta's indexing hadn't caught up yet or the query
+                # failed transiently; a miss does NOT block the save (the
+                # step-up cookie itself, verified by nginx before this
+                # request could even arrive, is what actually gates this
+                # endpoint) -- it only means this one entry's audit trail
+                # lacks Okta's own corroboration alongside this process's
+                # self-reported step_up_verified marker.
+                mfa_log_event = _mfa_log_event_from_headers(self.headers)
+                details = {**config, "step_up_verified": True, "okta_mfa_log_event": mfa_log_event}
+                self._log_audit_event(actor_email, actor_sub, "access_control.update", details)
                 return self._send_json(200, config)
 
             if path == "/api/environments":

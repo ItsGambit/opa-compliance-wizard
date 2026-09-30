@@ -130,6 +130,17 @@ actually permitting/requiring a second factor for this app -- if it doesn't,
 Okta may silently satisfy the step-up from the existing session without ever
 prompting for MFA. Verify this in the Okta admin console; it cannot be set
 from this repo. See developer.okta.com/docs/guides/step-up-authentication.
+
+Okta System Log corroboration for step-up: right when a step-up callback
+completes, _find_stepup_mfa_log_event queries Okta's own System Log for the
+user.authentication.auth_via_mfa event this triggered, and carries it
+through the step-up cookie to /verify?require_stepup=1's response as
+X-Auth-Mfa-Log-Event (base64 JSON) -- serve.py attaches it to the
+access_control.update audit entry so the audit trail carries Okta's own
+record, not just this process's self-reported step_up_verified:true. A
+miss (Okta indexing lag, transient API error) is NOT an error -- see that
+function's docstring for why this fails open, unlike group-membership
+checks elsewhere in this file.
 """
 
 import argparse
@@ -143,6 +154,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -186,6 +198,11 @@ STEPUP_COOKIE = "opa_wizard_stepup"
 SESSION_TTL_SECONDS = 12 * 60 * 60  # 12h -- re-login once a workday
 FLOW_TTL_SECONDS = 10 * 60  # 10 min is generous for "redirect to Okta and log in"
 STEPUP_TTL_SECONDS = 120  # short-lived on purpose -- proof of a JUST-completed MFA challenge, not a second session
+# Generous window for _find_stepup_mfa_log_event's actor+timing correlation
+# (see that function's docstring) -- covers real-world System Log ingest
+# lag plus clock skew between this process and Okta, not just the OIDC
+# round trip itself, which is normally only a few seconds.
+STEPUP_LOG_LOOKBACK_SECONDS = 120
 
 # access_control.json lives at the repo root, same place as
 # environments.json/banner_config.json -- read directly here (own plain
@@ -308,6 +325,61 @@ def _resolve_membership(group_ids: list[str] | None, admin_group_id: str | None,
     is_user = bool(user_group_id) and user_group_id in group_ids
     is_allowed = is_admin or is_user or (not admin_group_id and not user_group_id)
     return is_admin, is_allowed
+
+
+def _find_stepup_mfa_log_event(user_sub: str) -> dict | None:
+    """Looks up the real Okta System Log event(s) that corroborate a just-
+    completed step-up MFA challenge, so the audit trail this project keeps
+    (audit_log.jsonl, via serve.py's access_control.update entry) doesn't
+    just take this process's own step_up_verified:true marker on faith --
+    it also carries Okta's own record of the same event.
+
+    IMPORTANT, confirmed live against a real tenant (see
+    api_event_type_reference.md's "security_policy (MFA-gated access)"
+    row): Okta's own step-up/MFA sequence is policy.evaluate_sign_on
+    (outcome=CHALLENGE) followed by user.authentication.auth_via_mfa
+    (outcome=SUCCESS or FAILURE) -- and these are NOT correlated by any
+    shared transaction/request id to whatever triggered the step-up. The
+    ONLY way to associate "this MFA event" with "this specific step-up
+    flow" is actor + tight timing proximity, which is exactly what this
+    does: query a narrow window (now - MAX_LOOKBACK_SECONDS to now+a few
+    seconds of slop for clock skew/System Log ingest lag) filtered by
+    actor.id, and return the auth_via_mfa event closest to "now" if one
+    exists. This is inherently a best-effort correlation, not a proof by
+    shared ID -- if Okta's own indexing hasn't caught up yet (seen up to
+    ~60s lag elsewhere in this project, see api_event_type_reference.md's
+    Group Push propagation note for a worse real-world example), this
+    simply returns None and the audit entry is logged without Okta
+    corroboration rather than blocking or delaying the save.
+
+    Returns a small dict (published/eventType/outcome/displayMessage) or
+    None if no matching event was found (fails open here, unlike group
+    membership checks above -- absence of a corroborating log line must
+    never block a real, already-verified step-up from completing; it
+    only means the audit entry won't carry Okta's own confirmation)."""
+    since_dt = datetime.now(timezone.utc) - timedelta(seconds=STEPUP_LOG_LOOKBACK_SECONDS)
+    since = since_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    filter_expr = (
+        f'actor.id eq "{user_sub}" and eventType eq "user.authentication.auth_via_mfa"'
+    )
+    params = {"filter": filter_expr, "since": since, "sortOrder": "DESCENDING", "limit": "5"}
+    url = f"{OKTA_ORG_URL}/api/v1/logs?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"Authorization": f"SSWS {OKTA_ADMIN_CHECK_TOKEN}", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            events = json.loads(r.read())
+    except (urllib.error.HTTPError, urllib.error.URLError, ValueError):
+        return None
+    if not events:
+        return None
+    event = events[0]  # DESCENDING -- most recent first, i.e. closest to "now"
+    outcome = event.get("outcome") or {}
+    return {
+        "published": event.get("published"),
+        "eventType": event.get("eventType"),
+        "outcome_result": outcome.get("result"),
+        "display_message": event.get("displayMessage"),
+    }
 
 
 def _sign_payload(payload: dict, ttl_seconds: int) -> str:
@@ -481,7 +553,16 @@ class Handler(BaseHTTPRequestHandler):
             # consumes it (POST /api/access_control/save), same
             # defense-in-depth double-check this project already does
             # elsewhere for admin actions.
-            stepup_token = _sign_payload({"sub": claims["sub"]}, STEPUP_TTL_SECONDS)
+            #
+            # Best-effort Okta System Log corroboration, looked up ONCE here
+            # (right when this process knows the exact actor+moment) rather
+            # than later when serve.py writes the audit entry -- carried
+            # through the step-up cookie itself so serve.py never needs its
+            # own Okta call. A miss (None) is NOT an error -- see
+            # _find_stepup_mfa_log_event's docstring for why this fails
+            # open, unlike group-membership checks elsewhere in this file.
+            mfa_log_event = _find_stepup_mfa_log_event(claims["sub"])
+            stepup_token = _sign_payload({"sub": claims["sub"], "mfa_log_event": mfa_log_event}, STEPUP_TTL_SECONDS)
             self.send_response(302)
             self.send_header("Set-Cookie", _cookie_header(STEPUP_COOKIE, stepup_token, max_age=STEPUP_TTL_SECONDS))
             self.send_header("Set-Cookie", _cookie_header(FLOW_COOKIE, "", max_age=0))
@@ -528,6 +609,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        mfa_log_event = None
         if require_stepup:
             stepup_token = _get_cookie(self.headers, STEPUP_COOKIE)
             stepup = _verify_signed_payload(stepup_token) if stepup_token else None
@@ -540,6 +622,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(401)
                 self.end_headers()
                 return
+            mfa_log_event = stepup.get("mfa_log_event")
 
         self.send_response(200)
         # Two distinct headers, deliberately: `sub` is Okta's stable,
@@ -552,6 +635,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Auth-Sub", session.get("sub", ""))
         self.send_header("X-Auth-User", session.get("email") or session.get("sub", ""))
         self.send_header("X-Auth-Is-Admin", "true" if session.get("is_admin") else "false")
+        if mfa_log_event is not None:
+            # Carries the Okta System Log event that corroborates THIS
+            # step-up (see _find_stepup_mfa_log_event) through to serve.py's
+            # audit-log write, without serve.py needing its own Okta call.
+            # base64-encoded JSON since header values can't hold arbitrary
+            # structured data or non-ASCII bytes -- same reasoning as any
+            # other structured-value-in-a-header pattern.
+            encoded = base64.urlsafe_b64encode(json.dumps(mfa_log_event, separators=(",", ":")).encode()).decode()
+            self.send_header("X-Auth-Mfa-Log-Event", encoded)
         self.end_headers()
 
     def _logout(self):
