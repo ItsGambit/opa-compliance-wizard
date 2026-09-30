@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { ArrowLeft, RefreshCw } from 'lucide-react'
+import { ArrowLeft } from 'lucide-react'
 import { useReport } from '../api/hooks'
 import type { ComplianceReportDef, ComplianceReportRow } from '../types'
 import { complianceReportExportSections } from '../utils/exportSections'
@@ -20,7 +20,13 @@ export function ComplianceReportDetail({ def, environment, onBack }: Props) {
   const [from, setFrom] = useState(ninetyDaysAgo)
   const [to, setTo] = useState(today)
 
-  const { data, isLoading, refetch, isFetching } = useReport(def.key, environment, from, to)
+  // No per-view Refresh here -- every report reads the SAME shared
+  // audit_store.db archive, so pulling fresh Okta data is one global
+  // action (the Footer's "Sync now"), not something duplicated per
+  // screen. This query auto-refetches when that global sync completes,
+  // via queryClient.invalidateQueries on the ['report'] key prefix (see
+  // Footer.tsx).
+  const { data, isLoading } = useReport(def.key, environment, from, to)
   const rows = data?.rows ?? []
 
   // ExportButtons exports whatever ReportRowsTable's own filters have
@@ -35,12 +41,7 @@ export function ComplianceReportDetail({ def, environment, onBack }: Props) {
         <button type="button" className="btn-secondary text-xs" onClick={onBack}>
           <ArrowLeft size={12} /> Back to reports
         </button>
-        <div className="flex items-center gap-2">
-          <ExportButtons sections={complianceReportExportSections(def.label, filteredRows)} filenameBase={`opa-report-${def.key}`} />
-          <button type="button" className="btn-secondary text-xs" onClick={() => refetch()} disabled={isFetching}>
-            <RefreshCw size={12} className={isFetching ? 'animate-spin' : ''} /> Refresh
-          </button>
-        </div>
+        <ExportButtons sections={complianceReportExportSections(def.label, filteredRows)} filenameBase={`opa-report-${def.key}`} />
       </div>
 
       <div>

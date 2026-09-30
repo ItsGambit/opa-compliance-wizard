@@ -11,6 +11,7 @@ import {
   fetchResourceHistory,
   fetchSecretsAccessReport,
   fetchServiceAccount,
+  fetchSyncStatus,
   fetchUserResourceAccess,
   fetchVersion,
   fetchWhoami,
@@ -184,5 +185,20 @@ export function useResourceHistory(
     queryKey: ['resource_history', resourceId, environment, from, to, resourceName],
     queryFn: () => fetchResourceHistory(resourceId!, environment, from, to, resourceName),
     enabled: !!resourceId && !!environment,
+  })
+}
+
+/** A plain point-in-time read of one environment's sync state -- "when was
+ * this last actually synced from live Okta" (e.g. the Footer's "Last Okta
+ * import" line). Deliberately NOT useSyncJob (frontend/src/hooks/
+ * useSyncJob.ts) -- that hook exists to DRIVE a sync job (start + poll
+ * until done), which is overkill for something that just wants to display
+ * a timestamp once. No polling here; a caller that needs live progress
+ * should use useSyncJob instead. */
+export function useSyncStatus(environmentName: string | undefined) {
+  return useQuery({
+    queryKey: ['sync_status', environmentName],
+    queryFn: () => fetchSyncStatus(environmentName!),
+    enabled: !!environmentName,
   })
 }

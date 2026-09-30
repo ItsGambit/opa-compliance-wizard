@@ -323,6 +323,12 @@ function ResourceHistoryPanel({ resourceId, resourceLabel, onClose }: { resource
   const [from, setFrom] = useState(ninetyDaysAgo)
   const [to, setTo] = useState(today)
 
+  // No per-view Refresh here -- every resource's history reads the SAME
+  // shared audit_store.db archive as every ordinary report, so pulling
+  // fresh Okta data is one global action (the Footer's "Sync now"), not
+  // something duplicated per screen. This query auto-refetches when that
+  // global sync completes, via queryClient.invalidateQueries on the
+  // ['resource_history'] key prefix (see Footer.tsx).
   const { data, isLoading } = useResourceHistory(resourceId, activeEnv, from, to, resourceLabel)
   const rows = data?.rows ?? []
   const [filteredRows, setFilteredRows] = useState(rows)
