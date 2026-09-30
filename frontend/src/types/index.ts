@@ -65,6 +65,12 @@ export interface AuditLogEntry {
   actor_sub: string | null
   action: string
   details: Record<string, unknown>
+  // New as of 2026-09-30 (Okta's own System Log always captures both;
+  // this log never did) -- undefined/null on any entry written before
+  // this change, since neither was ever captured for those; rendered as
+  // "—", not backfilled (there's no real data to backfill).
+  client_ip?: string | null
+  user_agent?: string | null
 }
 
 export type ComplianceControl = 'CC6' | 'CC7' | 'CC8'
@@ -470,6 +476,40 @@ export interface AccessActiveDirectoryConnection {
   status?: string
 }
 
+// A relationship is a named grant type (e.g. "TDI_Safe_Owners"); an
+// assignment links one or more relationships to a principal (a real
+// user_group, confirmed live) plus the specific resource(s) it grants.
+// NOT a separate access-grant mechanism from security policies -- a
+// policy with a non-empty `relationships` field on AccessPolicy (see
+// above) uses this as an ALTERNATE way to specify both its principal and
+// its resource target; that resolution already happens server-side in
+// build_access_model, so these two lists exist here mainly for the
+// Resources tab's own direct visibility into them, not because the
+// frontend needs to re-derive the policy resolution itself.
+export interface AccessRelationship {
+  id: string
+  name: string
+  description?: string
+}
+
+export interface AccessRelationshipAssignment {
+  relationship: NamedRef
+  principal: NamedRef
+}
+
+export interface AccessAssignment {
+  id: string
+  name: string
+  description?: string
+  // Real shape varies by which resource kind was granted (confirmed live:
+  // saas_app_account_assignments on patlabs, secret_or_folder_assignments
+  // on dev) -- kept open since more kinds are expected to appear as this
+  // OPA feature matures (see create_secret_folders.py's
+  // _RELATIONSHIP_ASSIGNMENT_ID_NAME_FIELDS comment).
+  resource_assignments: Record<string, unknown> | null
+  relationship_assignments: AccessRelationshipAssignment[]
+}
+
 export interface AccessModel {
   resource_groups: AccessResourceGroup[]
   projects: AccessProject[]
@@ -487,6 +527,38 @@ export interface AccessModel {
   database_connections: AccessDatabaseConnection[]
   saas_app_connections: AccessSaasAppConnection[]
   active_directory_connections: AccessActiveDirectoryConnection[]
+  assignments: AccessAssignment[]
+  relationships: AccessRelationship[]
+}
+
+// ── Access Explorer: AD account-discovery configuration ──────────────────
+// On-demand only (fetched when an AD connection row is clicked in
+// ResourcesTab) -- explains WHY an individual AD account got discovered/
+// matched to an Okta user at all. See create_secret_folders.py's
+// get_ad_connection_discovery_config.
+
+export interface AdConnectionRule {
+  id: string
+  name: string
+  rule_type: string
+  organizational_units: string[]
+  priority: number
+  enable_initial_password_rotation: boolean
+  enable_import_okta_users: boolean
+  resource_group?: NamedRef
+  project?: NamedRef
+}
+
+export interface AdConnectionRuleSettings {
+  is_configured: boolean
+  matching_criteria: Record<string, boolean>
+  partial_matching_criteria: { operator: string; match_value: string }[]
+  allow_partial_matches: boolean
+}
+
+export interface AdConnectionDiscoveryConfig {
+  rules: AdConnectionRule[]
+  rule_settings: AdConnectionRuleSettings
 }
 
 // ── Access Explorer: System Log last-accessed lookup ─────────────────────

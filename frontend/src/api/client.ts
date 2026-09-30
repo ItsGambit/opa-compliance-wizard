@@ -1,5 +1,6 @@
 import type {
   AccessModel,
+  AdConnectionDiscoveryConfig,
   ApiErrorBody,
   AuditLogEntry,
   BannerConfig,
@@ -345,6 +346,13 @@ export function fetchResourceHistory(
   if (resourceName) params.set('resource_name', resourceName)
   const qs = params.toString()
   return apiFetch(`/api/resources/${encodeURIComponent(resourceId)}/history${qs ? `?${qs}` : ''}`)
+}
+
+/** On-demand only (fetched when an AD connection row is clicked in
+ * ResourcesTab) -- see AdConnectionDiscoveryConfig's own comment for why
+ * this isn't part of the bootstrap. */
+export function fetchAdConnectionDiscoveryConfig(connectionId: string): Promise<AdConnectionDiscoveryConfig> {
+  return apiFetch(`/api/active_directory_connections/${encodeURIComponent(connectionId)}/discovery_config`)
 }
 
 // ── Audit log (admin-only, see server/serve.py's /api/audit_log) ─────────

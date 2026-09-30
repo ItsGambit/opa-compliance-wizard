@@ -142,7 +142,16 @@ export function PolicyRuleCard({ rule, policyName, accessInfoByResourceId }: Pro
             res.kind === 'resolved' ? (
               <Tag key={i}>
                 {res.name}
-                {res.project_name ? ` — ${res.project_name}` : ' (project unknown)'}
+                {res.project_name
+                  ? ` — ${res.project_name}`
+                  // relationship_assignment resolutions (see
+                  // create_secret_folders.py's
+                  // _resolve_relationship_assignment_resources) are
+                  // team-wide grants with no project by design -- "(project
+                  // unknown)" would wrongly imply a data gap here.
+                  : res.resource_kind.startsWith('relationship_assignment:')
+                    ? ''
+                    : ' (project unknown)'}
               </Tag>
             ) : (
               <span key={i} className="text-xs text-text-faint italic">

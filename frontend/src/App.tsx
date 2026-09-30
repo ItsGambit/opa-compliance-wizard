@@ -3,7 +3,7 @@ import { useEnvironments, useWhoami } from './api/hooks'
 import { AboutDialog } from './components/AboutDialog'
 import { AccessExplorer, ACCESS_SUB_TABS } from './components/AccessExplorer'
 import { AnnouncementBanner } from './components/AnnouncementBanner'
-import { AuditLogDialog } from './components/AuditLogDialog'
+import { AuditLogPage } from './components/AuditLogPage'
 import { BannerSettingsDialog } from './components/BannerSettingsDialog'
 import { ComplianceReports } from './components/ComplianceReports'
 import { EnvironmentManagerDialog } from './components/EnvironmentManagerDialog'
@@ -19,7 +19,6 @@ export default function App() {
   const [accessSubTab, setAccessSubTab] = useState(ACCESS_SUB_TABS[0].value)
   const [reportsSubTab, setReportsSubTab] = useState(REPORTS_SUB_TABS[0].value)
   const [environmentsOpen, setEnvironmentsOpen] = useState(false)
-  const [auditLogOpen, setAuditLogOpen] = useState(false)
   const [bannerOpen, setBannerOpen] = useState(false)
   const [aboutOpen, setAboutOpen] = useState(false)
   const { data: environments, isLoading: environmentsLoading } = useEnvironments()
@@ -62,7 +61,6 @@ export default function App() {
           reportsSubTab={reportsSubTab}
           onReportsSubTabChange={setReportsSubTab}
           onOpenEnvironments={() => setEnvironmentsOpen(true)}
-          onOpenAuditLog={() => setAuditLogOpen(true)}
           isAdmin={whoami?.is_admin}
           onOpenBanner={() => setBannerOpen(true)}
           onOpenAbout={() => setAboutOpen(true)}
@@ -76,6 +74,7 @@ export default function App() {
                 {activeTab === 'reports' && reportsSubTab === 'secrets_access' && 'Secrets Access Dashboard'}
                 {activeTab === 'access' && 'Access Explorer'}
                 {activeTab === 'builder' && 'Folder Builder'}
+                {activeTab === 'audit_log' && 'Audit Log'}
               </h1>
               <p className="text-xs text-text-faint mt-1">
                 {activeTab === 'reports' && reportsSubTab === 'browse' &&
@@ -86,6 +85,8 @@ export default function App() {
                   'Explore who has access to what, across resource groups, projects, policies, users, and groups.'}
                 {activeTab === 'builder' &&
                   'Pick or create a resource group and project, build the folder tree, then preview and create.'}
+                {activeTab === 'audit_log' &&
+                  'Every write action across every environment and user — admin-only, for compliance visibility.'}
               </p>
             </div>
             <div className="flex items-center gap-3">
@@ -100,6 +101,7 @@ export default function App() {
           {activeTab === 'reports' && reportsSubTab === 'secrets_access' && <SecretsAccessDashboard />}
           {activeTab === 'access' && <AccessExplorer subTab={accessSubTab} />}
           {activeTab === 'builder' && <FolderBuilder />}
+          {activeTab === 'audit_log' && whoami?.is_admin && <AuditLogPage />}
 
           <Footer />
         </main>
@@ -111,7 +113,6 @@ export default function App() {
         onOpenChange={setEnvironmentsOpen}
         isAdmin={whoami?.is_admin}
       />
-      {whoami?.is_admin && <AuditLogDialog open={auditLogOpen} onOpenChange={setAuditLogOpen} />}
       <BannerSettingsDialog open={bannerOpen} onOpenChange={setBannerOpen} />
       <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />
     </div>

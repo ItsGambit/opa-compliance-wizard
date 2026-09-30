@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Search } from 'lucide-react'
 import { useEnvironments, useResourceHistory } from '../api/hooks'
+import { AdConnectionRulesPanel } from './AdConnectionRulesPanel'
 import type {
   AccessActiveDirectoryAccount,
   AccessActiveDirectoryConnection,
@@ -378,12 +379,22 @@ export function ResourcesTab({ model }: Props) {
   // rendering N history panels is a follow-up, not built now, but this
   // shape doesn't need re-architecting to get there.
   const [selected, setSelected] = useState<{ id: string; label: string } | null>(null)
+  // active_directory_connections rows are clickable too, but for a
+  // GENUINELY different purpose -- "show me discovery configuration"
+  // (AdConnectionRulesPanel), not "show me compliance events"
+  // (ResourceHistoryPanel). Tracked separately from `selected` rather than
+  // adding a `panel` tag to that shape, since the two panels take
+  // different props entirely (resourceName isn't meaningful for an AD
+  // connection) and mixing them would make `selected` harder to reason
+  // about for its original, still-primary use.
+  const [selectedAdConnection, setSelectedAdConnection] = useState<{ id: string; label: string } | null>(null)
 
   // Changing kind (or the search query narrowing away the selected row)
-  // clears the open history panel -- it was scoped to a resource that may
+  // clears whichever panel is open -- it was scoped to a resource that may
   // no longer even be visible.
   useEffect(() => {
     setSelected(null)
+    setSelectedAdConnection(null)
   }, [kind])
 
   // Real bug found and fixed 2026-09-30: EVERY OPA-managed server has
@@ -444,12 +455,27 @@ export function ResourcesTab({ model }: Props) {
         headers={headers}
         rows={rows}
         query={query}
-        selectedId={selected?.id ?? null}
-        onSelect={row => row.id && setSelected({ id: row.id, label: row.label })}
+        selectedId={kind === 'active_directory_connections' ? selectedAdConnection?.id ?? null : selected?.id ?? null}
+        onSelect={row => {
+          if (!row.id) return
+          if (kind === 'active_directory_connections') {
+            setSelectedAdConnection({ id: row.id, label: row.label })
+          } else {
+            setSelected({ id: row.id, label: row.label })
+          }
+        }}
       />
 
-      {selected && (
+      {selected && kind !== 'active_directory_connections' && (
         <ResourceHistoryPanel resourceId={selected.id} resourceLabel={selected.label} onClose={() => setSelected(null)} />
+      )}
+
+      {selectedAdConnection && kind === 'active_directory_connections' && (
+        <AdConnectionRulesPanel
+          connectionId={selectedAdConnection.id}
+          connectionLabel={selectedAdConnection.label}
+          onClose={() => setSelectedAdConnection(null)}
+        />
       )}
     </div>
   )

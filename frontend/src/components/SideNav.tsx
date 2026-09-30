@@ -58,10 +58,11 @@ interface Props {
   reportsSubTab: string
   onReportsSubTabChange: (value: string) => void
   onOpenEnvironments: () => void
-  // Only rendered when isAdmin is true -- undefined/omitted for a non-admin
-  // viewer rather than always present but disabled, so a non-admin sees no
-  // trace of an audit log existing at all.
-  onOpenAuditLog?: () => void
+  // Gates whether the Audit Log top-level nav item renders at all -- a
+  // non-admin viewer sees no trace of an audit log existing, matching the
+  // previous dialog's own admin gate (converted from a modal popup to a
+  // full page 2026-09-30, per user feedback that it deserved the same
+  // real-page treatment as Compliance Reports).
   isAdmin?: boolean
   onOpenBanner: () => void
   onOpenAbout: () => void
@@ -71,6 +72,7 @@ const TOP_LEVEL_ICON: Record<string, typeof FolderTree> = {
   reports: ClipboardCheck,
   access: Search,
   builder: FolderTree,
+  audit_log: ListChecks,
 }
 
 function NavItem({ active, label, icon, onClick }: { active: boolean; label: string; icon?: typeof FolderTree; onClick: () => void }) {
@@ -119,18 +121,20 @@ export function SideNav({
   reportsSubTab,
   onReportsSubTabChange,
   onOpenEnvironments,
-  onOpenAuditLog,
   isAdmin,
   onOpenBanner,
   onOpenAbout,
 }: Props) {
   const { theme, toggle } = useTheme()
+  const topLevelTabs = isAdmin
+    ? (['reports', 'access', 'builder', 'audit_log'] as const)
+    : (['reports', 'access', 'builder'] as const)
 
   return (
     <div className="flex h-full shrink-0">
       {/* Icon rail */}
       <div className="w-12 bg-bg-elevated border-r border-border flex flex-col items-center pt-3 gap-1.5">
-        {(['reports', 'access', 'builder'] as const).map(tab => {
+        {topLevelTabs.map(tab => {
           const Icon = TOP_LEVEL_ICON[tab]
           const isActive = activeTab === tab
           return (
@@ -198,18 +202,26 @@ export function SideNav({
             icon={FolderTree}
             onClick={() => onTabChange('builder')}
           />
+
+          {isAdmin && (
+            <NavItem
+              active={activeTab === 'audit_log'}
+              label="Audit Log"
+              icon={ListChecks}
+              onClick={() => onTabChange('audit_log')}
+            />
+          )}
         </div>
 
         <div className="flex-1" />
 
         {/* Utility row -- everything that used to live as icon buttons in
-            the page header (Environments' gear icon, Audit Log, banner
-            settings, About) now lives here as one consistent group of
-            pill-shaped buttons, alongside the theme toggle. */}
+            the page header (Environments' gear icon, banner settings,
+            About) now lives here as one consistent group of pill-shaped
+            buttons, alongside the theme toggle. Audit Log moved OUT of
+            this group 2026-09-30 -- it's a full top-level nav item/page
+            now, not a dialog trigger. */}
         <div className="flex flex-col gap-1 pt-2 border-t border-border-sub">
-          {isAdmin && onOpenAuditLog && (
-            <UtilityPill label="Audit Log" icon={ListChecks} onClick={onOpenAuditLog} />
-          )}
           <UtilityPill label="Environments" icon={Settings} onClick={onOpenEnvironments} />
           <UtilityPill label="Announcement banner" icon={Megaphone} onClick={onOpenBanner} />
           <UtilityPill label="About" icon={Info} onClick={onOpenAbout} />

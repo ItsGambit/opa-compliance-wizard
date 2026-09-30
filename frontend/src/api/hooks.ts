@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import {
+  fetchAdConnectionDiscoveryConfig,
   fetchBanner,
   fetchCsvFiles,
   fetchEnvironments,
@@ -200,5 +201,17 @@ export function useSyncStatus(environmentName: string | undefined) {
     queryKey: ['sync_status', environmentName],
     queryFn: () => fetchSyncStatus(environmentName!),
     enabled: !!environmentName,
+  })
+}
+
+/** On-demand fetch of one AD connection's discovery configuration --
+ * explains WHY an individual AD account got discovered/matched. Only
+ * fired once a connection row is actually clicked in ResourcesTab, not
+ * bootstrapped for every AD connection up front. */
+export function useAdConnectionDiscoveryConfig(connectionId: string | undefined) {
+  return useQuery({
+    queryKey: ['ad_connection_discovery_config', connectionId],
+    queryFn: () => fetchAdConnectionDiscoveryConfig(connectionId!),
+    enabled: !!connectionId,
   })
 }

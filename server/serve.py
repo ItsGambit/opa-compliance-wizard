@@ -429,6 +429,20 @@ class Handler(SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # keep console output to our own explicit prints
 
+    def _log_audit_event(self, actor_email, actor_sub, action, details=None):
+        """Thin wrapper around engine.log_audit_event that fills in
+        client_ip/user_agent from THIS request automatically -- added
+        2026-09-30 so every one of this class's ~17 existing call sites
+        gets real client IP + user agent captured (Okta's own System Log
+        always includes both; this audit log never did) without having to
+        thread self.client_address/self.headers through each one by
+        hand."""
+        return engine.log_audit_event(
+            actor_email, actor_sub, action, details,
+            client_ip=self.client_address[0] if self.client_address else None,
+            user_agent=self.headers.get("User-Agent"),
+        )
+
     def end_headers(self):
         origin = self.headers.get("Origin")
         # Echo back the real request Origin if it's one this app actually
@@ -615,6 +629,16 @@ class Handler(SimpleHTTPRequestHandler):
                     since=since, until=until, limit=limit,
                 )
                 return self._send_json(200, {"resource_id": resource_id, "environment": environment, "rows": rows})
+
+            if path.startswith("/api/active_directory_connections/") and path.endswith("/discovery_config"):
+                if not _require_client(self._send_json, local_client):
+                    return
+                connection_id = unquote(
+                    path[len("/api/active_directory_connections/"):-len("/discovery_config")]
+                )
+                if not connection_id:
+                    return self._send_json(400, {"error": "missing connection_id"})
+                return self._send_json(200, engine.get_ad_connection_discovery_config(local_client, connection_id))
 
             if path == "/api/resource_groups":
                 if not _require_client(self._send_json, local_client):
@@ -817,7 +841,7 @@ class Handler(SimpleHTTPRequestHandler):
                     payload.get("variant", "warning"),
                     payload.get("dismissible", True),
                 )
-                engine.log_audit_event(actor_email, actor_sub, "banner.update", config)
+                self._log_audit_event(actor_email, actor_sub, "banner.update", config)
                 return self._send_json(200, config)
 
             if path == "/api/environments":
@@ -826,7 +850,7 @@ class Handler(SimpleHTTPRequestHandler):
                     name = engine.upsert_environment(payload.get("name"), payload, owner=engine_owner, is_admin=is_admin)
                 except PermissionError as exc:
                     return self._send_json(403, {"error": str(exc)})
-                engine.log_audit_event(actor_email, actor_sub, "environment.upsert", {"name": name, "admin_override": is_admin})
+                self._log_audit_event(actor_email, actor_sub, "environment.upsert", {"name": name, "admin_override": is_admin})
                 try:
                     activate_environment(owner_key, name)
                 except engine.OpaApiError as exc:
@@ -841,7 +865,7 @@ class Handler(SimpleHTTPRequestHandler):
                     return self._send_json(404, {"error": str(exc)})
                 except engine.OpaApiError as exc:
                     return self._send_json(502, {"error": str(exc)})
-                engine.log_audit_event(actor_email, actor_sub, "environment.activate", {"name": name})
+                self._log_audit_event(actor_email, actor_sub, "environment.activate", {"name": name})
                 return self._send_json(200, {"activated": True, "active": name})
 
             if path.startswith("/api/environments/") and path.endswith("/share"):
@@ -854,7 +878,7 @@ class Handler(SimpleHTTPRequestHandler):
                     return self._send_json(404, {"error": str(exc)})
                 except PermissionError as exc:
                     return self._send_json(403, {"error": str(exc)})
-                engine.log_audit_event(actor_email, actor_sub, "environment.share", {"name": name, "shared": shared, "admin_override": is_admin})
+                self._log_audit_event(actor_email, actor_sub, "environment.share", {"name": name, "shared": shared, "admin_override": is_admin})
                 return self._send_json(200, {"name": name, "shared": shared})
 
             if path.startswith("/api/environments/") and path.endswith("/preserve_logs_locally"):
@@ -874,7 +898,7 @@ class Handler(SimpleHTTPRequestHandler):
                     return self._send_json(404, {"error": str(exc)})
                 except ValueError as exc:
                     return self._send_json(400, {"error": str(exc)})
-                engine.log_audit_event(actor_email, actor_sub, "sync_schedule.update", {"name": name, **saved})
+                self._log_audit_event(actor_email, actor_sub, "sync_schedule.update", {"name": name, **saved})
                 return self._send_json(200, {"name": name, "sync_schedule": saved})
 
             if path.startswith("/api/environments/") and path.endswith("/sync/start"):
@@ -885,7 +909,7 @@ class Handler(SimpleHTTPRequestHandler):
                     return self._send_json(404, {"error": str(exc)})
                 ingestion_scope = payload.get("ingestion_scope") or schedule.get("ingestion_scope", "curated")
                 started = _start_sync_job(name, ingestion_scope, owner=engine_owner)
-                engine.log_audit_event(actor_email, actor_sub, "sync.manual_start", {"name": name, "ingestion_scope": ingestion_scope})
+                self._log_audit_event(actor_email, actor_sub, "sync.manual_start", {"name": name, "ingestion_scope": ingestion_scope})
                 return self._send_json(200, {"started": started, "already_running": not started})
 
             if path.startswith("/api/environments/") and path.endswith("/sync/import_csv"):
@@ -899,7 +923,7 @@ class Handler(SimpleHTTPRequestHandler):
                     result = audit_store.import_from_csv(csv_path, name, ingestion_scope)
                 except ValueError as exc:
                     return self._send_json(400, {"error": str(exc)})
-                engine.log_audit_event(actor_email, actor_sub, "sync.import_csv", {"name": name, "csv_path": csv_path, **result})
+                self._log_audit_event(actor_email, actor_sub, "sync.import_csv", {"name": name, "csv_path": csv_path, **result})
                 return self._send_json(200, result)
 
             if path == "/api/access/bootstrap/start":
@@ -927,7 +951,7 @@ class Handler(SimpleHTTPRequestHandler):
                 created = local_client.create_resource_group(
                     name, payload.get("description", ""), delegated_resource_admin_group_ids=group_ids
                 )
-                engine.log_audit_event(actor_email, actor_sub, "resource_group.create", {
+                self._log_audit_event(actor_email, actor_sub, "resource_group.create", {
                     "env_name": _local_env_name, "name": name, "resource_group_id": created.get("id"),
                 })
                 return self._send_json(201, {"resource_group": created})
@@ -940,7 +964,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if not rg_id or not name:
                     return self._send_json(400, {"error": "resource_group_id (in URL) and name are required"})
                 created = local_client.create_project(rg_id, name)
-                engine.log_audit_event(actor_email, actor_sub, "project.create", {
+                self._log_audit_event(actor_email, actor_sub, "project.create", {
                     "env_name": _local_env_name, "resource_group_id": rg_id, "name": name, "project_id": created.get("id"),
                 })
                 return self._send_json(201, {"project": created})
@@ -979,7 +1003,7 @@ class Handler(SimpleHTTPRequestHandler):
                     }
                     engine.upsert_folder_rule_in_policy(policy_body, folder_id, folder_name, rule_name, privileges, mfa=mfa)
                     created = local_client.create_security_policy(policy_body)
-                    engine.log_audit_event(actor_email, actor_sub, "policy.create", {
+                    self._log_audit_event(actor_email, actor_sub, "policy.create", {
                         "env_name": _local_env_name, "resource_group_id": rg_id, "folder_id": folder_id,
                         "policy_name": name, "policy_id": created.get("id"),
                     })
@@ -994,7 +1018,7 @@ class Handler(SimpleHTTPRequestHandler):
                     engine.upsert_folder_rule_in_policy(current, folder_id, folder_name, rule_name, privileges, mfa=mfa)
                     local_client.update_security_policy(policy_id, current)
                     updated = local_client.get_security_policy(policy_id)
-                    engine.log_audit_event(actor_email, actor_sub, "policy.update", {
+                    self._log_audit_event(actor_email, actor_sub, "policy.update", {
                         "env_name": _local_env_name, "resource_group_id": rg_id, "folder_id": folder_id,
                         "policy_id": policy_id,
                     })
@@ -1024,7 +1048,7 @@ class Handler(SimpleHTTPRequestHandler):
                     time.sleep(GROUP_PUSH_PROPAGATION_DELAY_SECS)
 
                 if not opa_group:
-                    engine.log_audit_event(actor_email, actor_sub, "group.create", {
+                    self._log_audit_event(actor_email, actor_sub, "group.create", {
                         "env_name": _local_env_name, "name": name, "visible_in_opa": False,
                     })
                     return self._send_json(202, {
@@ -1055,7 +1079,7 @@ class Handler(SimpleHTTPRequestHandler):
                         f"Group created, but couldn't automatically add the service account to it: {exc}"
                     )
 
-                engine.log_audit_event(actor_email, actor_sub, "group.create", {
+                self._log_audit_event(actor_email, actor_sub, "group.create", {
                     "env_name": _local_env_name, "name": name, "visible_in_opa": True,
                     "group_id": (opa_group or {}).get("id"),
                 })
@@ -1079,7 +1103,7 @@ class Handler(SimpleHTTPRequestHandler):
                     return self._send_json(404, {"error": f"Unknown group id '{group_id}'"})
                 me = local_client.get_current_user()
                 local_client.add_user_to_group(group["name"], me["name"])
-                engine.log_audit_event(actor_email, actor_sub, "service_account.join_group", {
+                self._log_audit_event(actor_email, actor_sub, "service_account.join_group", {
                     "env_name": _local_env_name, "group_id": group_id,
                 })
                 return self._send_json(200, {"added": True, "group_id": group_id})
@@ -1093,7 +1117,7 @@ class Handler(SimpleHTTPRequestHandler):
                     for row in rows:
                         writer.writerow({"path": row.get("path", ""), "description": row.get("description", "")})
                 print(f"Saved {len(rows)} row(s) to {csv_path.name}")
-                engine.log_audit_event(actor_email, actor_sub, "csv.save", {
+                self._log_audit_event(actor_email, actor_sub, "csv.save", {
                     "file": csv_path.name, "row_count": len(rows),
                 })
                 return self._send_json(200, {"saved": True, "file": csv_path.name, "row_count": len(rows)})
@@ -1130,7 +1154,7 @@ class Handler(SimpleHTTPRequestHandler):
                 output_path = PROJECT_ROOT / f"folders_result_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
                 engine.write_results_csv(output_path, results)
                 print(f"Execute complete: results written to {output_path.name}")
-                engine.log_audit_event(actor_email, actor_sub, "folders.execute", {
+                self._log_audit_event(actor_email, actor_sub, "folders.execute", {
                     "env_name": _local_env_name, "resource_group_id": rg_id, "project_id": proj_id,
                     "output_file": output_path.name, "folder_count": len(results),
                 })
@@ -1198,7 +1222,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if was_active:
                     with _sessions_lock:
                         _sessions.pop(owner_key, None)
-                engine.log_audit_event(actor_email, actor_sub, "environment.delete", {"name": name, "admin_override": is_admin})
+                self._log_audit_event(actor_email, actor_sub, "environment.delete", {"name": name, "admin_override": is_admin})
                 return self._send_json(200, {"deleted": name})
 
             if (path.startswith("/api/resource_groups/") and "/projects/" in path
@@ -1222,7 +1246,7 @@ class Handler(SimpleHTTPRequestHandler):
                                  "remove or move its contents first, then delete it."
                     })
                 local_client.delete_folder(rg_id, proj_id, folder_id)
-                engine.log_audit_event(actor_email, actor_sub, "folder.delete", {
+                self._log_audit_event(actor_email, actor_sub, "folder.delete", {
                     "env_name": local_env_name, "resource_group_id": rg_id, "project_id": proj_id,
                     "folder_id": folder_id,
                 })
@@ -1240,7 +1264,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if not group:
                     return self._send_json(404, {"error": f"Unknown group id '{group_id}'"})
                 local_client.remove_user_from_group(group["name"], user_name)
-                engine.log_audit_event(actor_email, actor_sub, "group.remove_member", {
+                self._log_audit_event(actor_email, actor_sub, "group.remove_member", {
                     "env_name": local_env_name, "group_id": group_id, "user_name": user_name,
                 })
                 return self._send_json(200, {"removed": True, "group_id": group_id, "user_name": user_name})

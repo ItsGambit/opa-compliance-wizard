@@ -130,6 +130,25 @@ PROJECT_OKTA_UD_ACCOUNTS_PATH = PROJECTS_PATH + "/{project_id}/okta_universal_di
 # collection shape as the three siblings above.
 PROJECT_ACTIVE_DIRECTORY_ACCOUNTS_PATH = PROJECTS_PATH + "/{project_id}/active_directory_accounts"
 PROJECT_DATABASE_ACCOUNTS_PATH = PROJECTS_PATH + "/{project_id}/database_accounts"
+# Confirmed live 2026-09-30 -- a SEPARATE access-grant mechanism from
+# security policies (AccessPolicy/PolicyRule): a "relationship" is a named
+# grant type (e.g. "Service Account Users"), and an "assignment" links one
+# relationship to a principal (a real user_group in this tenant) plus the
+# specific resource(s) it grants (e.g. one SaaS service account). Both are
+# tenant-wide -- no resource_group_id in the real response, unlike every
+# per-project resource above.
+ASSIGNMENTS_PATH = "/v1/teams/{team}/assignments"
+RELATIONSHIPS_PATH = "/v1/teams/{team}/relationships"
+# Confirmed live 2026-09-30 -- explains WHY an individual AD account (e.g.
+# a1ruchir.parikh@usp.atkoepd.com) exists as a discovered resource at all:
+# an AD connection's discovery `rules` (OU-scoped SHARED/INDIVIDUAL scans)
+# plus its `rule_settings` (matching_criteria -- which real Okta user
+# fields it matches by, e.g. username -- and partial_matching_criteria,
+# e.g. "STARTS WITH a1") together are the real config that produced the
+# match. No database-connection equivalent exists (confirmed live via a
+# real 404 on the analogous path) -- this is AD-only.
+AD_CONNECTION_RULES_PATH = "/v1/teams/{team}/resource_assignment/active_directory/{ad_connection_id}/rules"
+AD_CONNECTION_RULE_SETTINGS_PATH = "/v1/teams/{team}/resource_assignment/active_directory/{ad_connection_id}/rule_settings"
 
 FIELD_TYPE = "type"
 TYPE_FOLDER = "folder"
@@ -805,13 +824,22 @@ def _audit_log_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit_log.jsonl")
 
 
-def log_audit_event(actor_email, actor_sub, action, details=None):
+def log_audit_event(actor_email, actor_sub, action, details=None, client_ip=None, user_agent=None):
+    """client_ip/user_agent are new as of 2026-09-30 (Okta's own System
+    Log always captures both; this log never did) -- optional so every
+    existing call site keeps working unchanged until updated to pass
+    them. Older entries in audit_log.jsonl predate these fields entirely
+    (not backfilled -- there's no real data to backfill, since neither
+    was ever captured) and simply won't have the keys; read_audit_log's
+    callers should treat a missing key the same as an explicit None."""
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "actor_email": actor_email,
         "actor_sub": actor_sub,
         "action": action,
         "details": details or {},
+        "client_ip": client_ip,
+        "user_agent": user_agent,
     }
     line = json.dumps(entry, separators=(",", ":"))
     with _audit_log_lock:
@@ -1343,6 +1371,50 @@ class OpaClient:
             team=self.team_name, resource_group_id=resource_group_id, project_id=project_id
         )
         return self._list(path)
+
+    def list_assignments(self):
+        """Confirmed live 2026-09-30, tenant-wide -- links a relationship
+        (see list_relationships) to a principal (a real user_group in this
+        tenant) plus the specific resource(s) it grants. See
+        ASSIGNMENTS_PATH's docstring.
+
+        REAL GOTCHA confirmed live: this list response's
+        `resource_assignments` is always null and `relationship_assignments`
+        is absent entirely -- only get_assignment (the per-item detail
+        fetch) has the real data. Never rely on this list alone for
+        resolving what an assignment actually grants."""
+        path = ASSIGNMENTS_PATH.format(team=self.team_name)
+        return self._list(path)
+
+    def get_assignment(self, assignment_id):
+        """The per-item detail fetch -- see list_assignments' docstring for
+        why this is required (the list endpoint alone omits
+        resource_assignments/relationship_assignments)."""
+        path = f"{ASSIGNMENTS_PATH.format(team=self.team_name)}/{assignment_id}"
+        return self.request("GET", path)
+
+    def list_relationships(self):
+        """Confirmed live 2026-09-30, tenant-wide -- see
+        RELATIONSHIPS_PATH's docstring. An assignment's own embedded
+        `relationships[]` is a stripped-down ref (id/name/type only); this
+        is the full object."""
+        path = RELATIONSHIPS_PATH.format(team=self.team_name)
+        return self._list(path)
+
+    def get_ad_connection_rules(self, ad_connection_id):
+        """Confirmed live 2026-09-30 -- one AD connection's discovery rules
+        (SHARED/INDIVIDUAL, OU-scoped). Plain list fetch, not paginated in
+        practice for a real tenant's AD connection count, but uses _list
+        for consistency with every other collection endpoint."""
+        path = AD_CONNECTION_RULES_PATH.format(team=self.team_name, ad_connection_id=ad_connection_id)
+        return self._list(path)
+
+    def get_ad_connection_rule_settings(self, ad_connection_id):
+        """Confirmed live 2026-09-30 -- a single object (is_configured/
+        matching_criteria/partial_matching_criteria/allow_partial_matches),
+        not a collection -- plain GET, not _list."""
+        path = AD_CONNECTION_RULE_SETTINGS_PATH.format(team=self.team_name, ad_connection_id=ad_connection_id)
+        return self.request("GET", path)
 
     def list_folders(self, resource_group_id, project_id):
         """TOP-LEVEL (root) folders only -- despite its name, this endpoint
@@ -2016,6 +2088,56 @@ def _resolve_selector_entry(resource_type, selector_type, selector, indexes):
     return {"kind": "condition", "description": describe_dynamic_selector(resource_type, selector_type, selector)}
 
 
+# One entry per real resource_assignments key seen live -- (id_field,
+# name_field) into a resolved {"kind":"resolved", ...} entry. Deliberately
+# a lookup table, not a hardcoded single-kind assumption: confirmed live
+# against BOTH patlabs (saas_app_account_assignments) and dev
+# (secret_or_folder_assignments) that this "this is a new feature, we'll
+# see more of this" -- new kinds are expected to keep appearing. An
+# unrecognized future key still resolves generically (see
+# _resolve_relationship_assignment_resources below) rather than being
+# silently dropped.
+_RELATIONSHIP_ASSIGNMENT_ID_NAME_FIELDS = {
+    # Confirmed live 2026-09-30 (patlabs) -- privileged_resource_id is the
+    # SaaS account's real System Log-tracking id (same field this
+    # codebase already relies on elsewhere for SaaS accounts -- see
+    # RESOURCE_ACCESS_EVENT_TYPES' access_tracking_id precedent).
+    "saas_app_account_assignments": ("privileged_resource_id", "account_name"),
+    # Confirmed live 2026-09-30 (dev) -- a secret OR secret_folder grant,
+    # distinguished by the item's own "type" field, not this dict key.
+    "secret_or_folder_assignments": ("id", "name"),
+}
+
+
+def _resolve_relationship_assignment_resources(resource_assignments):
+    """Resolves one assignment's `resource_assignments` (confirmed live to
+    vary in shape by which real resource kind was granted -- see
+    _RELATIONSHIP_ASSIGNMENT_ID_NAME_FIELDS above) into the same
+    {"kind": "resolved", ...} shape _resolve_selector_entry already
+    produces for ordinary policy-rule selectors, so the frontend renders
+    both identically with zero special-casing. Generic over unrecognized
+    future keys (falls back to whatever "id"/"name" fields the item
+    happens to have) rather than dropping them."""
+    if not resource_assignments:
+        return []
+    out = []
+    for key, items in resource_assignments.items():
+        id_field, name_field = _RELATIONSHIP_ASSIGNMENT_ID_NAME_FIELDS.get(key, ("id", "name"))
+        # secret_or_folder_assignments distinguishes secret vs. secret_folder
+        # via the item's own "type" field (confirmed live) -- fall back to
+        # the dict key itself for any kind with no such field.
+        for item in items or []:
+            inner_kind = item.get("type") or key
+            out.append({
+                "kind": "resolved",
+                "id": item.get(id_field),
+                "name": item.get(name_field),
+                "resource_kind": f"relationship_assignment:{inner_kind}",
+                "project_id": None, "project_name": None, "resource_group_id": None,
+            })
+    return out
+
+
 def _resolve_rule(rule, indexes):
     resource_type = rule.get("resource_type")
     entries = (rule.get("resource_selector") or {}).get("selectors") or []
@@ -2647,11 +2769,46 @@ def build_access_model(client, on_progress=None):
     database_connections = client.list_database_connections()
     saas_app_connections = client.list_saas_app_connections()
     active_directory_connections = client.list_active_directory_connections()
+    # Assignments/relationships are ALSO tenant-wide (confirmed live
+    # 2026-09-30 -- no resource_group_id in the real response). NOT a
+    # separate access-grant mechanism from security policies -- confirmed
+    # live (see ASSIGNMENTS_PATH/RELATIONSHIPS_PATH docstrings): a policy
+    # with a non-empty `relationships[]` field uses this as an ALTERNATE
+    # way to specify both its principal and its resource target, in place
+    # of the ordinary principals/resource_selector fields every other
+    # policy uses. list_assignments()'s own response omits the real
+    # resource_assignments/relationship_assignments data (confirmed live
+    # -- always null/absent on the list endpoint), so each assignment's
+    # detail must be fetched individually; real tenants have very few of
+    # these (a curated admin config, not a high-cardinality resource), so
+    # this doesn't scale badly even as the feature grows.
+    assignment_summaries = client.list_assignments()
+    assignments = [client.get_assignment(a["id"]) for a in assignment_summaries if a.get("id")]
+    relationships = client.list_relationships()
+    # relationship id -> LIST of (assignment, its matching
+    # relationship_assignment) pairs -- built once here, used by the
+    # policy-resolution loop below. MUST be one-to-MANY: confirmed live
+    # against the dev tenant that the SAME relationship (e.g.
+    # "TDI_Safe_Owners") is reused across multiple real assignments
+    # (Xactly-Prod, TDI-Root-Admin, AvalaraFloQast-Prod), each with a
+    # DIFFERENT principal group and a DIFFERENT granted secret/folder --
+    # a real policy referencing that one relationship effectively grants
+    # ALL of those groups access to ALL of those resources, not just one.
+    # A one-to-one dict here would silently drop every assignment but the
+    # last for a shared relationship -- caught before shipping by probing
+    # the dev environment specifically for this multi-assignment case.
+    assignments_by_relationship_id = {}
+    for assignment in assignments:
+        for ra in assignment.get("relationship_assignments") or []:
+            rel_id = (ra.get("relationship") or {}).get("id")
+            if rel_id:
+                assignments_by_relationship_id.setdefault(rel_id, []).append((assignment, ra))
     _report(on_progress, "workload_roles", "done",
             f"{len(workload_roles)} workload role(s), {len(workload_connections)} workload connection(s), "
             f"{len(gateways)} gateway(s), {len(database_connections)} database connection(s), "
             f"{len(saas_app_connections)} SaaS app connection(s), "
-            f"{len(active_directory_connections)} AD connection(s)")
+            f"{len(active_directory_connections)} AD connection(s), "
+            f"{len(assignments)} assignment(s), {len(relationships)} relationship(s)")
 
     _report(on_progress, "projects", "start")
     projects_by_rg = [(rg, client.list_projects(rg["id"])) for rg in resource_groups]
@@ -2765,8 +2922,60 @@ def build_access_model(client, on_progress=None):
     _report(on_progress, "resolve", "start")
     policies_out = []
     for policy in all_policies:
+        # Relationship-based policy (confirmed live 2026-09-30 -- see
+        # ASSIGNMENTS_PATH's docstring): a policy with a non-empty
+        # `relationships[]` uses this as an ALTERNATE way to specify both
+        # its principal and its resource target, replacing the ordinary
+        # principals/resource_selector fields every other policy uses.
+        # Every OTHER real policy (confirmed: 15 of 16 on patlabs, 13 of
+        # 15 on dev) has an EMPTY relationships field and is completely
+        # unaffected -- effective_principals/relationship_resolutions stay
+        # None for those, and the code below falls through to the
+        # existing behavior unchanged.
+        policy_relationships = policy.get("relationships") or []
+        effective_principals = None
+        relationship_resolutions = []
+        if policy_relationships:
+            # ONE-TO-MANY: confirmed live against the dev tenant that the
+            # SAME relationship is reused across multiple real assignments
+            # (e.g. "TDI_Safe_Owners" spans 3 assignments, each with a
+            # different principal group and a different granted resource)
+            # -- collect every matching (assignment, relationship_assignment)
+            # pair across every relationship this policy references, not
+            # just the first/last match.
+            matches = []
+            for rel_ref in policy_relationships:
+                matches.extend(assignments_by_relationship_id.get(rel_ref.get("id"), []))
+            if matches:
+                seen_principal_ids = set()
+                effective_principals_list = []
+                for assignment, ra in matches:
+                    principal = ra.get("principal") or {}
+                    if principal.get("id") and principal["id"] not in seen_principal_ids:
+                        seen_principal_ids.add(principal["id"])
+                        effective_principals_list.append(principal)
+                    relationship_resolutions.extend(
+                        _resolve_relationship_assignment_resources(assignment.get("resource_assignments"))
+                    )
+                # Matches this codebase's existing principals shape
+                # (user_groups is a plain list of {id,name,type} refs) --
+                # workload_roles stays empty since every real
+                # relationship_assignment principal seen live is a
+                # user_group, never a workload_role.
+                effective_principals = {"user_groups": effective_principals_list, "workload_roles": []}
+
         rules_out = []
         for rule in policy.get("rules", []):
+            resolutions = _resolve_rule(rule, indexes)
+            # A relationship-based policy's rule has an EMPTY
+            # resource_selector (confirmed live -- the real grant comes
+            # from the assignment instead), so _resolve_rule's own
+            # fallback would show a bare condition description with no
+            # real resource attached. Splice in the real resolved
+            # resource(s) from the matching assignment(s) instead, when
+            # any were found.
+            if relationship_resolutions:
+                resolutions = relationship_resolutions
             rules_out.append({
                 "name": rule.get("name"),
                 "resource_type": rule.get("resource_type"),
@@ -2776,7 +2985,7 @@ def build_access_model(client, on_progress=None):
                     for p in rule.get("privileges", [])
                 ],
                 "conditions": rule.get("conditions", []),
-                "resolutions": _resolve_rule(rule, indexes),
+                "resolutions": resolutions,
             })
         policies_out.append({
             "id": policy.get("id"),
@@ -2785,7 +2994,7 @@ def build_access_model(client, on_progress=None):
             "active": policy.get("active", False),
             "type": policy.get("type"),
             "resource_group": policy.get("resource_group"),
-            "principals": policy.get("principals", {}),
+            "principals": effective_principals if effective_principals is not None else policy.get("principals", {}),
             "rules": rules_out,
         })
     _report(on_progress, "resolve", "done", f"{len(policies_out)} polic(ies) resolved")
@@ -2807,6 +3016,22 @@ def build_access_model(client, on_progress=None):
         "database_connections": database_connections,
         "saas_app_connections": saas_app_connections,
         "active_directory_connections": active_directory_connections,
+        "assignments": assignments,
+        "relationships": relationships,
+    }
+
+
+def get_ad_connection_discovery_config(client, ad_connection_id):
+    """On-demand fetch (NOT part of build_access_model's bootstrap -- see
+    module notes above for the same reasoning find_last_access_for_user
+    already uses for per-user resource access: not worth fetching this for
+    every AD connection up front when only one is being looked at at a
+    time) of one AD connection's discovery configuration -- explains WHY
+    an individual AD account got discovered/matched at all. See
+    AD_CONNECTION_RULES_PATH's docstring."""
+    return {
+        "rules": client.get_ad_connection_rules(ad_connection_id),
+        "rule_settings": client.get_ad_connection_rule_settings(ad_connection_id),
     }
 
 
