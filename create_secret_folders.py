@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.22.1
+# Version     : 5.23.0
 # =============================================================================
 
 import argparse
@@ -77,7 +77,7 @@ import urllib.request
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.22.1"
+SCRIPT_VERSION = "5.23.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -488,6 +488,51 @@ def set_banner_config(enabled, message, variant, dismissible):
         raise ValueError("message is required when the banner is enabled")
     config = {"enabled": bool(enabled), "message": message, "variant": variant, "dismissible": bool(dismissible)}
     with open(_banner_config_path(), "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Access control (Okta admin/user group IDs for the login gate)
+# ---------------------------------------------------------------------------
+# Read by server/auth_gate.py (a separate process -- see its own module
+# docstring) to decide who may log in at all and who gets admin rights,
+# once an admin has saved settings here via POST /api/access_control/save.
+# Before that first save, auth_gate.py falls back to its own OKTA_ADMIN_GROUP_ID
+# env var with restrict_login=False, so a fresh deployment never locks anyone
+# out by default. This module is the sole writer of this file -- auth_gate.py
+# only ever reads it, avoiding any dual-writer race between the two processes.
+_ACCESS_CONTROL_DEFAULTS = {"admin_group_id": None, "user_group_id": None, "restrict_login": False}
+
+
+def _access_control_file_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "access_control.json")
+
+
+def get_access_control_config():
+    path = _access_control_file_path()
+    if not os.path.isfile(path):
+        return dict(_ACCESS_CONTROL_DEFAULTS)
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return {
+        "admin_group_id": data.get("admin_group_id") or None,
+        "user_group_id": data.get("user_group_id") or None,
+        "restrict_login": bool(data.get("restrict_login", False)),
+    }
+
+
+def set_access_control_config(admin_group_id, user_group_id, restrict_login):
+    admin_group_id = (admin_group_id or "").strip() or None
+    user_group_id = (user_group_id or "").strip() or None
+    if restrict_login and not admin_group_id and not user_group_id:
+        raise ValueError("at least one group ID is required to restrict login")
+    config = {
+        "admin_group_id": admin_group_id,
+        "user_group_id": user_group_id,
+        "restrict_login": bool(restrict_login),
+    }
+    with open(_access_control_file_path(), "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
     return config
 

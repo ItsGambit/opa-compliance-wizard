@@ -19,6 +19,11 @@ audit_log.jsonl
 # not something to ship in the repo template
 banner_config.json
 
+# Admin-configured Okta group IDs for the login gate (see
+# engine.get/set_access_control_config) -- deployment-specific Okta group
+# IDs, not something to ship in the repo template
+access_control.json
+
 # Compliance reporting dashboard's Okta+OPA audit archive (see
 # audit_store.py) -- real ingested tenant event history, plus SQLite's
 # own WAL/journal sidecar files, all deployment-specific local instance

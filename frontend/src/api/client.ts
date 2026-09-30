@@ -1,4 +1,5 @@
 import type {
+  AccessControlConfig,
   AccessModel,
   AdConnectionDiscoveryConfig,
   ApiErrorBody,
@@ -64,6 +65,17 @@ export function fetchBanner(): Promise<BannerConfig> {
 
 export function saveBanner(config: BannerConfig): Promise<BannerConfig> {
   return apiFetch('/api/banner', { method: 'POST', body: JSON.stringify(config) })
+}
+
+export function fetchAccessControl(): Promise<AccessControlConfig> {
+  return apiFetch('/api/access_control')
+}
+
+// Reachable only right after a completed step-up (fresh MFA) redirect --
+// see AccessControlDialog.tsx's save flow and nginx's dedicated
+// auth_request /verify_stepup gate on this exact path.
+export function saveAccessControl(config: AccessControlConfig): Promise<AccessControlConfig> {
+  return apiFetch('/api/access_control/save', { method: 'POST', body: JSON.stringify(config) })
 }
 
 export function saveEnvironment(values: EnvironmentFormValues): Promise<{ activated: boolean; active: string }> {

@@ -638,10 +638,50 @@ logged, by anyone. To set this up:
    right choice for a real deployment -- reusing a broader admin token
    works too but widens the blast radius if this process or its stored
    credential were ever compromised.
-3. Restart `opa-auth-gate.service` to pick up the new/changed env var
-   and token. Admin status is computed once at login (carried for the
-   life of the session, same as your identity/email) -- a group
-   membership change takes effect on the next login, not instantly.
+3. `OKTA_ADMIN_GROUP_ID` is only a **bootstrap default** now -- it's used
+   as-is (with no user group, and login open to any authenticated Okta
+   user) only until an admin saves real settings via the dashboard's new
+   **Access control** panel (sidebar, admin-only), described next. No
+   restart is needed for a group ID saved through that panel to take
+   effect -- it's read fresh on every login. The env var still needs to
+   be set for first boot, before anyone has admin rights to open that
+   panel at all (chicken-and-egg).
+
+**Restricting who can log in at all (User Group), and changing either
+group ID from the dashboard.** Beyond admin rights, a second Okta group
+("User Group") can be required for login itself -- open the **Access
+control** panel (sidebar, admin-only) to set:
+- **Admin Group ID** -- same group as above, now editable here instead
+  of only via the env var.
+- **User Group ID** -- a second Okta group; members get ordinary
+  (non-admin) access.
+- **Restrict login to these groups** -- off by default. When off (the
+  safe default for a fresh deployment), any authenticated Okta user can
+  log in, same as always -- only admin rights are gated. When on, anyone
+  in *neither* group is denied at login with a clear message, not just
+  denied admin rights. Turn this on only after confirming real users are
+  actually covered by one of the two groups, since flipping it on with
+  an empty/wrong User Group ID would lock out every non-admin user on
+  their next login.
+
+Saving a change in this panel requires completing a **fresh Okta MFA
+challenge immediately before the save** -- clicking Save redirects you
+through Okta again (even if you're already logged in) to prove you, right
+now, still control this identity, then returns you to the dashboard to
+finish saving. This is a real Okta Identity Engine step-up request
+(`max_age=0` + `acr_values=urn:okta:loa:2fa:any`) -- **it depends on your
+OIDC app's own Authentication Policy actually permitting/requiring a
+second factor.** If that policy doesn't, Okta may silently satisfy the
+step-up from your existing session without ever prompting for MFA; check
+this in the Okta Admin Console (Security -> Authentication Policies) if
+step-up doesn't seem to be challenging you. Every save is logged as
+`access_control.update` with a `step_up_verified: true` marker, alongside
+the usual `admin_override` marker convention for admin actions.
+
+As with the admin-group check, a change to either group ID or to
+`restrict_login` takes effect on each affected user's next login/session
+refresh, not instantly -- same accepted tradeoff this project has always
+had for the admin-group check.
 
 Every admin override action is logged with an `admin_override: true`
 marker, so an admin's own activity is just as visible in the audit
@@ -907,16 +947,38 @@ already exists is skipped, not duplicated.
 
 ## Version
 
-5.22.1 — **Fixed a mobile layout bug** in the 5.22.0 mobile pass: the
-Compliance Reports card grid stayed two-column below tablet width, so
-each card's event count overlapped its own description text. Also fixes
-a desktop regression from the same release, where the sidebar briefly
-rendered both a permanent icon rail *and* the full labeled panel at once
-(widening the sidebar) instead of one column that toggles between the
-two — replaced with a real collapse/expand toggle, persisted across
-reloads. See the changelog entries below for the full breakdown.
+5.23.0 — **A second Okta group can now restrict who's allowed to log in
+at all**, not just who gets admin rights, and both group IDs are
+editable from a new admin-only Access Control panel in the dashboard
+instead of only via a systemd env var + manual restart. Saving a change
+there requires a fresh Okta MFA challenge (step-up), completed right
+before the save. See the changelog entry below for the full breakdown.
 
 ### Changelog
+- **5.23.0**:
+  - **New: User Group + "Restrict login to these groups."** Previously,
+    `OKTA_ADMIN_GROUP_ID` only gated admin *rights* — any authenticated
+    Okta user in the org could log in and get non-admin access, with no
+    way to restrict that. A new User Group ID, combined with a
+    restrict-login toggle (off by default, so a fresh deployment never
+    locks anyone out), lets an admin require membership in either group
+    just to log in at all. See "Admin access" for the full setup.
+  - **New: Access Control panel (sidebar, admin-only)** — both group IDs,
+    and the restrict-login toggle, are now editable from the dashboard
+    itself instead of only via `/etc/opa-compliance-wizard.env` +
+    `systemctl restart opa-auth-gate` (no restart needed at all now — a
+    saved change is read fresh on the very next login).
+    `OKTA_ADMIN_GROUP_ID` becomes a first-boot bootstrap default only.
+  - **New: step-up MFA required to save Access Control changes.**
+    Clicking Save redirects through Okta again (Identity Engine's
+    `max_age=0` + `acr_values=urn:okta:loa:2fa:any`) to prove a fresh
+    second factor was just completed, before the save is accepted — a
+    genuinely new interaction pattern for this app (previously every
+    "dangerous action" was a plain inline confirm, never a re-auth step).
+    Depends on the OIDC app's own Authentication Policy actually
+    permitting/requiring MFA; see "Admin access" for the caveat. Every
+    save is logged with a `step_up_verified: true` marker alongside the
+    usual `admin_override` convention.
 - **5.22.1**:
   - **Fixed: Compliance Reports card grid broke below tablet width.**
     `grid-cols-2` was unconditional, so each card had too little room for

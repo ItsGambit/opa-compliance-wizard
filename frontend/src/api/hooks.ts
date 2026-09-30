@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import {
+  fetchAccessControl,
   fetchAdConnectionDiscoveryConfig,
   fetchBanner,
   fetchCsvFiles,
@@ -35,6 +36,17 @@ export function useBanner() {
     // useWhoami/useVersion above) -- unlike identity/version, a banner is
     // meant to change while the page is already open (an admin flips it
     // on mid-incident) and should show up without a manual reload.
+  })
+}
+
+export function useAccessControl(enabled: boolean) {
+  return useQuery({
+    queryKey: ['access_control'],
+    queryFn: fetchAccessControl,
+    // Only ever opened by an admin from the dialog -- gated by `enabled`
+    // (React Query's own conditional-fetch flag) so a non-admin's browser
+    // never even attempts this admin-only request in the background.
+    enabled,
   })
 }
 

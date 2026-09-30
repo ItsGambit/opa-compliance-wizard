@@ -1,6 +1,10 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useEnvironments, useWhoami } from './api/hooks'
+import { saveAccessControl } from './api/client'
+import { toast } from './hooks/useToast'
 import { AboutDialog } from './components/AboutDialog'
+import { AccessControlDialog, PENDING_SAVE_KEY } from './components/AccessControlDialog'
 import { AccessExplorer, ACCESS_SUB_TABS } from './components/AccessExplorer'
 import { AnnouncementBanner } from './components/AnnouncementBanner'
 import { AuditLogPage } from './components/AuditLogPage'
@@ -13,6 +17,7 @@ import { FolderBuilder } from './components/FolderBuilder'
 import { SecretsAccessDashboard } from './components/SecretsAccessDashboard'
 import { REPORTS_SUB_TABS, SideNav } from './components/SideNav'
 import { UserMenu } from './components/UserMenu'
+import type { AccessControlConfig } from './types'
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('reports')
@@ -20,10 +25,45 @@ export default function App() {
   const [reportsSubTab, setReportsSubTab] = useState(REPORTS_SUB_TABS[0].value)
   const [environmentsOpen, setEnvironmentsOpen] = useState(false)
   const [bannerOpen, setBannerOpen] = useState(false)
+  const [accessControlOpen, setAccessControlOpen] = useState(false)
   const [aboutOpen, setAboutOpen] = useState(false)
   const { data: environments, isLoading: environmentsLoading } = useEnvironments()
   const { data: whoami } = useWhoami()
   const isConfigured = !!environments?.active
+  const queryClient = useQueryClient()
+
+  // Completes the Access Control save flow after the browser comes back
+  // from Okta's step-up (fresh MFA) redirect -- see
+  // AccessControlDialog.tsx's Save button, which stashed the pending
+  // values here and navigated away before this component could catch the
+  // response itself. Runs once per completed step-up, not on every render:
+  // the effect strips both the query param AND the sessionStorage entry
+  // immediately, so a page refresh afterward can't accidentally replay it.
+  const finishStepUpMutation = useMutation({
+    mutationFn: (values: AccessControlConfig) => saveAccessControl(values),
+    onSuccess: () => {
+      toast({ title: 'Access control settings saved', variant: 'success' })
+      queryClient.invalidateQueries({ queryKey: ['access_control'] })
+    },
+    onError: (err: Error) => toast({ title: 'Could not save access control settings', description: err.message, variant: 'error' }),
+  })
+
+  useEffect(() => {
+    const url = new URL(window.location.href)
+    if (url.searchParams.get('stepup_complete') !== '1') return
+    url.searchParams.delete('stepup_complete')
+    window.history.replaceState({}, '', url.toString())
+
+    const pendingRaw = sessionStorage.getItem(PENDING_SAVE_KEY)
+    sessionStorage.removeItem(PENDING_SAVE_KEY)
+    if (!pendingRaw) return
+    try {
+      finishStepUpMutation.mutate(JSON.parse(pendingRaw) as AccessControlConfig)
+    } catch {
+      toast({ title: 'Could not save access control settings', description: 'The pending change was lost — please try again.', variant: 'error' })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   if (environmentsLoading) {
     return (
@@ -63,6 +103,7 @@ export default function App() {
           onOpenEnvironments={() => setEnvironmentsOpen(true)}
           isAdmin={whoami?.is_admin}
           onOpenBanner={() => setBannerOpen(true)}
+          onOpenAccessControl={() => setAccessControlOpen(true)}
           onOpenAbout={() => setAboutOpen(true)}
         />
 
@@ -114,6 +155,7 @@ export default function App() {
         isAdmin={whoami?.is_admin}
       />
       <BannerSettingsDialog open={bannerOpen} onOpenChange={setBannerOpen} />
+      <AccessControlDialog open={accessControlOpen} onOpenChange={setAccessControlOpen} />
       <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />
     </div>
   )

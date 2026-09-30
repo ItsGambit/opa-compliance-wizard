@@ -12,6 +12,7 @@ import {
   PanelLeftOpen,
   Search,
   Settings,
+  ShieldCheck,
   Sun,
 } from 'lucide-react'
 
@@ -79,13 +80,18 @@ interface Props {
   reportsSubTab: string
   onReportsSubTabChange: (value: string) => void
   onOpenEnvironments: () => void
-  // Gates whether the Audit Log top-level nav item renders at all -- a
-  // non-admin viewer sees no trace of an audit log existing, matching the
-  // previous dialog's own admin gate (converted from a modal popup to a
-  // full page 2026-09-30, per user feedback that it deserved the same
-  // real-page treatment as Compliance Reports).
+  // Gates whether the Audit Log top-level nav item AND the Access Control
+  // utility pill render at all -- a non-admin viewer sees no trace of
+  // either existing, matching the Audit Log page's own admin gate
+  // (converted from a modal popup to a full page 2026-09-30, per user
+  // feedback that it deserved the same real-page treatment as Compliance
+  // Reports). Access Control follows that SAME gated pattern deliberately
+  // -- NOT the ungated Announcement Banner pill just below it -- since
+  // these are the Okta group IDs that control login/admin rights for
+  // every user, not a cosmetic org-wide notice.
   isAdmin?: boolean
   onOpenBanner: () => void
+  onOpenAccessControl: () => void
   onOpenAbout: () => void
 }
 
@@ -206,6 +212,7 @@ export function SideNav({
   onOpenEnvironments,
   isAdmin,
   onOpenBanner,
+  onOpenAccessControl,
   onOpenAbout,
 }: Props) {
   const { theme, toggle } = useTheme()
@@ -346,6 +353,9 @@ export function SideNav({
             now, not a dialog trigger. */}
         <div className="flex flex-col gap-1 pt-2 border-t border-border-sub">
           <UtilityPill label="Environments" icon={Settings} onClick={() => { onOpenEnvironments(); closeDrawer() }} collapsed={collapsed} />
+          {isAdmin && (
+            <UtilityPill label="Access control" icon={ShieldCheck} onClick={() => { onOpenAccessControl(); closeDrawer() }} collapsed={collapsed} />
+          )}
           <UtilityPill label="Announcement banner" icon={Megaphone} onClick={() => { onOpenBanner(); closeDrawer() }} collapsed={collapsed} />
           <UtilityPill label="About" icon={Info} onClick={() => { onOpenAbout(); closeDrawer() }} collapsed={collapsed} />
           <UtilityPill

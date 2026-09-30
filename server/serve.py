@@ -805,6 +805,16 @@ class Handler(SimpleHTTPRequestHandler):
                 except ValueError:
                     return self._send_json(400, {"error": "limit/offset must be integers"})
                 return self._send_json(200, {"entries": engine.read_audit_log(limit=limit, offset=offset)})
+
+            if path == "/api/access_control":
+                # Admin-only read, same shape as /api/audit_log just above
+                # (including the local-mode exemption) -- these are the
+                # Okta group IDs that gate login/admin rights for EVERY
+                # user, not a per-owner setting, so a non-admin has no
+                # legitimate reason to see (let alone change) them.
+                if owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers(self.headers):
+                    return self._send_json(403, {"error": "Admin access required to view access control settings."})
+                return self._send_json(200, engine.get_access_control_config())
         except ValueError as exc:
             return self._send_json(400, {"error": str(exc)})
         except (engine.OpaApiError, engine.OktaApiError) as exc:
@@ -842,6 +852,33 @@ class Handler(SimpleHTTPRequestHandler):
                     payload.get("dismissible", True),
                 )
                 self._log_audit_event(actor_email, actor_sub, "banner.update", config)
+                return self._send_json(200, config)
+
+            if path == "/api/access_control/save":
+                # Admin check here too, in addition to nginx's own
+                # auth_request /verify_stepup gate on this exact path (see
+                # nginx-opa-secrets-wizard.conf) -- same defense-in-depth
+                # double-check this project already does for every other
+                # admin action (e.g. environment.upsert's is_admin check
+                # just below still runs even though /api/environments has
+                # no nginx-level admin gate of its own). A direct/local run
+                # (no login gate in front at all) is exempt, same as
+                # /api/audit_log and GET /api/access_control above.
+                if owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers(self.headers):
+                    return self._send_json(403, {"error": "Admin access required to change access control settings."})
+                config = engine.set_access_control_config(
+                    payload.get("admin_group_id"),
+                    payload.get("user_group_id"),
+                    payload.get("restrict_login", False),
+                )
+                # step_up_verified is always true here -- nginx physically
+                # cannot route a request to this path without a fresh,
+                # unexpired step-up cookie (see /verify_stepup); recorded
+                # explicitly anyway so the audit trail itself documents that
+                # this specific change was MFA-gated, not just admin-gated,
+                # matching this project's existing admin_override: true
+                # marker convention for admin-override actions.
+                self._log_audit_event(actor_email, actor_sub, "access_control.update", {**config, "step_up_verified": True})
                 return self._send_json(200, config)
 
             if path == "/api/environments":

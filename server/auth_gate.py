@@ -17,13 +17,35 @@ Runs standalone on 127.0.0.1:8767, fronted by nginx's auth_request module
 (see server/nginx-opa-secrets-wizard.conf):
   - GET  /login                          -> starts Authorization Code + PKCE,
                                              redirects to Okta's hosted login
+  - GET  /step-up                        -> same as /login, but adds
+                                             max_age=0 + acr_values (Identity
+                                             Engine step-up params -- see
+                                             _start_step_up) to force a fresh
+                                             MFA challenge regardless of the
+                                             existing Okta session. Used
+                                             before saving changes to the
+                                             Access Control group IDs (see
+                                             "Admin access" in the main
+                                             README) -- NOT for ordinary login.
   - GET  /authorization-code/callback    -> Okta redirects back here with
                                              ?code=...&state=...; exchanges
                                              the code for tokens, verifies the
-                                             ID token, sets the session cookie
+                                             ID token, then either completes
+                                             an ordinary login (sets the
+                                             session cookie) or, if this was
+                                             a /step-up flow, sets a
+                                             short-lived step-up cookie
+                                             instead (see _handle_callback's
+                                             purpose branch)
   - GET  /verify                         -> nginx auth_request target; 200 if
                                              the session cookie is valid, 401
-                                             otherwise
+                                             otherwise. With
+                                             ?require_stepup=1, ALSO requires
+                                             a valid, unexpired step-up
+                                             cookie matching the session's
+                                             sub -- used to gate the one
+                                             endpoint that saves Access
+                                             Control changes.
   - GET  /logout                         -> clears the local session cookie
                                              AND redirects through Okta's own
                                              logout endpoint (otherwise the
@@ -37,10 +59,11 @@ server-only secret in /etc/opa-secrets-wizard-session.key (root:rparikh,
 0640, generated once on first run). The PKCE code_verifier + OAuth `state`
 for an in-flight login are held in a short-lived signed cookie too (nothing
 server-side to garbage-collect), since this gate is a single Python process
-and doesn't need a shared session store.
+and doesn't need a shared session store. The step-up cookie (opa_wizard_
+stepup, STEPUP_TTL_SECONDS) uses the exact same signing scheme.
 
 Required environment variables (set via the systemd unit's EnvironmentFile,
-e.g. /etc/opa-secrets-wizard.env -- same file that already holds
+/etc/opa-compliance-wizard.env -- same file that already holds
 KEYRING_UNLOCK_PASSWORD; this process exits immediately at import time if
 any are missing, rather than silently pointing at a wrong/no org):
   OKTA_ORG_URL       e.g. https://your-org.oktapreview.com
@@ -49,13 +72,23 @@ any are missing, rather than silently pointing at a wrong/no org):
                        application" in the main README)
   DASHBOARD_ORIGIN   the public origin this dashboard is reachable at,
                      e.g. https://192.168.1.10 or https://opa.example.com
-  OKTA_ADMIN_GROUP_ID  the Okta GROUP ID (not name) whose members get
-                       admin/"see + manage every environment" rights in
-                       the dashboard -- see "Admin access" in the main
-                       README for how to create this group and find its
-                       ID. A group ID (not name) is required specifically
-                       so this check is one direct API call, not a
-                       name-to-id lookup on every single login.
+  OKTA_ADMIN_GROUP_ID  bootstrap-only default for the admin group ID --
+                       used verbatim (with no user group, restrict_login
+                       off) until an admin saves real settings via the
+                       dashboard's Access Control panel (POST
+                       /api/access_control/save, server/serve.py), at which
+                       point access_control.json (see
+                       create_secret_folders.py's get/set_access_control_
+                       config) becomes the sole source of truth and this
+                       env var is no longer consulted. Exists so a fresh
+                       deployment always has a working admin group from
+                       first boot, without requiring the dashboard to be
+                       used once (chicken-and-egg) before anyone can get
+                       admin rights to configure it via the UI. See "Admin
+                       access" in the main README for how to create an
+                       Okta group and find its ID -- a group ID (not name)
+                       is required so membership checks are one direct API
+                       call, never a name-to-id lookup.
   OKTA_ENV_NAME      (optional, defaults to "default") -- keyring service
                      suffix; client_secret AND the admin-group-check API
                      token (see below) are both resolved via the OS
@@ -77,6 +110,26 @@ project's other credentials use (create_secret_folders.py) -- this check
 must work for every logged-in user regardless of which environment(s)
 they've configured, so it can't depend on any one environment's own
 token existing at all.
+
+Login gate (restrict_login in access_control.json, off by default): once an
+admin sets a User Group ID and/or Admin Group ID and turns this on, anyone
+in NEITHER group is denied at the callback step (403, no session issued) --
+before that, any successfully-authenticated Okta user gets a session
+(non-admin unless in the admin group), same as always. Off by default so a
+fresh install, or one where nobody has configured a user group yet, never
+locks out real users the moment this ships. A group membership change
+(admin OR user group, and turning restrict_login on/off) takes effect on
+next login/session refresh, not instantly -- same accepted tradeoff as the
+existing admin-group check always had.
+
+Step-up MFA note (Okta IDENTITY ENGINE, not Classic -- the two engines use
+different /authorize parameters): _start_step_up sends max_age=0 (Classic
+uses 1) + acr_values=urn:okta:loa:2fa:any. This still depends on the OIDC
+app's own Authentication Policy (Identity Engine's App Sign-On Policy model)
+actually permitting/requiring a second factor for this app -- if it doesn't,
+Okta may silently satisfy the step-up from the existing session without ever
+prompting for MFA. Verify this in the Okta admin console; it cannot be set
+from this repo. See developer.okta.com/docs/guides/step-up-authentication.
 """
 
 import argparse
@@ -100,8 +153,8 @@ from jwt import PyJWKClient
 # app, which public origin this dashboard is reachable at -- so none of it
 # is hardcoded here; it's a real requirement, not a secret, and belongs in
 # each deployment's own config (this project's systemd unit sets it via
-# EnvironmentFile=/etc/opa-secrets-wizard.env, same file that already holds
-# KEYRING_UNLOCK_PASSWORD). No default is provided for any of these three --
+# EnvironmentFile=/etc/opa-compliance-wizard.env, same file that already
+# holds KEYRING_UNLOCK_PASSWORD). No default is provided for any of these three --
 # an operator MUST choose a real org/client/origin before this can run;
 # guessing a value here would silently point at nothing (or worse, a wrong
 # real org) rather than failing loudly and obviously at startup.
@@ -129,8 +182,39 @@ POST_LOGOUT_REDIRECT_URI = f"{DASHBOARD_ORIGIN}/login"
 SESSION_KEY_PATH = Path("/etc/opa-secrets-wizard-session.key")
 SESSION_COOKIE = "opa_wizard_session"
 FLOW_COOKIE = "opa_wizard_flow"
+STEPUP_COOKIE = "opa_wizard_stepup"
 SESSION_TTL_SECONDS = 12 * 60 * 60  # 12h -- re-login once a workday
 FLOW_TTL_SECONDS = 10 * 60  # 10 min is generous for "redirect to Okta and log in"
+STEPUP_TTL_SECONDS = 120  # short-lived on purpose -- proof of a JUST-completed MFA challenge, not a second session
+
+# access_control.json lives at the repo root, same place as
+# environments.json/banner_config.json -- read directly here (own plain
+# open+json.load, no import of create_secret_folders, see module docstring)
+# rather than via the dashboard app, since this is a separate process with
+# its own minimal dependency footprint. This file is the sole writer, via
+# POST /api/access_control/save (server/serve.py) calling
+# create_secret_folders.set_access_control_config -- auth_gate.py never
+# writes it, avoiding any dual-writer race between the two processes.
+ACCESS_CONTROL_FILE_PATH = Path(__file__).resolve().parent.parent / "access_control.json"
+
+
+def _read_access_control_config() -> dict:
+    """Read fresh on every callback -- a login is already a network round
+    trip to Okta, so one extra stat+read is negligible, and this avoids any
+    cache-staleness bug (a saved change takes effect on the very next login,
+    with zero restart of this process required). Falls back to
+    OKTA_ADMIN_GROUP_ID with no user group and restrict_login off when the
+    file doesn't exist yet (bootstrap default -- see the module docstring)."""
+    try:
+        with open(ACCESS_CONTROL_FILE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {"admin_group_id": OKTA_ADMIN_GROUP_ID, "user_group_id": None, "restrict_login": False}
+    return {
+        "admin_group_id": data.get("admin_group_id") or None,
+        "user_group_id": data.get("user_group_id") or None,
+        "restrict_login": bool(data.get("restrict_login", False)),
+    }
 
 
 def _load_or_create_session_key() -> bytes:
@@ -188,25 +272,42 @@ OKTA_ADMIN_CHECK_TOKEN = _load_admin_check_token()
 _JWKS_CLIENT = PyJWKClient(OKTA_JWKS_URL)
 
 
-def _is_member_of_admin_group(user_sub: str) -> bool:
+def _fetch_user_group_ids(user_sub: str) -> list[str] | None:
     """GET /api/v1/users/{id}/groups, checked once at login (see the module
     docstring for why this is a direct API call rather than a groups claim
     on the ID token) -- SSWS token auth, same scheme as
     create_secret_folders.py's OktaClient, but this file deliberately
     doesn't import that module (this is a standalone auth-gate process with
-    its own minimal dependency footprint, not part of the dashboard app)."""
+    its own minimal dependency footprint, not part of the dashboard app).
+    Returns None on any failure (fails closed -- see _resolve_membership),
+    never an empty list to mean "unknown"; a real "in zero groups" user
+    still gets a real (empty) list back from Okta."""
     url = f"{OKTA_ORG_URL}/api/v1/users/{urllib.parse.quote(user_sub, safe='')}/groups"
     req = urllib.request.Request(url, headers={"Authorization": f"SSWS {OKTA_ADMIN_CHECK_TOKEN}", "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             groups = json.loads(r.read())
     except (urllib.error.HTTPError, urllib.error.URLError, ValueError):
-        # Fails closed -- a broken/expired admin-check token or a transient
-        # Okta API error must never silently grant admin rights. Worst case,
-        # a real admin's login gets treated as non-admin until this is
-        # fixed, which is the safe direction for this failure to fall in.
-        return False
-    return any(g.get("id") == OKTA_ADMIN_GROUP_ID for g in groups)
+        return None
+    return [g.get("id") for g in groups if g.get("id")]
+
+
+def _resolve_membership(group_ids: list[str] | None, admin_group_id: str | None, user_group_id: str | None) -> tuple[bool, bool]:
+    """Pure -- returns (is_admin, is_allowed). Fails closed on group_ids is
+    None (a broken/expired admin-check token or a transient Okta API error
+    must never silently grant admin OR login rights -- worst case, a real
+    user's login gets denied/downgraded until this is fixed, the safe
+    direction for this failure to fall in). is_allowed is True whenever
+    EITHER group matches, or whenever neither group ID is configured at all
+    (nothing to restrict against yet) -- the actual login-time enforcement
+    of is_allowed is gated separately by restrict_login, see
+    _handle_callback."""
+    if group_ids is None:
+        return False, False
+    is_admin = bool(admin_group_id) and admin_group_id in group_ids
+    is_user = bool(user_group_id) and user_group_id in group_ids
+    is_allowed = is_admin or is_user or (not admin_group_id and not user_group_id)
+    return is_admin, is_allowed
 
 
 def _sign_payload(payload: dict, ttl_seconds: int) -> str:
@@ -304,20 +405,31 @@ class Handler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
         if path == "/login":
             self._start_login()
+        elif path == "/step-up":
+            self._start_login(purpose="step_up")
         elif path == "/authorization-code/callback":
             self._handle_callback(query)
         elif path == "/verify":
-            self._verify_session()
+            self._verify_session(require_stepup=query.get("require_stepup", ["0"])[0] == "1")
         elif path == "/logout":
             self._logout()
         else:
             self.send_response(404)
             self.end_headers()
 
-    def _start_login(self):
+    def _start_login(self, purpose="login"):
+        """Shared by /login and /step-up -- purpose is carried in the signed
+        flow cookie so _handle_callback knows, once Okta redirects back,
+        whether to issue an ordinary session or a short-lived step-up proof
+        (see _handle_callback). /step-up additionally sends max_age=0 +
+        acr_values to force a fresh MFA challenge regardless of the
+        existing Okta session -- Identity Engine parameters, NOT Classic
+        (Classic's equivalent max_age value is 1, not 0) -- see the module
+        docstring's step-up note for the Authentication Policy prerequisite
+        this depends on."""
         verifier, challenge = _pkce_pair()
         state = base64.urlsafe_b64encode(os.urandom(16)).rstrip(b"=").decode()
-        flow_token = _sign_payload({"state": state, "verifier": verifier}, FLOW_TTL_SECONDS)
+        flow_token = _sign_payload({"state": state, "verifier": verifier, "purpose": purpose}, FLOW_TTL_SECONDS)
 
         params = {
             "client_id": OKTA_CLIENT_ID,
@@ -328,6 +440,9 @@ class Handler(BaseHTTPRequestHandler):
             "code_challenge": challenge,
             "code_challenge_method": "S256",
         }
+        if purpose == "step_up":
+            params["max_age"] = "0"
+            params["acr_values"] = "urn:okta:loa:2fa:any"
         authorize_url = f"{OKTA_AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
 
         self.send_response(302)
@@ -357,12 +472,42 @@ class Handler(BaseHTTPRequestHandler):
             self._respond_text(401, f"Login failed during token verification: {exc}")
             return
 
+        if flow.get("purpose") == "step_up":
+            # No group/admin check here at all -- a step-up flow only proves
+            # a FRESH MFA challenge was just completed by whoever is already
+            # logged in; it's a re-authentication proof, not a login. Who's
+            # allowed to use that proof (e.g. only an admin) is enforced by
+            # serve.py's own admin check on the endpoint that actually
+            # consumes it (POST /api/access_control/save), same
+            # defense-in-depth double-check this project already does
+            # elsewhere for admin actions.
+            stepup_token = _sign_payload({"sub": claims["sub"]}, STEPUP_TTL_SECONDS)
+            self.send_response(302)
+            self.send_header("Set-Cookie", _cookie_header(STEPUP_COOKIE, stepup_token, max_age=STEPUP_TTL_SECONDS))
+            self.send_header("Set-Cookie", _cookie_header(FLOW_COOKIE, "", max_age=0))
+            self.send_header("Location", "/?stepup_complete=1")
+            self.end_headers()
+            return
+
         # Checked once here, not on every request -- consistent with how
         # email/sub already work for the life of a session. A group
-        # membership change takes effect on next login/session refresh
-        # (SESSION_TTL_SECONDS), not instantly -- an accepted tradeoff of
-        # this session model, not an oversight.
-        is_admin = _is_member_of_admin_group(claims["sub"])
+        # membership change (admin OR user group, and restrict_login itself)
+        # takes effect on next login/session refresh (SESSION_TTL_SECONDS),
+        # not instantly -- an accepted tradeoff of this session model, not
+        # an oversight.
+        access_control = _read_access_control_config()
+        group_ids = _fetch_user_group_ids(claims["sub"])
+        is_admin, is_allowed = _resolve_membership(
+            group_ids, access_control["admin_group_id"], access_control["user_group_id"]
+        )
+
+        if access_control["restrict_login"] and not is_allowed:
+            self._respond_text(
+                403,
+                "You don't have access to this dashboard. Contact an administrator to be "
+                "added to the required Okta group.",
+            )
+            return
 
         session_token = _sign_payload(
             {"sub": claims["sub"], "email": claims.get("email"), "id_token": tokens["id_token"], "is_admin": is_admin},
@@ -375,25 +520,39 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Location", "/")
         self.end_headers()
 
-    def _verify_session(self):
+    def _verify_session(self, require_stepup=False):
         token = _get_cookie(self.headers, SESSION_COOKIE)
         session = _verify_signed_payload(token) if token else None
-        if session:
-            self.send_response(200)
-            # Two distinct headers, deliberately: `sub` is Okta's stable,
-            # never-reused identity id -- the correct key for scoping
-            # storage (see create_secret_folders.py's per-owner
-            # environments). `email` can change (a user's email is updated,
-            # or reused across a re-provisioned account) and exists here
-            # purely for human-readable display/audit-log purposes -- never
-            # used as a storage/permission key downstream.
-            self.send_header("X-Auth-Sub", session.get("sub", ""))
-            self.send_header("X-Auth-User", session.get("email") or session.get("sub", ""))
-            self.send_header("X-Auth-Is-Admin", "true" if session.get("is_admin") else "false")
-            self.end_headers()
-        else:
+        if not session:
             self.send_response(401)
             self.end_headers()
+            return
+
+        if require_stepup:
+            stepup_token = _get_cookie(self.headers, STEPUP_COOKIE)
+            stepup = _verify_signed_payload(stepup_token) if stepup_token else None
+            # sub must match the CURRENT session's sub -- otherwise a
+            # step-up cookie left over from a previous user on a shared
+            # machine/browser profile could authorize a save on behalf of
+            # whoever is logged in now. A mismatch or missing/expired
+            # step-up cookie is treated identically to no step-up at all.
+            if not stepup or stepup.get("sub") != session.get("sub"):
+                self.send_response(401)
+                self.end_headers()
+                return
+
+        self.send_response(200)
+        # Two distinct headers, deliberately: `sub` is Okta's stable,
+        # never-reused identity id -- the correct key for scoping
+        # storage (see create_secret_folders.py's per-owner
+        # environments). `email` can change (a user's email is updated,
+        # or reused across a re-provisioned account) and exists here
+        # purely for human-readable display/audit-log purposes -- never
+        # used as a storage/permission key downstream.
+        self.send_header("X-Auth-Sub", session.get("sub", ""))
+        self.send_header("X-Auth-User", session.get("email") or session.get("sub", ""))
+        self.send_header("X-Auth-Is-Admin", "true" if session.get("is_admin") else "false")
+        self.end_headers()
 
     def _logout(self):
         token = _get_cookie(self.headers, SESSION_COOKIE)

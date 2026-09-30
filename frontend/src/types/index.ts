@@ -131,6 +131,15 @@ export interface BannerConfig {
   dismissible: boolean
 }
 
+// Okta group IDs (not names) that gate login/admin rights across the whole
+// dashboard -- see server/auth_gate.py + create_secret_folders.py's
+// get/set_access_control_config. null means "not configured yet."
+export interface AccessControlConfig {
+  admin_group_id: string | null
+  user_group_id: string | null
+  restrict_login: boolean
+}
+
 export interface EnvironmentFormValues {
   name: string
   base_domain: string
