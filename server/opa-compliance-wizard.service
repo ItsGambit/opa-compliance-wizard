@@ -1,12 +1,12 @@
 [Unit]
-Description=OPA Secrets Wizard
+Description=OPA Compliance Wizard
 After=network.target
 
 [Service]
 Type=simple
 User=rparikh
 WorkingDirectory=/home/rparikh/opa-secrets-folders
-EnvironmentFile=/etc/opa-secrets-wizard.env
+EnvironmentFile=/etc/opa-compliance-wizard.env
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 ExecStart=/home/rparikh/opa-secrets-folders/server/start-headless.sh

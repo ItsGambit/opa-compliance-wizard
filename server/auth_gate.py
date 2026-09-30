@@ -62,11 +62,14 @@ any are missing, rather than silently pointing at a wrong/no org):
                      keyring at startup using this project's existing
                      per-environment secret-storage convention (see
                      create_secret_folders.py -- service name
-                     f"opa-secrets-wizard:{OKTA_ENV_NAME}"), not a separate
-                     mechanism.
+                     f"opa-compliance-wizard:{OKTA_ENV_NAME}"), not a
+                     separate mechanism. An install that predates the
+                     5.20.0 rename still resolves via a read-only
+                     fallback to the old "opa-secrets-wizard:{...}"
+                     service name -- see _load_keyring_secret below.
 
 Also requires an Okta API token stored in the keyring under
-f"opa-secrets-wizard:{OKTA_ENV_NAME}" / "okta_admin_check_token" -- a
+f"opa-compliance-wizard:{OKTA_ENV_NAME}" / "okta_admin_check_token" -- a
 read-only, org-wide token (Users + Groups read scope is enough) used
 solely to check "/api/v1/users/{sub}/groups" at login time. This is
 deliberately separate from any per-environment `okta_api_token` this
@@ -142,30 +145,42 @@ def _load_or_create_session_key() -> bytes:
 SESSION_KEY = _load_or_create_session_key()
 
 
-def _load_client_secret() -> str:
+# Renamed at 5.20.0 from "opa-secrets-wizard" -- kept as a read-only
+# fallback below so an existing install's already-stored client secret/
+# admin-check token keep resolving with zero changes required on upgrade.
+# Never written to; a value naturally migrates to the new prefix the next
+# time it's re-stored via `keyring.set_password(...)`.
+_KEYRING_PREFIX = "opa-compliance-wizard"
+_LEGACY_KEYRING_PREFIX = "opa-secrets-wizard"
+
+
+def _load_keyring_secret(field: str, setup_hint: str) -> str:
     import keyring
 
-    secret = keyring.get_password(f"opa-secrets-wizard:{OKTA_ENV_NAME}", "okta_client_secret")
-    if not secret:
+    value = keyring.get_password(f"{_KEYRING_PREFIX}:{OKTA_ENV_NAME}", field)
+    if not value:
+        value = keyring.get_password(f"{_LEGACY_KEYRING_PREFIX}:{OKTA_ENV_NAME}", field)
+    if not value:
         raise RuntimeError(
-            f"No okta_client_secret in keyring for opa-secrets-wizard:{OKTA_ENV_NAME} -- "
-            "was it stored via `keyring.set_password(...)` after creating the Okta app?"
+            f"No {field} in keyring for {_KEYRING_PREFIX}:{OKTA_ENV_NAME} -- {setup_hint}"
         )
-    return secret
+    return value
+
+
+def _load_client_secret() -> str:
+    return _load_keyring_secret(
+        "okta_client_secret",
+        "was it stored via `keyring.set_password(...)` after creating the Okta app?",
+    )
 
 
 def _load_admin_check_token() -> str:
-    import keyring
-
-    token = keyring.get_password(f"opa-secrets-wizard:{OKTA_ENV_NAME}", "okta_admin_check_token")
-    if not token:
-        raise RuntimeError(
-            f"No okta_admin_check_token in keyring for opa-secrets-wizard:{OKTA_ENV_NAME} -- "
-            "store a read-only, org-wide Okta API token (Users + Groups read scope) via "
-            "`keyring.set_password('opa-secrets-wizard:{OKTA_ENV_NAME}', 'okta_admin_check_token', "
-            "'<token>')`. See \"Admin access\" in the main README."
-        )
-    return token
+    return _load_keyring_secret(
+        "okta_admin_check_token",
+        "store a read-only, org-wide Okta API token (Users + Groups read scope) via "
+        "`keyring.set_password('opa-compliance-wizard:{OKTA_ENV_NAME}', 'okta_admin_check_token', "
+        "'<token>')`. See \"Admin access\" in the main README.",
+    )
 
 
 OKTA_CLIENT_SECRET = _load_client_secret()

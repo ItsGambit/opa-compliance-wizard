@@ -314,7 +314,14 @@ try:
 except ImportError:
     KEYRING_AVAILABLE = False
 
-KEYRING_SERVICE_PREFIX = "opa-secrets-wizard"
+KEYRING_SERVICE_PREFIX = "opa-compliance-wizard"
+# Every credential this project ever stored before the 5.20.0 rename used
+# this prefix -- kept as a read-only fallback (see keyring_get below) so an
+# existing install's already-stored OPA keys/Okta tokens/etc. keep working
+# with zero changes required on upgrade. Never written to going forward;
+# a value that gets updated on an old install naturally migrates itself to
+# the new KEYRING_SERVICE_PREFIX the next time it's saved.
+_LEGACY_KEYRING_SERVICE_PREFIX = "opa-secrets-wizard"
 ENVIRONMENT_METADATA_FIELDS = ("base_domain", "team_name", "key_id", "okta_url")
 ENVIRONMENT_SECRET_FIELDS = ("key_secret", "okta_api_token")
 
@@ -439,8 +446,8 @@ def set_banner_config(enabled, message, variant, dismissible):
     return config
 
 
-def _keyring_service(storage_name):
-    return f"{KEYRING_SERVICE_PREFIX}:{storage_name}"
+def _keyring_service(storage_name, prefix=KEYRING_SERVICE_PREFIX):
+    return f"{prefix}:{storage_name}"
 
 
 def _require_keyring():
@@ -456,28 +463,45 @@ def keyring_set(storage_name, field, value):
     keyring.set_password(_keyring_service(storage_name), field, value)
 
 
+def _keyring_get_raw(service, field):
+    try:
+        return keyring.get_password(service, field)
+    except Exception:
+        return None
+
+
 def keyring_get(storage_name, field):
-    """Reads a secret, with one narrow backward-compat fallback: if
-    `storage_name` is namespaced under the local/unscoped owner
-    (`__local__::<name>`) and nothing's stored under that namespaced
-    service name, also try the pre-multi-user service name (bare `<name>`,
-    with no owner prefix at all) -- every environment that existed before
-    this change has its real secret sitting there, and this is what lets
-    it keep resolving without a one-time keyring migration script."""
+    """Reads a secret, with two independent, composable backward-compat
+    fallbacks -- an install that predates BOTH the multi-user change and
+    the 5.20.0 rename needs both to still resolve:
+    1. Service-name prefix: this project's keyring service prefix was
+       renamed from "opa-secrets-wizard" to "opa-compliance-wizard" at
+       5.20.0 (see KEYRING_SERVICE_PREFIX/_LEGACY_KEYRING_SERVICE_PREFIX
+       above) -- try the current prefix first, fall back to the legacy
+       one. Read-only: nothing is ever written back under the legacy
+       prefix, so a value naturally migrates to the new prefix the next
+       time it's saved (no migration script needed).
+    2. Storage-name shape: if `storage_name` is namespaced under the
+       local/unscoped owner (`__local__::<name>`) and nothing's stored
+       under that namespaced service name, also try the pre-multi-user
+       storage name (bare `<name>`, no owner prefix at all) -- every
+       environment that existed before THAT change has its real secret
+       sitting there.
+    Tries (current prefix, current name) -> (current prefix, legacy name)
+    -> (legacy prefix, current name) -> (legacy prefix, legacy name)."""
     if not KEYRING_AVAILABLE:
         return None
-    try:
-        value = keyring.get_password(_keyring_service(storage_name), field)
-    except Exception:
-        value = None
-    if value is not None:
-        return value
+
+    names = [storage_name]
     if storage_name.startswith(_LEGACY_STORAGE_PREFIX):
-        legacy_name = storage_name[len(_LEGACY_STORAGE_PREFIX):]
-        try:
-            return keyring.get_password(_keyring_service(legacy_name), field)
-        except Exception:
-            return None
+        names.append(storage_name[len(_LEGACY_STORAGE_PREFIX):])
+    prefixes = [KEYRING_SERVICE_PREFIX, _LEGACY_KEYRING_SERVICE_PREFIX]
+
+    for prefix in prefixes:
+        for name in names:
+            value = _keyring_get_raw(_keyring_service(name, prefix), field)
+            if value is not None:
+                return value
     return None
 
 

@@ -575,8 +575,11 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    looks like an MFA/access problem rather than a missing-setup-step one.
 3. Store the client secret in the OS keyring under this project's existing
    per-environment convention:
-   `keyring.set_password(f"opa-secrets-wizard:{env_name}", "okta_client_secret", "<secret>")`
-   (`env_name` matches whatever `OKTA_ENV_NAME` you set in step 4).
+   `keyring.set_password(f"opa-compliance-wizard:{env_name}", "okta_client_secret", "<secret>")`
+   (`env_name` matches whatever `OKTA_ENV_NAME` you set in step 4). An
+   install from before the 5.20.0 rename can leave existing credentials
+   stored under the old `opa-secrets-wizard:{env_name}` prefix as-is —
+   they're still read via a fallback and need no migration.
 4. Set these environment variables for `server/auth_gate.py` (e.g. in the
    systemd unit's `EnvironmentFile`) -- the process refuses to start
    without all three, rather than silently pointing at the wrong org:
@@ -593,9 +596,12 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    origin -- otherwise every write request is rejected with `403 Origin
    '...' is not allowed to call this API"` once real browser traffic
    arrives from that origin.
-6. Install and enable the two systemd units (`opa-secrets-wizard.service`,
+6. Install and enable the two systemd units (`opa-compliance-wizard.service`,
    `opa-auth-gate.service`) and the nginx site config, adjusting paths/IPs
-   for your own server.
+   for your own server. (An install predating the 5.20.0 rename can keep
+   its existing `opa-secrets-wizard.service` unit name as-is — nothing
+   requires renaming a unit that's already running; this filename is the
+   template a fresh install starts from.)
 
 **Per-user environments.** Once behind the login gate, each logged-in
 Okta identity gets their own private set of environments by default (an
@@ -626,7 +632,7 @@ logged, by anyone. To set this up:
    Okta token, since the check must work for every logged-in user
    regardless of which environment(s) they've personally configured:
    ```bash
-   python3 -c "import keyring; keyring.set_password('opa-secrets-wizard:<OKTA_ENV_NAME>', 'okta_admin_check_token', '<token>')"
+   python3 -c "import keyring; keyring.set_password('opa-compliance-wizard:<OKTA_ENV_NAME>', 'okta_admin_check_token', '<token>')"
    ```
    A read-only token (Users + Groups read scope) is enough and is the
    right choice for a real deployment -- reusing a broader admin token

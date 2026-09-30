@@ -1,6 +1,7 @@
 #!/bin/bash
 # Ensures a headless gnome-keyring Secret Service is unlocked, then execs serve.py.
-# Written for the systemd service (opa-secrets-wizard.service) on the Ubuntu host --
+# Written for the systemd service (opa-compliance-wizard.service, or an older
+# install's opa-secrets-wizard.service -- same file either way) on the Ubuntu host --
 # this box has no desktop/login session, so keyring's SecretService backend needs
 # its D-Bus daemon started+unlocked explicitly rather than via a normal login.
 set -euo pipefail
