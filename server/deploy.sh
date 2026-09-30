@@ -1,5 +1,5 @@
 #!/bin/bash
-# Repeatable deploy: pulls the latest OPA Secrets Wizard from GitHub and
+# Repeatable deploy: pulls the latest OPA Compliance Wizard from GitHub and
 # reinstalls it in place on this server. Run this ON THE SERVER (as the
 # `rparikh` user, or whichever user owns /home/rparikh/opa-secrets-folders
 # and the systemd service), not from your own machine.

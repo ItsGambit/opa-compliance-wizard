@@ -1,5 +1,5 @@
 """
-Okta OIDC login gate in front of the OPA Secrets Wizard.
+Okta OIDC login gate in front of the OPA Compliance Wizard.
 
 Why this exists: the app itself has no auth of its own (deliberately -- see
 serve.py's own docstring, it's meant to be a local-only tool), and the

@@ -1,5 +1,5 @@
 """
-Local-only server for the OPA Secrets Wizard dashboard.
+Local-only server for the OPA Compliance Wizard dashboard.
 
 Serves frontend/dist/ as static files and exposes a small JSON API the React
 app uses to: manage named environments (dev/uat/prod, credentials stored
@@ -1260,7 +1260,7 @@ def _ensure_session_initialized(owner_key):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Local server for the OPA Secrets Wizard dashboard.")
+    parser = argparse.ArgumentParser(description="Local server for the OPA Compliance Wizard dashboard.")
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
@@ -1284,7 +1284,7 @@ def main():
         sys.exit(1)
 
     url = f"http://127.0.0.1:{args.port}/"
-    print(f"Serving OPA Secrets Wizard at {url}")
+    print(f"Serving OPA Compliance Wizard at {url}")
     if LOCAL_OWNER_KEY_HEADER not in _sessions:
         print("No environment configured yet -- the dashboard will prompt you to set one up.")
     print("Press Ctrl+C to stop.")

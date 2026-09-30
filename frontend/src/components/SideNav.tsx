@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { ClipboardCheck, FolderTree, KeyRound, ListChecks, Moon, Search, Settings, Sun } from 'lucide-react'
 
-const THEME_STORAGE_KEY = 'opa-secrets-wizard-theme'
+const THEME_STORAGE_KEY = 'opa-compliance-wizard-theme'
 
 function useTheme() {
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
@@ -103,7 +103,7 @@ export function SideNav({
 
       {/* Sidebar panel */}
       <div className="w-64 bg-bg-elevated border-r border-border flex flex-col p-3">
-        <div className="text-sm font-semibold text-text px-2 mb-3">OPA Secrets Wizard</div>
+        <div className="text-sm font-semibold text-text px-2 mb-3">OPA Compliance Wizard</div>
 
         <div className="flex flex-col gap-0.5">
           <NavItem

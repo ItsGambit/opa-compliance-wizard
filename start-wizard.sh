@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Mac/Linux launcher -- mirrors "Start OPA Secrets Wizard.bat" for Windows.
+# Mac/Linux launcher -- mirrors "Start OPA Compliance Wizard.bat" for Windows.
 # All real logic lives in launch.py; this just finds python3 and calls it.
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

@@ -1,29 +1,41 @@
-# OPA Secrets Wizard
+# OPA Compliance Wizard
 
-A tool for managing **Okta Privileged Access (OPA)** secret folders and
-for **auditing and reporting** on both OPA and core Okta activity — built
-as a CLI for scripting and an interactive dashboard for everyday use, so
-whether you're a security engineer wiring this into a pipeline or an
-admin who just wants a clean UI, there's a path that fits.
+**A compliance evidence generator for Okta Privileged Access (OPA) and
+core Okta** — continuously archives Okta System Log history beyond
+Okta's own 90-day retention window and turns it into 14 pre-built,
+SOC 2 / SOX / ISO 27001-mapped reports (MFA enforcement, provisioning,
+privileged access, policy changes, and more), so you're never stuck
+answering an audit request for evidence Okta itself has already aged
+out. It also includes the tools this project started as: building and
+managing OPA vault secret folders, resource groups, projects, and
+access policies.
+
+Ships as both a CLI for scripting and an interactive dashboard for
+everyday use, so whether you're a security engineer wiring this into a
+pipeline or an admin who just wants a clean UI, there's a path that
+fits.
 
 At its core, it does two things:
 
-1. **Creates a tree of OPA vault secret folders** (root / sub / sub-sub /
-   ... any depth) — and, if needed, the resource group / project / access
-   group they live under — from a CSV file or the dashboard's visual tree
-   editor.
-2. **Generates compliance-ready audit reports** (SOC 2 / SOX / ISO 27001
+1. **Generates compliance-ready audit reports** (SOC 2 / SOX / ISO 27001
    evidence: MFA enforcement, provisioning, privileged access, policy
    changes, and more) by continuously archiving Okta System Log history
    beyond Okta's own 90-day retention window — see
    [Compliance Reports Dashboard](#compliance-reports-dashboard) below.
+   **This is the primary use case — start here.**
+2. **Creates a tree of OPA vault secret folders** (root / sub / sub-sub /
+   ... any depth) — and, if needed, the resource group / project / access
+   group they live under — from a CSV file or the dashboard's visual tree
+   editor. See [Resource Groups, Projects, and Groups](#resource-groups-projects-and-groups)
+   and [Building the folder tree](#building-the-folder-tree) below.
 
-- **CLI** (`create_secret_folders.py`) — scriptable, CSV in, CSV out.
-- **Interactive dashboard** ("OPA Secrets Wizard", `frontend/` + `server/`)
-  — pick or create the resource group/project/group from live dropdowns,
-  build the folder tree visually, save it to a CSV, then Preview/Create
-  right from the page, plus the full reporting/audit feature set. See
-  [Interactive Dashboard](#interactive-dashboard) below.
+- **Interactive dashboard** ("OPA Compliance Wizard", `frontend/` +
+  `server/`) — the compliance reports, the full secrets-management
+  feature set, and admin/audit tooling for hosted multi-user
+  deployments. See [Interactive Dashboard](#interactive-dashboard)
+  below.
+- **CLI** (`create_secret_folders.py`) — scriptable, CSV in, CSV out,
+  for the secret-folder-management side specifically.
 
 Both share the exact same engine code (`create_secret_folders.py` is
 imported by the dashboard server, not reimplemented) — no logic is
@@ -56,10 +68,11 @@ below.
 - [Security: encrypted credential storage](#security-encrypted-credential-storage)
 - [Interactive Dashboard](#interactive-dashboard)
   - [Environments](#environments-dev--uat--prod-etc)
+  - [Compliance Reports Dashboard](#compliance-reports-dashboard)
+  - [Admin roles and the audit log](#admin-roles-and-the-audit-log-hosted-deployments)
   - [Resource Groups, Projects, and Groups](#resource-groups-projects-and-groups)
   - [Building the folder tree](#building-the-folder-tree)
   - [Access Explorer](#access-explorer)
-  - [Compliance Reports Dashboard](#compliance-reports-dashboard)
   - [Secrets Access Dashboard](#secrets-access-dashboard)
   - [Policy assignment (Folder Builder)](#policy-assignment-folder-builder)
 - [Hosting on a server (optional)](#hosting-on-a-server-optional)
@@ -149,7 +162,7 @@ to keep in sync between them):
 
 | OS | How to run |
 |---|---|
-| Windows | Double-click `Start OPA Secrets Wizard.bat` |
+| Windows | Double-click `Start OPA Compliance Wizard.bat` |
 | Mac / Linux | Run `./start-wizard.sh` (or double-click it if your file manager runs `.sh` files) |
 | Any OS | `python launch.py` (or `python3 launch.py`) directly |
 
@@ -179,6 +192,116 @@ environments. Editing always shows both secret fields blank — leave
 blank to keep the existing value, or type a new one to rotate it.
 Deleting the active environment locks the dashboard again until
 another is activated.
+
+### Compliance Reports Dashboard
+
+**This is the tab most people using this tool will live in day-to-day** —
+it's the primary reason this project exists. It answers the question
+auditors actually ask — *"prove that X happened, for every occurrence,
+over the period we're auditing"* — for both OPA and core Okta activity,
+without you needing to know Okta's System Log event-type names or write
+a single query.
+
+**Why this exists, in plain terms:** Okta's own System Log only keeps
+90 days of history. Most audits (SOC 2, SOX, ISO 27001) cover a
+12-month period. Without something standing between "Okta's 90-day
+window" and "your auditor's 12-month ask," you simply can't produce
+the evidence — no amount of clicking around the Okta Admin Console
+fixes that gap. This dashboard closes it by continuously archiving
+System Log events into a local, indefinitely-retained store (SQLite —
+see [Hosting on a server](#hosting-on-a-server-optional) for why that
+choice, not a bigger database, is the right one here), then serving
+14 pre-built reports on top of that archive.
+
+**The 14 reports, grouped by SOC 2 Trust Services Criteria** (each maps
+to a specific, live-verified set of real Okta/OPA event types — nothing
+here is a guess or a report card that will silently always read zero):
+
+- **CC6 — Access Controls:** MFA Enforcement, Session Activity,
+  Provisioning & De-provisioning, Role/Group Changes, Admin Privilege
+  Grants, JIT Access Requests
+- **CC7 — System Operations:** Threat Detection, API Token Lifecycle
+- **CC8 — Change Management:** Policy Modifications
+- **Privileged Access (OPA/PAM):** Secrets Activity, PAM JIT
+  Checkout/Checkin, Session Logins, Credential Reveals, PAM Policy
+  Modifications
+
+Click any report card to open its detail view: a date-range filter and
+a results table in the **four-field audit standard** — **User**,
+**Action**, **Timestamp**, **Affected Resource** — plus a color-coded
+outcome (success/failure/denied) column, which is the shape most audit
+evidence requests are written around. Every report supports
+**Export CSV** (via the same export mechanism used throughout the rest
+of this tool) both from its detail view and directly from its card on
+the picker screen (hover to reveal the export icon) — there's also a
+single **Export all reports** button at the top of the picker for
+pulling the entire evidence set in one pass.
+
+**Getting data into the archive — the sync settings dialog** (gear
+icon → environment row → sync settings, next to the existing local log
+retention indicator):
+
+- **Ingestion scope** — a real either/or choice made at the point data
+  is written in, not a filter applied afterward:
+  - *Curated only* — store just the ~20 event types the 14 reports
+    above actually use. Smallest footprint; the right default for most
+    deployments, especially larger tenants with high daily event
+    volume.
+  - *Everything* — store every System Log event type, for teams who
+    want the full tenant history available for ad-hoc investigation
+    beyond these 14 reports. Bigger archive, same reports.
+- **Retention** — a separate setting layered on top of whichever scope
+  you picked: a time window (e.g. "keep 2 years"), a size cap, or both.
+  Curated events are the evidence trail itself, so they're **never**
+  auto-pruned by this setting regardless of scope — retention only
+  ever prunes non-curated ("everything" scope) events past the
+  configured window/size.
+- **Schedule** — enable a daily sync, choose the run time (shown in
+  UTC), and the background job keeps the archive current with
+  delta-only pulls (it only asks Okta for events published after the
+  last successful sync — never a full re-fetch). This runs as a
+  server-side background thread, so it works unattended on a hosted
+  deployment; see [Hosting on a server](#hosting-on-a-server-optional).
+- **First run, three ways in** — the first time sync is enabled for an
+  environment, you're asked how to seed the archive:
+  1. **Backfill the last 90 days** via the live Okta API (chunked
+     day-by-day under the hood so it works reliably even on tenants
+     with thousands of events/day, without hitting API pagination
+     limits).
+  2. **Import a System Log CSV** you've already exported from the Okta
+     Admin Console — useful if you want to seed the archive from a
+     specific date range, or simply avoid the API calls entirely.
+  3. **Start fresh** — no backfill; the archive just grows from today
+     forward.
+
+A manual **Sync now** action is always available alongside the
+schedule, for kicking off an out-of-band sync without waiting for the
+next scheduled run.
+
+### Admin roles and the audit log (hosted deployments)
+
+On a server-hosted deployment (behind Okta login — see
+[Hosting on a server](#hosting-on-a-server-optional)), every saved
+environment is private to whoever created it by default, with an
+opt-in **Shared** toggle (visible right next to each environment's name
+in the manager — a clickable badge showing **Shared** or **Private**)
+that makes it usable by every other logged-in user. Environments you
+don't own show as disabled for editing/deleting, so it's never
+ambiguous whose credentials you're looking at.
+
+For teams that need someone to see and manage *every* environment on a
+shared server — for onboarding, cleanup, or troubleshooting another
+admin's stuck sync — membership in a designated **Okta group** grants
+full admin rights: every environment becomes visible and editable, not
+just your own or shared ones, and a new **Audit Log** panel (sidebar,
+admin-only) shows every write action ever taken, by whom, across every
+user and environment — sourced from the same `audit_log.jsonl` this
+tool has always written, just newly given a UI. See
+`OKTA_ADMIN_GROUP_ID` in [Hosting on a server](#hosting-on-a-server-optional)
+for how to set this up. Every admin override action is itself logged
+(with an `admin_override: true` marker), so an admin's own use of this
+power is just as visible in the audit trail as anyone else's activity —
+this is a compliance feature, not a backdoor.
 
 ### Resource Groups, Projects, and Groups
 
@@ -276,90 +399,6 @@ below, both non-resolvable), Database accounts — there's nothing to
 resolve to one project, so the condition itself is shown as readable
 text (e.g. "Servers labeled `system.os_type=linux`") at the
 resource-group level.
-
-### Compliance Reports Dashboard
-
-The tab most admins will live in day-to-day if you're using this tool
-for audit prep. It answers the question auditors actually ask —
-*"prove that X happened, for every occurrence, over the period we're
-auditing"* — for both OPA and core Okta activity, without you needing
-to know Okta's System Log event-type names or write a single query.
-
-**Why this exists, in plain terms:** Okta's own System Log only keeps
-90 days of history. Most audits (SOC 2, SOX, ISO 27001) cover a
-12-month period. Without something standing between "Okta's 90-day
-window" and "your auditor's 12-month ask," you simply can't produce
-the evidence — no amount of clicking around the Okta Admin Console
-fixes that gap. This dashboard closes it by continuously archiving
-System Log events into a local, indefinitely-retained store (SQLite —
-see [Hosting on a server](#hosting-on-a-server-optional) for why that
-choice, not a bigger database, is the right one here), then serving
-14 pre-built reports on top of that archive.
-
-**The 14 reports, grouped by SOC 2 Trust Services Criteria** (each maps
-to a specific, live-verified set of real Okta/OPA event types — nothing
-here is a guess or a report card that will silently always read zero):
-
-- **CC6 — Access Controls:** MFA Enforcement, Session Activity,
-  Provisioning & De-provisioning, Role/Group Changes, Admin Privilege
-  Grants, JIT Access Requests
-- **CC7 — System Operations:** Threat Detection, API Token Lifecycle
-- **CC8 — Change Management:** Policy Modifications
-- **Privileged Access (OPA/PAM):** Secrets Activity, PAM JIT
-  Checkout/Checkin, Session Logins, Credential Reveals, PAM Policy
-  Modifications
-
-Click any report card to open its detail view: a date-range filter and
-a results table in the **four-field audit standard** — **User**,
-**Action**, **Timestamp**, **Affected Resource** — plus a color-coded
-outcome (success/failure/denied) column, which is the shape most audit
-evidence requests are written around. Every report supports
-**Export CSV** (via the same export mechanism used throughout the rest
-of this tool) both from its detail view and directly from its card on
-the picker screen (hover to reveal the export icon) — there's also a
-single **Export all reports** button at the top of the picker for
-pulling the entire evidence set in one pass.
-
-**Getting data into the archive — the sync settings dialog** (gear
-icon → environment row → sync settings, next to the existing local log
-retention indicator):
-
-- **Ingestion scope** — a real either/or choice made at the point data
-  is written in, not a filter applied afterward:
-  - *Curated only* — store just the ~20 event types the 14 reports
-    above actually use. Smallest footprint; the right default for most
-    deployments, especially larger tenants with high daily event
-    volume.
-  - *Everything* — store every System Log event type, for teams who
-    want the full tenant history available for ad-hoc investigation
-    beyond these 14 reports. Bigger archive, same reports.
-- **Retention** — a separate setting layered on top of whichever scope
-  you picked: a time window (e.g. "keep 2 years"), a size cap, or both.
-  Curated events are the evidence trail itself, so they're **never**
-  auto-pruned by this setting regardless of scope — retention only
-  ever prunes non-curated ("everything" scope) events past the
-  configured window/size.
-- **Schedule** — enable a daily sync, choose the run time (shown in
-  UTC), and the background job keeps the archive current with
-  delta-only pulls (it only asks Okta for events published after the
-  last successful sync — never a full re-fetch). This runs as a
-  server-side background thread, so it works unattended on a hosted
-  deployment; see [Hosting on a server](#hosting-on-a-server-optional).
-- **First run, three ways in** — the first time sync is enabled for an
-  environment, you're asked how to seed the archive:
-  1. **Backfill the last 90 days** via the live Okta API (chunked
-     day-by-day under the hood so it works reliably even on tenants
-     with thousands of events/day, without hitting API pagination
-     limits).
-  2. **Import a System Log CSV** you've already exported from the Okta
-     Admin Console — useful if you want to seed the archive from a
-     specific date range, or simply avoid the API calls entirely.
-  3. **Start fresh** — no backfill; the archive just grows from today
-     forward.
-
-A manual **Sync now** action is always available alongside the
-schedule, for kicking off an out-of-band sync without waiting for the
-next scheduled run.
 
 ### Secrets Access Dashboard
 
@@ -546,6 +585,7 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
      still specific to your deployment)
    - `DASHBOARD_ORIGIN` — the public origin this dashboard is reachable
      at, e.g. `https://192.168.1.10` or `https://opa.example.com`
+   - `OKTA_ADMIN_GROUP_ID` — see "Admin access" below.
    - `OKTA_ENV_NAME` (optional, defaults to `"default"`)
 5. If `server/serve.py` itself will be reached through a hostname/IP other
    than `127.0.0.1`/`localhost` (true for any reverse-proxied deployment),
@@ -560,14 +600,47 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
 **Per-user environments.** Once behind the login gate, each logged-in
 Okta identity gets their own private set of environments by default (an
 environment created by user A is invisible to user B) -- opt an
-environment into being visible to every other logged-in user via
-`PUT /api/environments/{name}/share`. Every write action (environment
-changes, folder/resource-group/policy/group creates and deletes) is
-appended to `audit_log.jsonl`, attributed to the real logged-in identity.
-Running the CLI or `launch.py` directly (no login gate in front of them at
-all) is entirely unaffected by any of this -- there's exactly one shared,
-unscoped environment list, matching this tool's original single-user
-design.
+environment into being visible to every other logged-in user via the
+**Shared / Private** badge in the environment manager (or directly:
+`POST /api/environments/{name}/share`). Every write action (environment
+changes, folder/resource-group/policy/group creates and deletes, sync
+starts, admin overrides) is appended to `audit_log.jsonl`, attributed to
+the real logged-in identity. Running the CLI or `launch.py` directly (no
+login gate in front of them at all) is entirely unaffected by any of
+this -- there's exactly one shared, unscoped environment list, matching
+this tool's original single-user design.
+
+**Admin access.** Members of one designated Okta group get full admin
+rights across the whole dashboard: every environment becomes visible and
+editable (not just their own or explicitly shared ones), and a new
+Audit Log panel (sidebar, admin-only) shows every write action ever
+logged, by anyone. To set this up:
+1. Create (or reuse) an Okta group for admins of this tool, and note its
+   **group ID** (Admin Console -> Directory -> Groups -> click the
+   group -> the ID is in the URL, `.../groups/<id>/...`) -- a group ID,
+   not its display name, is what `OKTA_ADMIN_GROUP_ID` (step 4 above)
+   expects, so this check is one direct API call per login rather than
+   a name-to-id lookup every time.
+2. Store an Okta API token in the keyring for the admin-membership check
+   itself -- this is deliberately separate from any environment's own
+   Okta token, since the check must work for every logged-in user
+   regardless of which environment(s) they've personally configured:
+   ```bash
+   python3 -c "import keyring; keyring.set_password('opa-secrets-wizard:<OKTA_ENV_NAME>', 'okta_admin_check_token', '<token>')"
+   ```
+   A read-only token (Users + Groups read scope) is enough and is the
+   right choice for a real deployment -- reusing a broader admin token
+   works too but widens the blast radius if this process or its stored
+   credential were ever compromised.
+3. Restart `opa-auth-gate.service` to pick up the new/changed env var
+   and token. Admin status is computed once at login (carried for the
+   life of the session, same as your identity/email) -- a group
+   membership change takes effect on the next login, not instantly.
+
+Every admin override action is logged with an `admin_override: true`
+marker, so an admin's own activity is just as visible in the audit
+trail as anyone else's -- this is meant to support compliance work, not
+to be a quiet backdoor.
 
 ## CLI Setup
 
@@ -828,17 +901,72 @@ already exists is skipped, not duplicated.
 
 ## Version
 
-5.19.0 — A new **Compliance Reports Dashboard** turns this tool into a
-general OPA + Okta audit-evidence generator, not just a secret-folder
-builder: 14 pre-built SOC 2/SOX/ISO 27001-mapped reports, backed by a
-continuously-syncing local archive that outlives Okta's 90-day System
-Log retention window. The old Secrets Access Dashboard now draws on
-that same archive once an environment opts in, with zero regression
-for environments that haven't. See the changelog entry below for the
-full breakdown, including the real event-type and timezone bugs found
-and fixed along the way.
+5.20.0 — **Renamed to OPA Compliance Wizard**, reflecting what this tool
+is actually for now: compliance evidence generation is the primary use
+case, with OPA secret-folder management as a supporting feature rather
+than the other way around (this README is restructured to match — see
+[Compliance Reports Dashboard](#compliance-reports-dashboard) right
+after Environments, ahead of the secrets-management sections). Also
+ships **Okta-group-based admin roles**, a **per-environment Shared /
+Private indicator**, and an **admin-only audit log viewer** — see
+[Admin roles and the audit log](#admin-roles-and-the-audit-log-hosted-deployments).
+See the changelog entry below for the full breakdown.
 
 ### Changelog
+- **5.20.0**:
+  - **Renamed the project** from "OPA Secrets Wizard" to **"OPA
+    Compliance Wizard"** throughout (page title, sidebar, About dialog,
+    footer, launcher filenames, CLI/server startup messages) — the
+    compliance reporting feature set (5.19.0) is now this tool's
+    primary purpose, not an add-on to a secrets-folder manager.
+    Internal implementation details that would be riskier to rename —
+    the OS keychain credential-storage prefix, the live server's
+    systemd service names — were deliberately left unchanged for this
+    release to avoid a credential-migration/downtime risk; see the
+    project's own internal notes if you're tracking that follow-up.
+  - **New: Okta-group-based admin roles.** Members of a designated Okta
+    group (`OKTA_ADMIN_GROUP_ID`, see "Admin access" in
+    [Hosting on a server](#hosting-on-a-server-optional)) can see and
+    manage every environment on a hosted, multi-user deployment, not
+    just their own or explicitly shared ones — checked once at login
+    via a direct Okta API call, carried through the session the same
+    way identity already was, and forwarded to the app via a new
+    `X-Auth-Is-Admin` header (same pattern as the existing
+    `X-Auth-Sub`/`X-Auth-User` headers). Every admin override action is
+    logged with an `admin_override: true` marker.
+  - **New: admin-only Audit Log viewer.** The `audit_log.jsonl` write
+    path and its `GET /api/audit_log` read endpoint already existed
+    (every mutating action has always been logged) but had no UI until
+    now — a new sidebar panel, visible only to admins, lists every
+    entry most-recent-first with load-more pagination.
+  - **New: Shared / Private indicator on every environment.** Found
+    while debugging a sync that looked "stuck" — the real cause was an
+    Okta API token added to the wrong owner-scoped copy of an
+    environment, with no way to see from the UI that separate
+    owner-scoped copies even existed. The environment manager now shows
+    a clickable Shared/Private badge and disables Edit/Delete for
+    environments you don't own (unless you're an admin).
+  - **Fixed: sync errors were silently swallowed.** The sync settings
+    dialog only ever rendered `sync_state.last_sync_error`, which is
+    `null` on a first-ever failed sync (nothing had been written yet to
+    produce a `sync_state` row) — so a real, immediately-returned error
+    like "No Okta URL/API token configured for this environment" looked
+    like the Sync button had simply done nothing. The real error was
+    already present in the job's live status the whole time; it just
+    was never displayed. Fixed, plus a compact progress bar (with a
+    real percentage, computed from how far the backfill's date window
+    has actually advanced) replaced what was previously a raw, unbounded
+    scrolling list of one line per day-chunk.
+  - **Fixed a deploy gap that let nginx silently run a stale config.**
+    `server/deploy.sh` syncs the app directory and restarts the app
+    service, but nginx's config is a plain file copy on the server, not
+    something this script ever touched — so a real nginx change (like
+    the new `X-Auth-Is-Admin` header-forwarding rule this release needs)
+    could sit committed and "deployed" for a while with nginx quietly
+    still serving the old config underneath it, no error anywhere.
+    `deploy.sh` now diffs its own nginx config against what's actually
+    loaded and warns loudly (it can't safely auto-apply this itself, no
+    sudo access to nginx by design) if they've drifted.
 - **5.19.0**:
   - **New: Compliance Reports Dashboard.** A new top-level tab
     generates 14 audit-ready reports (grouped by SOC 2 CC6/CC7/CC8,

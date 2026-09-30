@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cross-platform launcher for the OPA Secrets Wizard dashboard.
+Cross-platform launcher for the OPA Compliance Wizard dashboard.
 
 Checks prerequisites (Python, Node.js/npm, the `keyring` Python package,
 frontend deps), offering to install/upgrade anything missing or too old via
@@ -315,7 +315,7 @@ def stop_stale_server(port):
 
 
 def start_server(extra_args):
-    print("Starting OPA Secrets Wizard server...", flush=True)
+    print("Starting OPA Compliance Wizard server...", flush=True)
     print("No credentials required to start -- if none are configured yet, the dashboard")
     print("itself will prompt you to set up an environment on first load.")
     print("Press Ctrl+C to stop.\n")
