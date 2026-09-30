@@ -13,8 +13,18 @@ const VARIANTS: { value: BannerVariant; label: string }[] = [
   { value: 'danger', label: 'Danger (red)' },
 ]
 
-export function BannerSettingsDialog() {
-  const [open, setOpen] = useState(false)
+interface Props {
+  // Both optional -- omit for the self-contained trigger button (falls back
+  // to internal state, unchanged behavior). Pass both when opened remotely
+  // (e.g. SideNav's utility row).
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
+}
+
+export function BannerSettingsDialog({ open: openProp, onOpenChange }: Props = {}) {
+  const [openState, setOpenState] = useState(false)
+  const open = openProp ?? openState
+  const setOpen = onOpenChange ?? setOpenState
   const { data: banner } = useBanner()
   const queryClient = useQueryClient()
 
@@ -47,11 +57,13 @@ export function BannerSettingsDialog() {
 
   return (
     <Dialog.Root open={open} onOpenChange={setOpen}>
-      <Dialog.Trigger asChild>
-        <button type="button" className="btn-secondary !px-2" title="Announcement banner">
-          <Megaphone size={14} />
-        </button>
-      </Dialog.Trigger>
+      {openProp === undefined && (
+        <Dialog.Trigger asChild>
+          <button type="button" className="btn-secondary !px-2" title="Announcement banner">
+            <Megaphone size={14} />
+          </button>
+        </Dialog.Trigger>
+      )}
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
         <Dialog.Content className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[28rem] p-5">

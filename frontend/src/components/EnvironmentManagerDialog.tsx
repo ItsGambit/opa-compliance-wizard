@@ -84,11 +84,13 @@ export function EnvironmentManagerDialog({ data, open: openProp, onOpenChange, i
 
   return (
     <Dialog.Root open={open} onOpenChange={setOpen}>
-      <Dialog.Trigger asChild>
-        <button type="button" className="btn-secondary !px-2" title="Manage environments">
-          <Settings size={14} />
-        </button>
-      </Dialog.Trigger>
+      {openProp === undefined && (
+        <Dialog.Trigger asChild>
+          <button type="button" className="btn-secondary !px-2" title="Manage environments">
+            <Settings size={14} />
+          </button>
+        </Dialog.Trigger>
+      )}
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
         <Dialog.Content className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[30rem] max-h-[85vh] overflow-y-auto p-5">

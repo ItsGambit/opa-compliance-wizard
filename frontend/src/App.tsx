@@ -11,14 +11,17 @@ import { EnvironmentSetup } from './components/EnvironmentSetup'
 import { Footer } from './components/Footer'
 import { FolderBuilder } from './components/FolderBuilder'
 import { SecretsAccessDashboard } from './components/SecretsAccessDashboard'
-import { SideNav } from './components/SideNav'
+import { REPORTS_SUB_TABS, SideNav } from './components/SideNav'
 import { UserMenu } from './components/UserMenu'
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState('builder')
+  const [activeTab, setActiveTab] = useState('reports')
   const [accessSubTab, setAccessSubTab] = useState(ACCESS_SUB_TABS[0].value)
+  const [reportsSubTab, setReportsSubTab] = useState(REPORTS_SUB_TABS[0].value)
   const [environmentsOpen, setEnvironmentsOpen] = useState(false)
   const [auditLogOpen, setAuditLogOpen] = useState(false)
+  const [bannerOpen, setBannerOpen] = useState(false)
+  const [aboutOpen, setAboutOpen] = useState(false)
   const { data: environments, isLoading: environmentsLoading } = useEnvironments()
   const { data: whoami } = useWhoami()
   const isConfigured = !!environments?.active
@@ -56,29 +59,33 @@ export default function App() {
           accessSubTabs={ACCESS_SUB_TABS}
           accessSubTab={accessSubTab}
           onAccessSubTabChange={setAccessSubTab}
+          reportsSubTab={reportsSubTab}
+          onReportsSubTabChange={setReportsSubTab}
           onOpenEnvironments={() => setEnvironmentsOpen(true)}
           onOpenAuditLog={() => setAuditLogOpen(true)}
           isAdmin={whoami?.is_admin}
+          onOpenBanner={() => setBannerOpen(true)}
+          onOpenAbout={() => setAboutOpen(true)}
         />
 
         <main className="flex-1 overflow-y-auto px-8 py-6 flex flex-col gap-5">
           <header className="flex items-start justify-between">
             <div>
               <h1 className="text-lg font-semibold text-text">
-                {activeTab === 'builder' && 'Folder Builder'}
+                {activeTab === 'reports' && reportsSubTab === 'browse' && 'Compliance Reports'}
+                {activeTab === 'reports' && reportsSubTab === 'secrets_access' && 'Secrets Access Dashboard'}
                 {activeTab === 'access' && 'Access Explorer'}
-                {activeTab === 'reports' && 'Compliance Reports'}
-                {activeTab === 'secrets_access' && 'Secrets Access Dashboard'}
+                {activeTab === 'builder' && 'Folder Builder'}
               </h1>
               <p className="text-xs text-text-faint mt-1">
-                {activeTab === 'builder' &&
-                  'Pick or create a resource group and project, build the folder tree, then preview and create.'}
+                {activeTab === 'reports' && reportsSubTab === 'browse' &&
+                  'SOC 2 / SOX / ISO 27001 evidence, generated from OPA + core Okta audit history.'}
+                {activeTab === 'reports' && reportsSubTab === 'secrets_access' &&
+                  'See who created, updated, retrieved, or deleted each secret and folder in a resource group/project.'}
                 {activeTab === 'access' &&
                   'Explore who has access to what, across resource groups, projects, policies, users, and groups.'}
-                {activeTab === 'reports' &&
-                  'SOC 2 / SOX / ISO 27001 evidence, generated from OPA + core Okta audit history.'}
-                {activeTab === 'secrets_access' &&
-                  'See who created, updated, retrieved, or deleted each secret and folder in a resource group/project.'}
+                {activeTab === 'builder' &&
+                  'Pick or create a resource group and project, build the folder tree, then preview and create.'}
               </p>
             </div>
             <div className="flex items-center gap-3">
@@ -86,28 +93,27 @@ export default function App() {
                 Connected: <span className="text-text-dim font-medium">{environments?.active}</span>
               </span>
               <UserMenu />
-              <div className="flex items-center gap-2">
-                <BannerSettingsDialog />
-                <AboutDialog />
-                <EnvironmentManagerDialog
-                  data={environments}
-                  open={environmentsOpen}
-                  onOpenChange={setEnvironmentsOpen}
-                  isAdmin={whoami?.is_admin}
-                />
-                {whoami?.is_admin && <AuditLogDialog open={auditLogOpen} onOpenChange={setAuditLogOpen} />}
-              </div>
             </div>
           </header>
 
-          {activeTab === 'builder' && <FolderBuilder />}
+          {activeTab === 'reports' && reportsSubTab === 'browse' && <ComplianceReports />}
+          {activeTab === 'reports' && reportsSubTab === 'secrets_access' && <SecretsAccessDashboard />}
           {activeTab === 'access' && <AccessExplorer subTab={accessSubTab} />}
-          {activeTab === 'reports' && <ComplianceReports />}
-          {activeTab === 'secrets_access' && <SecretsAccessDashboard />}
+          {activeTab === 'builder' && <FolderBuilder />}
 
           <Footer />
         </main>
       </div>
+
+      <EnvironmentManagerDialog
+        data={environments}
+        open={environmentsOpen}
+        onOpenChange={setEnvironmentsOpen}
+        isAdmin={whoami?.is_admin}
+      />
+      {whoami?.is_admin && <AuditLogDialog open={auditLogOpen} onOpenChange={setAuditLogOpen} />}
+      <BannerSettingsDialog open={bannerOpen} onOpenChange={setBannerOpen} />
+      <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />
     </div>
   )
 }

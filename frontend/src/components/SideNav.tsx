@@ -1,5 +1,16 @@
 import { useEffect, useState } from 'react'
-import { ClipboardCheck, FolderTree, KeyRound, ListChecks, Moon, Search, Settings, Sun } from 'lucide-react'
+import {
+  ClipboardCheck,
+  FolderTree,
+  Info,
+  KeyRound,
+  ListChecks,
+  Megaphone,
+  Moon,
+  Search,
+  Settings,
+  Sun,
+} from 'lucide-react'
 
 const THEME_STORAGE_KEY = 'opa-compliance-wizard-theme'
 
@@ -26,29 +37,40 @@ export interface AccessSubTab {
   label: string
 }
 
+// Exported so App.tsx can drive which panel renders under the Compliance
+// Reports top-level nav item -- Secrets Access Dashboard is a SUB-item here
+// (per-project secret/folder drill-down), not its own top-level tab, since
+// it now reads from the same compliance archive as the report cards do
+// (see build_project_secrets_report_from_archive in create_secret_folders.py)
+// and belongs conceptually under the same umbrella rather than sitting
+// alongside it as an unrelated dashboard.
+export const REPORTS_SUB_TABS = [
+  { value: 'browse', label: 'Browse Reports' },
+  { value: 'secrets_access', label: 'Secrets Access' },
+]
+
 interface Props {
   activeTab: string
   onTabChange: (value: string) => void
   accessSubTabs: AccessSubTab[]
   accessSubTab: string
   onAccessSubTabChange: (value: string) => void
-  // "Environments" has no dedicated page/tab of its own -- it's the existing
-  // EnvironmentManagerDialog (gear icon in the topbar). This just opens that
-  // same dialog from the sidebar instead of duplicating its content as a tab.
+  reportsSubTab: string
+  onReportsSubTabChange: (value: string) => void
   onOpenEnvironments: () => void
-  // Same "open an existing dialog" pattern as onOpenEnvironments above.
   // Only rendered when isAdmin is true -- undefined/omitted for a non-admin
   // viewer rather than always present but disabled, so a non-admin sees no
   // trace of an audit log existing at all.
   onOpenAuditLog?: () => void
   isAdmin?: boolean
+  onOpenBanner: () => void
+  onOpenAbout: () => void
 }
 
 const TOP_LEVEL_ICON: Record<string, typeof FolderTree> = {
-  builder: FolderTree,
-  access: Search,
   reports: ClipboardCheck,
-  secrets_access: KeyRound,
+  access: Search,
+  builder: FolderTree,
 }
 
 function NavItem({ active, label, icon, onClick }: { active: boolean; label: string; icon?: typeof FolderTree; onClick: () => void }) {
@@ -67,15 +89,40 @@ function NavItem({ active, label, icon, onClick }: { active: boolean; label: str
   )
 }
 
+// Pill-shaped, semi-transparent utility button -- same treatment as the
+// theme toggle originally had, now applied consistently to every utility
+// action (Environments, Audit Log, Announcement banner, About, theme) so
+// they read as one coherent group rather than the theme toggle looking
+// like a one-off.
+function UtilityPill({ label, icon, onClick }: { label: string; icon: typeof FolderTree; onClick: () => void }) {
+  const Icon = icon
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex items-center gap-2 px-2.5 py-2 rounded-full text-sm text-text-dim
+        bg-[color-mix(in_srgb,var(--color-text)_6%,transparent)]
+        hover:bg-[color-mix(in_srgb,var(--color-text)_10%,transparent)] transition-colors"
+    >
+      <Icon size={14} />
+      {label}
+    </button>
+  )
+}
+
 export function SideNav({
   activeTab,
   onTabChange,
   accessSubTabs,
   accessSubTab,
   onAccessSubTabChange,
+  reportsSubTab,
+  onReportsSubTabChange,
   onOpenEnvironments,
   onOpenAuditLog,
   isAdmin,
+  onOpenBanner,
+  onOpenAbout,
 }: Props) {
   const { theme, toggle } = useTheme()
 
@@ -83,7 +130,7 @@ export function SideNav({
     <div className="flex h-full shrink-0">
       {/* Icon rail */}
       <div className="w-12 bg-bg-elevated border-r border-border flex flex-col items-center pt-3 gap-1.5">
-        {(['builder', 'access', 'reports', 'secrets_access'] as const).map(tab => {
+        {(['reports', 'access', 'builder'] as const).map(tab => {
           const Icon = TOP_LEVEL_ICON[tab]
           const isActive = activeTab === tab
           return (
@@ -107,11 +154,24 @@ export function SideNav({
 
         <div className="flex flex-col gap-0.5">
           <NavItem
-            active={activeTab === 'builder'}
-            label="Folder Builder"
-            icon={FolderTree}
-            onClick={() => onTabChange('builder')}
+            active={activeTab === 'reports'}
+            label="Compliance Reports"
+            icon={ClipboardCheck}
+            onClick={() => onTabChange('reports')}
           />
+          {activeTab === 'reports' && (
+            <div className="pl-6 flex flex-col gap-0.5 mb-1">
+              {REPORTS_SUB_TABS.map(sub => (
+                <NavItem
+                  key={sub.value}
+                  active={reportsSubTab === sub.value}
+                  label={sub.label}
+                  icon={sub.value === 'secrets_access' ? KeyRound : undefined}
+                  onClick={() => onReportsSubTabChange(sub.value)}
+                />
+              ))}
+            </div>
+          )}
 
           <NavItem
             active={activeTab === 'access'}
@@ -133,39 +193,32 @@ export function SideNav({
           )}
 
           <NavItem
-            active={activeTab === 'reports'}
-            label="Compliance Reports"
-            icon={ClipboardCheck}
-            onClick={() => onTabChange('reports')}
-          />
-
-          <NavItem
-            active={activeTab === 'secrets_access'}
-            label="Secrets Access Dashboard"
-            icon={KeyRound}
-            onClick={() => onTabChange('secrets_access')}
+            active={activeTab === 'builder'}
+            label="Folder Builder"
+            icon={FolderTree}
+            onClick={() => onTabChange('builder')}
           />
         </div>
 
-        {/* Theme toggle -- docked right below nav items, per user feedback on the
-            mockup (not pushed to the bottom via margin-top: auto). */}
-        <button
-          type="button"
-          onClick={toggle}
-          className="flex items-center gap-2 mt-2.5 px-2.5 py-2 rounded-md text-sm text-text-dim
-            bg-[color-mix(in_srgb,var(--color-text)_6%,transparent)]
-            hover:bg-[color-mix(in_srgb,var(--color-text)_10%,transparent)] transition-colors"
-        >
-          {theme === 'light' ? <Sun size={14} /> : <Moon size={14} />}
-          {theme === 'light' ? 'Light mode' : 'Dark mode'}
-        </button>
-
         <div className="flex-1" />
 
-        {isAdmin && onOpenAuditLog && (
-          <NavItem active={false} label="Audit Log" icon={ListChecks} onClick={onOpenAuditLog} />
-        )}
-        <NavItem active={false} label="Environments" icon={Settings} onClick={onOpenEnvironments} />
+        {/* Utility row -- everything that used to live as icon buttons in
+            the page header (Environments' gear icon, Audit Log, banner
+            settings, About) now lives here as one consistent group of
+            pill-shaped buttons, alongside the theme toggle. */}
+        <div className="flex flex-col gap-1 pt-2 border-t border-border-sub">
+          {isAdmin && onOpenAuditLog && (
+            <UtilityPill label="Audit Log" icon={ListChecks} onClick={onOpenAuditLog} />
+          )}
+          <UtilityPill label="Environments" icon={Settings} onClick={onOpenEnvironments} />
+          <UtilityPill label="Announcement banner" icon={Megaphone} onClick={onOpenBanner} />
+          <UtilityPill label="About" icon={Info} onClick={onOpenAbout} />
+          <UtilityPill
+            label={theme === 'light' ? 'Light mode' : 'Dark mode'}
+            icon={theme === 'light' ? Sun : Moon}
+            onClick={toggle}
+          />
+        </div>
       </div>
     </div>
   )

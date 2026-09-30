@@ -1,14 +1,29 @@
+import { useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { Info, X } from 'lucide-react'
 
-export function AboutDialog() {
+interface Props {
+  // Both optional -- omit for the self-contained trigger button (falls back
+  // to internal state, unchanged behavior). Pass both when opened remotely
+  // (e.g. SideNav's utility row).
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
+}
+
+export function AboutDialog({ open: openProp, onOpenChange }: Props = {}) {
+  const [openState, setOpenState] = useState(false)
+  const open = openProp ?? openState
+  const setOpen = onOpenChange ?? setOpenState
+
   return (
-    <Dialog.Root>
-      <Dialog.Trigger asChild>
-        <button type="button" className="btn-secondary !px-2" title="About / disclaimer">
-          <Info size={14} />
-        </button>
-      </Dialog.Trigger>
+    <Dialog.Root open={open} onOpenChange={setOpen}>
+      {openProp === undefined && (
+        <Dialog.Trigger asChild>
+          <button type="button" className="btn-secondary !px-2" title="About / disclaimer">
+            <Info size={14} />
+          </button>
+        </Dialog.Trigger>
+      )}
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
         <Dialog.Content className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[26rem] p-5">
