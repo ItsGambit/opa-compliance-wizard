@@ -1,0 +1,73 @@
+import Fuse from 'fuse.js'
+import { useMemo } from 'react'
+
+export interface FuzzyMatch {
+  item: unknown
+  matches: { key: string; indices: [number, number][] }[]
+}
+
+/** Every existing filter/picker in this app (Select dropdowns, the
+ * Compliance Report table's per-column filters) used to be plain
+ * case-insensitive substring matching -- no typo tolerance, and no way to
+ * show WHY a result matched. This hook is the one shared fuzzy-matching
+ * implementation for the whole app (Select.tsx, ComplianceReportDetail.tsx,
+ * ResourcesTab.tsx all use it) so every picker upgrades consistently
+ * instead of each growing its own slightly-different matcher.
+ *
+ * Returns EVERY item unfiltered (as { item, matches: [] }) when `query` is
+ * blank -- matches the "no filter = show all" behavior every existing
+ * picker already had, so this is a drop-in upgrade, not a behavior change
+ * for the empty-query case. `keys` are dot-paths into each item (Fuse's own
+ * key syntax, e.g. "details.email") -- pass every field a user might
+ * reasonably type into, not just the primary display label, so e.g.
+ * searching a user by email still works. */
+export function useFuzzyFilter<T>(items: T[], query: string, keys: string[]): { item: T; matches: FuzzyMatch['matches'] }[] {
+  const fuse = useMemo(
+    () =>
+      new Fuse(items, {
+        keys,
+        includeMatches: true,
+        threshold: 0.4, // Fuse's own tuned default range for "typo tolerant but not noisy" -- 0 is exact-only, 1 matches almost anything
+        ignoreLocation: true, // a match anywhere in the string counts, not just near Fuse's default 0-index window (a UUID/hostname match happens anywhere)
+      }),
+    // Fuse's own index is rebuilt whenever the underlying item list changes --
+    // `keys` is expected to be a stable literal array per call site, not
+    // included here to avoid rebuilding the index every render off a new
+    // array reference with the same contents.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [items]
+  )
+
+  return useMemo(() => {
+    const trimmed = query.trim()
+    if (!trimmed) return items.map(item => ({ item, matches: [] }))
+    return fuse.search(trimmed).map(result => ({
+      item: result.item,
+      matches: (result.matches ?? []).map(m => ({ key: String(m.key), indices: m.indices as [number, number][] })),
+    }))
+  }, [fuse, items, query])
+}
+
+/** Renders `text` with the character ranges in `indices` (Fuse's own
+ * 0-indexed, inclusive-inclusive [start, end] pairs) wrapped for visual
+ * highlighting -- the "hint" showing why a fuzzy result matched. Renders
+ * plain text unchanged when there's nothing to highlight (e.g. the
+ * no-query "show everything" case, or a field with no match on this
+ * particular row). */
+export function HighlightedText({ text, indices }: { text: string; indices?: [number, number][] }) {
+  if (!indices || indices.length === 0) return <>{text}</>
+  const sorted = [...indices].sort((a, b) => a[0] - b[0])
+  const parts: JSX.Element[] = []
+  let cursor = 0
+  sorted.forEach(([start, end], i) => {
+    if (start > cursor) parts.push(<span key={`plain-${i}`}>{text.slice(cursor, start)}</span>)
+    parts.push(
+      <mark key={`hit-${i}`} className="bg-accent-dim text-accent rounded-[2px] px-0">
+        {text.slice(start, end + 1)}
+      </mark>
+    )
+    cursor = end + 1
+  })
+  if (cursor < text.length) parts.push(<span key="plain-end">{text.slice(cursor)}</span>)
+  return <>{parts}</>
+}

@@ -279,6 +279,31 @@ def init_db():
         """)
         conn.commit()
 
+    # Added 2026-09-30 for the Resources tab's per-resource history drill-
+    # down -- resource_id/resource_alternate_id/resource_type_detail used
+    # to be computed at READ time in _four_field_row() from raw_json only
+    # (never stored, never indexed), so "show me every report row about
+    # THIS server/account" would have meant scanning + JSON-parsing the
+    # whole table in Python on every click. Storing them as real, indexed
+    # columns instead makes that lookup fast forever after. SQLite has no
+    # "ADD COLUMN IF NOT EXISTS" -- ALTER TABLE is run unconditionally and
+    # the "duplicate column" error it raises on every run after the first
+    # is caught and ignored, matching this file's existing convention of
+    # never crashing on a safe re-run.
+    with _db_lock:
+        for column in ("resource_id", "resource_alternate_id", "resource_type_detail"):
+            try:
+                conn.execute(f"ALTER TABLE events ADD COLUMN {column} TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_env_resource_id ON events (environment, resource_id)"
+        )
+        conn.commit()
+
+    backfill_resource_columns()
+
 
 # ---------------------------------------------------------------------------
 # Event shape normalization -- live API (nested JSON) and CSV export
@@ -289,9 +314,13 @@ def init_db():
 # ---------------------------------------------------------------------------
 def _normalize_live_event(event):
     """Shapes one raw Okta System Log API event (nested JSON, `target`
-    is a list of dicts) into the normalized row tuple."""
+    is a list of dicts) into the normalized row tuple. resource_id/
+    resource_alternate_id/resource_type_detail are computed here (via the
+    same _resource_fields helper _four_field_row uses at read time) so
+    they land in the DB as real, indexed columns -- see resource_history."""
     actor = event.get("actor") or {}
     outcome = event.get("outcome") or {}
+    resource_id, resource_alt_id, resource_type_detail = _resource_fields(event.get("eventType"), event)
     return (
         event.get("uuid"),
         event.get("eventType"),
@@ -301,6 +330,9 @@ def _normalize_live_event(event):
         actor.get("alternateId"),
         outcome.get("result"),
         json.dumps(event, separators=(",", ":")),
+        resource_id,
+        resource_alt_id,
+        resource_type_detail,
     )
 
 
@@ -339,6 +371,7 @@ def _normalize_csv_row(row):
         "target": targets,
         "_source": "csv_import",
     }
+    resource_id, resource_alt_id, resource_type_detail = _resource_fields(row.get("event_type"), raw)
     return (
         row.get("uuid"),
         row.get("event_type"),
@@ -348,6 +381,9 @@ def _normalize_csv_row(row):
         row.get("actor.alternate_id"),
         row.get("outcome.result"),
         json.dumps(raw, separators=(",", ":")),
+        resource_id,
+        resource_alt_id,
+        resource_type_detail,
     )
 
 
@@ -375,7 +411,8 @@ def _insert_rows(conn, environment, rows, ingestion_scope):
     max_published = None
     inserted = 0
     with _db_lock:
-        for uuid, event_type, published, actor_id, actor_name, actor_alt, outcome, raw_json in rows:
+        for (uuid, event_type, published, actor_id, actor_name, actor_alt, outcome, raw_json,
+             resource_id, resource_alt_id, resource_type_detail) in rows:
             if not uuid or not event_type or not published:
                 continue  # malformed row (e.g. a CSV export's trailing blank line) -- skip, don't crash
             is_curated = 1 if event_type in COMPLIANCE_EVENT_TYPES else 0
@@ -385,10 +422,12 @@ def _insert_rows(conn, environment, rows, ingestion_scope):
                 """INSERT OR IGNORE INTO events
                    (uuid, environment, event_type, published, actor_id,
                     actor_display_name, actor_alternate_id, outcome_result,
-                    is_curated, raw_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    is_curated, raw_json, resource_id, resource_alternate_id,
+                    resource_type_detail)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (uuid, environment, event_type, published, actor_id,
-                 actor_name, actor_alt, outcome, is_curated, raw_json),
+                 actor_name, actor_alt, outcome, is_curated, raw_json,
+                 resource_id, resource_alt_id, resource_type_detail),
             )
             inserted += cur.rowcount
             if max_published is None or published > max_published:
@@ -656,12 +695,19 @@ def _normalize_until(until):
     return until
 
 
-def query_events(environment, event_types=None, since=None, until=None, actor_id=None, limit=1000):
+def query_events(environment, event_types=None, since=None, until=None, actor_id=None, resource_id=None, limit=1000):
     """Generic report query -- used by every COMPLIANCE_REPORTS preset in
-    Phase 4. Returns raw rows (dicts with the full parsed raw_json under
-    "raw"), shaping to the four-field standard is left to the caller
-    since different reports want different extra columns from the same
-    underlying rows."""
+    Phase 4, and by resource_history below. Returns raw rows (dicts with
+    the full parsed raw_json under "raw"), shaping to the four-field
+    standard is left to the caller since different reports want different
+    extra columns from the same underlying rows.
+
+    resource_id, when given, matches against EITHER the stored
+    resource_id OR resource_alternate_id column (both are populated from
+    the same real target id -- see _resource_fields -- and for most
+    resource kinds confirmed live to just be the same value twice, but
+    matching both covers any kind where they'd genuinely differ) and uses
+    idx_events_env_resource_id, so this stays fast even on a large archive."""
     conn = _get_connection()
     until = _normalize_until(until)
     clauses = ["environment = ?"]
@@ -679,9 +725,13 @@ def query_events(environment, event_types=None, since=None, until=None, actor_id
     if actor_id:
         clauses.append("actor_id = ?")
         params.append(actor_id)
+    if resource_id:
+        clauses.append("(resource_id = ? OR resource_alternate_id = ?)")
+        params.extend([resource_id, resource_id])
     sql = (
         "SELECT uuid, event_type, published, actor_id, actor_display_name, "
-        "actor_alternate_id, outcome_result, raw_json FROM events WHERE "
+        "actor_alternate_id, outcome_result, resource_id, resource_alternate_id, "
+        "resource_type_detail, raw_json FROM events WHERE "
         + " AND ".join(clauses)
         + " ORDER BY published DESC LIMIT ?"
     )
@@ -772,6 +822,97 @@ def _primary_target(event_type, targets):
     return targets[0] if targets else None
 
 
+def _resource_fields(event_type, raw):
+    """Computes (resource_id, resource_alternate_id, resource_type_detail)
+    for one raw event -- shared by _four_field_row (read-time display) AND
+    the ingest normalizers (_normalize_live_event/_normalize_csv_row, which
+    persist these as real, indexed DB columns for the Resources tab's
+    per-resource history drill-down -- see resource_history). Keeping ONE
+    implementation means the stored columns and the read-time display can
+    never drift out of sync with each other.
+
+    resource_id/resource_alternate_id (real Okta user id / email, confirmed
+    live 2026-09-30 on e.g. user.lifecycle.create's target) matter for the
+    same reason actor_id/actor_alternate_id already did for the "User"
+    column -- displayName alone is not a unique identifier (a real tenant
+    can have two people who share a display name but have distinct Okta
+    user ids/emails) -- AND, as of this drill-down feature, this same id is
+    the join key back to a resource's own `id` in the Access Explorer
+    resource inventory (AccessServer/AccessGateway/etc. -- confirmed live
+    2026-09-30 by comparing a real Gateway/Server Account/Database Account
+    target's id directly against the matching AccessModel entry's id).
+
+    resource_type_detail is a SEPARATE thing from the target's own generic
+    `type` field (e.g. "Service Account") -- it surfaces
+    debugContext.debugData.resourceType when present (confirmed live
+    2026-09-30: real values include PAM_DATABASE_ACCOUNT, SERVER_ACCOUNT on
+    pam.resource.checkout/checkin.* events), which is what actually
+    distinguishes checking out a database account from checking out a
+    server account -- the target's own generic type alone can't tell those
+    apart."""
+    targets = raw.get("target") or []
+    primary = _primary_target(event_type, targets)
+    resource_id = primary.get("id") if primary else None
+    resource_alternate_id = primary.get("alternateId") if primary else None
+    resource_type_detail = ((raw.get("debugContext") or {}).get("debugData") or {}).get("resourceType")
+    return resource_id or None, resource_alternate_id or None, resource_type_detail or None
+
+
+def backfill_resource_columns():
+    """One-time (per environment's worth of pre-existing rows) migration,
+    called from init_db() right after the ALTER TABLEs above -- populates
+    resource_id/resource_alternate_id/resource_type_detail for every row
+    that predates those columns existing. Idempotent and cheap to call on
+    every boot: only rows where ALL THREE columns are still NULL are
+    touched (a real row can legitimately have resource_type_detail NULL
+    while resource_id is set, e.g. any non-PAM-checkout event -- so "any
+    one of the three is set" is treated as "already backfilled", not
+    "still needs it", to avoid ever recomputing rows that were already
+    correctly populated at ingest time going forward).
+
+    Batches UPDATEs (500 rows per transaction) rather than one giant
+    transaction, since a real archive was seen this session at 56k+ rows
+    for a single 90-day window -- holding the write lock for one huge
+    transaction would block concurrent report reads for longer than
+    necessary."""
+    conn = _get_connection()
+    BATCH_SIZE = 500
+    with _db_lock:
+        rows = conn.execute(
+            """SELECT environment, uuid, event_type, raw_json FROM events
+               WHERE resource_id IS NULL AND resource_alternate_id IS NULL
+                     AND resource_type_detail IS NULL"""
+        ).fetchall()
+    if not rows:
+        return 0
+    updated = 0
+    batch = []
+    for row in rows:
+        raw = json.loads(row["raw_json"])
+        resource_id, resource_alt_id, resource_type_detail = _resource_fields(row["event_type"], raw)
+        batch.append((resource_id, resource_alt_id, resource_type_detail, row["environment"], row["uuid"]))
+        if len(batch) >= BATCH_SIZE:
+            with _db_lock:
+                conn.executemany(
+                    """UPDATE events SET resource_id = ?, resource_alternate_id = ?,
+                       resource_type_detail = ? WHERE environment = ? AND uuid = ?""",
+                    batch,
+                )
+                conn.commit()
+            updated += len(batch)
+            batch = []
+    if batch:
+        with _db_lock:
+            conn.executemany(
+                """UPDATE events SET resource_id = ?, resource_alternate_id = ?,
+                   resource_type_detail = ? WHERE environment = ? AND uuid = ?""",
+                batch,
+            )
+            conn.commit()
+        updated += len(batch)
+    return updated
+
+
 def _four_field_row(event_row):
     """Shapes one query_events() row to the "four-field standard" the
     audit-requirements guide calls for on every exported report row:
@@ -781,32 +922,19 @@ def _four_field_row(event_row):
     row, the reconstructed list built by _normalize_csv_row) -- see
     _primary_target for which entry is picked as "the resource".
 
-    `resource_type_detail` is a SEPARATE thing from `resource_type`
-    (which reflects the target's own `type` field, e.g. "Service
-    Account") -- it surfaces `debugContext.debugData.resourceType` when
-    present (confirmed live 2026-09-30: real values include
-    PAM_DATABASE_ACCOUNT, SERVER_ACCOUNT on pam.resource.checkout/
-    checkin.* events), which is what actually distinguishes checking out
-    a database account from checking out a server account -- the target's
-    own generic "Service Account" type alone can't tell those apart.
-
-    `resource_id`/`resource_alternate_id` (real Okta user id / email,
-    confirmed live 2026-09-30 on e.g. user.lifecycle.create's target) are
-    ALSO surfaced now for the same reason `actor_id`/`actor_alternate_id`
-    already were for the "User" column -- displayName alone is not a
-    unique identifier (a real tenant can have two people who share a
-    display name but have distinct Okta user ids/emails), which matters
-    most for exactly the reports where "prove who was specifically
-    affected" is the whole point (Provisioning & De-provisioning, Role/
-    Group Changes, Admin Privilege Grants)."""
+    resource_id/resource_alternate_id/resource_type_detail are read
+    straight from the row's own stored columns (populated at ingest time
+    by _resource_fields -- see there for what each one means) rather than
+    recomputed from raw_json here, so a query_events() caller that already
+    filtered/joined on those columns (e.g. resource_history) doesn't pay
+    to recompute values it already has. resource_type (the target's own
+    generic `type`, e.g. "Service Account") is display-only and NOT one of
+    the stored/indexed columns, so it's still derived here."""
     raw = event_row["raw"]
     targets = raw.get("target") or []
     primary = _primary_target(event_row["event_type"], targets)
     resource = primary.get("displayName") if primary else None
     resource_type = primary.get("type") if primary else None
-    resource_id = primary.get("id") if primary else None
-    resource_alternate_id = primary.get("alternateId") if primary else None
-    resource_type_detail = ((raw.get("debugContext") or {}).get("debugData") or {}).get("resourceType")
     return {
         "uuid": event_row["uuid"],
         "user": event_row["actor_display_name"] or event_row["actor_alternate_id"] or event_row["actor_id"] or "unknown",
@@ -816,9 +944,9 @@ def _four_field_row(event_row):
         "timestamp": event_row["published"],
         "resource": resource or "",
         "resource_type": resource_type or "",
-        "resource_type_detail": resource_type_detail or "",
-        "resource_id": resource_id or "",
-        "resource_alternate_id": resource_alternate_id or "",
+        "resource_type_detail": event_row.get("resource_type_detail") or "",
+        "resource_id": event_row.get("resource_id") or "",
+        "resource_alternate_id": event_row.get("resource_alternate_id") or "",
         "outcome": event_row["outcome_result"] or "",
         "targets": targets,  # full target list -- some reports need target1/2 too, e.g. PAM's Team/Server
     }
@@ -832,4 +960,22 @@ def run_report(report_key, environment, since=None, until=None, limit=1000):
         raise KeyError(f"Unknown report: {report_key!r}")
     event_types = _event_types_for_report(report_key)
     rows = query_events(environment, event_types=event_types, since=since, until=until, limit=limit)
+    return [_four_field_row(r) for r in rows]
+
+
+def resource_history(environment, resource_id, since=None, until=None, limit=1000):
+    """Every report row across EVERY event type (not scoped to one
+    COMPLIANCE_REPORTS preset) whose resource_id/resource_alternate_id
+    matches this one real resource's own id -- the Resources tab's
+    per-resource drill-down (click a server/AD account/DB account/etc.,
+    see its full compliance history). The join key was confirmed live
+    2026-09-30 by comparing real target ids on archived patlabs events
+    directly against the matching AccessModel entries' own ids (a
+    Gateway target's id IS that gateway's AccessGateway.id, etc. -- see
+    the plan file for the exact sampled events). No resource_id given
+    means "nothing to look up" -- returns [] rather than every event ever,
+    since an empty/falsy id is never a real resource's id."""
+    if not resource_id:
+        return []
+    rows = query_events(environment, since=since, until=until, resource_id=resource_id, limit=limit)
     return [_four_field_row(r) for r in rows]

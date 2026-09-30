@@ -8,6 +8,7 @@ import {
   fetchReportDefs,
   fetchResourceGroupSecurityPolicies,
   fetchResourceGroups,
+  fetchResourceHistory,
   fetchSecretsAccessReport,
   fetchServiceAccount,
   fetchUserResourceAccess,
@@ -165,5 +166,15 @@ export function useReport(reportKey: string | undefined, environment: string | u
     queryKey: ['report', reportKey, environment, from, to],
     queryFn: () => runReport(reportKey!, environment, from, to),
     enabled: !!reportKey && !!environment,
+  })
+}
+
+/** The Resources tab's per-resource drill-down -- mirrors useReport's exact
+ * shape, just keyed by a resource's own id instead of a report_key. */
+export function useResourceHistory(resourceId: string | undefined, environment: string | undefined, from?: string, to?: string) {
+  return useQuery({
+    queryKey: ['resource_history', resourceId, environment, from, to],
+    queryFn: () => fetchResourceHistory(resourceId!, environment, from, to),
+    enabled: !!resourceId && !!environment,
   })
 }

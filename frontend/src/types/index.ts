@@ -107,6 +107,15 @@ export interface ComplianceReportResponse {
   rows: ComplianceReportRow[]
 }
 
+/** GET /api/resources/{id}/history -- same ComplianceReportRow shape as
+ * every report, just scoped to one resource's own id instead of one
+ * report_key's event types. See audit_store.resource_history. */
+export interface ResourceHistoryResponse {
+  resource_id: string
+  environment: string
+  rows: ComplianceReportRow[]
+}
+
 export type BannerVariant = 'info' | 'warning' | 'danger'
 
 export interface BannerConfig {

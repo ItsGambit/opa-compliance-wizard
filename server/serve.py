@@ -590,6 +590,23 @@ class Handler(SimpleHTTPRequestHandler):
                     return self._send_json(404, {"error": str(exc)})
                 return self._send_json(200, {"report": report_key, "environment": environment, "rows": rows})
 
+            if path.startswith("/api/resources/") and path.endswith("/history"):
+                import audit_store
+                resource_id = unquote(path[len("/api/resources/"):-len("/history")])
+                environment = (qs.get("environment") or [local_env_name])[0]
+                if not environment:
+                    return self._send_json(400, {"error": "No active environment and none specified via ?environment="})
+                if not resource_id:
+                    return self._send_json(400, {"error": "missing resource_id"})
+                since = (qs.get("from") or [None])[0]
+                until = (qs.get("to") or [None])[0]
+                try:
+                    limit = min(int((qs.get("limit") or [1000])[0]), 5000)
+                except ValueError:
+                    return self._send_json(400, {"error": "limit must be an integer"})
+                rows = audit_store.resource_history(environment, resource_id, since=since, until=until, limit=limit)
+                return self._send_json(200, {"resource_id": resource_id, "environment": environment, "rows": rows})
+
             if path == "/api/resource_groups":
                 if not _require_client(self._send_json, local_client):
                     return

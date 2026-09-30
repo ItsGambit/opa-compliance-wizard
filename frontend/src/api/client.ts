@@ -18,6 +18,7 @@ import type {
   Project,
   ResourceAccessInfo,
   ResourceGroup,
+  ResourceHistoryResponse,
   SecretsAccessReport,
   ServiceAccountInfo,
   SyncSchedule,
@@ -314,6 +315,25 @@ export function runReport(
   if (to) params.set('to', to)
   const qs = params.toString()
   return apiFetch(`/api/reports/${encodeURIComponent(reportKey)}${qs ? `?${qs}` : ''}`)
+}
+
+/** The Resources tab's per-resource drill-down -- every compliance report
+ * row about one specific resource (server/AD account/DB account/gateway/
+ * etc.), scoped by that resource's own real id. See
+ * audit_store.resource_history and server/serve.py's /api/resources/*
+ * route. */
+export function fetchResourceHistory(
+  resourceId: string,
+  environment?: string,
+  from?: string,
+  to?: string
+): Promise<ResourceHistoryResponse> {
+  const params = new URLSearchParams()
+  if (environment) params.set('environment', environment)
+  if (from) params.set('from', from)
+  if (to) params.set('to', to)
+  const qs = params.toString()
+  return apiFetch(`/api/resources/${encodeURIComponent(resourceId)}/history${qs ? `?${qs}` : ''}`)
 }
 
 // ── Audit log (admin-only, see server/serve.py's /api/audit_log) ─────────
