@@ -8,12 +8,32 @@ import {
   Megaphone,
   Menu,
   Moon,
+  PanelLeftClose,
+  PanelLeftOpen,
   Search,
   Settings,
   Sun,
 } from 'lucide-react'
 
 const THEME_STORAGE_KEY = 'opa-compliance-wizard-theme'
+const COLLAPSED_STORAGE_KEY = 'opa-compliance-wizard-nav-collapsed'
+
+/** Tracks Tailwind's `md` breakpoint (768px) so JS-driven layout choices
+ * (the desktop collapse below) can be scoped to exactly the same
+ * viewport range as the `md:` classes already used throughout this
+ * component -- collapse is a desktop-only concept; the mobile drawer is
+ * always full-width/full-label regardless of a collapsed state persisted
+ * from a prior desktop session. */
+function useIsDesktop() {
+  const [isDesktop, setIsDesktop] = useState(() => window.matchMedia('(min-width: 768px)').matches)
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 768px)')
+    const listener = (e: MediaQueryListEvent) => setIsDesktop(e.matches)
+    mq.addEventListener('change', listener)
+    return () => mq.removeEventListener('change', listener)
+  }, [])
+  return isDesktop
+}
 
 function useTheme() {
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
@@ -76,8 +96,45 @@ const TOP_LEVEL_ICON: Record<string, typeof FolderTree> = {
   audit_log: ListChecks,
 }
 
-function NavItem({ active, label, icon, onClick }: { active: boolean; label: string; icon?: typeof FolderTree; onClick: () => void }) {
+const TOP_LEVEL_LABEL: Record<string, string> = {
+  reports: 'Compliance Reports',
+  access: 'Access Explorer',
+  builder: 'Folder Builder',
+  audit_log: 'Audit Log',
+}
+
+/** One top-level nav row. When `collapsed`, renders icon-only (centered,
+ * square) with a title tooltip as the only label; expanded renders the
+ * ordinary icon+label row. Used for both this row and (via NavItem below)
+ * sub-items, which never render in collapsed mode at all -- see SideNav. */
+function NavItem({
+  active,
+  label,
+  icon,
+  onClick,
+  collapsed,
+}: {
+  active: boolean
+  label: string
+  icon?: typeof FolderTree
+  onClick: () => void
+  collapsed?: boolean
+}) {
   const Icon = icon
+  if (collapsed) {
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        title={label}
+        className={`w-9 h-9 mx-auto flex items-center justify-center rounded-md transition-colors ${
+          active ? 'bg-accent text-white' : 'text-text-faint hover:bg-bg-hover hover:text-text-dim'
+        }`}
+      >
+        {Icon && <Icon size={16} />}
+      </button>
+    )
+  }
   return (
     <button
       type="button"
@@ -96,9 +153,34 @@ function NavItem({ active, label, icon, onClick }: { active: boolean; label: str
 // theme toggle originally had, now applied consistently to every utility
 // action (Environments, Audit Log, Announcement banner, About, theme) so
 // they read as one coherent group rather than the theme toggle looking
-// like a one-off.
-function UtilityPill({ label, icon, onClick }: { label: string; icon: typeof FolderTree; onClick: () => void }) {
+// like a one-off. Collapses to an icon-only square, same treatment as
+// NavItem above, when the sidebar is collapsed.
+function UtilityPill({
+  label,
+  icon,
+  onClick,
+  collapsed,
+}: {
+  label: string
+  icon: typeof FolderTree
+  onClick: () => void
+  collapsed?: boolean
+}) {
   const Icon = icon
+  if (collapsed) {
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        title={label}
+        className="w-9 h-9 mx-auto flex items-center justify-center rounded-full text-text-dim
+          bg-[color-mix(in_srgb,var(--color-text)_6%,transparent)]
+          hover:bg-[color-mix(in_srgb,var(--color-text)_10%,transparent)] transition-colors"
+      >
+        <Icon size={14} />
+      </button>
+    )
+  }
   return (
     <button
       type="button"
@@ -127,69 +209,81 @@ export function SideNav({
   onOpenAbout,
 }: Props) {
   const { theme, toggle } = useTheme()
-  const topLevelTabs = isAdmin
-    ? (['reports', 'access', 'builder', 'audit_log'] as const)
-    : (['reports', 'access', 'builder'] as const)
-  // Below md, the labeled panel (w-64) doesn't fit alongside real content
-  // on a phone-width viewport -- it's hidden by default and toggled open
-  // as a fixed overlay drawer instead (closes itself on any nav click, or
-  // the backdrop, so it never lingers open over the page underneath).
-  // Above md, this is pixel-identical to the original always-visible
-  // panel -- drawerOpen is simply never consulted there.
-  const [drawerOpen, setDrawerOpen] = useState(false)
 
+  // Desktop collapse (persisted -- a deliberate "make it narrower and
+  // leave it that way" choice, distinct from the mobile drawer below,
+  // which is always closed on load). Real regression this replaces: an
+  // earlier revision rendered a permanent icon-only rail AND the full
+  // labeled panel as two separate always-visible columns, which is what
+  // actually widened the sidebar on desktop -- this is one single column
+  // that toggles between the two states instead of showing both at once.
+  const [collapsedPref, setCollapsedPref] = useState(() => localStorage.getItem(COLLAPSED_STORAGE_KEY) === 'true')
+  useEffect(() => {
+    localStorage.setItem(COLLAPSED_STORAGE_KEY, String(collapsedPref))
+  }, [collapsedPref])
+  const isDesktop = useIsDesktop()
+  // The actual effective collapsed state -- only ever true on desktop,
+  // regardless of what's persisted, so a collapsed preference saved on a
+  // wide screen never leaks into the mobile drawer's rendering.
+  const collapsed = isDesktop && collapsedPref
+
+  // Below md, collapsed/expanded doesn't apply at all -- the panel is
+  // hidden by default and toggled open as a fixed overlay drawer instead
+  // (closes itself on any nav click, or the backdrop, so it never lingers
+  // open over the page underneath).
+  const [drawerOpen, setDrawerOpen] = useState(false)
   const closeDrawer = () => setDrawerOpen(false)
 
   return (
     <div className="flex h-full shrink-0">
-      {/* Icon rail */}
-      <div className="w-12 bg-bg-elevated border-r border-border flex flex-col items-center pt-3 gap-1.5">
+      {/* Mobile-only rail: just the hamburger, no icon rail duplicate of
+          the panel below it (that duplication was the desktop bug). */}
+      <div className="md:hidden w-12 bg-bg-elevated border-r border-border flex flex-col items-center pt-3">
         <button
           type="button"
           onClick={() => setDrawerOpen(o => !o)}
-          className="md:hidden w-8 h-8 flex items-center justify-center rounded-md text-text-faint hover:bg-bg-hover hover:text-text-dim mb-1"
+          className="w-8 h-8 flex items-center justify-center rounded-md text-text-faint hover:bg-bg-hover hover:text-text-dim"
           title="Toggle menu"
         >
           <Menu size={16} />
         </button>
-        {topLevelTabs.map(tab => {
-          const Icon = TOP_LEVEL_ICON[tab]
-          const isActive = activeTab === tab
-          return (
-            <button
-              key={tab}
-              type="button"
-              onClick={() => onTabChange(tab)}
-              className={`w-8 h-8 flex items-center justify-center rounded-md transition-colors ${
-                isActive ? 'bg-accent text-white' : 'text-text-faint hover:bg-bg-hover hover:text-text-dim'
-              }`}
-            >
-              <Icon size={16} />
-            </button>
-          )
-        })}
       </div>
 
       {/* Mobile-only backdrop, closes the drawer on outside click */}
-      {drawerOpen && (
-        <div className="md:hidden fixed inset-0 bg-black/50 z-30" onClick={closeDrawer} />
-      )}
+      {drawerOpen && <div className="md:hidden fixed inset-0 bg-black/50 z-30" onClick={closeDrawer} />}
 
-      {/* Sidebar panel -- fixed overlay drawer below md when open, ordinary
-          flex sibling (unchanged from before) at md and above. */}
+      {/* The one sidebar column -- fixed overlay drawer below md when
+          open; an ordinary flex sibling at md and above, width toggling
+          between collapsed (icon rail) and expanded (labeled panel). */}
       <div
-        className={`${drawerOpen ? 'flex' : 'hidden'} md:flex w-64 bg-bg-elevated border-r border-border flex-col p-3 fixed md:relative top-0 left-12 h-full z-40`}
+        className={`${drawerOpen ? 'flex' : 'hidden'} md:flex ${collapsed ? 'md:w-14' : 'md:w-64'} w-64
+          bg-bg-elevated border-r border-border flex-col p-3 fixed md:relative top-0 left-0 h-full z-40 transition-[width] duration-150`}
       >
-        <div className="text-sm font-semibold text-text px-2 mb-3">OPA Compliance Wizard</div>
+        <div className={`flex items-center mb-3 ${collapsed ? 'md:justify-center' : 'justify-between'} px-2`}>
+          {!collapsed && <div className="text-sm font-semibold text-text truncate">OPA Compliance Wizard</div>}
+          <button
+            type="button"
+            onClick={() => setCollapsedPref(c => !c)}
+            title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            className="hidden md:flex w-7 h-7 shrink-0 items-center justify-center rounded-md text-text-faint hover:bg-bg-hover hover:text-text-dim"
+          >
+            {collapsed ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}
+          </button>
+        </div>
+        {/* Mobile drawer always shows the full title -- collapsed only
+            ever applies at md and above (mobile has its own always-full
+            drawer state, distinct from this desktop toggle). */}
+        {collapsed && <div className="md:hidden text-sm font-semibold text-text px-2 mb-3">OPA Compliance Wizard</div>}
 
         <div className="flex flex-col gap-0.5">
           <NavItem
             active={activeTab === 'reports'}
-            label="Compliance Reports"
-            icon={ClipboardCheck}
+            label={TOP_LEVEL_LABEL.reports}
+            icon={TOP_LEVEL_ICON.reports}
             onClick={() => { onTabChange('reports'); closeDrawer() }}
+            collapsed={collapsed}
           />
-          {activeTab === 'reports' && (
+          {!collapsed && activeTab === 'reports' && (
             <div className="pl-6 flex flex-col gap-0.5 mb-1">
               {REPORTS_SUB_TABS.map(sub => (
                 <NavItem
@@ -205,11 +299,12 @@ export function SideNav({
 
           <NavItem
             active={activeTab === 'access'}
-            label="Access Explorer"
-            icon={Search}
+            label={TOP_LEVEL_LABEL.access}
+            icon={TOP_LEVEL_ICON.access}
             onClick={() => { onTabChange('access'); closeDrawer() }}
+            collapsed={collapsed}
           />
-          {activeTab === 'access' && (
+          {!collapsed && activeTab === 'access' && (
             <div className="pl-6 flex flex-col gap-0.5 mb-1">
               {accessSubTabs.map(sub => (
                 <NavItem
@@ -224,17 +319,19 @@ export function SideNav({
 
           <NavItem
             active={activeTab === 'builder'}
-            label="Folder Builder"
-            icon={FolderTree}
+            label={TOP_LEVEL_LABEL.builder}
+            icon={TOP_LEVEL_ICON.builder}
             onClick={() => { onTabChange('builder'); closeDrawer() }}
+            collapsed={collapsed}
           />
 
           {isAdmin && (
             <NavItem
               active={activeTab === 'audit_log'}
-              label="Audit Log"
-              icon={ListChecks}
+              label={TOP_LEVEL_LABEL.audit_log}
+              icon={TOP_LEVEL_ICON.audit_log}
               onClick={() => { onTabChange('audit_log'); closeDrawer() }}
+              collapsed={collapsed}
             />
           )}
         </div>
@@ -248,13 +345,14 @@ export function SideNav({
             this group 2026-09-30 -- it's a full top-level nav item/page
             now, not a dialog trigger. */}
         <div className="flex flex-col gap-1 pt-2 border-t border-border-sub">
-          <UtilityPill label="Environments" icon={Settings} onClick={() => { onOpenEnvironments(); closeDrawer() }} />
-          <UtilityPill label="Announcement banner" icon={Megaphone} onClick={() => { onOpenBanner(); closeDrawer() }} />
-          <UtilityPill label="About" icon={Info} onClick={() => { onOpenAbout(); closeDrawer() }} />
+          <UtilityPill label="Environments" icon={Settings} onClick={() => { onOpenEnvironments(); closeDrawer() }} collapsed={collapsed} />
+          <UtilityPill label="Announcement banner" icon={Megaphone} onClick={() => { onOpenBanner(); closeDrawer() }} collapsed={collapsed} />
+          <UtilityPill label="About" icon={Info} onClick={() => { onOpenAbout(); closeDrawer() }} collapsed={collapsed} />
           <UtilityPill
             label={theme === 'light' ? 'Light mode' : 'Dark mode'}
             icon={theme === 'light' ? Sun : Moon}
             onClick={toggle}
+            collapsed={collapsed}
           />
         </div>
       </div>

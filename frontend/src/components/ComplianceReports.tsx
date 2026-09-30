@@ -118,7 +118,7 @@ export function ComplianceReports() {
       {grouped.map(({ control, reports: controlReports }) => (
         <div key={control} className="flex flex-col gap-2">
           <div className="section-label">{CONTROL_LABELS[control]}</div>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             {controlReports.map(def => (
               <ReportCard key={def.key} def={def} environment={activeEnv} onClick={() => setSelectedReport(def.key)} />
             ))}

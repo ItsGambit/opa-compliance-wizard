@@ -907,13 +907,32 @@ already exists is skipped, not duplicated.
 
 ## Version
 
-5.22.0 — **Relationships & Assignments are now directly browsable**, a
-mobile-friendlier UI pass (collapsible sidebar drawer, dialogs that fit
-a phone-width viewport, stacked two-column tabs), and a real progress
-bar on the footer's "Sync now" (previously spinner-only). See the
-changelog entry below for the full breakdown.
+5.22.1 — **Fixed a mobile layout bug** in the 5.22.0 mobile pass: the
+Compliance Reports card grid stayed two-column below tablet width, so
+each card's event count overlapped its own description text. Also fixes
+a desktop regression from the same release, where the sidebar briefly
+rendered both a permanent icon rail *and* the full labeled panel at once
+(widening the sidebar) instead of one column that toggles between the
+two — replaced with a real collapse/expand toggle, persisted across
+reloads. See the changelog entries below for the full breakdown.
 
 ### Changelog
+- **5.22.1**:
+  - **Fixed: Compliance Reports card grid broke below tablet width.**
+    `grid-cols-2` was unconditional, so each card had too little room for
+    its icon+description+count row — the event count overlapped the
+    description on a phone-width viewport. Now stacks to one column below
+    `md`, matching every other multi-column layout from the 5.22.0 mobile
+    pass. Checked every other grid in the app (`KeyValueGrid`, the Sync
+    Settings run-time/retention/max-size row) — both hold up fine at
+    390px as-is, no change needed there.
+  - **Fixed: sidebar showed both the icon rail and the labeled panel at
+    once on desktop**, widening it instead of collapsing — a real
+    regression from 5.22.0's mobile pass. Replaced with one column that
+    toggles between an icon-only rail and the full labeled panel via a
+    new collapse/expand button; the choice persists across reloads
+    (desktop-only — the mobile drawer is unaffected and always shows the
+    full labeled panel when open).
 - **5.22.0**:
   - **New: Relationships tab (Access Explorer).** Browse every
     relationship → its assignments → the policies that use them, in one
