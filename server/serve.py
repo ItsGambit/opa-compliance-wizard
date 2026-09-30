@@ -596,15 +596,24 @@ class Handler(SimpleHTTPRequestHandler):
                 environment = (qs.get("environment") or [local_env_name])[0]
                 if not environment:
                     return self._send_json(400, {"error": "No active environment and none specified via ?environment="})
-                if not resource_id:
-                    return self._send_json(400, {"error": "missing resource_id"})
+                # resource_name: fallback exact-displayName match for
+                # resource kinds with no discoverable log-side id at all
+                # (database accounts, individual AD accounts -- see
+                # audit_store.resource_history's docstring). resource_id
+                # alone is kept working for every kind that DOES have one.
+                resource_name = (qs.get("resource_name") or [None])[0]
+                if not resource_id and not resource_name:
+                    return self._send_json(400, {"error": "missing resource_id or resource_name"})
                 since = (qs.get("from") or [None])[0]
                 until = (qs.get("to") or [None])[0]
                 try:
                     limit = min(int((qs.get("limit") or [1000])[0]), 5000)
                 except ValueError:
                     return self._send_json(400, {"error": "limit must be an integer"})
-                rows = audit_store.resource_history(environment, resource_id, since=since, until=until, limit=limit)
+                rows = audit_store.resource_history(
+                    environment, resource_id=resource_id, resource_name=resource_name,
+                    since=since, until=until, limit=limit,
+                )
                 return self._send_json(200, {"resource_id": resource_id, "environment": environment, "rows": rows})
 
             if path == "/api/resource_groups":

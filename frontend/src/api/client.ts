@@ -319,19 +319,30 @@ export function runReport(
 
 /** The Resources tab's per-resource drill-down -- every compliance report
  * row about one specific resource (server/AD account/DB account/gateway/
- * etc.), scoped by that resource's own real id. See
- * audit_store.resource_history and server/serve.py's /api/resources/*
- * route. */
+ * etc.), scoped by that resource's own real id AND/OR its exact display
+ * name. See audit_store.resource_history and server/serve.py's
+ * /api/resources/* route.
+ *
+ * resourceName is a real, needed fallback (not a nice-to-have) -- confirmed
+ * live 2026-09-30 that database accounts and individual Active Directory
+ * accounts have NO discoverable log-side id at all (the System Log
+ * references a different, unresolvable "Service Account" id for those two
+ * kinds), so matching by resourceId alone finds nothing for them. Passing
+ * both is safe for every other kind too -- the backend OR-matches whichever
+ * is given, so this never narrows results for a kind that already works by
+ * id alone. */
 export function fetchResourceHistory(
   resourceId: string,
   environment?: string,
   from?: string,
-  to?: string
+  to?: string,
+  resourceName?: string
 ): Promise<ResourceHistoryResponse> {
   const params = new URLSearchParams()
   if (environment) params.set('environment', environment)
   if (from) params.set('from', from)
   if (to) params.set('to', to)
+  if (resourceName) params.set('resource_name', resourceName)
   const qs = params.toString()
   return apiFetch(`/api/resources/${encodeURIComponent(resourceId)}/history${qs ? `?${qs}` : ''}`)
 }

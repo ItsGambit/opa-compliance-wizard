@@ -170,11 +170,19 @@ export function useReport(reportKey: string | undefined, environment: string | u
 }
 
 /** The Resources tab's per-resource drill-down -- mirrors useReport's exact
- * shape, just keyed by a resource's own id instead of a report_key. */
-export function useResourceHistory(resourceId: string | undefined, environment: string | undefined, from?: string, to?: string) {
+ * shape, just keyed by a resource's own id (and, for kinds with no
+ * log-side id at all -- see fetchResourceHistory -- an exact display-name
+ * fallback) instead of a report_key. */
+export function useResourceHistory(
+  resourceId: string | undefined,
+  environment: string | undefined,
+  from?: string,
+  to?: string,
+  resourceName?: string
+) {
   return useQuery({
-    queryKey: ['resource_history', resourceId, environment, from, to],
-    queryFn: () => fetchResourceHistory(resourceId!, environment, from, to),
+    queryKey: ['resource_history', resourceId, environment, from, to, resourceName],
+    queryFn: () => fetchResourceHistory(resourceId!, environment, from, to, resourceName),
     enabled: !!resourceId && !!environment,
   })
 }

@@ -276,6 +276,23 @@ def init_db():
                 total_events_ingested INTEGER NOT NULL DEFAULT 0,
                 ingestion_scope TEXT NOT NULL DEFAULT 'curated'
             );
+
+            CREATE TABLE IF NOT EXISTS event_targets (
+                environment TEXT NOT NULL,
+                uuid TEXT NOT NULL,
+                target_id TEXT,
+                target_alternate_id TEXT,
+                target_display_name TEXT,
+                FOREIGN KEY (environment, uuid) REFERENCES events(environment, uuid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_event_targets_id
+                ON event_targets (environment, target_id);
+            CREATE INDEX IF NOT EXISTS idx_event_targets_alt_id
+                ON event_targets (environment, target_alternate_id);
+            CREATE INDEX IF NOT EXISTS idx_event_targets_name
+                ON event_targets (environment, target_display_name);
+            CREATE INDEX IF NOT EXISTS idx_event_targets_env_uuid
+                ON event_targets (environment, uuid);
         """)
         conn.commit()
 
@@ -303,6 +320,7 @@ def init_db():
         conn.commit()
 
     backfill_resource_columns()
+    backfill_event_targets()
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +335,18 @@ def _normalize_live_event(event):
     is a list of dicts) into the normalized row tuple. resource_id/
     resource_alternate_id/resource_type_detail are computed here (via the
     same _resource_fields helper _four_field_row uses at read time) so
-    they land in the DB as real, indexed columns -- see resource_history."""
+    they land in the DB as real, indexed columns -- see resource_history.
+
+    The trailing `targets` list (Okta's own raw target dicts) is carried
+    through separately from resource_id/etc above -- _insert_rows fans it
+    out into one event_targets row per real target, for
+    resource_history's "was this resource ANY target on this event, not
+    just the ONE primary one" query. Real bug found 2026-09-30: a genuine
+    Server target (e.g. usp-srv1) can coexist on an event alongside a
+    Server Account target that _primary_target prefers as "the" resource
+    -- resource_id alone silently drops the Server's own id, so clicking
+    it in the Resources tab found zero history even though real activity
+    against it existed."""
     actor = event.get("actor") or {}
     outcome = event.get("outcome") or {}
     resource_id, resource_alt_id, resource_type_detail = _resource_fields(event.get("eventType"), event)
@@ -333,6 +362,7 @@ def _normalize_live_event(event):
         resource_id,
         resource_alt_id,
         resource_type_detail,
+        event.get("target") or [],
     )
 
 
@@ -384,6 +414,7 @@ def _normalize_csv_row(row):
         resource_id,
         resource_alt_id,
         resource_type_detail,
+        targets,
     )
 
 
@@ -412,7 +443,7 @@ def _insert_rows(conn, environment, rows, ingestion_scope):
     inserted = 0
     with _db_lock:
         for (uuid, event_type, published, actor_id, actor_name, actor_alt, outcome, raw_json,
-             resource_id, resource_alt_id, resource_type_detail) in rows:
+             resource_id, resource_alt_id, resource_type_detail, targets) in rows:
             if not uuid or not event_type or not published:
                 continue  # malformed row (e.g. a CSV export's trailing blank line) -- skip, don't crash
             is_curated = 1 if event_type in COMPLIANCE_EVENT_TYPES else 0
@@ -432,6 +463,20 @@ def _insert_rows(conn, environment, rows, ingestion_scope):
             inserted += cur.rowcount
             if max_published is None or published > max_published:
                 max_published = published
+            # Only fan out into event_targets on a genuine new insert
+            # (cur.rowcount == 1) -- INSERT OR IGNORE is a no-op on a
+            # duplicate uuid, and re-inserting the same event's targets
+            # every re-run would duplicate rows with nothing to dedupe on.
+            if cur.rowcount and targets:
+                conn.executemany(
+                    """INSERT INTO event_targets
+                       (environment, uuid, target_id, target_alternate_id, target_display_name)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    [
+                        (environment, uuid, t.get("id"), t.get("alternateId"), t.get("displayName"))
+                        for t in targets
+                    ],
+                )
         conn.commit()
     return inserted, max_published
 
@@ -913,6 +958,65 @@ def backfill_resource_columns():
     return updated
 
 
+def backfill_event_targets():
+    """One-time (per environment's worth of pre-existing rows) migration,
+    called from init_db() right after backfill_resource_columns() above --
+    populates event_targets for every row that predates that table
+    existing. Idempotent: an event already present in event_targets is
+    skipped (checked via NOT EXISTS, since target_id can legitimately be
+    NULL for a real target with no id -- a plain NULL-column check like
+    backfill_resource_columns uses doesn't work here). A real event with
+    genuinely zero targets (raw.target == [], confirmed real -- 547 of a
+    ~20k sample) never gets an event_targets row and so gets re-scanned on
+    every boot; harmless (a cheap re-check, not a re-insert) but not
+    perfectly idempotent for that slice -- acceptable given how small it
+    is relative to a full backfill's one-time cost.
+
+    Same batched-executemany pattern as backfill_resource_columns (500
+    rows per transaction) for the same reason: don't hold the write lock
+    for one giant transaction on a 56k+ row archive."""
+    conn = _get_connection()
+    BATCH_SIZE = 500
+    with _db_lock:
+        rows = conn.execute(
+            """SELECT e.environment, e.uuid, e.raw_json FROM events e
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM event_targets t
+                   WHERE t.environment = e.environment AND t.uuid = e.uuid
+               )"""
+        ).fetchall()
+    if not rows:
+        return 0
+    updated = 0
+    batch = []
+    for row in rows:
+        raw = json.loads(row["raw_json"])
+        for t in raw.get("target") or []:
+            batch.append((row["environment"], row["uuid"], t.get("id"), t.get("alternateId"), t.get("displayName")))
+        if len(batch) >= BATCH_SIZE:
+            with _db_lock:
+                conn.executemany(
+                    """INSERT INTO event_targets
+                       (environment, uuid, target_id, target_alternate_id, target_display_name)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    batch,
+                )
+                conn.commit()
+            updated += len(batch)
+            batch = []
+    if batch:
+        with _db_lock:
+            conn.executemany(
+                """INSERT INTO event_targets
+                   (environment, uuid, target_id, target_alternate_id, target_display_name)
+                   VALUES (?, ?, ?, ?, ?)""",
+                batch,
+            )
+            conn.commit()
+        updated += len(batch)
+    return updated
+
+
 def _four_field_row(event_row):
     """Shapes one query_events() row to the "four-field standard" the
     audit-requirements guide calls for on every exported report row:
@@ -963,19 +1067,78 @@ def run_report(report_key, environment, since=None, until=None, limit=1000):
     return [_four_field_row(r) for r in rows]
 
 
-def resource_history(environment, resource_id, since=None, until=None, limit=1000):
+def resource_history(environment, resource_id=None, resource_name=None, since=None, until=None, limit=1000):
     """Every report row across EVERY event type (not scoped to one
-    COMPLIANCE_REPORTS preset) whose resource_id/resource_alternate_id
-    matches this one real resource's own id -- the Resources tab's
-    per-resource drill-down (click a server/AD account/DB account/etc.,
-    see its full compliance history). The join key was confirmed live
-    2026-09-30 by comparing real target ids on archived patlabs events
-    directly against the matching AccessModel entries' own ids (a
-    Gateway target's id IS that gateway's AccessGateway.id, etc. -- see
-    the plan file for the exact sampled events). No resource_id given
-    means "nothing to look up" -- returns [] rather than every event ever,
-    since an empty/falsy id is never a real resource's id."""
-    if not resource_id:
+    COMPLIANCE_REPORTS preset) where this one real resource appears as
+    ANY target on the event -- the Resources tab's per-resource drill-down
+    (click a server/AD account/DB account/etc., see its full compliance
+    history).
+
+    Deliberately NOT the same query as query_events(resource_id=...) --
+    that matches only the ONE target _primary_target() picked as "the"
+    resource for the event's four-field-standard row, which is correct
+    for an ordinary report row but wrong here: a real bug found
+    2026-09-30 live against patlabs is that a genuine Server target (e.g.
+    usp-srv1) can coexist on an event alongside a Server Account target
+    _primary_target prefers, so resource_id alone silently drops the
+    Server's own id and a click on it found zero history despite real
+    activity existing. This instead JOINs event_targets (one row per REAL
+    target per event, populated at ingest time -- see _insert_rows) so
+    ANY target match surfaces the event, not just the primary pick.
+
+    resource_id matches target_id OR target_alternate_id. resource_name
+    (an exact display-name match against target_display_name) is a
+    SEPARATE fallback needed for two resource kinds confirmed live
+    2026-09-30 to have NO discoverable log-side id at all: database
+    accounts and individual Active Directory accounts. Their own `id`
+    field (fetched from the ordinary list/detail API) never appears
+    anywhere in the System Log -- the log instead references a completely
+    different "Service Account" target id with no API lookup, confirmed
+    STABLE across a real, fresh rotation triggered live to verify (so a
+    genuine persistent identity, just not one this codebase can resolve
+    to an object). Exact-displayName matching is the only way to link
+    those two kinds back to their real history; confirmed no real name
+    collisions exist within either kind on this tenant (5 distinct
+    database account names, 11 distinct AD account names). SaaS/Okta
+    accounts do NOT need this fallback -- their own id (privileged_
+    resource_id/okta_user_id) IS the real log target id, confirmed live
+    against a real Salesforce account and two Okta service accounts.
+
+    At least one of resource_id/resource_name must be given (both empty
+    means "nothing to look up" -- returns [] rather than every event
+    ever)."""
+    if not resource_id and not resource_name:
         return []
-    rows = query_events(environment, since=since, until=until, resource_id=resource_id, limit=limit)
-    return [_four_field_row(r) for r in rows]
+    conn = _get_connection()
+    until_norm = _normalize_until(until)
+    match_clauses = []
+    match_params = []
+    if resource_id:
+        match_clauses.append("(t.target_id = ? OR t.target_alternate_id = ?)")
+        match_params.extend([resource_id, resource_id])
+    if resource_name:
+        match_clauses.append("t.target_display_name = ?")
+        match_params.append(resource_name)
+    clauses = ["e.environment = ?", "(" + " OR ".join(match_clauses) + ")"]
+    params = [environment, *match_params]
+    if since:
+        clauses.append("e.published >= ?")
+        params.append(since)
+    if until_norm:
+        clauses.append("e.published <= ?")
+        params.append(until_norm)
+    sql = (
+        "SELECT DISTINCT e.uuid, e.event_type, e.published, e.actor_id, e.actor_display_name, "
+        "e.actor_alternate_id, e.outcome_result, e.resource_id, e.resource_alternate_id, "
+        "e.resource_type_detail, e.raw_json FROM events e JOIN event_targets t "
+        "ON e.environment = t.environment AND e.uuid = t.uuid WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY e.published DESC LIMIT ?"
+    )
+    params.append(limit)
+    out = []
+    for row in conn.execute(sql, params):
+        d = dict(row)
+        d["raw"] = json.loads(d.pop("raw_json"))
+        out.append(d)
+    return [_four_field_row(r) for r in out]

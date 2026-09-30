@@ -90,27 +90,39 @@ function buildRows(kind: string, model: AccessModel, windowsServers: AccessServe
       }
     }
     case 'okta_accounts': {
+      // Real bug fixed 2026-09-30: this used to read a.account_name,
+      // which doesn't exist on the real API object -- confirmed live the
+      // real fields are `name` (human label, e.g. "McKinsey Okta SA") and
+      // `username` (the login identity, e.g. "mcksa@atko.email"), so
+      // every row was silently falling through to the raw id.
       const list: AccessOktaAccount[] = model.okta_accounts
       return {
-        headers: ['Account', 'Resource Group', 'Project'],
-        rows: list.map(a => ({
-          id: a.id,
-          label: String(a.account_name ?? a.id),
-          cells: [String(a.account_name ?? a.id), a.resource_group_name, a.project_name],
-          exportRow: { Account: String(a.account_name ?? a.id), 'Resource Group': a.resource_group_name, Project: a.project_name },
-        })),
+        headers: ['Account', 'Username', 'Resource Group', 'Project'],
+        rows: list.map(a => {
+          const label = String(a.name ?? a.username ?? a.id)
+          return {
+            id: a.id,
+            label,
+            cells: [label, a.username ?? '', a.resource_group_name, a.project_name],
+            exportRow: { Account: label, Username: a.username ?? '', 'Resource Group': a.resource_group_name, Project: a.project_name },
+          }
+        }),
       }
     }
     case 'saas_accounts': {
+      // Same real bug/fix as okta_accounts above -- same field names confirmed live.
       const list: AccessSaasAccount[] = model.saas_accounts
       return {
-        headers: ['Account', 'Resource Group', 'Project'],
-        rows: list.map(a => ({
-          id: a.id,
-          label: String(a.account_name ?? a.id),
-          cells: [String(a.account_name ?? a.id), a.resource_group_name, a.project_name],
-          exportRow: { Account: String(a.account_name ?? a.id), 'Resource Group': a.resource_group_name, Project: a.project_name },
-        })),
+        headers: ['Account', 'Username', 'Resource Group', 'Project'],
+        rows: list.map(a => {
+          const label = String(a.name ?? a.username ?? a.id)
+          return {
+            id: a.id,
+            label,
+            cells: [label, a.username ?? '', a.resource_group_name, a.project_name],
+            exportRow: { Account: label, Username: a.username ?? '', 'Resource Group': a.resource_group_name, Project: a.project_name },
+          }
+        }),
       }
     }
     case 'active_directory_accounts': {
@@ -297,9 +309,12 @@ function ResourceTable({
 }
 
 /** The per-resource compliance-report history drill-down -- clicking a row
- * above shows every report row (across EVERY report, not one) whose real
- * resource_id/resource_alternate_id matches this one resource's own id.
- * See audit_store.resource_history for the join-key verification. */
+ * above shows every report row (across EVERY report, not one) where this
+ * resource appears as ANY target on the event, matched by id AND/OR its
+ * exact display name (resourceLabel, passed through as resourceName --
+ * needed for database/AD accounts, which have no log-side id at all --
+ * see audit_store.resource_history's docstring for the full live-verified
+ * explanation). */
 function ResourceHistoryPanel({ resourceId, resourceLabel, onClose }: { resourceId: string; resourceLabel: string; onClose: () => void }) {
   const { data: environments } = useEnvironments()
   const activeEnv = environments?.active
@@ -308,7 +323,7 @@ function ResourceHistoryPanel({ resourceId, resourceLabel, onClose }: { resource
   const [from, setFrom] = useState(ninetyDaysAgo)
   const [to, setTo] = useState(today)
 
-  const { data, isLoading } = useResourceHistory(resourceId, activeEnv, from, to)
+  const { data, isLoading } = useResourceHistory(resourceId, activeEnv, from, to, resourceLabel)
   const rows = data?.rows ?? []
   const [filteredRows, setFilteredRows] = useState(rows)
 

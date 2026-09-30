@@ -358,7 +358,13 @@ export interface AccessServer {
 export interface AccessSaasAccount {
   id: string
   privileged_resource_id?: string
-  account_name?: string
+  // Real field names confirmed live 2026-09-30 -- there is no
+  // account_name field on the real API object (a prior version of this
+  // type guessed wrong, causing every row to silently show a raw UUID
+  // instead of a name). `name` is the human label (e.g. "Salesforce
+  // account with atko"), `username` is the login identity.
+  name?: string
+  username?: string
   project_id: string
   project_name: string
   resource_group_id: string
@@ -369,7 +375,9 @@ export interface AccessSaasAccount {
 export interface AccessOktaAccount {
   id: string
   okta_user_id?: string
-  account_name?: string
+  // Same real-field-names fix as AccessSaasAccount above.
+  name?: string
+  username?: string
   project_id: string
   project_name: string
   resource_group_id: string
