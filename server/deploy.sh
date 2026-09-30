@@ -7,9 +7,9 @@
 #   ./deploy.sh
 #
 # What it does, in order:
-#   1. Sparse-clones just OPA/Secrets-Wizard/ from the GitHub repo (this
-#      project lives nested inside a larger monorepo, not at repo root) into
-#      a throwaway temp dir.
+#   1. Clones the GitHub repo (standalone as of the 2026-09-30 split from the
+#      ItsGambit/Okta monorepo -- this project now lives at repo root, not
+#      nested under OPA/Secrets-Wizard/) into a throwaway temp dir.
 #   2. rsyncs it over the live app directory, EXCLUDING local-only state that
 #      must never be overwritten or deleted: the Python venv, credential/
 #      session stores, the audit log, and the locally-preserved System Log
@@ -36,8 +36,7 @@
 
 set -euo pipefail
 
-REPO_URL="https://github.com/ItsGambit/Okta.git"
-REPO_SUBDIR="OPA/Secrets-Wizard"
+REPO_URL="https://github.com/ItsGambit/opa-compliance-wizard.git"
 APP_DIR="/home/rparikh/opa-secrets-folders"
 SERVICE_NAME="opa-secrets-wizard"
 TMP_DIR="$(mktemp -d)"
@@ -45,13 +44,12 @@ TMP_DIR="$(mktemp -d)"
 cleanup() { rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
 
-echo "==> Fetching latest '$REPO_SUBDIR' from $REPO_URL"
-git clone --depth 1 --filter=blob:none --sparse "$REPO_URL" "$TMP_DIR/repo"
-git -C "$TMP_DIR/repo" sparse-checkout set "$REPO_SUBDIR"
+echo "==> Fetching latest from $REPO_URL"
+git clone --depth 1 "$REPO_URL" "$TMP_DIR/repo"
 
-SRC="$TMP_DIR/repo/$REPO_SUBDIR"
+SRC="$TMP_DIR/repo"
 if [ ! -f "$SRC/create_secret_folders.py" ]; then
-  echo "ERROR: expected files not found under $SRC -- check REPO_URL/REPO_SUBDIR above." >&2
+  echo "ERROR: expected files not found under $SRC -- check REPO_URL above." >&2
   exit 1
 fi
 
