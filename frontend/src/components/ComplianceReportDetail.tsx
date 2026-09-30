@@ -14,6 +14,28 @@ interface Props {
 
 const CONTROL_LABEL: Record<string, string> = { CC6: 'CC6', CC7: 'CC7', CC8: 'CC8' }
 
+// resource_type_detail comes from Okta's own debugContext.debugData.resourceType
+// (confirmed live 2026-09-30 -- real values seen: PAM_DATABASE_ACCOUNT,
+// SERVER_ACCOUNT) -- more specific than the generic target-derived
+// resource_type (e.g. "Service Account"), which alone can't distinguish a
+// database account checkout from a server account checkout. Shown in
+// preference to resource_type when present, falling back otherwise.
+const RESOURCE_TYPE_DETAIL_LABEL: Record<string, string> = {
+  PAM_DATABASE_ACCOUNT: 'Database Account',
+  SERVER_ACCOUNT: 'Server Account',
+  // confirmed live 2026-09-30 via a real patlabs pam.resource.checkout
+  // event for a Salesforce account -- not seen during initial probing,
+  // found via this session's own Playwright verification pass instead.
+  MANAGED_SAAS_APP_SERVICE_ACCOUNT: 'SaaS Service Account',
+}
+
+function resourceTypeLabel(row: { resource_type: string; resource_type_detail: string }): string {
+  if (row.resource_type_detail) {
+    return RESOURCE_TYPE_DETAIL_LABEL[row.resource_type_detail] ?? row.resource_type_detail
+  }
+  return row.resource_type
+}
+
 function outcomeVariant(outcome: string): string {
   const o = outcome.toUpperCase()
   if (o === 'SUCCESS' || o === 'ALLOW') return 'bg-win/10 text-win'
@@ -94,7 +116,7 @@ export function ComplianceReportDetail({ def, environment, onBack }: Props) {
                   <td className="px-3 py-2 text-text-faint whitespace-nowrap">{formatDateTime(row.timestamp)}</td>
                   <td className="px-3 py-2 text-text-dim">
                     {row.resource || <span className="text-text-faint">—</span>}
-                    {row.resource_type && <span className="text-text-faint text-[0.6875rem]"> ({row.resource_type})</span>}
+                    {resourceTypeLabel(row) && <span className="text-text-faint text-[0.6875rem]"> ({resourceTypeLabel(row)})</span>}
                   </td>
                   <td className="px-3 py-2">
                     {row.outcome ? (

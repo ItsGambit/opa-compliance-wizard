@@ -7,6 +7,7 @@ import { GroupsTab } from './GroupsTab'
 import { PoliciesTab } from './PoliciesTab'
 import { ProjectsTab } from './ProjectsTab'
 import { ResourceGroupsTab } from './ResourceGroupsTab'
+import { ResourcesTab } from './ResourcesTab'
 import { UsersTab } from './UsersTab'
 import { ExportButtons } from './ExportButtons'
 import { accessModelExportSections } from '../utils/exportSections'
@@ -18,6 +19,7 @@ import { accessModelExportSections } from '../utils/exportSections'
 export const ACCESS_SUB_TABS = [
   { value: 'resource_groups', label: 'Resource Groups' },
   { value: 'projects', label: 'Projects' },
+  { value: 'resources', label: 'Resources' },
   { value: 'policies', label: 'Policies' },
   { value: 'users', label: 'Users' },
   { value: 'groups', label: 'Groups' },
@@ -76,6 +78,7 @@ export function AccessExplorer({ subTab }: Props) {
 
       {subTab === 'resource_groups' && <ResourceGroupsTab model={displayedModel} />}
       {subTab === 'projects' && <ProjectsTab model={displayedModel} />}
+      {subTab === 'resources' && <ResourcesTab model={displayedModel} />}
       {subTab === 'policies' && <PoliciesTab model={displayedModel} />}
       {subTab === 'users' && (
         <UsersTab

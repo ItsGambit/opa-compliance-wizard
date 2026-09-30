@@ -45,6 +45,7 @@ COMPLIANCE_EVENT_TYPES = {
     "user.authentication.auth_via_mfa": "mfa_enforcement",
     "policy.evaluate_sign_on": "mfa_enforcement",
     "user.session.start": "session_activity",
+    "pam.auth_token.issue": "session_activity",  # confirmed live 2026-09-30: "Issue an authentication token for a web session"
     "user.lifecycle.create": "provisioning",
     "user.lifecycle.deactivate": "provisioning",
     "group.user_membership.add": "role_group_changes",
@@ -79,6 +80,24 @@ COMPLIANCE_EVENT_TYPES = {
     "pam.gateway_creds.issue": "pam_sessions",
     "pam.server.ssh_login": "pam_sessions",
     "pam.service_account.password.reveal": "pam_credential_reveals",
+    # confirmed live 2026-09-30: "reveal password for a vaulted server
+    # account to an end-user" -- same conceptual bucket as the
+    # service-account reveal above, just for a server-local account.
+    "pam.server_account.password.reveal": "pam_credential_reveals",
+    # confirmed live 2026-09-30: actor is the Server itself reporting a
+    # local-account password change result -- a credential-lifecycle
+    # event, same bucket as secret create/update/delete/reveal.
+    "pam.server_account.password_change.update": "pam_secrets",
+    # confirmed live 2026-09-30: SystemPrincipal-initiated, target is the
+    # Active Directory Connection itself -- recurring automated AD sync,
+    # a real CC7 system-operations signal, not previously covered by any
+    # report.
+    "pam.active_directory.account_discovery.complete": "ad_sync_activity",
+    # confirmed live 2026-09-30: real, high-volume (55 combined events/90d
+    # on patlabs) service-account credential rotation lifecycle, not
+    # previously covered by any report.
+    "pam.service_account.password_rotation.start": "credential_rotation",
+    "pam.service_account.password_rotation.end": "credential_rotation",
     "pam.security_policy.create": "pam_policy_modifications",
     "pam.security_policy.update": "pam_policy_modifications",
 }
@@ -162,6 +181,16 @@ COMPLIANCE_REPORTS = {
         "label": "PAM Policy Modifications",
         "control": "CC8",
         "description": "OPA security policy create/update.",
+    },
+    "ad_sync_activity": {
+        "label": "Active Directory Sync Activity",
+        "control": "CC7",
+        "description": "Recurring, automated Active Directory account discovery -- evidence that AD-vaulted accounts stay in sync with the domain.",
+    },
+    "credential_rotation": {
+        "label": "Credential Rotation",
+        "control": "CC8",
+        "description": "Service-account password rotation lifecycle (scheduled and manual).",
     },
 }
 
@@ -680,19 +709,47 @@ def count_events(environment, event_types=None, since=None, until=None):
     return conn.execute(sql, params).fetchone()[0]
 
 
+def _primary_target(targets):
+    """The first target that isn't the enclosing Team -- for almost every
+    event type target[0] already IS the primary affected resource (Secret,
+    Security Policy, User, etc, confirmed live 2026-09-30 across several
+    event types), but pam.resource.checkout/checkin.start/checkin.end are a
+    real, confirmed exception: target[0] is ALWAYS the Team
+    ("opa-patlabs-usp"), with the actual resource (a Service Account /
+    Server Account / etc) at target[1] -- so a naive targets[0] pick on
+    those specific events showed the team name as "the resource" instead
+    of the real one. Skipping a leading Team entry fixes that case without
+    reordering anything for every other event type, where target[0] was
+    already correct."""
+    for t in targets:
+        if t.get("type") != "Team":
+            return t
+    return targets[0] if targets else None
+
+
 def _four_field_row(event_row):
     """Shapes one query_events() row to the "four-field standard" the
     audit-requirements guide calls for on every exported report row:
     User, Action, Timestamp, Affected Resource -- plus Outcome and the
     real event_type, which every report needs regardless of its specific
     focus. `raw.target` is Okta's own target list (or, for a CSV-imported
-    row, the reconstructed list built by _normalize_csv_row) -- the first
-    entry is usually the primary affected resource; falls back to
-    displayMessage when no target exists at all (e.g. some system.* events)."""
+    row, the reconstructed list built by _normalize_csv_row) -- see
+    _primary_target for which entry is picked as "the resource".
+
+    `resource_type_detail` is a SEPARATE thing from `resource_type`
+    (which reflects the target's own `type` field, e.g. "Service
+    Account") -- it surfaces `debugContext.debugData.resourceType` when
+    present (confirmed live 2026-09-30: real values include
+    PAM_DATABASE_ACCOUNT, SERVER_ACCOUNT on pam.resource.checkout/
+    checkin.* events), which is what actually distinguishes checking out
+    a database account from checking out a server account -- the target's
+    own generic "Service Account" type alone can't tell those apart."""
     raw = event_row["raw"]
     targets = raw.get("target") or []
-    resource = targets[0].get("displayName") if targets else None
-    resource_type = targets[0].get("type") if targets else None
+    primary = _primary_target(targets)
+    resource = primary.get("displayName") if primary else None
+    resource_type = primary.get("type") if primary else None
+    resource_type_detail = ((raw.get("debugContext") or {}).get("debugData") or {}).get("resourceType")
     return {
         "uuid": event_row["uuid"],
         "user": event_row["actor_display_name"] or event_row["actor_alternate_id"] or event_row["actor_id"] or "unknown",
@@ -702,6 +759,7 @@ def _four_field_row(event_row):
         "timestamp": event_row["published"],
         "resource": resource or "",
         "resource_type": resource_type or "",
+        "resource_type_detail": resource_type_detail or "",
         "outcome": event_row["outcome_result"] or "",
         "targets": targets,  # full target list -- some reports need target1/2 too, e.g. PAM's Team/Server
     }

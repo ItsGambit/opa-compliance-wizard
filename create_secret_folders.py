@@ -98,11 +98,38 @@ FOLDER_ITEMS_PATH = FOLDER_ITEM_PATH + "/items"
 SECURITY_POLICY_PATH = "/v1/teams/{team}/security_policy"
 SECURITY_POLICY_ITEM_PATH = SECURITY_POLICY_PATH + "/{security_policy_id}"
 WORKLOAD_ROLES_PATH = "/v1/teams/{team}/workload-roles"
+# Confirmed live 2026-09-30 via the real OPA API's own live OpenAPI spec
+# (GET /v1/openapi.json) -- tenant-wide, not resource_group/project-scoped,
+# same as WORKLOAD_ROLES_PATH. Distinct resource from a workload ROLE: a
+# connection is the actual JWT/JWT_STATIC trust config (issuer, audience,
+# JWKS URL, matcher conditions) a role's `requirements[].workload_connection`
+# points at.
+WORKLOAD_CONNECTIONS_PATH = "/v1/teams/{team}/connections/workloads"
+# Confirmed live 2026-09-30 (found via the same GET /v1/openapi.json spec
+# discovery) -- tenant-wide. A gateway here is the actual gateway
+# CONFIGURATION resource (access_address, infrastructure_orchestrator,
+# refuse_connections, labels) -- distinct from the server object hosting
+# it (list_project_servers, which shows the same gateway host but only
+# via a "broker" entry in its services[] list, with none of these
+# gateway-specific fields).
+GATEWAYS_PATH = "/v1/teams/{team}/gateways"
+# The rest of the "connections" family, confirmed live 2026-09-30 -- all
+# tenant-wide, all distinct from the per-project ACCOUNT resources they
+# back (a connection is the integration config; an account is one
+# discovered identity reachable through it):
+DATABASE_CONNECTIONS_PATH = "/v1/teams/{team}/connections/databases"
+SAAS_APP_CONNECTIONS_PATH = "/v1/teams/{team}/connections/saas_apps"
+ACTIVE_DIRECTORY_CONNECTIONS_PATH = "/v1/teams/{team}/connections/active_directory"
 USERS_PATH = "/v1/teams/{team}/users"
 USER_GROUPS_PATH = USERS_PATH + "/{user_name}/groups"
 PROJECT_SERVERS_PATH = PROJECTS_PATH + "/{project_id}/servers"
 PROJECT_SAAS_APP_ACCOUNTS_PATH = PROJECTS_PATH + "/{project_id}/saas_app_accounts"
 PROJECT_OKTA_UD_ACCOUNTS_PATH = PROJECTS_PATH + "/{project_id}/okta_universal_directory_accounts"
+# Both confirmed live 2026-09-30 against a real tenant (patlabs) -- neither
+# was previously used anywhere in this codebase. Same {"list": [...]}
+# collection shape as the three siblings above.
+PROJECT_ACTIVE_DIRECTORY_ACCOUNTS_PATH = PROJECTS_PATH + "/{project_id}/active_directory_accounts"
+PROJECT_DATABASE_ACCOUNTS_PATH = PROJECTS_PATH + "/{project_id}/database_accounts"
 
 FIELD_TYPE = "type"
 TYPE_FOLDER = "folder"
@@ -1237,6 +1264,48 @@ class OpaClient:
             path += "?contains=" + urllib.parse.quote(contains)
         return self._list(path)
 
+    def list_workload_connections(self):
+        """Confirmed live 2026-09-30 via GET /v1/openapi.json (the real
+        API's own live spec) -- tenant-wide, same as list_workload_roles.
+        A connection is the JWT/JWT_STATIC trust config (issuer/audience/
+        JWKS URL/matcher conditions) a workload role's
+        requirements[].workload_connection references."""
+        path = WORKLOAD_CONNECTIONS_PATH.format(team=self.team_name)
+        return self._list(path)
+
+    def list_gateways(self):
+        """Confirmed live 2026-09-30, tenant-wide -- the gateway
+        CONFIGURATION resource itself, distinct from the server object
+        that hosts it (see GATEWAYS_PATH's docstring above)."""
+        path = GATEWAYS_PATH.format(team=self.team_name)
+        return self._list(path)
+
+    def list_database_connections(self):
+        """Confirmed live 2026-09-30, tenant-wide -- the DB integration
+        config (auth_type/auth_details/health_issues/
+        discovered_accounts_count) that database accounts are discovered
+        through, distinct from a database ACCOUNT itself."""
+        path = DATABASE_CONNECTIONS_PATH.format(team=self.team_name)
+        return self._list(path)
+
+    def list_saas_app_connections(self):
+        """Confirmed live 2026-09-30, tenant-wide -- the Okta app
+        integration (app_instance_id/app_instance_name/global_app_name)
+        that SaaS service accounts are discovered through."""
+        path = SAAS_APP_CONNECTIONS_PATH.format(team=self.team_name)
+        return self._list(path)
+
+    def list_active_directory_connections(self):
+        """Confirmed live 2026-09-30, tenant-wide -- the AD domain
+        connection (domain/okta_app_instance_id/status) that Active
+        Directory accounts are discovered through. NOT the same as
+        GET /integrations/ad_connections, which returned 401 "Missing
+        capability: ad_connection.list" for this tenant's service account
+        -- this connections/active_directory path is separately
+        accessible and returns real data."""
+        path = ACTIVE_DIRECTORY_CONNECTIONS_PATH.format(team=self.team_name)
+        return self._list(path)
+
     def list_project_servers(self, resource_group_id, project_id):
         path = PROJECT_SERVERS_PATH.format(
             team=self.team_name, resource_group_id=resource_group_id, project_id=project_id
@@ -1251,6 +1320,26 @@ class OpaClient:
 
     def list_project_okta_ud_accounts(self, resource_group_id, project_id):
         path = PROJECT_OKTA_UD_ACCOUNTS_PATH.format(
+            team=self.team_name, resource_group_id=resource_group_id, project_id=project_id
+        )
+        return self._list(path)
+
+    def list_project_active_directory_accounts(self, resource_group_id, project_id):
+        """Confirmed live 2026-09-30 against a real tenant (patlabs, project
+        Test_User_A_Project) -- real shape includes account_name,
+        sam_account_name, distinguished_name, sid, domain.name, email,
+        account_status_detail."""
+        path = PROJECT_ACTIVE_DIRECTORY_ACCOUNTS_PATH.format(
+            team=self.team_name, resource_group_id=resource_group_id, project_id=project_id
+        )
+        return self._list(path)
+
+    def list_project_database_accounts(self, resource_group_id, project_id):
+        """Confirmed live 2026-09-30 against a real tenant (patlabs, projects
+        Postgresql-DB-Accounts/SQL-DB-Accounts) -- real shape includes
+        account_name, database_connection.name,
+        database_connection_auth_type, account_status_detail."""
+        path = PROJECT_DATABASE_ACCOUNTS_PATH.format(
             team=self.team_name, resource_group_id=resource_group_id, project_id=project_id
         )
         return self._list(path)
@@ -2495,6 +2584,7 @@ ACCESS_MODEL_STEPS = [
     ("resource_groups", "Fetching resource groups"),
     ("groups", "Fetching groups"),
     ("users", "Fetching users"),
+    ("workload_roles", "Fetching workload roles"),
     ("projects", "Fetching projects"),
     ("index_resources", "Indexing project resources (folders, secrets, servers, accounts)"),
     ("user_groups", "Fetching user group memberships"),
@@ -2546,6 +2636,23 @@ def build_access_model(client, on_progress=None):
     users = client.list_users()
     _report(on_progress, "users", "done", f"{len(users)} user(s)")
 
+    # Workload roles/connections are TENANT-WIDE, not per-project
+    # (confirmed live 2026-09-30 -- neither path takes a resource_group_id/
+    # project_id), unlike servers/saas/okta/AD/database accounts below --
+    # fetched once here rather than inside the per-project loop.
+    _report(on_progress, "workload_roles", "start")
+    workload_roles = client.list_workload_roles()
+    workload_connections = client.list_workload_connections()
+    gateways = client.list_gateways()
+    database_connections = client.list_database_connections()
+    saas_app_connections = client.list_saas_app_connections()
+    active_directory_connections = client.list_active_directory_connections()
+    _report(on_progress, "workload_roles", "done",
+            f"{len(workload_roles)} workload role(s), {len(workload_connections)} workload connection(s), "
+            f"{len(gateways)} gateway(s), {len(database_connections)} database connection(s), "
+            f"{len(saas_app_connections)} SaaS app connection(s), "
+            f"{len(active_directory_connections)} AD connection(s)")
+
     _report(on_progress, "projects", "start")
     projects_by_rg = [(rg, client.list_projects(rg["id"])) for rg in resource_groups]
     total_projects = sum(len(ps) for _rg, ps in projects_by_rg)
@@ -2555,6 +2662,18 @@ def build_access_model(client, on_progress=None):
     indexes = {"secret_folders": {}, "secrets": {}, "servers": {}, "saas_accounts": {}, "okta_accounts": {},
                "secret_folder_children": {}}
     projects = []
+    # Full resource objects, not just id-keyed lookup refs -- `indexes` above
+    # exists solely to resolve security-policy rule selectors down to a
+    # project (see _resolve_rule) and always discarded the actual objects
+    # once that lookup was built. These four lists are what the new
+    # tenant-wide Resources tab (Access Explorer) actually renders --
+    # populated in the SAME per-project walk below so this doesn't cost a
+    # second full pass over every resource group/project.
+    all_servers = []
+    all_saas_accounts = []
+    all_okta_accounts = []
+    all_active_directory_accounts = []
+    all_database_accounts = []
 
     _report(on_progress, "index_resources", "start")
     indexed_count = 0
@@ -2564,6 +2683,13 @@ def build_access_model(client, on_progress=None):
             project["resource_group_id"] = rg["id"]
             projects.append(project)
             proj_ref = {"project_id": project["id"], "project_name": project["name"], "resource_group_id": rg["id"]}
+            # Adds resource_group_name too, unlike proj_ref above -- the new
+            # full-object lists are rendered directly in a flat tenant-wide
+            # table (ResourcesTab), which needs the human-readable name
+            # without a second resource_groups lookup; proj_ref's existing
+            # shape is left untouched since _resolve_rule's callers already
+            # depend on its exact fields.
+            proj_ref_named = {**proj_ref, "resource_group_name": rg["name"]}
 
             folders, secrets = fetch_all_folders_and_secrets(client, rg["id"], project["id"])
             for f in folders:
@@ -2577,6 +2703,7 @@ def build_access_model(client, on_progress=None):
             for server in client.list_project_servers(rg["id"], project["id"]):
                 if server.get("id"):
                     indexes["servers"][server["id"]] = proj_ref
+                all_servers.append({**server, **proj_ref_named})
 
             for acct in client.list_project_saas_app_accounts(rg["id"], project["id"]):
                 key = acct.get("privileged_resource_id")
@@ -2591,11 +2718,27 @@ def build_access_model(client, on_progress=None):
                     # never logged as a System Log target at all -- see
                     # RESOURCE_ACCESS_EVENT_TYPES.
                     indexes["saas_accounts"][key] = {**proj_ref, "access_tracking_id": acct.get("id")}
+                all_saas_accounts.append({**acct, **proj_ref_named})
 
             for acct in client.list_project_okta_ud_accounts(rg["id"], project["id"]):
                 key = acct.get("okta_user_id")
                 if key:
                     indexes["okta_accounts"][key] = {**proj_ref, "access_tracking_id": acct.get("id")}
+                all_okta_accounts.append({**acct, **proj_ref_named})
+
+            # These two are new as of 2026-09-30 -- confirmed live against a
+            # real tenant (patlabs), not previously called anywhere in this
+            # codebase. Unlike servers/saas/okta above, no security-policy
+            # rule selector resolves to either of these by an OPA-internal
+            # id today (AD/DB selectors resolve via name/domain condition
+            # text instead -- see _resolve_rule's active_directory/database
+            # branches), so there's no matching `indexes[...]` entry to
+            # populate here, only the full-object list for the Resources tab.
+            for acct in client.list_project_active_directory_accounts(rg["id"], project["id"]):
+                all_active_directory_accounts.append({**acct, **proj_ref_named})
+
+            for acct in client.list_project_database_accounts(rg["id"], project["id"]):
+                all_database_accounts.append({**acct, **proj_ref_named})
 
             indexed_count += 1
             _report(on_progress, "index_resources", "progress",
@@ -2653,6 +2796,17 @@ def build_access_model(client, on_progress=None):
         "groups": groups,
         "users": users_with_groups,
         "policies": policies_out,
+        "servers": all_servers,
+        "saas_accounts": all_saas_accounts,
+        "okta_accounts": all_okta_accounts,
+        "active_directory_accounts": all_active_directory_accounts,
+        "database_accounts": all_database_accounts,
+        "workload_roles": workload_roles,
+        "workload_connections": workload_connections,
+        "gateways": gateways,
+        "database_connections": database_connections,
+        "saas_app_connections": saas_app_connections,
+        "active_directory_connections": active_directory_connections,
     }
 
 

@@ -157,6 +157,7 @@ export function complianceReportRow(row: ComplianceReportRow): Record<string, st
     Action: row.action,
     Timestamp: formatDateTime(row.timestamp),
     'Affected Resource': row.resource || '—',
+    'Resource Type': row.resource_type_detail || row.resource_type || '',
     Outcome: row.outcome || '',
     'Event Type': row.event_type,
   }

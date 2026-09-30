@@ -94,6 +94,7 @@ export interface ComplianceReportRow {
   timestamp: string
   resource: string
   resource_type: string
+  resource_type_detail: string
   outcome: string
   targets: ComplianceReportTarget[]
 }
@@ -321,12 +322,152 @@ export interface AccessPolicy {
   rules: PolicyRule[]
 }
 
+// ── Access Explorer: tenant-wide resource inventory (Resources sub-tab) ──
+// All six live-verified 2026-09-30 against a real tenant (patlabs). Servers
+// cover Windows/Linux/Gateway in one shape -- os_type distinguishes
+// Windows/Linux, and a gateway is just a server whose services[] includes
+// "broker" (confirmed live -- NOT a separate resource type/API).
+
+export interface AccessServer {
+  id: string
+  hostname: string
+  os_type: string
+  os: string
+  services: string[]
+  state: string
+  managed: boolean
+  access_address: string | null
+  cloud_provider: string | null
+  project_id: string
+  project_name: string
+  resource_group_id: string
+  resource_group_name: string
+}
+
+export interface AccessSaasAccount {
+  id: string
+  privileged_resource_id?: string
+  account_name?: string
+  project_id: string
+  project_name: string
+  resource_group_id: string
+  resource_group_name: string
+  [key: string]: unknown
+}
+
+export interface AccessOktaAccount {
+  id: string
+  okta_user_id?: string
+  account_name?: string
+  project_id: string
+  project_name: string
+  resource_group_id: string
+  resource_group_name: string
+  [key: string]: unknown
+}
+
+export interface AccessActiveDirectoryAccount {
+  id: string
+  account_name: string
+  sam_account_name?: string
+  distinguished_name?: string
+  sid?: string
+  domain?: NamedRef
+  email?: string
+  account_status_detail?: string
+  project_id: string
+  project_name: string
+  resource_group_id: string
+  resource_group_name: string
+}
+
+export interface AccessDatabaseAccount {
+  id: string
+  account_name: string
+  database_connection?: NamedRef
+  database_connection_auth_type?: string
+  account_status_detail?: string
+  project_id: string
+  project_name: string
+  resource_group_id: string
+  resource_group_name: string
+}
+
+export interface AccessWorkloadRole {
+  id: string
+  name: string
+  description: string
+  linux_server_username?: string
+  created_at?: string
+}
+
+// The rest of the "connections" family -- all tenant-wide, all distinct
+// from the per-project ACCOUNT resources they back (a connection is the
+// integration config; an account is one discovered identity reachable
+// through it). All confirmed live 2026-09-30.
+
+export interface AccessWorkloadConnection {
+  id: string
+  name: string
+  type: string
+  description?: string
+  status?: string
+  created_at?: string
+  updated_at?: string
+}
+
+export interface AccessGateway {
+  id: string
+  name: string
+  access_address?: string
+  default_address?: string
+  cloud_provider?: string
+  refuse_connections?: boolean
+  last_seen?: string
+}
+
+export interface AccessDatabaseConnection {
+  id: string
+  name: string
+  auth_type?: string
+  status?: string
+  discovered_accounts_count?: number
+  health_issues?: unknown[]
+  last_discovery_run_at?: string
+}
+
+export interface AccessSaasAppConnection {
+  app_instance_id: string
+  app_instance_name: string
+  global_app_name?: string
+  created_at?: string
+  updated_at?: string
+}
+
+export interface AccessActiveDirectoryConnection {
+  id: string
+  domain: string
+  okta_app_instance_id?: string
+  status?: string
+}
+
 export interface AccessModel {
   resource_groups: AccessResourceGroup[]
   projects: AccessProject[]
   groups: AccessGroup[]
   users: AccessUser[]
   policies: AccessPolicy[]
+  servers: AccessServer[]
+  saas_accounts: AccessSaasAccount[]
+  okta_accounts: AccessOktaAccount[]
+  active_directory_accounts: AccessActiveDirectoryAccount[]
+  database_accounts: AccessDatabaseAccount[]
+  workload_roles: AccessWorkloadRole[]
+  workload_connections: AccessWorkloadConnection[]
+  gateways: AccessGateway[]
+  database_connections: AccessDatabaseConnection[]
+  saas_app_connections: AccessSaasAppConnection[]
+  active_directory_connections: AccessActiveDirectoryConnection[]
 }
 
 // ── Access Explorer: System Log last-accessed lookup ─────────────────────
