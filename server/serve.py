@@ -1758,10 +1758,38 @@ def main():
     if not FRONTEND_DIST.exists():
         print(f"Warning: {FRONTEND_DIST} does not exist yet -- run 'npm run build' in frontend/ first.")
 
-    try:
-        server = StrictBindHTTPServer(("127.0.0.1", args.port), Handler)
-    except OSError as exc:
-        print(f"Could not bind 127.0.0.1:{args.port} ({exc}).")
+    # FIX (confirmed live, 2026-10-01): on the hosted Linux server, a
+    # `systemctl restart` can start this new process before the OS has
+    # actually released the OLD process's socket on this exact port --
+    # systemd considers the unit "stopped" as soon as the old process
+    # exits, with no guarantee the kernel's TCP teardown (TIME_WAIT, etc.)
+    # has finished by the time the new ExecStart runs. StrictBindHTTPServer
+    # deliberately keeps allow_reuse_address=False (see its own comment --
+    # this is what makes a GENUINE double-bind mistake fail loudly instead
+    # of silently succeeding on Windows), so this transient race surfaced
+    # as a real bind failure, not a silent success -- confirmed live via
+    # repeated clean (no manual interference) systemctl restarts: it
+    # failed outright 2-3 times in a row before eventually succeeding,
+    # relying entirely on systemd's RestartSec=3 to paper over it with a
+    # visible crash-loop in `systemctl status` each time. A short in-process
+    # retry here resolves the exact same transient condition directly,
+    # without the restart-counter noise, while still failing with the
+    # SAME clear error message below if the port is genuinely never
+    # released (e.g. an actual second instance left running).
+    max_bind_attempts = 5
+    bind_retry_delay_secs = 1
+    server = None
+    last_exc = None
+    for attempt in range(1, max_bind_attempts + 1):
+        try:
+            server = StrictBindHTTPServer(("127.0.0.1", args.port), Handler)
+            break
+        except OSError as exc:
+            last_exc = exc
+            if attempt < max_bind_attempts:
+                time.sleep(bind_retry_delay_secs)
+    if server is None:
+        print(f"Could not bind 127.0.0.1:{args.port} ({last_exc}) after {max_bind_attempts} attempts.")
         print("Likely an existing server is already running on this port -- stop it (Ctrl+C in its")
         print(f"window, or close it) and try again, or run with --port <other_port>.")
         sys.exit(1)

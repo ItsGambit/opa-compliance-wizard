@@ -127,19 +127,24 @@ export function AuditLogPage() {
             // file/locking every other write action already uses) have no
             // logged-in actor at all -- "local / CLI" would be misleading
             // here, since this is a server-side script, not someone using
-            // the dashboard. Visually distinct (accent border + tinted
-            // action text) so a deploy is scannable at a glance in a feed
-            // otherwise dominated by user actions -- a different "shape"
-            // of event, not another severity level like win/loss/warn
-            // already represent.
+            // the dashboard. Visually distinct (left border + tinted action
+            // text) so a deploy is scannable at a glance in a feed otherwise
+            // dominated by user actions. deploy.failed specifically uses
+            // this app's existing text-loss/red error convention (same as
+            // every other failure state), NOT the neutral accent color the
+            // other two deploy.* actions get -- a failed deploy is a real
+            // problem, not just "a different shape of event."
             const isDeployEvent = entry.action.startsWith('deploy.')
+            const isDeployFailure = entry.action === 'deploy.failed'
+            const deployBorderColor = isDeployFailure ? 'border-l-loss' : 'border-l-accent'
+            const deployTextColor = isDeployFailure ? 'text-loss' : 'text-accent'
             return (
               <div
                 key={`${entry.timestamp}-${entry.action}`}
-                className={`card p-3 text-xs ${isDeployEvent ? 'border-l-2 border-l-accent' : ''}`}
+                className={`card p-3 text-xs ${isDeployEvent ? `border-l-2 ${deployBorderColor}` : ''}`}
               >
                 <div className="flex items-center justify-between gap-2 mb-1.5">
-                  <span className={`font-medium ${isDeployEvent ? 'text-accent' : 'text-text'}`}>
+                  <span className={`font-medium ${isDeployEvent ? deployTextColor : 'text-text'}`}>
                     <HighlightedText text={entry.action} indices={actionMatch?.indices} />
                   </span>
                   <span className="text-text-faint whitespace-nowrap">{formatDateTime(entry.timestamp)}</span>

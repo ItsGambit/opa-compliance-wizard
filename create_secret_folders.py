@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.25.0
+# Version     : 5.25.1
 # =============================================================================
 
 import argparse
@@ -78,7 +78,7 @@ import urllib.request
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.25.0"
+SCRIPT_VERSION = "5.25.1"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------

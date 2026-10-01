@@ -1055,6 +1055,18 @@ already exists is skipped, not duplicated.
 
 ## Version
 
+5.25.1 — **Fixed a real `systemctl restart` crash-loop, and a UI color
+nit from 5.25.0.** `server/serve.py` now retries binding its port a few
+times with a short backoff before giving up — on the hosted Linux
+server, `systemctl restart` can start the new process before the OS has
+actually released the old one's socket, which surfaced as a real,
+reproducible crash-loop (confirmed via repeated clean restarts, no
+concurrent interference) that only ever recovered via systemd's own
+`RestartSec=3`. Also: `deploy.failed` entries in the Audit Log now use
+the existing red/`text-loss` error color (same as every other failure
+state in this app) instead of the same neutral accent color as a
+successful deploy — a mismatch caught immediately after 5.25.0 shipped.
+
 5.25.0 — **New: deploys now show up in the Audit Log.** `server/deploy.sh`
 logs `deploy.started`/`deploy.completed`/`deploy.failed` entries directly
 to the same audit trail every other write action already uses — visually
@@ -1119,6 +1131,21 @@ the fix (and 5.24.0's entry, right after it, for the security remediation
 pass that exposed this).
 
 ### Changelog
+- **5.25.1**:
+  - **Fixed a real `systemctl restart` crash-loop.** On the hosted Linux
+    server, a restart could start the new `serve.py` process before the
+    OS released the previous one's socket on the same port — confirmed
+    live via several clean (no concurrent manual interference) restarts
+    failing 2-3 times each before settling, relying entirely on
+    systemd's `RestartSec=3` to eventually succeed. `main()` now retries
+    the bind itself (5 attempts, 1s apart) before falling back to the
+    same clear "could not bind" error — `StrictBindHTTPServer`'s
+    deliberate `allow_reuse_address=False` (what makes a genuine
+    double-bind mistake fail loudly) is unchanged.
+  - **Fixed `deploy.failed` using the wrong color.** 5.25.0's new Audit
+    Log entries for a deploy used the same neutral accent color for
+    started/completed/failed alike — a failed deploy now uses this
+    app's existing red/`text-loss` error convention instead.
 - **5.25.0**:
   - **New: deploys now show up in the Audit Log.** `server/deploy.sh`
     logs `deploy.started`/`deploy.completed`/`deploy.failed` via the same
