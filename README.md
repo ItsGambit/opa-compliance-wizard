@@ -1055,6 +1055,18 @@ already exists is skipped, not duplicated.
 
 ## Version
 
+5.24.3 — **Fixed `deploy.sh` running one version behind its own fixes.**
+The self-modification fix added in 5.24.1 (re-exec from a frozen copy
+before `rsync` can overwrite this file mid-run) protected the clone/sync
+steps, but froze that copy BEFORE `rsync` pulled the newest code — so
+every deploy's restart/nginx-apply logic actually ran the PREVIOUS
+version's code, one version behind what had just been pulled. Confirmed
+live: a run that correctly rsynced 5.24.2's nginx fix to disk still
+printed 5.24.1's old warning text for the rest of that same run. Fixed
+by re-executing a second time, right after `rsync`, so the steps that
+follow run from the version just deployed, not the one before it. See
+this version's changelog entry below.
+
 5.24.2 — **Fixed `deploy.sh`'s nginx config backup path.** Found during
 the first real deploy after widening the server's sudoers rule per
 5.24.0/5.24.1's own instructions: the backup-before-apply step wrote to a
@@ -1081,6 +1093,16 @@ the fix (and 5.24.0's entry, right after it, for the security remediation
 pass that exposed this).
 
 ### Changelog
+- **5.24.3**:
+  - **Fixed `deploy.sh` always running one version behind its own
+    fixes.** 5.24.1's self-modification fix re-exec'd from a frozen copy
+    taken BEFORE `rsync` pulled the newest code, so the restart/
+    nginx-apply logic that followed always ran the version that was live
+    before this deploy started, never the one it just pulled — confirmed
+    live: a run that correctly rsynced 5.24.2's fix to disk still printed
+    5.24.1's old (pre-fix) warning text for its own nginx step. Added a
+    second re-exec, right after `rsync` and the executable-bit restore,
+    so the rest of each run actually executes the version just deployed.
 - **5.24.2**:
   - **Fixed `deploy.sh`'s nginx config backup landing in a path that
     changes every run.** The pre-apply backup of the live nginx config

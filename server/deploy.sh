@@ -58,83 +58,121 @@
 # already-read copy for the rest of the run, not the one just written to
 # disk. This was invisible before because the old tail only ever printed
 # a warning, so a stale in-memory tail happened to produce the same
-# observable behavior as the new one would have. Fixed below by
-# re-executing from a frozen copy of THIS script in a private temp dir
-# before doing anything else -- the running process then never reads
-# from the path rsync is about to overwrite, at all.
+# observable behavior as the new one would have.
+#
+# ONE-VERSION-LAG FIX (confirmed live, 2026-10-01, the SAME DAY as the fix
+# above): freezing a copy of this script BEFORE the rsync step (the first
+# attempt at the fix above) stops the corruption, but means every run
+# executes the PREVIOUS version's post-rsync logic, never the one just
+# pulled -- confirmed live: a run that correctly rsynced 5.24.2's nginx
+# backup-path fix to disk still printed 5.24.1's old warning text
+# verbatim for the rest of that same run, because the frozen copy it was
+# re-exec'd from was taken from the 5.24.1 file, before rsync overwrote
+# it. Fixed by re-executing a SECOND time, from a NEW frozen copy taken
+# AFTER the rsync -- the first re-exec (before rsync) only exists to
+# protect the clone+rsync steps themselves from self-corruption; the
+# second one (right after rsync) is what makes the restart/nginx-apply
+# steps that follow actually run THIS run's freshly-pulled logic, not
+# last run's.
 #
 # Safe to re-run any time; every step is idempotent.
 
 set -euo pipefail
 
-# Must happen before anything else (see "SELF-MODIFICATION FIX" above) --
-# $BASH_SOURCE is this script's own path as actually invoked; re-exec a
-# frozen copy of it from a private temp dir exactly once (the
-# DEPLOY_SH_REEXEC guard prevents infinite re-exec once already running
-# from that frozen copy).
-if [ -z "${DEPLOY_SH_REEXEC:-}" ]; then
+APP_DIR="/home/rparikh/opa-secrets-folders"
+
+# Phase 1 re-exec (see "SELF-MODIFICATION FIX" above): protects the
+# clone+rsync steps below from reading a file that's changing out from
+# under them. $DEPLOY_SH_PHASE tracks which phase is currently running
+# (unset -> "1" -> "2") so each phase re-execs exactly once and never
+# loops.
+if [ -z "${DEPLOY_SH_PHASE:-}" ]; then
   _frozen_dir="$(mktemp -d)"
   _frozen_copy="$_frozen_dir/deploy.sh"
   cp "${BASH_SOURCE[0]}" "$_frozen_copy"
   chmod +x "$_frozen_copy"
-  export DEPLOY_SH_REEXEC="$_frozen_dir"
+  export DEPLOY_SH_PHASE=1
+  export DEPLOY_SH_PHASE1_FROZEN_DIR="$_frozen_dir"
   exec "$_frozen_copy" "$@"
 fi
-# `exec` above replaces this entire process -- nothing after it in THIS
-# branch ever runs. The copy that actually continues past this point owns
-# BOTH the frozen-copy dir (DEPLOY_SH_REEXEC) and its own TMP_DIR below --
-# one single trap cleans up both at exit (a second `trap ... EXIT` would
-# silently REPLACE this one, not stack with it, so TMP_DIR's own cleanup
-# is folded in here rather than set separately below).
 
-REPO_URL="https://github.com/ItsGambit/opa-compliance-wizard.git"
-APP_DIR="/home/rparikh/opa-secrets-folders"
-SERVICE_NAME="opa-secrets-wizard"
-AUTH_GATE_SERVICE="opa-auth-gate"
 NGINX_LIVE="/etc/nginx/sites-available/opa-secrets-wizard"
 NGINX_REPO="$APP_DIR/server/nginx-opa-secrets-wizard.conf"
-TMP_DIR="$(mktemp -d)"
+SERVICE_NAME="opa-secrets-wizard"
+AUTH_GATE_SERVICE="opa-auth-gate"
 SUDOERS_GAPS=()
 
-cleanup() { rm -rf "$TMP_DIR" "$DEPLOY_SH_REEXEC"; }
-trap cleanup EXIT
+if [ "$DEPLOY_SH_PHASE" = "1" ]; then
+  REPO_URL="https://github.com/ItsGambit/opa-compliance-wizard.git"
+  TMP_DIR="$(mktemp -d)"
 
-echo "==> Fetching latest from $REPO_URL"
-git clone --depth 1 "$REPO_URL" "$TMP_DIR/repo"
+  # Phase 1's own cleanup -- only matters if phase 1 exits WITHOUT
+  # reaching the phase-2 re-exec at the end of this block (e.g. the clone
+  # or rsync step fails). Once phase 2 is successfully exec'd, this trap
+  # (and this entire process image) is gone -- phase 2 sets its OWN trap
+  # further down to clean up everything listed here, via
+  # DEPLOY_SH_PHASE1_FROZEN_DIR/DEPLOY_SH_PHASE1_TMP_DIR passed through as
+  # env vars.
+  trap 'rm -rf "$TMP_DIR" "$DEPLOY_SH_PHASE1_FROZEN_DIR"' EXIT
 
-SRC="$TMP_DIR/repo"
-if [ ! -f "$SRC/create_secret_folders.py" ]; then
-  echo "ERROR: expected files not found under $SRC -- check REPO_URL above." >&2
-  exit 1
+  echo "==> Fetching latest from $REPO_URL"
+  git clone --depth 1 "$REPO_URL" "$TMP_DIR/repo"
+
+  SRC="$TMP_DIR/repo"
+  if [ ! -f "$SRC/create_secret_folders.py" ]; then
+    echo "ERROR: expected files not found under $SRC -- check REPO_URL above." >&2
+    exit 1
+  fi
+
+  echo "==> Syncing into $APP_DIR (excluding local-only state)"
+  rsync -a --delete \
+    --exclude '.venv/' \
+    --exclude '.git/' \
+    --exclude '__pycache__/' \
+    --exclude 'frontend/node_modules/' \
+    --exclude 'frontend/dist/' \
+    --exclude 'environments.json' \
+    --exclude 'banner_config.json' \
+    --exclude 'audit_log.jsonl' \
+    --exclude 'secrets_log_cache.json' \
+    --exclude 'audit_store.db' \
+    --exclude 'audit_store.db-wal' \
+    --exclude 'audit_store.db-shm' \
+    --exclude '.env' \
+    "$SRC/" "$APP_DIR/"
+
+  # git-for-windows checkouts of this repo commonly have core.fileMode=false,
+  # which silently drops the executable bit on *.sh files whenever they're
+  # edited/committed from Windows (chmod succeeds on disk but git never
+  # records it, so the tree's tracked mode stays 100644) -- confirmed as the
+  # real cause of a service crash-loop the first time this script ran
+  # (start-headless.sh landed non-executable, systemd failed with
+  # "203/EXEC ... Permission denied"). Restoring the bit here is a
+  # belt-and-suspenders fix independent of ever getting every .sh file's
+  # git-tracked mode right at commit time. MUST happen before the phase-2
+  # re-exec below, which execs this exact file.
+  find "$APP_DIR" -maxdepth 3 -name '*.sh' -exec chmod +x {} +
+
+  # Phase 2 re-exec (see "ONE-VERSION-LAG FIX" above): $APP_DIR/server/
+  # deploy.sh is now THIS run's freshly-rsynced copy -- exec it directly
+  # (no new frozen copy needed; nothing modifies this file again for the
+  # rest of the run, so there's no self-corruption risk left to protect
+  # against). Passes through phase 1's temp dirs so phase 2's cleanup can
+  # remove them too, since phase 1's own trap never fires once exec below
+  # succeeds (exec replaces this process entirely, trap included).
+  export DEPLOY_SH_PHASE=2
+  export DEPLOY_SH_PHASE1_TMP_DIR="$TMP_DIR"
+  exec "$APP_DIR/server/deploy.sh" "$@"
 fi
 
-echo "==> Syncing into $APP_DIR (excluding local-only state)"
-rsync -a --delete \
-  --exclude '.venv/' \
-  --exclude '.git/' \
-  --exclude '__pycache__/' \
-  --exclude 'frontend/node_modules/' \
-  --exclude 'frontend/dist/' \
-  --exclude 'environments.json' \
-  --exclude 'banner_config.json' \
-  --exclude 'audit_log.jsonl' \
-  --exclude 'secrets_log_cache.json' \
-  --exclude 'audit_store.db' \
-  --exclude 'audit_store.db-wal' \
-  --exclude 'audit_store.db-shm' \
-  --exclude '.env' \
-  "$SRC/" "$APP_DIR/"
+# Everything below only ever runs in phase 2 (DEPLOY_SH_PHASE=2) --
+# phase 1's block above always ends in `exec`, so execution only
+# reaches here via that exec, never by falling through from phase 1.
 
-# git-for-windows checkouts of this repo commonly have core.fileMode=false,
-# which silently drops the executable bit on *.sh files whenever they're
-# edited/committed from Windows (chmod succeeds on disk but git never
-# records it, so the tree's tracked mode stays 100644) -- confirmed as the
-# real cause of a service crash-loop the first time this script ran
-# (start-headless.sh landed non-executable, systemd failed with
-# "203/EXEC ... Permission denied"). Restoring the bit here is a
-# belt-and-suspenders fix independent of ever getting every .sh file's
-# git-tracked mode right at commit time.
-find "$APP_DIR" -maxdepth 3 -name '*.sh' -exec chmod +x {} +
+# Cleans up phase 1's frozen-copy dir AND its TMP_DIR (the git clone,
+# already rsynced and no longer needed) -- phase 1's own trap never fired
+# for these since exec replaced that process entirely before it could.
+trap 'rm -rf "$DEPLOY_SH_PHASE1_FROZEN_DIR" "$DEPLOY_SH_PHASE1_TMP_DIR"' EXIT
 
 echo "==> Reinstalling Python dependencies"
 "$APP_DIR/.venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
