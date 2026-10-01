@@ -125,18 +125,41 @@ if [ "$DEPLOY_SH_PHASE" = "1" ]; then
   fi
 
   echo "==> Syncing into $APP_DIR (excluding local-only state)"
+  # BUG FIX (real incident, found live deploying Phase 2's SQLite
+  # migration, 2026-10-01): environments.json/banner_config.json's
+  # exclude lines were REMOVED when Phase 2 shipped, on the reasoning
+  # "the migration deletes these files anyway, so excluding is a no-op."
+  # That reasoning only holds AFTER a successful migration -- on an
+  # install that hasn't migrated yet (or is deploying the very release
+  # that introduces the migration), this rsync step runs BEFORE the
+  # server process (and its migration) ever starts, so --delete removed
+  # the real environments.json/banner_config.json itself, with the
+  # server never getting a chance to read and import them first.
+  # Confirmed live: the Ubuntu server's real 4-environment metadata
+  # (including its genuine two-owner collision case) was deleted by this
+  # rsync step, recovered only because a manual pre-deploy backup had
+  # been taken outside $APP_DIR. Excluding them is the correct
+  # permanent state regardless of migration status -- once a real
+  # install HAS migrated, these files no longer exist on either side of
+  # the sync, so the exclude is a harmless no-op; it is NOT a no-op
+  # before/during migration, which is exactly the case that broke.
   rsync -a --delete \
     --exclude '.venv/' \
     --exclude '.git/' \
     --exclude '__pycache__/' \
     --exclude 'frontend/node_modules/' \
     --exclude 'frontend/dist/' \
+    --exclude 'environments.json' \
+    --exclude 'environments.json.*' \
+    --exclude 'banner_config.json' \
+    --exclude 'banner_config.json.*' \
     --exclude 'audit_log.jsonl' \
     --exclude 'secrets_log_cache.json' \
     --exclude 'access_control.json' \
     --exclude 'audit_store.db' \
     --exclude 'audit_store.db-wal' \
     --exclude 'audit_store.db-shm' \
+    --exclude 'audit_store.db.*' \
     --exclude '.env' \
     "$SRC/" "$APP_DIR/"
 

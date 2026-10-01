@@ -2,6 +2,27 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.29.2 — **Fixes a real data-loss bug found live deploying v5.29.1 to
+the Ubuntu server**: v5.29.0's `server/deploy.sh` update dropped
+`environments.json`/`banner_config.json`'s rsync exclude lines, reasoning
+"the migration deletes these files anyway, so excluding is a no-op." That
+reasoning only holds AFTER a successful migration -- on an install
+deploying the very release that introduces the migration, `rsync -a
+--delete` runs BEFORE the server process (and its one-shot
+`migrate_legacy_environments_json()`) ever starts, so `--delete` removed
+the real `environments.json` itself before the server got a chance to
+read and import it. Confirmed live: the Ubuntu server's real 4-environment
+metadata (including its genuine two-owner collision case) was deleted
+this way -- recovered in full from a manual pre-deploy backup taken
+outside `$APP_DIR` (so a later `--delete` couldn't remove it too), which
+is the only reason no real data was permanently lost. The archive itself
+(`audit_store.db`, all 193,924 real events) was never touched -- confirmed
+via row counts and `PRAGMA foreign_key_check` before and after. Both
+exclude lines are restored (plus their own `.* ` backup-file patterns,
+and `audit_store.db.*` for its own backup convention) -- the exclude is a
+harmless no-op on an already-migrated install and load-bearing on one
+that isn't, so it must stay regardless of migration status.
+
 5.29.1 — **Fixes a real crash-loop found live deploying v5.29.0 to the
 Ubuntu server**: `main()` called `_try_activate_saved_environment()`
 (which queries `active_environments`) BEFORE `audit_store.init_db()`
