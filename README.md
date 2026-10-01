@@ -1047,23 +1047,28 @@ already exists is skipped, not duplicated.
 
 ## Version
 
-5.24.0 — **Security remediation pass: 14 confirmed findings from
-independent reviews, plus several more found during the fix.** The
-single worst finding (flagged independently by multiple reviewers): with
-nginx in front of this app, `server/serve.py`'s loopback port trusted
-`X-Auth-Is-Admin`/`X-Auth-Sub` from ANY request that could reach it
-directly, bypassing login and step-up MFA entirely — closed with a new
-required `NGINX_PROXY_SECRET`. Three severe cross-tenant data leaks (two
-different logged-in users with same-named environments, e.g. both named
-`dev`, could see or write each other's Access Explorer results, sync
-status, and compliance report data) are fixed via one root-cause change:
-every one of those subsystems now keys off the environment's existing
-stable owner-qualified ID instead of its bare display name. See the
-changelog entry below for the full breakdown (filesystem path
-confinement for CSV import, atomic config writes, fail-closed access
-control, and several more).
+5.24.1 — **Fixed a self-modification bug in `server/deploy.sh`** found
+during the very first real deploy of 5.24.0: that script's own rsync
+step overwrites itself on disk while still running, which (for the first
+time, now that this script does more after that step than just print a
+warning) made it silently keep executing its OLD in-memory tail instead
+of the newly-deployed one — meaning the previous version's `opa-auth-gate`
+restart and nginx-apply logic never actually ran, even though the app
+itself deployed correctly. See that version's changelog entry below for
+the fix (and 5.24.0's entry, right after it, for the security remediation
+pass that exposed this).
 
 ### Changelog
+- **5.24.1**:
+  - **Fixed `server/deploy.sh` silently skipping its own newest logic.**
+    Confirmed live: the rsync step overwrites this script's own file on
+    disk while bash is still executing it, so anything added to the tail
+    of a deploy (here, 5.24.0's `opa-auth-gate` restart + nginx apply)
+    could silently never run — the process kept executing the OLD
+    in-memory copy for the rest of that run. Fixed by having the script
+    re-execute itself from a frozen temp copy before touching anything
+    else, so the running process is never reading from the path rsync is
+    about to overwrite.
 - **5.24.0**:
   - **Critical: closed the nginx header-spoofing trust gap.** New
     required `NGINX_PROXY_SECRET` env var + matching nginx
