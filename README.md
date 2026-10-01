@@ -1055,6 +1055,22 @@ already exists is skipped, not duplicated.
 
 ## Version
 
+5.24.4 — **Fixed a stale `gnome-keyring-daemon` process pile-up on the
+hosted server.** `server/start-headless.sh` calls `gnome-keyring-daemon
+--unlock --login` on every service start/restart, but `--login` is
+specifically a PAM-style, one-time-at-login invocation that deliberately
+never fully initializes (per `gnome-keyring-daemon(1)`) — nothing ever
+tore down the previous invocation first, so repeated restarts (e.g.
+back-to-back `deploy.sh` runs) accumulated multiple competing daemon
+processes with none reaped, one observed still running from over a week
+earlier. This daemon pile-up was the likely cause of a crash-loop
+observed during this session's deploys (self-healing within systemd's
+retry window every time, so never a sustained outage, but worth fixing
+at the root). Fixed by killing any stray `gnome-keyring-daemon` for this
+user before starting a fresh one — safe on this box specifically because
+it has no desktop/login session at all, so this script is the only thing
+that ever starts one here.
+
 5.24.3 — **Fixed `deploy.sh` running one version behind its own fixes.**
 The self-modification fix added in 5.24.1 (re-exec from a frozen copy
 before `rsync` can overwrite this file mid-run) protected the clone/sync
@@ -1093,6 +1109,16 @@ the fix (and 5.24.0's entry, right after it, for the security remediation
 pass that exposed this).
 
 ### Changelog
+- **5.24.4**:
+  - **Fixed `gnome-keyring-daemon` processes piling up across restarts
+    on the hosted server.** `server/start-headless.sh` ran `--unlock
+    --login` on every start/restart, but `--login` is a one-time
+    PAM-style invocation that never fully initializes and has no
+    corresponding teardown — confirmed live, a daemon from over a week
+    prior was still running untouched, with more added on every
+    subsequent restart. Now kills any stray daemon for this user first;
+    safe since this box has no desktop session, so this script is the
+    only thing that ever starts one.
 - **5.24.3**:
   - **Fixed `deploy.sh` always running one version behind its own
     fixes.** 5.24.1's self-modification fix re-exec'd from a frozen copy
