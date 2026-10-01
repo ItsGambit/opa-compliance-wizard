@@ -1,0 +1,9 @@
+[tool.pytest.ini_options]
+# This repo is a flat-script project (no package __init__.py anywhere,
+# server/serve.py inserts the repo root onto sys.path itself at import
+# time -- see that file's own PROJECT_ROOT/sys.path.insert lines). Setting
+# pythonpath here means `import create_secret_folders` / `import
+# audit_store` work from pytest regardless of the invoking shell's cwd,
+# without relying on serve.py's own side-effecting import trick.
+pythonpath = ["."]
+testpaths = ["tests"]

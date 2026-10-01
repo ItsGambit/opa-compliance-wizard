@@ -25,11 +25,21 @@ Run it with `python launch.py` from the repo root — see the main
 
 ## Before opening a PR
 
-**There is currently no automated test suite** — that's a known gap (see
-the "Project status" section of the README), not a secret. Until that
-changes, this is the real bar for a PR to be mergeable:
+**There is a small, backend-only `pytest` suite** (`tests/`, run with
+`pip install -r requirements-dev.txt && pytest` from the repo root) — it
+covers the functions with the most direct history of silent breakage
+(admin same-owner-name disambiguation, the P0 header-spoofing fix, the
+sync watermark, atomic-write crash safety) plus a two-owner collision
+integration test, but it is **not yet comprehensive** — no frontend
+tests, no CI. Run it if you touched any of `create_secret_folders.py`,
+`server/serve.py`, or `audit_store.py`; add a test alongside your fix if
+you can. This is the real bar for a PR to be mergeable:
 
 ```bash
+# Backend: run the test suite
+pip install -r requirements-dev.txt
+pytest
+
 # Backend: confirm every touched Python file still parses
 python -c "import ast; ast.parse(open('path/to/file.py', encoding='utf-8').read())"
 

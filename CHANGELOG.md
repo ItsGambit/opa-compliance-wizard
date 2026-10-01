@@ -2,6 +2,46 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.27.0 — **First automated test suite (pytest, backend), plus an explicit
+`DEPLOYMENT_MODE=local|hosted` startup guard.** First two items from the
+fast-follow architecture plan's own suggested sequencing — regression
+protection and deployment-safety hardening, both deliberately shipped
+before any bigger migration work (environment UUIDs, SQLite) begins.
+- **New: `DEPLOYMENT_MODE` environment variable** (`server/serve.py`,
+  optional, defaults to `local`). `NGINX_PROXY_SECRET` being optional was
+  the right call for not breaking standalone usage, but it meant the SAME
+  binary, with ONE missing environment variable, could silently run in a
+  dramatically weaker trust mode with no error, no startup warning,
+  nothing — an easy misconfiguration to make exactly once, on exactly the
+  deploy that matters, and never notice. In `hosted` mode, `serve.py` now
+  refuses to start at all unless `NGINX_PROXY_SECRET` is also set — fails
+  loudly at boot, matching this project's existing `_require_env` pattern
+  in `server/auth_gate.py`, instead of failing silently at the first
+  spoofed request. An unrecognized value (anything other than `local`/
+  `hosted`) also fails fast rather than silently falling back to `local`.
+  `local` (the default) is byte-for-byte unchanged behavior for every
+  existing standalone/CLI run. See `docs/hosting.md` for setup.
+- **New: first pytest suite in this repo** (`tests/`, `conftest.py`,
+  `pyproject.toml`, `requirements-dev.txt`). Covers the functions with the
+  most direct history of silent breakage this quarter:
+  `_resolve_admin_target`/`environment_storage_name` (admin same-name
+  disambiguation), `_is_admin_from_headers`/`_request_is_from_nginx` (the
+  P0 header-spoofing fix — a regression test that fails loudly if anyone
+  ever reverts it), `sync_okta_events`'s incomplete-chunk watermark
+  behavior, `_atomic_write_json`'s crash-mid-write safety, and the new
+  `DEPLOYMENT_MODE` guard above. Also adds a two-owner collision
+  integration test (`test_two_owner_collision.py`) — two environments
+  both named `"dev"` under different owners, exercised through the real
+  admin HTTP routes — the single test that would have caught the
+  cross-tenant F1/F2/F3 bugs (fixed by hand, external review, 2026-09-30)
+  automatically instead of needing a human review to surface them.
+  Written against today's `environment_storage_name`/`storage_name`
+  scheme deliberately, asserting against the stable public contract
+  (explicit `environment_id`, `_environment_visible_to`, the HTTP routes'
+  `id` round-trip) rather than `environments.json`'s on-disk shape — so it
+  keeps passing unchanged once a future UUID/SQLite migration lands.
+  `CONTRIBUTING.md`'s "no automated test suite" note updated to match.
+
 5.26.0 — **README/About wording fix (overselling what the Compliance
 Reports Dashboard produces), plus two new live-verified resource kinds:
 enrolled OPA Clients and Okta-managed Devices, now visible in Access

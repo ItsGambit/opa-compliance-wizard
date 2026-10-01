@@ -108,6 +108,13 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
      run this app standalone/locally with no nginx in front at all (this
      app's other explicitly supported mode), leave this unset — nothing
      is weakened in that mode, since there's no proxy boundary to spoof.
+   - `DEPLOYMENT_MODE` (optional, defaults to `local`) — set to `hosted`
+     for any real nginx-fronted deployment. In `hosted` mode, `serve.py`
+     refuses to start at all unless `NGINX_PROXY_SECRET` (above) is also
+     set — turning "forgot to set `NGINX_PROXY_SECRET`" from a silent,
+     easy-to-never-notice trust downgrade into a loud startup failure.
+     Leave unset (or `local`) for standalone/local-only runs — behavior is
+     unchanged either way.
 5. If `server/serve.py` itself will be reached through a hostname/IP other
    than `127.0.0.1`/`localhost` (true for any reverse-proxied deployment),
    also set `EXTRA_ALLOWED_ORIGINS` (comma-separated) to that public

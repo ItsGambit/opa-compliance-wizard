@@ -1,0 +1,107 @@
+"""Shared pytest fixtures for this repo's flat-script test suite.
+
+No test anywhere in this suite may touch the REAL environments.json,
+audit_store.db, or OS keychain -- those hold live credentials
+(base_domain/team_name/key_id for the dev/patlabs environments) and real
+tenant data. Every fixture below exists specifically to redirect this
+project's module-level, hardcoded file paths and OS-keyring calls to
+disposable per-test substitutes.
+"""
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import create_secret_folders as engine
+
+
+@pytest.fixture
+def tmp_environments_file(tmp_path, monkeypatch):
+    """Redirects environments.json to a disposable temp file so no test
+    can ever read or write the real one (which holds live dev/patlabs
+    credentials metadata)."""
+    path = tmp_path / "environments.json"
+    monkeypatch.setattr(engine, "_environments_file_path", lambda: str(path))
+    return path
+
+
+@pytest.fixture
+def fake_keyring(monkeypatch):
+    """Replaces keyring_set/keyring_get/keyring_delete with an in-memory
+    dict -- no test may write to the real OS keychain (Windows Credential
+    Manager on this machine), which keyring_set would otherwise do for
+    real on every upsert_environment call."""
+    store = {}
+
+    def _set(storage_name, field, value):
+        store[(storage_name, field)] = value
+
+    def _get(storage_name, field):
+        return store.get((storage_name, field))
+
+    def _delete(storage_name, field):
+        store.pop((storage_name, field), None)
+
+    monkeypatch.setattr(engine, "keyring_set", _set)
+    monkeypatch.setattr(engine, "keyring_get", _get)
+    monkeypatch.setattr(engine, "keyring_delete", _delete)
+    return store
+
+
+@pytest.fixture
+def tmp_audit_log(tmp_path, monkeypatch):
+    """Redirects audit_log.jsonl (create_secret_folders.log_audit_event's
+    append-only file) to a disposable temp path -- never let a test
+    append to the real one."""
+    path = tmp_path / "audit_log.jsonl"
+    monkeypatch.setattr(engine, "_audit_log_path", lambda: str(path))
+    return path
+
+
+@pytest.fixture
+def tmp_audit_store(tmp_path, monkeypatch):
+    """Redirects audit_store.db to a disposable temp file. audit_store's
+    _get_connection() has no path-override parameter -- it always calls
+    _audit_db_path() directly -- so the path FUNCTION itself must be
+    monkeypatched, not a constant."""
+    import audit_store
+
+    path = tmp_path / "audit_store.db"
+    monkeypatch.setattr(audit_store, "_audit_db_path", lambda: str(path))
+    # Each test gets a fresh thread-local connection cache, since the real
+    # one is keyed by threading.local() and would otherwise carry a stale
+    # connection (to a PRIOR test's temp db) into this test if the same
+    # worker thread ran both.
+    audit_store._thread_local = __import__("threading").local()
+    return path
+
+
+@pytest.fixture(autouse=True)
+def reset_serve_module_state(monkeypatch):
+    """server/serve.py keeps several module-level mutable dicts
+    (_sessions, _access_jobs, _sync_jobs) with zero built-in per-test
+    isolation -- a test that imports server.serve and populates one of
+    these would otherwise leak state into every later test in the same
+    process. Only resets state IF server.serve has already been imported
+    by an earlier fixture/test; importing it fresh here just to reset it
+    would pull in its module-level env-var reads (NGINX_PROXY_SECRET,
+    DEPLOYMENT_MODE, etc.) for tests that have nothing to do with it."""
+    mod = sys.modules.get("server.serve")
+    if mod is not None:
+        with mod._sessions_lock:
+            mod._sessions.clear()
+        with mod._access_jobs_lock:
+            mod._access_jobs.clear()
+        with mod._sync_jobs_lock:
+            mod._sync_jobs.clear()
+    yield
+    mod = sys.modules.get("server.serve")
+    if mod is not None:
+        with mod._sessions_lock:
+            mod._sessions.clear()
+        with mod._access_jobs_lock:
+            mod._access_jobs.clear()
+        with mod._sync_jobs_lock:
+            mod._sync_jobs.clear()

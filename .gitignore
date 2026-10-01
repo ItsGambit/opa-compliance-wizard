@@ -47,6 +47,13 @@ folders_result_*.csv
 frontend/node_modules/
 frontend/dist/
 
+# Internal design/planning docs -- stay local-only, never pushed to the
+# public GitHub remote even though code/deploy docs in docs/ do get
+# pushed. See CLAUDE memory "local-only design docs" for why: a candid
+# writeup of this app's remaining architectural weak points shouldn't be
+# visible to anyone before they're actually fixed.
+docs/fast-follow-redesign.md
+
 # Editors / OS
 .vscode/
 .idea/

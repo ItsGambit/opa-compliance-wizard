@@ -119,6 +119,34 @@ AUTH_GATE_INTERNAL_URL = "http://127.0.0.1:8767"
 # a server" section.
 NGINX_PROXY_SECRET = os.environ.get("NGINX_PROXY_SECRET")
 
+# Fast-follow-redesign Phase 9: closes the "which trust model am I in"
+# ambiguity above. NGINX_PROXY_SECRET being optional is the right call for
+# not breaking standalone usage, but it means the SAME binary, with ONE
+# missing environment variable, silently runs in a dramatically weaker
+# trust mode with no error, no startup warning, nothing -- an easy
+# misconfiguration to make exactly once, on exactly the deploy that
+# matters, and never notice. DEPLOYMENT_MODE makes the intended trust
+# model explicit instead of inferring it from whether NGINX_PROXY_SECRET
+# happens to be set: in "hosted" mode, this process refuses to start at
+# all without NGINX_PROXY_SECRET -- fails loudly at boot, not silently at
+# the first spoofed request. "local" (the default) is byte-for-byte
+# today's behavior; every existing standalone/CLI run is unaffected.
+#
+# An unrecognized value fails fast too, deliberately -- not a silent
+# fallback to "local". A typo'd DEPLOYMENT_MODE=Hosted landing in the weak
+# trust mode unnoticed would just be this exact failure mode moved up one
+# level, which defeats the point of adding this check at all.
+DEPLOYMENT_MODE = os.environ.get("DEPLOYMENT_MODE", "local")
+if DEPLOYMENT_MODE not in ("local", "hosted"):
+    raise RuntimeError(
+        f"DEPLOYMENT_MODE must be 'local' or 'hosted', got {DEPLOYMENT_MODE!r} (see docs/hosting.md)."
+    )
+if DEPLOYMENT_MODE == "hosted" and not NGINX_PROXY_SECRET:
+    raise RuntimeError(
+        "DEPLOYMENT_MODE=hosted requires NGINX_PROXY_SECRET to be set -- refusing to start in a "
+        "weakened trust mode. See docs/hosting.md."
+    )
+
 
 def _request_is_from_nginx(headers):
     """True if NGINX_PROXY_SECRET is unset (nothing to check -- standalone/

@@ -1,0 +1,5 @@
+# Dev/test-only dependencies -- NOT installed in production deploys
+# (server/deploy.sh installs from requirements.txt only, unchanged).
+-r requirements.txt
+pytest>=8.0
+requests>=2.31
