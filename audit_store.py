@@ -29,6 +29,7 @@ import json
 import os
 import sqlite3
 import threading
+import uuid
 from datetime import datetime, timedelta, timezone
 
 # ---------------------------------------------------------------------------
@@ -288,82 +289,206 @@ def _get_connection():
     return conn
 
 
-def init_db():
+def _schema_version(conn):
+    """Returns the highest-applied migration version, or 0 if
+    schema_migrations doesn't exist yet (a fresh database, or one that
+    predates this mechanism -- see migration 1, which creates the table
+    itself as its own first act)."""
+    try:
+        row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+        return row[0] or 0
+    except sqlite3.OperationalError:
+        return 0
+
+
+def _table_columns(conn, table):
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _migration_001_unified_schema(conn):
+    """The Phase 2 migration: creates every table this app now stores in
+    SQLite (environment metadata, active-environment pointers, sync
+    schedules, the banner) alongside the archive tables
+    (events/sync_state/event_targets).
+
+    Two real starting shapes handled here, confirmed by direct inspection
+    rather than assumed:
+    1. **Fresh database** (no `events` table at all) -- the CREATE TABLE
+       statements below create every table with its final shape
+       (`environment_id`, not `environment`) directly.
+    2. **Existing pre-Phase-2 database** (real `events`/`sync_state`/
+       `event_targets` tables already populated, keyed by bare display
+       name in a column literally named `environment`) -- renamed IN
+       PLACE via `ALTER TABLE ... RENAME COLUMN`, empirically confirmed
+       (against both this app's installed SQLite versions, 3.46.1 and
+       3.49.1) to correctly carry the primary key, foreign key clause,
+       and every index referencing that column along with it -- no manual
+       index/FK rebuild needed. Real data is PRESERVED, not recreated;
+       only the column's name changes here. The column's real VALUES
+       (today's bare display names) are re-pointed to real
+       `environment_id`s by `create_secret_folders.migrate_legacy_
+       environments_json` immediately after this schema migration runs,
+       since resolving the real collision-tiebreak logic (which
+       `environment_id` a bare name should map to, when more than one
+       shares that name) needs keyring access this module doesn't have.
+
+    `environment_id` was deliberately chosen as the real
+    `app_environments` foreign key everywhere, instead of continuing to
+    key the archive by bare display name -- the whole point of this
+    migration. `active_environments.environment_id REFERENCES
+    app_environments(environment_id) ON DELETE CASCADE` is a REAL fix
+    over the old environments.json design (confirmed via code history: a
+    deleted environment used to leave a dangling active-pointer unless
+    delete_environment remembered to clean it up by hand) -- SQLite
+    enforces this at the schema level now, for free."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS app_environments (
+            environment_id TEXT PRIMARY KEY,
+            owner_id TEXT,
+            display_name TEXT NOT NULL,
+            base_domain TEXT NOT NULL,
+            team_name TEXT NOT NULL,
+            key_id TEXT NOT NULL,
+            okta_url TEXT,
+            shared INTEGER NOT NULL DEFAULT 0,
+            preserve_logs_locally INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(owner_id, display_name)
+        );
+
+        CREATE TABLE IF NOT EXISTS active_environments (
+            owner_key TEXT PRIMARY KEY,
+            environment_id TEXT NOT NULL REFERENCES app_environments(environment_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_schedules (
+            environment_id TEXT PRIMARY KEY REFERENCES app_environments(environment_id) ON DELETE CASCADE,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            run_time TEXT NOT NULL DEFAULT '02:00',
+            ingestion_scope TEXT NOT NULL DEFAULT 'curated',
+            retention_days INTEGER,
+            retention_max_size_mb INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS banner_config (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            enabled INTEGER NOT NULL DEFAULT 0,
+            message TEXT NOT NULL DEFAULT '',
+            variant TEXT NOT NULL DEFAULT 'warning',
+            dismissible INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS events (
+            uuid TEXT NOT NULL,
+            environment_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            published TEXT NOT NULL,
+            actor_id TEXT,
+            actor_display_name TEXT,
+            actor_alternate_id TEXT,
+            outcome_result TEXT,
+            is_curated INTEGER NOT NULL DEFAULT 0,
+            raw_json TEXT NOT NULL,
+            resource_id TEXT,
+            resource_alternate_id TEXT,
+            resource_type_detail TEXT,
+            PRIMARY KEY (environment_id, uuid)
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_state (
+            environment_id TEXT PRIMARY KEY,
+            last_synced_at TEXT,
+            last_sync_completed_at TEXT,
+            last_sync_status TEXT,
+            last_sync_error TEXT,
+            total_events_ingested INTEGER NOT NULL DEFAULT 0,
+            ingestion_scope TEXT NOT NULL DEFAULT 'curated'
+        );
+
+        CREATE TABLE IF NOT EXISTS event_targets (
+            environment_id TEXT NOT NULL,
+            uuid TEXT NOT NULL,
+            target_id TEXT,
+            target_alternate_id TEXT,
+            target_display_name TEXT,
+            FOREIGN KEY (environment_id, uuid) REFERENCES events(environment_id, uuid)
+        );
+    """)
+
+    # The three CREATE TABLE IF NOT EXISTS above are no-ops when the
+    # table already exists under the OLD column name ("environment") --
+    # detect and rename in place, preserving real data, rather than ever
+    # dropping/recreating. Order matters: events before event_targets
+    # (its FOREIGN KEY clause references events' own column), though
+    # SQLite's RENAME COLUMN updates both sides regardless of order --
+    # confirmed empirically, this ordering is just for readability.
+    for table in ("events", "sync_state", "event_targets"):
+        columns = _table_columns(conn, table)
+        if "environment" in columns and "environment_id" not in columns:
+            conn.execute(f"ALTER TABLE {table} RENAME COLUMN environment TO environment_id")
+
+    conn.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_events_env_published
+            ON events (environment_id, published);
+        CREATE INDEX IF NOT EXISTS idx_events_env_type
+            ON events (environment_id, event_type);
+        CREATE INDEX IF NOT EXISTS idx_events_env_curated_published
+            ON events (environment_id, is_curated, published);
+        CREATE INDEX IF NOT EXISTS idx_events_env_resource_id
+            ON events (environment_id, resource_id);
+        CREATE INDEX IF NOT EXISTS idx_event_targets_id
+            ON event_targets (environment_id, target_id);
+        CREATE INDEX IF NOT EXISTS idx_event_targets_alt_id
+            ON event_targets (environment_id, target_alternate_id);
+        CREATE INDEX IF NOT EXISTS idx_event_targets_name
+            ON event_targets (environment_id, target_display_name);
+        CREATE INDEX IF NOT EXISTS idx_event_targets_env_uuid
+            ON event_targets (environment_id, uuid);
+    """)
+
+
+MIGRATIONS = {
+    1: _migration_001_unified_schema,
+}
+
+
+def run_migrations():
+    """Applies every migration in MIGRATIONS whose version is greater
+    than what's already recorded in schema_migrations, in order, each in
+    its own transaction. Replaces the old ad hoc `ALTER TABLE ... except
+    sqlite3.OperationalError` pattern (and its two always-re-run backfill
+    functions) that was this file's only schema-growth mechanism before
+    Phase 2 -- every future schema change should add a new numbered
+    function to MIGRATIONS, not another one-off patch.
+
+    Idempotent: calling this on an already-fully-migrated database is a
+    cheap no-op (one SELECT MAX(version), no transactions opened)."""
     conn = _get_connection()
-    with _db_lock:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS events (
-                uuid TEXT NOT NULL,
-                environment TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                published TEXT NOT NULL,
-                actor_id TEXT,
-                actor_display_name TEXT,
-                actor_alternate_id TEXT,
-                outcome_result TEXT,
-                is_curated INTEGER NOT NULL DEFAULT 0,
-                raw_json TEXT NOT NULL,
-                PRIMARY KEY (environment, uuid)
-            );
-            CREATE INDEX IF NOT EXISTS idx_events_env_published
-                ON events (environment, published);
-            CREATE INDEX IF NOT EXISTS idx_events_env_type
-                ON events (environment, event_type);
-            CREATE INDEX IF NOT EXISTS idx_events_env_curated_published
-                ON events (environment, is_curated, published);
-
-            CREATE TABLE IF NOT EXISTS sync_state (
-                environment TEXT PRIMARY KEY,
-                last_synced_at TEXT,
-                last_sync_completed_at TEXT,
-                last_sync_status TEXT,
-                last_sync_error TEXT,
-                total_events_ingested INTEGER NOT NULL DEFAULT 0,
-                ingestion_scope TEXT NOT NULL DEFAULT 'curated'
-            );
-
-            CREATE TABLE IF NOT EXISTS event_targets (
-                environment TEXT NOT NULL,
-                uuid TEXT NOT NULL,
-                target_id TEXT,
-                target_alternate_id TEXT,
-                target_display_name TEXT,
-                FOREIGN KEY (environment, uuid) REFERENCES events(environment, uuid)
-            );
-            CREATE INDEX IF NOT EXISTS idx_event_targets_id
-                ON event_targets (environment, target_id);
-            CREATE INDEX IF NOT EXISTS idx_event_targets_alt_id
-                ON event_targets (environment, target_alternate_id);
-            CREATE INDEX IF NOT EXISTS idx_event_targets_name
-                ON event_targets (environment, target_display_name);
-            CREATE INDEX IF NOT EXISTS idx_event_targets_env_uuid
-                ON event_targets (environment, uuid);
-        """)
-        conn.commit()
-
-    # Added 2026-09-30 for the Resources tab's per-resource history drill-
-    # down -- resource_id/resource_alternate_id/resource_type_detail used
-    # to be computed at READ time in _four_field_row() from raw_json only
-    # (never stored, never indexed), so "show me every report row about
-    # THIS server/account" would have meant scanning + JSON-parsing the
-    # whole table in Python on every click. Storing them as real, indexed
-    # columns instead makes that lookup fast forever after. SQLite has no
-    # "ADD COLUMN IF NOT EXISTS" -- ALTER TABLE is run unconditionally and
-    # the "duplicate column" error it raises on every run after the first
-    # is caught and ignored, matching this file's existing convention of
-    # never crashing on a safe re-run.
-    with _db_lock:
-        for column in ("resource_id", "resource_alternate_id", "resource_type_detail"):
+    current_version = _schema_version(conn)
+    for version in sorted(v for v in MIGRATIONS if v > current_version):
+        with _db_lock:
             try:
-                conn.execute(f"ALTER TABLE events ADD COLUMN {column} TEXT")
-            except sqlite3.OperationalError as exc:
-                if "duplicate column" not in str(exc).lower():
-                    raise
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_env_resource_id ON events (environment, resource_id)"
-        )
-        conn.commit()
+                MIGRATIONS[version](conn)
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                    (version, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
+
+def init_db():
+    run_migrations()
+    import create_secret_folders
+    create_secret_folders.migrate_legacy_environments_json()
     backfill_resource_columns()
     backfill_event_targets()
 
@@ -463,11 +588,11 @@ def _normalize_csv_row(row):
     )
 
 
-def _insert_rows(conn, environment, rows, ingestion_scope):
+def _insert_rows(conn, environment_id, rows, ingestion_scope):
     """rows: list of normalized tuples from either normalizer above.
     Filters by ingestion_scope BEFORE inserting (see module docstring --
     scope governs what's written, not a later filter), dedupes by
-    (environment, uuid). Uses INSERT OR IGNORE, not OR REPLACE -- a raw
+    (environment_id, uuid). Uses INSERT OR IGNORE, not OR REPLACE -- a raw
     Okta System Log event is immutable once published (matches the
     guide's own "Immutable Audit Trails" requirement), so a genuine
     re-ingest of an already-stored uuid should be a true no-op, not a
@@ -496,12 +621,12 @@ def _insert_rows(conn, environment, rows, ingestion_scope):
                 continue
             cur = conn.execute(
                 """INSERT OR IGNORE INTO events
-                   (uuid, environment, event_type, published, actor_id,
+                   (uuid, environment_id, event_type, published, actor_id,
                     actor_display_name, actor_alternate_id, outcome_result,
                     is_curated, raw_json, resource_id, resource_alternate_id,
                     resource_type_detail)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (uuid, environment, event_type, published, actor_id,
+                (uuid, environment_id, event_type, published, actor_id,
                  actor_name, actor_alt, outcome, is_curated, raw_json,
                  resource_id, resource_alt_id, resource_type_detail),
             )
@@ -515,10 +640,10 @@ def _insert_rows(conn, environment, rows, ingestion_scope):
             if cur.rowcount and targets:
                 conn.executemany(
                     """INSERT INTO event_targets
-                       (environment, uuid, target_id, target_alternate_id, target_display_name)
+                       (environment_id, uuid, target_id, target_alternate_id, target_display_name)
                        VALUES (?, ?, ?, ?, ?)""",
                     [
-                        (environment, uuid, t.get("id"), t.get("alternateId"), t.get("displayName"))
+                        (environment_id, uuid, t.get("id"), t.get("alternateId"), t.get("displayName"))
                         for t in targets
                     ],
                 )
@@ -526,15 +651,15 @@ def _insert_rows(conn, environment, rows, ingestion_scope):
     return inserted, max_published
 
 
-def is_first_sync(environment):
+def is_first_sync(environment_id):
     conn = _get_connection()
     row = conn.execute(
-        "SELECT 1 FROM sync_state WHERE environment = ?", (environment,)
+        "SELECT 1 FROM sync_state WHERE environment_id = ?", (environment_id,)
     ).fetchone()
     return row is None
 
 
-def get_sync_state(environment):
+def get_sync_state(environment_id):
     """`total_events_ingested` is always recomputed live via COUNT(*),
     overriding whatever the stored column says -- caught live during
     Phase 3 testing: the stored running-counter approach silently drifted
@@ -547,23 +672,23 @@ def get_sync_state(environment):
     only so existing rows don't need a migration."""
     conn = _get_connection()
     row = conn.execute(
-        "SELECT * FROM sync_state WHERE environment = ?", (environment,)
+        "SELECT * FROM sync_state WHERE environment_id = ?", (environment_id,)
     ).fetchone()
     if row is None:
         return None
     result = dict(row)
     result["total_events_ingested"] = conn.execute(
-        "SELECT COUNT(*) FROM events WHERE environment = ?", (environment,)
+        "SELECT COUNT(*) FROM events WHERE environment_id = ?", (environment_id,)
     ).fetchone()[0]
     return result
 
 
-def _upsert_sync_state(conn, environment, **fields):
+def _upsert_sync_state(conn, environment_id, **fields):
     existing = conn.execute(
-        "SELECT * FROM sync_state WHERE environment = ?", (environment,)
+        "SELECT * FROM sync_state WHERE environment_id = ?", (environment_id,)
     ).fetchone()
     merged = dict(existing) if existing else {
-        "environment": environment, "last_synced_at": None,
+        "environment_id": environment_id, "last_synced_at": None,
         "last_sync_completed_at": None, "last_sync_status": None,
         "last_sync_error": None, "total_events_ingested": 0,
         "ingestion_scope": "curated",
@@ -571,10 +696,10 @@ def _upsert_sync_state(conn, environment, **fields):
     merged.update(fields)
     conn.execute(
         """INSERT OR REPLACE INTO sync_state
-           (environment, last_synced_at, last_sync_completed_at, last_sync_status,
+           (environment_id, last_synced_at, last_sync_completed_at, last_sync_status,
             last_sync_error, total_events_ingested, ingestion_scope)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (merged["environment"], merged["last_synced_at"], merged["last_sync_completed_at"],
+        (merged["environment_id"], merged["last_synced_at"], merged["last_sync_completed_at"],
          merged["last_sync_status"], merged["last_sync_error"], merged["total_events_ingested"],
          merged["ingestion_scope"]),
     )
@@ -584,12 +709,12 @@ def _upsert_sync_state(conn, environment, **fields):
 CHUNK_DAYS = 1  # window size for the day-by-day walk below
 
 
-def sync_okta_events(okta_client, environment, ingestion_scope, since=None, on_progress=None):
+def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, on_progress=None):
     """Pulls System Log events from the real Okta API via the EXISTING
     OktaClient.get_system_log (pagination + rate-limit handling already
     built in, shared with every other Okta call in this project) and
     ingests them. `since` defaults to 90 days ago if this is the first
-    sync for `environment`, else resumes from the last watermark.
+    sync for `environment_id`, else resumes from the last watermark.
 
     Walks the window one day at a time (via get_system_log's `until`)
     rather than one unbounded call -- confirmed live 2026-09-29: a
@@ -614,7 +739,7 @@ def sync_okta_events(okta_client, environment, ingestion_scope, since=None, on_p
     conn = _get_connection()
 
     if since is None:
-        state = get_sync_state(environment)
+        state = get_sync_state(environment_id)
         if state and state.get("last_synced_at"):
             since = state["last_synced_at"]
         else:
@@ -640,7 +765,7 @@ def sync_okta_events(okta_client, environment, ingestion_scope, since=None, on_p
         total_scanned += len(events)
 
         rows = [_normalize_live_event(e) for e in events]
-        inserted, max_published = _insert_rows(conn, environment, rows, ingestion_scope)
+        inserted, max_published = _insert_rows(conn, environment_id, rows, ingestion_scope)
         total_inserted += inserted
         chunks += 1
 
@@ -663,11 +788,11 @@ def sync_okta_events(okta_client, environment, ingestion_scope, since=None, on_p
                 f"exceed what a single day-chunk can safely page through."
             )
             _upsert_sync_state(
-                conn, environment,
+                conn, environment_id,
                 last_sync_completed_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
                 last_sync_status="error",
                 last_sync_error=error_message,
-                total_events_ingested=(get_sync_state(environment) or {}).get("total_events_ingested", 0) + inserted,
+                total_events_ingested=(get_sync_state(environment_id) or {}).get("total_events_ingested", 0) + inserted,
                 ingestion_scope=ingestion_scope,
             )
             if on_progress:
@@ -682,23 +807,23 @@ def sync_okta_events(okta_client, environment, ingestion_scope, since=None, on_p
         watermark = max_published or chunk_until
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
         _upsert_sync_state(
-            conn, environment,
+            conn, environment_id,
             last_synced_at=watermark,
             last_sync_completed_at=now_iso,
             last_sync_status="running",
             last_sync_error=None,
-            total_events_ingested=(get_sync_state(environment) or {}).get("total_events_ingested", 0) + inserted,
+            total_events_ingested=(get_sync_state(environment_id) or {}).get("total_events_ingested", 0) + inserted,
             ingestion_scope=ingestion_scope,
         )
         cursor = chunk_until_dt
 
-    _upsert_sync_state(conn, environment, last_sync_status="success")
+    _upsert_sync_state(conn, environment_id, last_sync_status="success")
     if on_progress:
         on_progress("ingest", "done", f"{total_inserted} new row(s) inserted across {chunks} day-chunk(s)")
     return {"inserted": total_inserted, "scanned": total_scanned, "since": original_since, "chunks": chunks, "complete": True}
 
 
-def import_from_csv(csv_path, environment, ingestion_scope, on_progress=None):
+def import_from_csv(csv_path, environment_id, ingestion_scope, on_progress=None):
     """Ingests a System Log CSV export (the FLATTENED column shape --
     event_type, timestamp, actor.*, target0-3.*, etc. -- confirmed
     against a real 90-day export this session, distinct from the live
@@ -720,17 +845,17 @@ def import_from_csv(csv_path, environment, ingestion_scope, on_progress=None):
     if on_progress:
         on_progress("read_csv", "done", f"{len(rows)} row(s) read")
 
-    inserted, max_published = _insert_rows(conn, environment, rows, ingestion_scope)
+    inserted, max_published = _insert_rows(conn, environment_id, rows, ingestion_scope)
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    existing_state = get_sync_state(environment)
+    existing_state = get_sync_state(environment_id)
     # A CSV import advances the watermark too, IF it's newer than what's
     # already recorded -- e.g. importing a 90-day export shouldn't roll
     # last_synced_at BACKWARD if a live sync already ran more recently.
     prior_watermark = (existing_state or {}).get("last_synced_at")
     new_watermark = max_published if (not prior_watermark or (max_published and max_published > prior_watermark)) else prior_watermark
     _upsert_sync_state(
-        conn, environment,
+        conn, environment_id,
         last_synced_at=new_watermark,
         last_sync_completed_at=now,
         last_sync_status="success",
@@ -743,7 +868,7 @@ def import_from_csv(csv_path, environment, ingestion_scope, on_progress=None):
     return {"inserted": inserted, "scanned": len(rows)}
 
 
-def prune_events(environment, retention_days=None, max_size_mb=None):
+def prune_events(environment_id, retention_days=None, max_size_mb=None):
     """Deletes non-curated rows older than retention_days. Curated rows
     (is_curated=1) are NEVER auto-pruned regardless of ingestion_scope --
     even a "curated only" archive can have its own separate, longer
@@ -763,8 +888,8 @@ def prune_events(environment, retention_days=None, max_size_mb=None):
         cutoff = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
         with _db_lock:
             cur = conn.execute(
-                "DELETE FROM events WHERE environment = ? AND is_curated = 0 AND published < ?",
-                (environment, cutoff),
+                "DELETE FROM events WHERE environment_id = ? AND is_curated = 0 AND published < ?",
+                (environment_id, cutoff),
             )
             pruned_total += cur.rowcount
             conn.commit()
@@ -813,14 +938,14 @@ def prune_events(environment, retention_days=None, max_size_mb=None):
             if _live_data_bytes() <= max_bytes:
                 break
             remaining = conn.execute(
-                "SELECT COUNT(*) FROM events WHERE environment = ? AND is_curated = 0",
-                (environment,),
+                "SELECT COUNT(*) FROM events WHERE environment_id = ? AND is_curated = 0",
+                (environment_id,),
             ).fetchone()[0]
             if remaining == 0:
                 break
             oldest = conn.execute(
-                "SELECT MIN(published) FROM events WHERE environment = ? AND is_curated = 0",
-                (environment,),
+                "SELECT MIN(published) FROM events WHERE environment_id = ? AND is_curated = 0",
+                (environment_id,),
             ).fetchone()[0]
             if not oldest:
                 break
@@ -829,8 +954,8 @@ def prune_events(environment, retention_days=None, max_size_mb=None):
             ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
             with _db_lock:
                 cur = conn.execute(
-                    "DELETE FROM events WHERE environment = ? AND is_curated = 0 AND published < ?",
-                    (environment, step_cutoff),
+                    "DELETE FROM events WHERE environment_id = ? AND is_curated = 0 AND published < ?",
+                    (environment_id, step_cutoff),
                 )
                 pruned_total += cur.rowcount
                 conn.commit()
@@ -861,7 +986,7 @@ def _normalize_until(until):
     return until
 
 
-def query_events(environment, event_types=None, since=None, until=None, actor_id=None, resource_id=None, limit=1000):
+def query_events(environment_id, event_types=None, since=None, until=None, actor_id=None, resource_id=None, limit=1000):
     """Generic report query -- used by every COMPLIANCE_REPORTS preset in
     Phase 4, and by resource_history below. Returns raw rows (dicts with
     the full parsed raw_json under "raw"), shaping to the four-field
@@ -876,8 +1001,8 @@ def query_events(environment, event_types=None, since=None, until=None, actor_id
     idx_events_env_resource_id, so this stays fast even on a large archive."""
     conn = _get_connection()
     until = _normalize_until(until)
-    clauses = ["environment = ?"]
-    params = [environment]
+    clauses = ["environment_id = ?"]
+    params = [environment_id]
     if event_types:
         placeholders = ",".join("?" for _ in event_types)
         clauses.append(f"event_type IN ({placeholders})")
@@ -910,14 +1035,14 @@ def query_events(environment, event_types=None, since=None, until=None, actor_id
     return out
 
 
-def count_events(environment, event_types=None, since=None, until=None):
+def count_events(environment_id, event_types=None, since=None, until=None):
     """Cheap count-only query (no raw_json parsing) -- used by the report
     picker's per-card event counts, where fetching every row's full
     payload just to discard it would be wasteful."""
     conn = _get_connection()
     until = _normalize_until(until)
-    clauses = ["environment = ?"]
-    params = [environment]
+    clauses = ["environment_id = ?"]
+    params = [environment_id]
     if event_types:
         placeholders = ",".join("?" for _ in event_types)
         clauses.append(f"event_type IN ({placeholders})")
@@ -1058,7 +1183,7 @@ def backfill_resource_columns():
     BATCH_SIZE = 500
     with _db_lock:
         rows = conn.execute(
-            """SELECT environment, uuid, event_type, raw_json FROM events
+            """SELECT environment_id, uuid, event_type, raw_json FROM events
                WHERE resource_id IS NULL AND resource_alternate_id IS NULL
                      AND resource_type_detail IS NULL"""
         ).fetchall()
@@ -1069,12 +1194,12 @@ def backfill_resource_columns():
     for row in rows:
         raw = json.loads(row["raw_json"])
         resource_id, resource_alt_id, resource_type_detail = _resource_fields(row["event_type"], raw)
-        batch.append((resource_id, resource_alt_id, resource_type_detail, row["environment"], row["uuid"]))
+        batch.append((resource_id, resource_alt_id, resource_type_detail, row["environment_id"], row["uuid"]))
         if len(batch) >= BATCH_SIZE:
             with _db_lock:
                 conn.executemany(
                     """UPDATE events SET resource_id = ?, resource_alternate_id = ?,
-                       resource_type_detail = ? WHERE environment = ? AND uuid = ?""",
+                       resource_type_detail = ? WHERE environment_id = ? AND uuid = ?""",
                     batch,
                 )
                 conn.commit()
@@ -1084,7 +1209,7 @@ def backfill_resource_columns():
         with _db_lock:
             conn.executemany(
                 """UPDATE events SET resource_id = ?, resource_alternate_id = ?,
-                   resource_type_detail = ? WHERE environment = ? AND uuid = ?""",
+                   resource_type_detail = ? WHERE environment_id = ? AND uuid = ?""",
                 batch,
             )
             conn.commit()
@@ -1113,10 +1238,10 @@ def backfill_event_targets():
     BATCH_SIZE = 500
     with _db_lock:
         rows = conn.execute(
-            """SELECT e.environment, e.uuid, e.raw_json FROM events e
+            """SELECT e.environment_id, e.uuid, e.raw_json FROM events e
                WHERE NOT EXISTS (
                    SELECT 1 FROM event_targets t
-                   WHERE t.environment = e.environment AND t.uuid = e.uuid
+                   WHERE t.environment_id = e.environment_id AND t.uuid = e.uuid
                )"""
         ).fetchall()
     if not rows:
@@ -1126,12 +1251,12 @@ def backfill_event_targets():
     for row in rows:
         raw = json.loads(row["raw_json"])
         for t in raw.get("target") or []:
-            batch.append((row["environment"], row["uuid"], t.get("id"), t.get("alternateId"), t.get("displayName")))
+            batch.append((row["environment_id"], row["uuid"], t.get("id"), t.get("alternateId"), t.get("displayName")))
         if len(batch) >= BATCH_SIZE:
             with _db_lock:
                 conn.executemany(
                     """INSERT INTO event_targets
-                       (environment, uuid, target_id, target_alternate_id, target_display_name)
+                       (environment_id, uuid, target_id, target_alternate_id, target_display_name)
                        VALUES (?, ?, ?, ?, ?)""",
                     batch,
                 )
@@ -1142,7 +1267,7 @@ def backfill_event_targets():
         with _db_lock:
             conn.executemany(
                 """INSERT INTO event_targets
-                   (environment, uuid, target_id, target_alternate_id, target_display_name)
+                   (environment_id, uuid, target_id, target_alternate_id, target_display_name)
                    VALUES (?, ?, ?, ?, ?)""",
                 batch,
             )
@@ -1190,18 +1315,18 @@ def _four_field_row(event_row):
     }
 
 
-def run_report(report_key, environment, since=None, until=None, limit=1000):
+def run_report(report_key, environment_id, since=None, until=None, limit=1000):
     """Runs one named COMPLIANCE_REPORTS preset and returns rows shaped to
     the four-field standard. Raises KeyError if report_key isn't a real
     report."""
     if report_key not in COMPLIANCE_REPORTS:
         raise KeyError(f"Unknown report: {report_key!r}")
     event_types = _event_types_for_report(report_key)
-    rows = query_events(environment, event_types=event_types, since=since, until=until, limit=limit)
+    rows = query_events(environment_id, event_types=event_types, since=since, until=until, limit=limit)
     return [_four_field_row(r) for r in rows]
 
 
-def resource_history(environment, resource_id=None, resource_name=None, since=None, until=None, limit=1000):
+def resource_history(environment_id, resource_id=None, resource_name=None, since=None, until=None, limit=1000):
     """Every report row across EVERY event type (not scoped to one
     COMPLIANCE_REPORTS preset) where this one real resource appears as
     ANY target on the event -- the Resources tab's per-resource drill-down
@@ -1253,8 +1378,8 @@ def resource_history(environment, resource_id=None, resource_name=None, since=No
     if resource_name:
         match_clauses.append("t.target_display_name = ?")
         match_params.append(resource_name)
-    clauses = ["e.environment = ?", "(" + " OR ".join(match_clauses) + ")"]
-    params = [environment, *match_params]
+    clauses = ["e.environment_id = ?", "(" + " OR ".join(match_clauses) + ")"]
+    params = [environment_id, *match_params]
     if since:
         clauses.append("e.published >= ?")
         params.append(since)
@@ -1265,7 +1390,7 @@ def resource_history(environment, resource_id=None, resource_name=None, since=No
         "SELECT DISTINCT e.uuid, e.event_type, e.published, e.actor_id, e.actor_display_name, "
         "e.actor_alternate_id, e.outcome_result, e.resource_id, e.resource_alternate_id, "
         "e.resource_type_detail, e.raw_json FROM events e JOIN event_targets t "
-        "ON e.environment = t.environment AND e.uuid = t.uuid WHERE "
+        "ON e.environment_id = t.environment_id AND e.uuid = t.uuid WHERE "
         + " AND ".join(clauses)
         + " ORDER BY e.published DESC LIMIT ?"
     )

@@ -2,6 +2,104 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.29.0 — **Fast-follow Phase 2 of 11 of docs/fast-follow-redesign.md:
+environment metadata (`environments.json`/`banner_config.json`) and the
+compliance archive (`audit_store.py`'s `events`/`sync_state`/
+`event_targets`) move into one unified, transactional SQLite store**,
+now that Phase 1's real `environment_id` (UUID4) gives every environment
+a stable key to re-partition the archive around. The single biggest item
+in the whole fast-follow doc.
+- New `schema_migrations`/`MIGRATIONS` registry in `audit_store.py`
+  (`_schema_version`, `run_migrations()`) replaces the old ad hoc
+  `ALTER TABLE ... except OperationalError` pattern -- every future
+  schema change lands as a numbered, resumable migration function from
+  here on, not another one-off patch.
+- Migration 1 creates `app_environments`, `active_environments`,
+  `sync_schedules`, and `banner_config` tables, and renames
+  `events`/`sync_state`/`event_targets`'s `environment` column to
+  `environment_id` in place (`ALTER TABLE ... RENAME COLUMN`, confirmed
+  to preserve PK/FK/index relationships automatically on both installed
+  SQLite versions, 3.46.1 and 3.49.1).
+- `active_environments.environment_id REFERENCES app_environments
+  ON DELETE CASCADE` is a real schema-level fix for the "a deleted
+  environment leaves a dangling active-pointer" bug class that
+  previously needed hand-written cleanup logic in `delete_environment`.
+- `create_secret_folders.py`'s environment-management functions
+  (`list_environments_for`, `list_all_environments`,
+  `get_active_environment_name`/`set_active_environment`, `upsert_environment`,
+  `_resolve_admin_target`, `set_environment_shared`, `delete_environment`,
+  `get_sync_schedule`/`set_sync_schedule`, the banner config functions)
+  are now SQL-backed instead of JSON-file-backed, behind unchanged public
+  signatures where possible -- `_resolve_admin_target`'s signature changed
+  from `(data, name, environment_id)` to `(environment_id, name=None)`
+  since there's no longer an in-memory `data` dict to scan.
+  `load_environments()`/`save_environments()` are deleted outright (no
+  callers left).
+- `access_control.json` deliberately stays a flat file, permanently --
+  `server/auth_gate.py` is a separate OS process with zero `sqlite3`
+  import today, by design (minimal dependency footprint on the most
+  security-critical path in the app). Coupling it to the same SQLite
+  file every sync/admin-write touches would mean lock contention risk at
+  login grows as the app's real scaling axis grows -- the opposite of
+  what "scales well" should mean for a security-critical path.
+- New one-shot `migrate_legacy_environments_json()` (called from
+  `audit_store.init_db()`): reads `environments.json`/`banner_config.json`
+  directly, inserts their data into the new tables, re-keys the
+  archive's `environment_id` column VALUES from bare display name to the
+  real `environment_id` (`PRAGMA defer_foreign_keys = ON` for the
+  circular `events`<->`event_targets` FK remap -- found and fixed during
+  this migration's own live test against this machine's real
+  `audit_store.db`), verifies row counts match before/after, and only
+  deletes the JSON files once every step is verified.
+- **Real two-owner-collision archive attribution, decided from real
+  data, not an arbitrary pick**: when more than one `environment_id`
+  shares a display name, historical archive rows attach to whichever
+  `environment_id` has an actual stored keyring `key_secret` (checked by
+  length only, never by value) -- confirmed on the Ubuntu server that
+  the shared/no-owner copies in that exact scenario have zero
+  credentials and therefore could not have produced any of the real
+  archived history; attaching history to the uncredentialed copy instead
+  would have exposed sensitive audit data (PAM credential reveals, admin
+  privilege grants) to anyone who can merely see a shared environment.
+- `server/serve.py`'s ~9 call sites that previously passed a bare
+  display name into `audit_store` functions now pass the real
+  `environment_id` (sync job start/run, the scheduler loop, sync-status/
+  reports/resource-history routes, the secrets-access-report route, CSV
+  import). Found and fixed a pre-existing (since v5.28.0) argument-count
+  bug in `/sync/start`'s call to `_start_sync_job` while doing this --
+  it was missing its required `env_id` positional argument entirely,
+  silently shifting every argument by one position. The now-unused
+  `_environment_visible_to` helper (superseded by resolving
+  `environment_id` directly via `list_environments_for`) was removed.
+- Live-verified end-to-end on this machine's real data (2 real
+  environments, 5,336 real archived events): backed up `environments.json`
+  and `audit_store.db` first, ran the migration, verified exact row-count
+  match pre/post (1995 + 3341 = 5336), confirmed `PRAGMA foreign_key_check`
+  returns clean, confirmed keyring credentials resolve identically under
+  the same `environment_id`s as before, confirmed idempotency (a second
+  `init_db()` call is a no-op), and confirmed a live running `serve.py`
+  instance's `/api/environments`, `/api/reports`, `/api/reports/<key>`,
+  `/api/environments/<name>/sync/status`, and `/api/banner` routes all
+  return correct data against the real migrated archive.
+- **Real incident during this work, caught and fixed**: a test calling
+  `audit_store.init_db()` with only the `tmp_audit_store` fixture applied
+  (not `tmp_environments_file`) ran the real migration against this
+  machine's actual `environments.json` and deleted it. Recovered in full
+  from a pytest temp directory's copy of the same run (the migration
+  copies data into SQLite before deleting the JSON source, so nothing
+  was actually lost) and the file was restored. `tmp_audit_store` now
+  also redirects `environments.json`/`banner_config.json` to disposable
+  temp paths unconditionally, closing this class of mistake for every
+  future test rather than relying on remembering to combine fixtures.
+- `tests/test_resolve_admin_target.py` and `tests/test_two_owner_collision.py`
+  rewritten against the new SQL-backed storage (inserting rows directly
+  via `app_environments`/`list_all_environments()` instead of
+  hand-constructing `environments.json`'s old shape).
+- `server/deploy.sh`'s rsync exclude-list drops the now-obsolete
+  `environments.json`/`banner_config.json` lines (those files no longer
+  exist post-migration) and gains `access_control.json`, for consistency
+  with the locked decision that it stays flat long-term.
+
 5.28.1 — **Deletes v5.28.0's one-shot environment UUID migration code,
 now that both of this project's real installs (this machine + the
 Ubuntu server) are confirmed migrated** -- the exact "delete it once

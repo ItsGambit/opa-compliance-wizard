@@ -131,10 +131,9 @@ if [ "$DEPLOY_SH_PHASE" = "1" ]; then
     --exclude '__pycache__/' \
     --exclude 'frontend/node_modules/' \
     --exclude 'frontend/dist/' \
-    --exclude 'environments.json' \
-    --exclude 'banner_config.json' \
     --exclude 'audit_log.jsonl' \
     --exclude 'secrets_log_cache.json' \
+    --exclude 'access_control.json' \
     --exclude 'audit_store.db' \
     --exclude 'audit_store.db-wal' \
     --exclude 'audit_store.db-shm' \

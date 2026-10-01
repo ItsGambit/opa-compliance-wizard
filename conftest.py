@@ -65,7 +65,19 @@ def tmp_audit_store(tmp_path, monkeypatch):
     """Redirects audit_store.db to a disposable temp file. audit_store's
     _get_connection() has no path-override parameter -- it always calls
     _audit_db_path() directly -- so the path FUNCTION itself must be
-    monkeypatched, not a constant."""
+    monkeypatched, not a constant.
+
+    Also redirects environments.json to a disposable temp file -- a REAL
+    incident, 2026-10-01: a test called audit_store.init_db() (which also
+    calls migrate_legacy_environments_json(), reading AND DELETING
+    environments.json) with only this fixture applied, not
+    tmp_environments_file -- the migration ran against this machine's
+    REAL environments.json and deleted it (recovered; see
+    tests/test_sync_watermark.py's docstring for the full account). Any
+    test using tmp_audit_store now gets this redirect automatically too,
+    so forgetting tmp_environments_file can no longer touch the real
+    file -- redirecting unconditionally is harmless for tests that never
+    call init_db() at all."""
     import audit_store
 
     path = tmp_path / "audit_store.db"
@@ -75,6 +87,12 @@ def tmp_audit_store(tmp_path, monkeypatch):
     # connection (to a PRIOR test's temp db) into this test if the same
     # worker thread ran both.
     audit_store._thread_local = __import__("threading").local()
+
+    env_path = tmp_path / "environments.json"
+    monkeypatch.setattr(engine, "_environments_file_path", lambda: str(env_path))
+    banner_path = tmp_path / "banner_config.json"
+    monkeypatch.setattr(engine, "_banner_config_path", lambda: str(banner_path))
+
     return path
 
 

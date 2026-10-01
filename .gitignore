@@ -32,6 +32,7 @@ access_control.json
 audit_store.db
 audit_store.db-wal
 audit_store.db-shm
+audit_store.db.*
 
 # Python
 __pycache__/

@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.28.1
+# Version     : 5.29.0
 # =============================================================================
 
 import argparse
@@ -79,7 +79,7 @@ import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.28.1"
+SCRIPT_VERSION = "5.29.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -385,6 +385,10 @@ ENVIRONMENT_SECRET_FIELDS = ("key_secret", "okta_api_token")
 
 
 def _environments_file_path():
+    """Only still used by migrate_legacy_environments_json() -- the
+    one-shot Phase 2 import of this file's data into SQLite. Nothing else
+    reads/writes environments.json anymore (see load_environments() and
+    its siblings below, all SQL-backed as of v5.29.0)."""
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "environments.json")
 
 
@@ -392,48 +396,24 @@ LOCAL_OWNER_KEY = None  # sentinel for "no verified identity" -- local/direct ru
 
 
 def _owner_storage_key(owner):
-    """The dict key used for both `data["active"]` and, combined with an
-    environment name, the keyring/metadata storage key below. Never emit
+    """The real storage key for `data["active"]`/`active_environments.owner_key`
+    (and, pre-Phase-2, the keyring/metadata storage key too). Never emit
     the JSON token "null" as an actual key string -- use a stable literal
-    instead, since JSON object keys are always strings anyway and `None`
-    would otherwise round-trip as the 4-character string "null"."""
+    instead, since both JSON object keys and SQLite TEXT primary keys are
+    always strings anyway, and `None` would otherwise round-trip as the
+    4-character string "null"."""
     return owner if owner else "__local__"
-
-
-def load_environments():
-    """Loads the whole store. `environments` is keyed by `environment_id`
-    (a UUID4, see upsert_environment), with `name` and `owner` stored as
-    explicit fields on each record -- see docs/fast-follow-redesign.md's
-    Phase 1. (This function used to also run a one-shot migration for two
-    older shapes -- pre-multi-user bare-name keys, and the pre-UUID
-    "{owner}::{name}" storage_name scheme -- removed 2026-10-01 once both
-    of this project's real installs, this machine and the Ubuntu server,
-    were confirmed migrated. There is no third install that could still
-    be running pre-migration code.)"""
-    path = _environments_file_path()
-    if not os.path.isfile(path):
-        return {"active": {}, "environments": {}}
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-
-    if not isinstance(data.get("active"), dict):
-        data["active"] = {}
-    if not isinstance(data.get("environments"), dict):
-        data["environments"] = {}
-    return data
 
 
 def _atomic_write_json(path, value, mode=0o600):
     """SECURITY FIX (external review, 2026-09-30): every mutable JSON file
-    this project writes (environments.json, banner_config.json,
-    access_control.json) previously used a plain truncating `open(path,
+    this project writes previously used a plain truncating `open(path,
     "w")` -- a reader (in this case, a SEPARATE process:
     server/auth_gate.py reading access_control.json) hitting that file
     mid-write sees a truncated/partial file, gets a JSONDecodeError, and
-    (for access_control.json specifically) falls back to the unrestricted
-    login-bootstrap default -- confirmed exploitable: a crash or a login
-    landing exactly during a write can transiently or permanently disable
-    the login-restriction gate.
+    falls back to the unrestricted login-bootstrap default -- confirmed
+    exploitable: a crash or a login landing exactly during a write can
+    transiently or permanently disable the login-restriction gate.
 
     Standard write-new-file-then-rename pattern: write to a temp file in
     the SAME directory (so the final os.replace is on the same filesystem,
@@ -442,7 +422,20 @@ def _atomic_write_json(path, value, mode=0o600):
     rename so the write is durable even across a crash between the write
     and the rename, then os.replace -- POSIX guarantees a concurrent
     reader always sees either the complete old file or the complete new
-    one, never a partial write, no matter when it opens the path."""
+    one, never a partial write, no matter when it opens the path.
+
+    As of v5.29.0 (Phase 2 SQLite migration), the only remaining caller
+    of this is access_control.json's own setter -- environments.json and
+    banner_config.json moved into SQLite, which gives them a real
+    transactional story this function never could (see docs/fast-follow-
+    redesign.md's Phase 2 for why access_control.json deliberately did
+    NOT move: server/auth_gate.py reads it directly as a separate OS
+    process with zero sqlite3 dependency today, by design, and that
+    process's login-gate role is exactly the one place in this app where
+    adding a new dependency/failure-mode isn't worth a consistency win
+    this file genuinely doesn't need -- it's a single, infrequently
+    written, admin-only config blob with nothing else to be
+    cross-table-consistent with)."""
     directory = os.path.dirname(path) or "."
     fd, temp_path = tempfile.mkstemp(dir=directory, prefix=".tmp-")
     try:
@@ -475,9 +468,156 @@ def _atomic_write_bytes(path, data, mode=0o600):
             os.unlink(temp_path)
 
 
-def save_environments(data):
-    _atomic_write_json(_environments_file_path(), data)
+# ---------------------------------------------------------------------------
+# Environment metadata, active-environment pointers, sync schedules, and
+# the announcement banner -- all SQL-backed as of v5.29.0 (Phase 2 of
+# docs/fast-follow-redesign.md). Every one of these functions keeps the
+# EXACT SAME public signature it had when backed by environments.json/
+# banner_config.json -- every caller in server/serve.py and the CLI's
+# own main() goes through these functions already, so swapping the
+# storage engine behind them needed zero call-site changes anywhere
+# else, confirmed by a full exploration pass before this was written.
+# ---------------------------------------------------------------------------
+def _row_to_environment_meta(row):
+    """Shapes one app_environments row (plus its sync_schedule, if any)
+    into the same dict shape every caller already expects (the old
+    environments.json record shape) -- so list_environments_for/
+    list_all_environments/etc. don't need their own callers to change."""
+    import audit_store
+    conn = audit_store._get_connection()
+    meta = {
+        "environment_id": row["environment_id"],
+        "owner": row["owner_id"],
+        "name": row["display_name"],
+        "base_domain": row["base_domain"],
+        "team_name": row["team_name"],
+        "key_id": row["key_id"],
+        "okta_url": row["okta_url"] or "",
+        "shared": bool(row["shared"]),
+        "preserve_logs_locally": bool(row["preserve_logs_locally"]),
+    }
+    schedule_row = conn.execute(
+        "SELECT * FROM sync_schedules WHERE environment_id = ?", (row["environment_id"],)
+    ).fetchone()
+    if schedule_row is not None:
+        meta["sync_schedule"] = {
+            "enabled": bool(schedule_row["enabled"]),
+            "run_time": schedule_row["run_time"],
+            "ingestion_scope": schedule_row["ingestion_scope"],
+            "retention_days": schedule_row["retention_days"],
+            "retention_max_size_mb": schedule_row["retention_max_size_mb"],
+        }
+    return meta
 
+
+def list_environments_for(owner):
+    """Returns {name: meta} visible to `owner`: their own environments plus
+    anything explicitly marked shared=True. LOCAL_OWNER_KEY is treated as
+    just another owner value here -- NOT a bypass that sees every other
+    owner's private environments (same reasoning as the pre-Phase-2
+    JSON-backed version: a bypass would let anyone with local/CLI access
+    on a shared server read every logged-in user's private credentials).
+
+    Own environments are applied AFTER shared ones so a same-named
+    environment `owner` actually owns always wins over a like-named
+    environment merely shared by someone else -- without this ordering,
+    iteration order alone would decide which one a caller's own
+    credential lookup resolves to, which could silently authenticate
+    against the wrong tenant. (SQLite's own iteration order for a SELECT
+    with no ORDER BY isn't guaranteed stable the way a dict literal's
+    insertion order is, which is exactly why this ordering is enforced
+    explicitly here via two separate queries, not left implicit.)
+
+    Each returned `meta` carries its real `environment_id` -- see
+    _row_to_environment_meta."""
+    import audit_store
+    conn = audit_store._get_connection()
+    visible = {}
+    for row in conn.execute("SELECT * FROM app_environments WHERE shared = 1 AND owner_id IS NOT ?", (owner,)):
+        visible[row["display_name"]] = _row_to_environment_meta(row)
+    for row in conn.execute("SELECT * FROM app_environments WHERE owner_id IS ?", (owner,)):
+        visible[row["display_name"]] = _row_to_environment_meta(row)
+    return visible
+
+
+def list_all_environments():
+    """Returns {environment_id: meta} for EVERY stored environment, across
+    every owner -- unlike list_environments_for(owner), which deliberately
+    scopes to what one requesting identity is allowed to see. This exists
+    for server-side background work with no requesting identity of its
+    own (the daily sync scheduler): it needs to find and run every saved
+    environment's sync schedule, including a non-shared environment
+    privately owned by some other logged-in user, not just LOCAL_OWNER_KEY's
+    own/shared ones. Never expose this dict directly to an HTTP response --
+    it carries every owner's metadata (though still no secrets; those stay
+    in the keychain either way).
+
+    Keyed by the real environment_id (unique regardless of display name or
+    owner), so a genuine owner collision (two different owners each have an
+    environment named the same) never silently drops one, unlike
+    list_environments_for's flat {name: meta} would if collapsed the same
+    way."""
+    import audit_store
+    conn = audit_store._get_connection()
+    return {
+        row["environment_id"]: _row_to_environment_meta(row)
+        for row in conn.execute("SELECT * FROM app_environments")
+    }
+
+
+def get_active_environment_name(owner):
+    import audit_store
+    conn = audit_store._get_connection()
+    row = conn.execute(
+        """SELECT a.display_name FROM active_environments ae
+           JOIN app_environments a ON a.environment_id = ae.environment_id
+           WHERE ae.owner_key = ?""",
+        (_owner_storage_key(owner),),
+    ).fetchone()
+    return row["display_name"] if row else None
+
+
+def set_active_environment(owner, name):
+    """Stores the active pointer by resolving `name` to its real
+    environment_id and storing THAT in active_environments -- a real
+    improvement over the old environments.json design (confirmed via
+    code history: the old `data["active"][owner_key] = name` stored the
+    bare display name directly, so renaming an environment or a same-name
+    collision could silently point `active` at the wrong thing).
+    active_environments.environment_id REFERENCES
+    app_environments(environment_id) ON DELETE CASCADE, so a deleted
+    environment can never leave a dangling active-pointer -- SQLite
+    enforces this at the schema level now, instead of delete_environment
+    needing to remember to clean it up by hand (which it still does
+    below, for the SEPARATE case of an admin deleting a different
+    owner's environment -- CASCADE only helps the CALLING owner's own
+    pointer here, see delete_environment's docstring)."""
+    import audit_store
+    conn = audit_store._get_connection()
+    environment_id, _ = _find_own_environment_sql(conn, owner, name)
+    if environment_id is None:
+        raise KeyError(f"No saved environment named '{name}' owned by this user.")
+    with audit_store._db_lock:
+        conn.execute(
+            "INSERT OR REPLACE INTO active_environments (owner_key, environment_id) VALUES (?, ?)",
+            (_owner_storage_key(owner), environment_id),
+        )
+        conn.commit()
+
+
+def _find_own_environment_sql(conn, owner, name):
+    """SQL-backed sibling of _find_own_environment -- returns
+    (environment_id, meta) for the CALLING owner's own environment with
+    this display name, or (None, None). (owner, name) is guaranteed
+    unique by the UNIQUE(owner_id, display_name) constraint on
+    app_environments, so this is a direct, unambiguous lookup, never a
+    cross-owner scan -- that's _resolve_admin_target's job."""
+    row = conn.execute(
+        "SELECT * FROM app_environments WHERE owner_id IS ? AND display_name = ?", (owner, name)
+    ).fetchone()
+    if row is None:
+        return None, None
+    return row["environment_id"], _row_to_environment_meta(row)
 
 # ---------------------------------------------------------------------------
 # Announcement banner
@@ -485,27 +625,29 @@ def save_environments(data):
 # A single, dashboard-wide banner (not per-environment/per-owner) shown at
 # the top of every page -- mirrors Okta's own admin console banners
 # ("Preview Sandbox", incident notices) which are one announcement for the
-# whole org, not one per admin. Stored in its own file since it holds no
-# secrets and has nothing to do with which environment is active.
+# whole org, not one per admin. SQL-backed as of v5.29.0 (a single-row
+# table, same one-banner-for-the-whole-app shape as the old banner_config.json).
 BANNER_VARIANTS = ("info", "warning", "danger")
 _BANNER_DEFAULTS = {"enabled": False, "message": "", "variant": "warning", "dismissible": True}
 
 
 def _banner_config_path():
+    """Only still used by migrate_legacy_environments_json() -- the
+    one-shot Phase 2 import of this file's data into SQLite."""
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "banner_config.json")
 
 
 def get_banner_config():
-    path = _banner_config_path()
-    if not os.path.isfile(path):
+    import audit_store
+    conn = audit_store._get_connection()
+    row = conn.execute("SELECT * FROM banner_config WHERE id = 1").fetchone()
+    if row is None:
         return dict(_BANNER_DEFAULTS)
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
     return {
-        "enabled": bool(data.get("enabled", False)),
-        "message": data.get("message", ""),
-        "variant": data.get("variant") if data.get("variant") in BANNER_VARIANTS else "warning",
-        "dismissible": bool(data.get("dismissible", True)),
+        "enabled": bool(row["enabled"]),
+        "message": row["message"],
+        "variant": row["variant"] if row["variant"] in BANNER_VARIANTS else "warning",
+        "dismissible": bool(row["dismissible"]),
     }
 
 
@@ -515,9 +657,18 @@ def set_banner_config(enabled, message, variant, dismissible):
     message = (message or "").strip()
     if enabled and not message:
         raise ValueError("message is required when the banner is enabled")
-    config = {"enabled": bool(enabled), "message": message, "variant": variant, "dismissible": bool(dismissible)}
-    _atomic_write_json(_banner_config_path(), config)
-    return config
+    import audit_store
+    conn = audit_store._get_connection()
+    with audit_store._db_lock:
+        conn.execute(
+            """INSERT INTO banner_config (id, enabled, message, variant, dismissible)
+               VALUES (1, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, message=excluded.message,
+                   variant=excluded.variant, dismissible=excluded.dismissible""",
+            (int(bool(enabled)), message, variant, int(bool(dismissible))),
+        )
+        conn.commit()
+    return {"enabled": bool(enabled), "message": message, "variant": variant, "dismissible": bool(dismissible)}
 
 
 # ---------------------------------------------------------------------------
@@ -624,101 +775,9 @@ def keyring_delete(storage_name, field):
         pass
 
 
-def list_environments_for(owner):
-    """Returns {name: meta} visible to `owner`: their own environments plus
-    anything explicitly marked shared=True. LOCAL_OWNER_KEY is treated as
-    just another owner value here -- NOT a bypass that sees every other
-    owner's private environments. This matters for two reasons found while
-    testing this function against real same-named environments owned by
-    different users: (1) a bypass would let anyone with local/CLI access on
-    a shared server read every logged-in user's private credentials, which
-    directly violates "shouldn't be shared unless explicitly allowed";
-    (2) collapsing every owner's environments into one flat {name: meta}
-    dict silently drops entries whenever two owners happen to pick the same
-    name -- whichever iterates last wins, with no error. Every pre-existing
-    (pre-multi-user) environment was migrated to owner=LOCAL_OWNER_KEY,
-    shared=True by load_environments(), so LOCAL_OWNER_KEY/the CLI still
-    sees exactly what it used to -- via the shared=True path below, not a
-    special case.
-
-    Own environments are applied AFTER shared ones so a same-named
-    environment `owner` actually owns always wins over a like-named
-    environment merely shared by someone else -- without this ordering,
-    dict iteration order alone would decide which one a caller's own
-    credential lookup resolves to, which could silently authenticate
-    against the wrong tenant.
-
-    Each returned `meta` carries its real `environment_id` (added once
-    Phase 1's UUID migration landed) alongside the rest of its fields --
-    `_public_entry` (server/serve.py) reads this directly instead of
-    re-deriving an id, which it used to have to do by (incorrectly)
-    recomputing a storage key from (owner, name)."""
-    data = load_environments()
-    visible = {}
-    for environment_id, meta in data["environments"].items():
-        name = meta.get("name")
-        if meta.get("shared") and meta.get("owner") != owner:
-            visible[name] = {**meta, "environment_id": environment_id}
-    for environment_id, meta in data["environments"].items():
-        name = meta.get("name")
-        if meta.get("owner") == owner:
-            visible[name] = {**meta, "environment_id": environment_id}
-    return visible
-
-
-def list_all_environments():
-    """Returns {name: meta} for EVERY stored environment, across every
-    owner -- unlike list_environments_for(owner), which deliberately
-    scopes to what one requesting identity is allowed to see. This
-    exists for server-side background work with no requesting identity
-    of its own (the daily sync scheduler): it needs to find and run
-    every saved environment's sync schedule, including a non-shared
-    environment privately owned by some other logged-in user, not just
-    LOCAL_OWNER_KEY's own/shared ones. Never expose this dict directly
-    to an HTTP response -- it carries every owner's metadata (though
-    still no secrets; those stay in the keychain either way).
-
-    On a genuine owner collision (two different owners each have an
-    environment named the same, e.g. two users both naming one "dev"),
-    both are still returned -- keyed by their real environment_id (a
-    UUID, unique regardless of display name or owner), not the bare
-    display name, so a caller here always disambiguates by that real id
-    and never silently drops one like list_environments_for's flat
-    {name: meta} would if collapsed the same way."""
-    data = load_environments()
-    return dict(data["environments"])
-
-
-def get_active_environment_name(owner):
-    data = load_environments()
-    return data["active"].get(_owner_storage_key(owner))
-
-
-def set_active_environment(owner, name):
-    data = load_environments()
-    data["active"][_owner_storage_key(owner)] = name
-    save_environments(data)
-
-
-def _find_own_environment(data, owner, name):
-    """Returns (environment_id, meta) for the CALLING owner's own
-    environment with this display name, or (None, None) if they have none
-    by that name. Unlike _find_environment_by_name below, this is NOT
-    ambiguous -- it's scoped to one specific owner, where (owner, name) is
-    guaranteed unique by convention (the same uniqueness Phase 2's planned
-    SQLite schema formalizes via UNIQUE(owner_id, display_name)). This is
-    the replacement for the old environment_storage_name(owner, name)
-    direct-computation pattern everywhere a function only ever needs to
-    resolve its OWN caller's environment, never to disambiguate across
-    different owners (that's _resolve_admin_target's job, below)."""
-    for environment_id, meta in data["environments"].items():
-        if meta.get("owner") == owner and meta.get("name") == name:
-            return environment_id, meta
-    return None, None
-
 
 def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, environment_id=None):
-    """Saves non-secret metadata to environments.json and secret fields to
+    """Saves non-secret metadata to app_environments and secret fields to
     the OS keychain. Blank secret fields on an update leave the previously
     stored secret untouched (so editing metadata doesn't force re-entering
     credentials). Raises ValueError if required fields end up missing.
@@ -740,7 +799,7 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, envi
 
     `environment_id`, when supplied (an admin editing an EXISTING
     environment via the UI, which always knows its real id), resolves the
-    target directly via an O(1) dict lookup -- unambiguous even when two
+    target directly via an O(1) lookup -- unambiguous even when two
     different owners share a display name. Without it (a create, where no
     id exists yet, or a legacy caller), an admin edit falls back to a
     by-name scan across every owner, which is genuinely ambiguous in that
@@ -749,12 +808,13 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, envi
     if not name or not name.strip():
         raise ValueError("Environment name is required (e.g. dev, uat, prod).")
     name = name.strip()
-    data = load_environments()
+    import audit_store
+    conn = audit_store._get_connection()
 
     # Resolve which environment_id/owner this update actually targets. A
     # normal (non-admin) call always targets the CALLING owner's own copy
-    # by (owner, name) -- see _find_own_environment -- correct even if no
-    # such environment exists yet (a create, handled below). An admin
+    # by (owner, name) -- see _find_own_environment_sql -- correct even if
+    # no such environment exists yet (a create, handled below). An admin
     # override editing an EXISTING environment must target whichever
     # owner's copy actually already exists (there's no such thing as an
     # admin "creating" someone else's environment -- only editing one
@@ -763,20 +823,18 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, envi
     # (ambiguous, see above).
     target_owner = owner
     target_id = None
+    existing_meta = None
     if is_admin:
-        if environment_id and environment_id in data["environments"]:
-            target_owner = data["environments"][environment_id].get("owner")
-            target_id = environment_id
-        else:
-            for sid, meta in data["environments"].items():
-                if meta.get("name") == name:
-                    target_owner = meta.get("owner")
-                    target_id = sid
-                    break
+        row = conn.execute("SELECT * FROM app_environments WHERE environment_id = ?", (environment_id,)).fetchone() if environment_id else None
+        if row is None:
+            row = conn.execute("SELECT * FROM app_environments WHERE display_name = ?", (name,)).fetchone()
+        if row is not None:
+            target_owner = row["owner_id"]
+            target_id = row["environment_id"]
+            existing_meta = _row_to_environment_meta(row)
     else:
-        target_id, _ = _find_own_environment(data, owner, name)
+        target_id, existing_meta = _find_own_environment_sql(conn, owner, name)
 
-    existing_meta = data["environments"].get(target_id) if target_id else None
     if existing_meta is not None and existing_meta.get("owner") != owner and not is_admin:
         raise PermissionError(f"Environment '{name}' is not owned by this user.")
 
@@ -789,8 +847,6 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, envi
         target_id = str(uuid.uuid4())
 
     meta = dict(existing_meta or {})
-    for field in ENVIRONMENT_SECRET_FIELDS:
-        meta.pop(field, None)  # migrate away any pre-encryption plaintext secret left in metadata
     for field in ENVIRONMENT_METADATA_FIELDS:
         if field in fields:
             meta[field] = (fields.get(field) or "").strip()
@@ -810,49 +866,48 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, envi
     if not keyring_get(target_id, "key_secret"):
         raise ValueError("Missing required field: key_secret")
 
-    data["environments"][target_id] = meta
-    save_environments(data)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    with audit_store._db_lock:
+        conn.execute(
+            """INSERT INTO app_environments
+               (environment_id, owner_id, display_name, base_domain, team_name, key_id, okta_url,
+                shared, preserve_logs_locally, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(environment_id) DO UPDATE SET
+                   owner_id=excluded.owner_id, display_name=excluded.display_name,
+                   base_domain=excluded.base_domain, team_name=excluded.team_name,
+                   key_id=excluded.key_id, okta_url=excluded.okta_url,
+                   shared=excluded.shared, updated_at=excluded.updated_at""",
+            (target_id, meta.get("owner"), name, meta.get("base_domain", ""), meta.get("team_name", ""),
+             meta.get("key_id", ""), meta.get("okta_url", ""), int(bool(meta.get("shared"))),
+             int(bool(meta.get("preserve_logs_locally", False))), now, now),
+        )
+        conn.commit()
     return name, target_id
 
 
-def _find_environment_by_name(data, name):
-    """Returns (environment_id, meta) for the first stored environment
-    whose display name matches, across every owner, or (None, None) if
-    none exists.
-
-    SECURITY: first-match-wins across EVERY owner -- confirmed exploitable
-    (external review, 2026-09-30): if two different owners each have an
-    environment named "dev", an admin override targeting "dev" by this
-    function silently acts on whichever one happens to iterate first,
-    never the one the admin actually meant. Kept ONLY as a fallback for
-    legacy admin API callers that still pass a bare name with no real
-    stable ID available (see the `environment_id` param on the callers
-    below) -- every serve.py route has been updated to resolve and pass a
-    real `environment_id` instead, which is unambiguous. New code should
-    never call this."""
-    for environment_id, meta in data["environments"].items():
-        if meta.get("name") == name:
-            return environment_id, meta
-    return None, None
-
-
-def _resolve_admin_target(data, name, environment_id):
+def _resolve_admin_target(environment_id, name=None):
     """Shared resolution for every admin-override path below. Prefers the
     unambiguous `environment_id` (the real UUID primary key) whenever the
-    caller has one -- an O(1) dict lookup, never a cross-owner scan. Falls
-    back to the old, ambiguous by-name scan (_find_environment_by_name)
-    ONLY when no id was supplied, for backward compatibility with any
-    caller that hasn't been updated yet. Raises KeyError if nothing
+    caller has one -- an O(1) lookup, never a cross-owner scan. Falls back
+    to an ambiguous by-name scan across every owner ONLY when no id was
+    supplied, for backward compatibility with any caller that hasn't been
+    updated yet -- SECURITY: that fallback is first-match-wins across
+    EVERY owner (confirmed exploitable, external review 2026-09-30, if
+    two different owners each have an environment named the same; new
+    code should always pass environment_id). Raises KeyError if nothing
     matches either way."""
+    import audit_store
+    conn = audit_store._get_connection()
     if environment_id:
-        meta = data["environments"].get(environment_id)
-        if meta is None:
+        row = conn.execute("SELECT * FROM app_environments WHERE environment_id = ?", (environment_id,)).fetchone()
+        if row is None:
             raise KeyError(f"No saved environment with id '{environment_id}'")
-        return environment_id, meta
-    found_id, meta = _find_environment_by_name(data, name)
-    if meta is None:
+        return row["environment_id"], _row_to_environment_meta(row)
+    row = conn.execute("SELECT * FROM app_environments WHERE display_name = ?", (name,)).fetchone()
+    if row is None:
         raise KeyError(f"No saved environment named '{name}'")
-    return found_id, meta
+    return row["environment_id"], _row_to_environment_meta(row)
 
 
 def set_environment_shared(name, owner, shared, is_admin=False, environment_id=None):
@@ -863,17 +918,19 @@ def set_environment_shared(name, owner, shared, is_admin=False, environment_id=N
     _resolve_admin_target -- ambiguous if two owners share a display
     name, kept only for backward compatibility). Raises PermissionError
     if not the owner and not an admin, KeyError if unknown."""
-    data = load_environments()
+    import audit_store
+    conn = audit_store._get_connection()
     if is_admin:
-        _, meta = _resolve_admin_target(data, name, environment_id)
+        target_id, meta = _resolve_admin_target(environment_id, name)
     else:
-        _, meta = _find_own_environment(data, owner, name)
+        target_id, meta = _find_own_environment_sql(conn, owner, name)
         if meta is None:
             raise KeyError(f"No environment named '{name}' owned by this user.")
         if meta.get("owner") != owner:
             raise PermissionError(f"Environment '{name}' is not owned by this user.")
-    meta["shared"] = bool(shared)
-    save_environments(data)
+    with audit_store._db_lock:
+        conn.execute("UPDATE app_environments SET shared = ? WHERE environment_id = ?", (int(bool(shared)), target_id))
+        conn.commit()
 
 
 def delete_environment(name, owner=LOCAL_OWNER_KEY, is_admin=False, environment_id=None):
@@ -883,38 +940,33 @@ def delete_environment(name, owner=LOCAL_OWNER_KEY, is_admin=False, environment_
     doesn't exist (for this owner, unless `is_admin`), PermissionError if
     it exists but is owned by someone else and `is_admin` is False. See
     _resolve_admin_target for how `environment_id` disambiguates an admin
-    override across same-named environments from different owners."""
-    data = load_environments()
+    override across same-named environments from different owners.
+
+    `active_environments.environment_id REFERENCES app_environments
+    ON DELETE CASCADE` means the DELETE below automatically removes EVERY
+    owner's active-pointer row that referenced this environment, not just
+    the calling owner's -- a real improvement over the old environments.json
+    design, which needed delete_environment to remember to hand-clean the
+    "someone else's active pointer might dangle" case (still checked below,
+    for the return value's sake, but no longer needed to prevent a dangling
+    pointer -- SQLite guarantees that now)."""
+    import audit_store
+    conn = audit_store._get_connection()
     if is_admin:
-        target_id, meta = _resolve_admin_target(data, name, environment_id)
+        target_id, meta = _resolve_admin_target(environment_id, name)
     else:
-        target_id, meta = _find_own_environment(data, owner, name)
+        target_id, meta = _find_own_environment_sql(conn, owner, name)
         if meta is None:
             raise KeyError(f"No saved environment named '{name}'")
         if meta.get("owner") != owner:
             raise PermissionError(f"Environment '{name}' is not owned by this user.")
-    real_owner = meta.get("owner")
-    del data["environments"][target_id]
-    # Return value ("was it active") is about the CALLING owner's own
-    # active slot specifically -- that's what tells serve.py whether to
-    # clear the calling owner's own live client.
     owner_key = _owner_storage_key(owner)
-    was_active = data["active"].get(owner_key) == name
-    if was_active:
-        del data["active"][owner_key]
-    # SEPARATELY, and regardless of who called this: if this was an admin
-    # override deleting someone ELSE's environment, that real owner's own
-    # active pointer needs clearing too if it pointed here -- otherwise it
-    # dangles, pointing at an environment that no longer exists, and that
-    # owner sees a failed auto-activation / appears unconfigured on their
-    # next login with no obvious cause (external review finding,
-    # 2026-09-30). Guarded by `real_owner != owner` so the non-admin path
-    # above (which already handled its own single owner_key) never
-    # double-clears the same key it just cleared.
-    real_owner_key = _owner_storage_key(real_owner)
-    if real_owner_key != owner_key and data["active"].get(real_owner_key) == name:
-        del data["active"][real_owner_key]
-    save_environments(data)
+    was_active = conn.execute(
+        "SELECT 1 FROM active_environments WHERE owner_key = ? AND environment_id = ?", (owner_key, target_id)
+    ).fetchone() is not None
+    with audit_store._db_lock:
+        conn.execute("DELETE FROM app_environments WHERE environment_id = ?", (target_id,))
+        conn.commit()
     for field in ENVIRONMENT_SECRET_FIELDS:
         keyring_delete(target_id, field)
     return was_active
@@ -951,6 +1003,182 @@ def get_active_environment_credentials(owner=LOCAL_OWNER_KEY):
         return get_environment_credentials(name, owner=owner)
     except KeyError:
         return None
+
+
+def migrate_legacy_environments_json():
+    """One-shot Phase 2 migration: imports environments.json's and
+    banner_config.json's data into the SQLite tables audit_store.py's
+    migration 1 (_migration_001_unified_schema) just created, re-keys the
+    archive's existing `environment` (now `environment_id`) column values
+    from bare display name to the real environment_id, then DELETES both
+    JSON files once every step is verified -- read-old -> write-new ->
+    verify -> delete-old, same discipline Phase 1 used for keyring
+    credential migration.
+
+    Called once from main()/server startup, AFTER audit_store.init_db()
+    has already run its schema migrations -- a no-op if environments.json
+    doesn't exist (either a fresh install, or an install that's already
+    been migrated and had the file deleted).
+
+    THE REAL-DATA-INFORMED DECISION this function encodes (confirmed with
+    the user before writing this, against real data on the Ubuntu server):
+    when more than one environment_id shares a display name (the genuine
+    owner-collision case Phase 1 was built to handle -- e.g. a shared/
+    no-owner "dev" AND a real-identity-owned "dev" pointing at the same
+    tenant), the archive's historical rows for that bare name attach to
+    whichever environment_id has a REAL stored keyring key_secret, not an
+    arbitrary pick. Confirmed live: the shared/no-owner copies in this
+    exact scenario had ZERO credentials and therefore could not possibly
+    have produced any of the real archived history -- attaching history
+    to the uncredentialed copy instead would have exposed sensitive audit
+    data (PAM credential reveals, admin privilege grants) to anyone who
+    can merely see a shared environment, regardless of real relationship
+    to the identity that actually generated that history. If NEITHER or
+    BOTH candidates have a credential (ambiguous either way), the first
+    one encountered is used and a warning is logged -- this is a one-shot
+    migration decision made once, not an ongoing ambiguity the app has to
+    keep resolving."""
+    import audit_store
+    path = _environments_file_path()
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    environments = data.get("environments") or {}
+    active = data.get("active") or {}
+
+    conn = audit_store._get_connection()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    # name -> [environment_id, ...] -- built BEFORE inserting anything, so
+    # the collision-resolution step below can see every candidate for a
+    # given bare name up front.
+    ids_by_name = defaultdict(list)
+    for environment_id, meta in environments.items():
+        ids_by_name[meta.get("name")].append(environment_id)
+
+    with audit_store._db_lock:
+        # BUG FIX (found live-testing this migration against this
+        # machine's real audit_store.db, 2026-10-01): the archive
+        # re-keying step below updates events.environment_id and
+        # event_targets.environment_id in separate statements, but
+        # event_targets' FOREIGN KEY (environment_id, uuid) REFERENCES
+        # events(environment_id, uuid) is checked per-statement by
+        # default -- re-keying events first makes every one of its
+        # event_targets rows momentarily point at a (environment_id,
+        # uuid) pair that no longer exists in events, failing the FK
+        # check before event_targets' own UPDATE ever runs (and the
+        # reverse order fails symmetrically). PRAGMA defer_foreign_keys,
+        # unlike PRAGMA foreign_keys, can be toggled mid-transaction and
+        # defers every FK check to COMMIT instead of per-statement --
+        # exactly what this circular events<->event_targets remap needs.
+        # Automatically resets to OFF at the next commit/rollback (SQLite's
+        # own documented behavior), so no explicit cleanup is needed.
+        conn.execute("PRAGMA defer_foreign_keys = ON")
+        for environment_id, meta in environments.items():
+            conn.execute(
+                """INSERT OR REPLACE INTO app_environments
+                   (environment_id, owner_id, display_name, base_domain, team_name, key_id, okta_url,
+                    shared, preserve_logs_locally, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (environment_id, meta.get("owner"), meta.get("name"), meta.get("base_domain", ""),
+                 meta.get("team_name", ""), meta.get("key_id", ""), meta.get("okta_url", ""),
+                 int(bool(meta.get("shared"))), int(bool(meta.get("preserve_logs_locally", False))),
+                 now, now),
+            )
+            schedule = meta.get("sync_schedule")
+            if schedule:
+                conn.execute(
+                    """INSERT OR REPLACE INTO sync_schedules
+                       (environment_id, enabled, run_time, ingestion_scope, retention_days, retention_max_size_mb)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (environment_id, int(bool(schedule.get("enabled", False))),
+                     schedule.get("run_time", "02:00"), schedule.get("ingestion_scope", "curated"),
+                     schedule.get("retention_days"), schedule.get("retention_max_size_mb")),
+                )
+
+        for owner_key, name in active.items():
+            candidate_ids = ids_by_name.get(name) or []
+            if len(candidate_ids) == 1:
+                conn.execute(
+                    "INSERT OR REPLACE INTO active_environments (owner_key, environment_id) VALUES (?, ?)",
+                    (owner_key, candidate_ids[0]),
+                )
+            elif len(candidate_ids) > 1:
+                # Ambiguous by name alone -- resolve by matching the
+                # owner_key's OWN environment first (the common, correct
+                # case), falling back to the first candidate otherwise.
+                owned = [eid for eid in candidate_ids if _owner_storage_key(environments[eid].get("owner")) == owner_key]
+                conn.execute(
+                    "INSERT OR REPLACE INTO active_environments (owner_key, environment_id) VALUES (?, ?)",
+                    (owner_key, owned[0] if owned else candidate_ids[0]),
+                )
+
+        banner_path = _banner_config_path()
+        if os.path.isfile(banner_path):
+            with open(banner_path, encoding="utf-8") as f:
+                banner = json.load(f)
+            conn.execute(
+                """INSERT OR REPLACE INTO banner_config (id, enabled, message, variant, dismissible)
+                   VALUES (1, ?, ?, ?, ?)""",
+                (int(bool(banner.get("enabled", False))), banner.get("message", ""),
+                 banner.get("variant", "warning") if banner.get("variant") in BANNER_VARIANTS else "warning",
+                 int(bool(banner.get("dismissible", True)))),
+            )
+
+        # Archive re-keying: for each bare display name with real rows in
+        # events/sync_state (still keyed by that name at this point --
+        # audit_store's migration 1 renamed the COLUMN to environment_id,
+        # but the stored VALUES are still whatever bare name was there
+        # before), resolve the correct environment_id and UPDATE in place.
+        archived_names = {row[0] for row in conn.execute("SELECT DISTINCT environment_id FROM events")}
+        archived_names |= {row[0] for row in conn.execute("SELECT DISTINCT environment_id FROM sync_state")}
+        for bare_name in archived_names:
+            candidate_ids = ids_by_name.get(bare_name) or []
+            if not candidate_ids:
+                continue  # archived data for an environment that no longer has a JSON record -- leave as-is, nothing to resolve to
+            if bare_name in candidate_ids:
+                continue  # already a real environment_id (archive was already migrated in a prior partial run) -- do not re-map
+            if len(candidate_ids) == 1:
+                resolved_id = candidate_ids[0]
+            else:
+                # THE credential-based collision resolution -- see this
+                # function's own docstring for the real-data finding that
+                # justifies this over any name-based heuristic.
+                credentialed = [eid for eid in candidate_ids if keyring_get(eid, "key_secret")]
+                if len(credentialed) == 1:
+                    resolved_id = credentialed[0]
+                else:
+                    log("WARN", f"Archive collision for '{bare_name}': {len(candidate_ids)} candidate environment_ids, "
+                                 f"{len(credentialed)} with a stored credential -- using the first candidate "
+                                 f"({candidate_ids[0]}) rather than guessing further. Verify this is correct.")
+                    resolved_id = candidate_ids[0]
+            before_events = conn.execute("SELECT COUNT(*) FROM events WHERE environment_id = ?", (bare_name,)).fetchone()[0]
+            before_sync_state = conn.execute("SELECT COUNT(*) FROM sync_state WHERE environment_id = ?", (bare_name,)).fetchone()[0]
+            before_targets = conn.execute("SELECT COUNT(*) FROM event_targets WHERE environment_id = ?", (bare_name,)).fetchone()[0]
+            conn.execute("UPDATE events SET environment_id = ? WHERE environment_id = ?", (resolved_id, bare_name))
+            conn.execute("UPDATE sync_state SET environment_id = ? WHERE environment_id = ?", (resolved_id, bare_name))
+            conn.execute("UPDATE event_targets SET environment_id = ? WHERE environment_id = ?", (resolved_id, bare_name))
+            after_events = conn.execute("SELECT COUNT(*) FROM events WHERE environment_id = ?", (resolved_id,)).fetchone()[0]
+            if after_events < before_events:
+                raise RuntimeError(
+                    f"Archive migration row-count mismatch for '{bare_name}' -> '{resolved_id}': "
+                    f"expected at least {before_events} events, found {after_events}. Aborting without committing."
+                )
+            log("INFO", f"Archive migration: '{bare_name}' -> environment_id '{resolved_id}' "
+                        f"({before_events} events, {before_sync_state} sync_state row(s), {before_targets} targets).")
+
+        conn.commit()
+
+    # Delete the JSON files only AFTER every insert/update above has
+    # committed successfully -- not transactional with the SQLite commit
+    # (separate files can't be), so delete-after-verified-commit is the
+    # correct order, same read-old -> write-new -> verify -> delete-old
+    # shape Phase 1 used for keyring credentials.
+    os.remove(path)
+    if os.path.isfile(_banner_config_path()):
+        os.remove(_banner_config_path())
+    log("INFO", f"Migrated {len(environments)} environment(s) from environments.json into SQLite; file deleted.")
 
 
 # ---------------------------------------------------------------------------
@@ -2646,12 +2874,17 @@ def set_preserve_logs_locally(name, enabled, owner=LOCAL_OWNER_KEY):
     upsert_environment's metadata-field loop, since this is a plain
     boolean toggle, not part of the credential form. Raises KeyError if
     `name` isn't a saved environment owned by `owner`."""
-    data = load_environments()
-    target_id, meta = _find_own_environment(data, owner, name)
+    import audit_store
+    conn = audit_store._get_connection()
+    target_id, meta = _find_own_environment_sql(conn, owner, name)
     if meta is None:
         raise KeyError(f"No saved environment named '{name}'")
-    data["environments"][target_id]["preserve_logs_locally"] = bool(enabled)
-    save_environments(data)
+    with audit_store._db_lock:
+        conn.execute(
+            "UPDATE app_environments SET preserve_logs_locally = ? WHERE environment_id = ?",
+            (int(bool(enabled)), target_id),
+        )
+        conn.commit()
 
 
 SYNC_SCHEDULE_DEFAULTS = {
@@ -2668,8 +2901,9 @@ def get_sync_schedule(name, owner=LOCAL_OWNER_KEY):
     SYNC_SCHEDULE_DEFAULTS for any field never explicitly set (so callers
     never have to guess at partial/legacy shapes). Raises KeyError if
     `name` isn't a saved environment owned by `owner`."""
-    data = load_environments()
-    _, meta = _find_own_environment(data, owner, name)
+    import audit_store
+    conn = audit_store._get_connection()
+    _, meta = _find_own_environment_sql(conn, owner, name)
     if meta is None:
         raise KeyError(f"No saved environment named '{name}'")
     stored = meta.get("sync_schedule", {})
@@ -2686,13 +2920,25 @@ def set_sync_schedule(name, config, owner=LOCAL_OWNER_KEY):
     ingestion_scope isn't a real choice."""
     if config.get("ingestion_scope", "curated") not in ("curated", "all"):
         raise ValueError('ingestion_scope must be "curated" or "all"')
-    data = load_environments()
-    target_id, meta = _find_own_environment(data, owner, name)
+    import audit_store
+    conn = audit_store._get_connection()
+    target_id, meta = _find_own_environment_sql(conn, owner, name)
     if meta is None:
         raise KeyError(f"No saved environment named '{name}'")
     merged = {**SYNC_SCHEDULE_DEFAULTS, **meta.get("sync_schedule", {}), **config}
-    data["environments"][target_id]["sync_schedule"] = merged
-    save_environments(data)
+    with audit_store._db_lock:
+        conn.execute(
+            """INSERT INTO sync_schedules
+               (environment_id, enabled, run_time, ingestion_scope, retention_days, retention_max_size_mb)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(environment_id) DO UPDATE SET
+                   enabled=excluded.enabled, run_time=excluded.run_time,
+                   ingestion_scope=excluded.ingestion_scope, retention_days=excluded.retention_days,
+                   retention_max_size_mb=excluded.retention_max_size_mb""",
+            (target_id, int(bool(merged["enabled"])), merged["run_time"], merged["ingestion_scope"],
+             merged["retention_days"], merged["retention_max_size_mb"]),
+        )
+        conn.commit()
     return merged
 
 
@@ -2885,7 +3131,7 @@ def build_secrets_access_report(client, okta_client, resource_group_id, project_
     }
 
 
-def build_project_secrets_report_from_archive(client, environment, resource_group_id, project_id):
+def build_project_secrets_report_from_archive(client, environment_id, resource_group_id, project_id):
     """Phase 5 of the compliance-reporting-dashboard plan: the same report
     as build_secrets_access_report above, but sourced from the unified
     audit_store.py SQLite archive instead of a live Okta System Log call
@@ -2915,7 +3161,7 @@ def build_project_secrets_report_from_archive(client, environment, resource_grou
     secrets_by_id = {s["id"]: s for s in secrets if s.get("id")}
 
     all_event_types = [t for types in SECRETS_ACCESS_REPORT_EVENT_TYPES.values() for t in types]
-    archived_rows = audit_store.query_events(environment, event_types=all_event_types, limit=100000)
+    archived_rows = audit_store.query_events(environment_id, event_types=all_event_types, limit=100000)
     # audit_store stores the raw Okta event dict under "raw" -- filter to
     # this project client-side (confirmed live: a project-scoped event's
     # target[] always includes the project itself as a co-target, same

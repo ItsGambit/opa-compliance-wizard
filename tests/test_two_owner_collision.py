@@ -7,14 +7,23 @@ them.
 Scenario: two different owners each have an environment named "dev".
 Written against the STABLE PUBLIC CONTRACT (_resolve_admin_target called
 WITH an explicit environment_id, _environment_visible_to, and the HTTP
-routes' `id` round-trip) rather than environments.json's on-disk shape.
+routes' `id` round-trip) rather than any particular storage shape.
 
 Real ids are read back from upsert_environment's own return value (it
 returns (name, environment_id)) rather than precomputed via the retired
 environment_storage_name -- Phase 1's UUID migration means there's no
 longer a deterministic function of (owner, name) that produces the real
 id ahead of time; the system has to be asked.
-"""
+
+Phase 2 (SQLite migration, 2026-10-01) retired environments.json and
+load_environments()/save_environments() entirely -- this file now reads
+state back via list_all_environments() ({environment_id: meta}) instead
+of load_environments()'s old data["environments"] dict, and every test
+uses tmp_audit_store (not just tmp_environments_file) since
+app_environments/active_environments now live in audit_store.db. Each
+test calls audit_store.run_migrations() directly (NOT init_db(), which
+would also call migrate_legacy_environments_json() against this
+process's real environments.json -- never wanted in a test)."""
 import socket
 import threading
 import time
@@ -28,13 +37,21 @@ OWNER_A = engine.LOCAL_OWNER_KEY  # None -- "__local__"
 OWNER_B = "00uOWNERB"
 
 
-def _seed_two_owner_dev_environments(tmp_environments_file, fake_keyring):
+@pytest.fixture
+def tmp_schema(tmp_audit_store):
+    import audit_store
+    audit_store.run_migrations()
+    return tmp_audit_store
+
+
+def _seed_two_owner_dev_environments(tmp_schema, tmp_environments_file, fake_keyring):
     """Builds two "dev" environments, one per owner, directly through the
     real public API (upsert_environment) rather than hand-constructing
-    environments.json's shape -- this IS part of the stable contract this
-    test is meant to survive a future storage-format migration against.
-    Returns (id_a, id_b, data) -- the real ids come straight from
-    upsert_environment's own return value."""
+    any particular storage shape -- this IS part of the stable contract
+    this test is meant to survive a future storage-format migration
+    against. Returns (id_a, id_b, all_envs) -- the real ids come straight
+    from upsert_environment's own return value; all_envs is
+    list_all_environments()'s {environment_id: meta} dict."""
     _, id_a = engine.upsert_environment(
         "dev",
         {"base_domain": "a.example.com", "team_name": "team-a", "key_id": "key-a", "key_secret": "secret-a"},
@@ -45,52 +62,52 @@ def _seed_two_owner_dev_environments(tmp_environments_file, fake_keyring):
         {"base_domain": "b.example.com", "team_name": "team-b", "key_id": "key-b", "key_secret": "secret-b"},
         owner=OWNER_B,
     )
-    data = engine.load_environments()
-    return id_a, id_b, data
+    all_envs = engine.list_all_environments()
+    return id_a, id_b, all_envs
 
 
 # ---------------------------------------------------------------------------
 # 1. Admin edit/delete/share must disambiguate by environment_id, never by
 #    bare name.
 # ---------------------------------------------------------------------------
-def test_admin_resolves_correct_owner_by_environment_id(tmp_environments_file, fake_keyring):
-    id_a, id_b, data = _seed_two_owner_dev_environments(tmp_environments_file, fake_keyring)
+def test_admin_resolves_correct_owner_by_environment_id(tmp_schema, tmp_environments_file, fake_keyring):
+    id_a, id_b, _ = _seed_two_owner_dev_environments(tmp_schema, tmp_environments_file, fake_keyring)
 
-    found_id, meta = engine._resolve_admin_target(data, "dev", id_b)
+    found_id, meta = engine._resolve_admin_target(id_b)
     assert found_id == id_b
     assert meta["base_domain"] == "b.example.com"
 
-    found_id, meta = engine._resolve_admin_target(data, "dev", id_a)
+    found_id, meta = engine._resolve_admin_target(id_a)
     assert found_id == id_a
     assert meta["base_domain"] == "a.example.com"
 
 
-def test_admin_set_environment_shared_targets_only_the_specified_owner(tmp_environments_file, fake_keyring):
-    id_a, id_b, _ = _seed_two_owner_dev_environments(tmp_environments_file, fake_keyring)
+def test_admin_set_environment_shared_targets_only_the_specified_owner(tmp_schema, tmp_environments_file, fake_keyring):
+    id_a, id_b, _ = _seed_two_owner_dev_environments(tmp_schema, tmp_environments_file, fake_keyring)
 
     engine.set_environment_shared("dev", owner=OWNER_A, shared=True, is_admin=True, environment_id=id_b)
 
-    data = engine.load_environments()
-    assert data["environments"][id_b]["shared"] is True
+    all_envs = engine.list_all_environments()
+    assert all_envs[id_b]["shared"] is True
     # Owner A's own "dev" must be completely untouched by an admin action
     # explicitly targeting owner B's environment_id.
-    assert data["environments"][id_a].get("shared") in (False, None)
+    assert all_envs[id_a].get("shared") in (False, None)
 
 
-def test_admin_delete_environment_removes_only_the_targeted_owner(tmp_environments_file, fake_keyring):
-    id_a, id_b, _ = _seed_two_owner_dev_environments(tmp_environments_file, fake_keyring)
+def test_admin_delete_environment_removes_only_the_targeted_owner(tmp_schema, tmp_environments_file, fake_keyring):
+    id_a, id_b, _ = _seed_two_owner_dev_environments(tmp_schema, tmp_environments_file, fake_keyring)
 
     engine.delete_environment("dev", owner=OWNER_A, is_admin=True, environment_id=id_b)
 
-    data = engine.load_environments()
-    assert id_b not in data["environments"]
-    assert id_a in data["environments"]  # owner A's "dev" survives
+    all_envs = engine.list_all_environments()
+    assert id_b not in all_envs
+    assert id_a in all_envs  # owner A's "dev" survives
 
 
 # ---------------------------------------------------------------------------
 # 2. Non-admin visibility must not leak.
 # ---------------------------------------------------------------------------
-def test_private_environment_not_visible_to_other_owner(tmp_environments_file, fake_keyring):
+def test_private_environment_not_visible_to_other_owner(tmp_schema, tmp_environments_file, fake_keyring):
     engine.upsert_environment(
         "dev",
         {"base_domain": "b.example.com", "team_name": "team-b", "key_id": "key-b", "key_secret": "secret-b"},
@@ -103,7 +120,7 @@ def test_private_environment_not_visible_to_other_owner(tmp_environments_file, f
     assert "dev" not in visible_to_a
 
 
-def test_shared_environment_is_visible_but_private_one_is_not(tmp_environments_file, fake_keyring):
+def test_shared_environment_is_visible_but_private_one_is_not(tmp_schema, tmp_environments_file, fake_keyring):
     engine.upsert_environment(
         "dev",
         {"base_domain": "b.example.com", "team_name": "team-b", "key_id": "key-b", "key_secret": "secret-b"},
@@ -148,7 +165,7 @@ def test_access_and_sync_jobs_keyed_by_full_environment_id_not_bare_name():
 #    nginx trust boundary itself is covered by test_auth_headers.py).
 # ---------------------------------------------------------------------------
 @pytest.fixture
-def live_server(tmp_environments_file, fake_keyring, tmp_audit_log, monkeypatch):
+def live_server(tmp_schema, tmp_environments_file, fake_keyring, tmp_audit_log, monkeypatch):
     import server.serve as serve
 
     monkeypatch.setattr(serve, "NGINX_PROXY_SECRET", "test-proxy-secret")
@@ -184,7 +201,7 @@ def _admin_headers():
     }
 
 
-def test_http_delete_with_environment_id_deletes_only_that_owners_dev(live_server, tmp_environments_file, fake_keyring):
+def test_http_delete_with_environment_id_deletes_only_that_owners_dev(live_server, tmp_schema, tmp_environments_file, fake_keyring):
     _, id_a = engine.upsert_environment(
         "dev", {"base_domain": "a.example.com", "team_name": "team-a", "key_id": "key-a", "key_secret": "secret-a"},
         owner=OWNER_A,
@@ -202,12 +219,12 @@ def test_http_delete_with_environment_id_deletes_only_that_owners_dev(live_serve
     )
     assert resp.status_code == 200, resp.text
 
-    data = engine.load_environments()
-    assert id_b not in data["environments"]
-    assert id_a in data["environments"]
+    all_envs = engine.list_all_environments()
+    assert id_b not in all_envs
+    assert id_a in all_envs
 
 
-def test_http_share_with_environment_id_shares_only_that_owners_dev(live_server, tmp_environments_file, fake_keyring):
+def test_http_share_with_environment_id_shares_only_that_owners_dev(live_server, tmp_schema, tmp_environments_file, fake_keyring):
     _, id_a = engine.upsert_environment(
         "dev", {"base_domain": "a.example.com", "team_name": "team-a", "key_id": "key-a", "key_secret": "secret-a"},
         owner=OWNER_A,
@@ -225,6 +242,6 @@ def test_http_share_with_environment_id_shares_only_that_owners_dev(live_server,
     )
     assert resp.status_code == 200, resp.text
 
-    data = engine.load_environments()
-    assert data["environments"][id_b]["shared"] is True
-    assert data["environments"][id_a].get("shared") in (False, None)
+    all_envs = engine.list_all_environments()
+    assert all_envs[id_b]["shared"] is True
+    assert all_envs[id_a].get("shared") in (False, None)

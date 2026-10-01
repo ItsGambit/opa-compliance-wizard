@@ -3,7 +3,20 @@ review, 2026-09-30, "1.5"): if a day-chunk hits get_system_log's
 max_pages cap, the sync must stop immediately, mark last_sync_status as
 "error", and -- critically -- NOT advance the watermark past that
 incomplete chunk, so the next sync run retries it rather than silently
-skipping events that aged out of Okta's own 90-day retention."""
+skipping events that aged out of Okta's own 90-day retention.
+
+Uses audit_store.run_migrations() (schema only), NOT init_db() -- init_db
+also calls migrate_legacy_environments_json(), which reads AND DELETES
+environments.json. A real incident during this file's own Phase 2 update
+(2026-10-01): these tests called init_db() with only tmp_audit_store
+applied (redirects the DB path) and no tmp_environments_file (redirects
+the JSON path) -- the migration ran against this machine's REAL
+environments.json and deleted it. Recovered from a pytest temp dir's
+audit_store.db from that same run (migrate_legacy_environments_json
+copies before deleting, so the data wasn't actually lost, just briefly
+sitting in a temp file instead of the real one) and environments.json
+was restored. Every test below now takes BOTH fixtures whenever it
+triggers a schema-creating/migrating call, as a direct result."""
 from datetime import datetime, timedelta, timezone
 
 import audit_store
@@ -42,9 +55,9 @@ def _event(uuid, published):
     }
 
 
-def test_incomplete_chunk_stops_sync_and_does_not_advance_watermark(tmp_audit_store):
-    audit_store.init_db()
-    environment = "dev"
+def test_incomplete_chunk_stops_sync_and_does_not_advance_watermark(tmp_audit_store, tmp_environments_file):
+    audit_store.run_migrations()
+    environment = "11111111-1111-1111-1111-111111111111"
 
     since = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     okta_client = FakeOktaClient([
@@ -72,7 +85,7 @@ def test_incomplete_chunk_stops_sync_and_does_not_advance_watermark(tmp_audit_st
     assert state["total_events_ingested"] == 2
 
 
-def test_resuming_after_incomplete_chunk_retries_same_window(tmp_audit_store):
+def test_resuming_after_incomplete_chunk_retries_same_window(tmp_audit_store, tmp_environments_file):
     """The actual regression this fix prevents: a subsequent sync call
     with since=None must resume from the retained watermark and retry
     the SAME day-chunk that previously came back incomplete, not skip
@@ -89,8 +102,8 @@ def test_resuming_after_incomplete_chunk_retries_same_window(tmp_audit_store):
     completion, and the resumed sync must start exactly there, not at
     day 2 (which would silently skip day 2's un-fetched events) and not
     at 90 days ago (which would silently re-scan day 1 for nothing)."""
-    audit_store.init_db()
-    environment = "dev"
+    audit_store.run_migrations()
+    environment = "11111111-1111-1111-1111-111111111111"
     day1_since = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
     first_client = FakeOktaClient([
@@ -131,9 +144,9 @@ def test_resuming_after_incomplete_chunk_retries_same_window(tmp_audit_store):
     assert final_state["last_sync_status"] == "success"
 
 
-def test_full_success_marks_status_success_with_no_error(tmp_audit_store):
-    audit_store.init_db()
-    environment = "dev"
+def test_full_success_marks_status_success_with_no_error(tmp_audit_store, tmp_environments_file):
+    audit_store.run_migrations()
+    environment = "11111111-1111-1111-1111-111111111111"
     since = (datetime.now(timezone.utc) - timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     okta_client = FakeOktaClient([
         ([_event("evt-1", since)], True),

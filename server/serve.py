@@ -375,19 +375,19 @@ def _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, trigger
     # env_id (the real, stable environment_id -- Phase 1 UUID migration;
     # the caller already has it, either from the session via
     # _session_snapshot or from _scheduler_loop's own iteration, so it's
-    # passed in rather than recomputed) is used ONLY as the in-memory
+    # passed in rather than recomputed) is used both as the in-memory
     # _sync_jobs dict key (see that dict's module-level comment for the
-    # cross-owner collision this fixes) -- every audit_store/engine call
-    # below still takes the bare env_name, since the archive schema
-    # itself is still partitioned by display name (a separate, larger
-    # migration, tracked as a fast-follow, not this fix).
+    # cross-owner collision this fixes) AND, as of Phase 2's SQLite
+    # migration, as the real archive key every audit_store call below
+    # takes -- the archive is now partitioned by environment_id, not
+    # display name.
     storage_name = env_id
     action_prefix = "sync.scheduled" if trigger == "scheduled" else "sync.manual"
     with _sync_jobs_lock:
         _sync_jobs[storage_name] = {"status": "running", "steps": [], "error": None}
     try:
         result = audit_store.sync_okta_events(
-            okta_client, env_name, ingestion_scope, on_progress=_sync_job_progress(storage_name)
+            okta_client, env_id, ingestion_scope, on_progress=_sync_job_progress(storage_name)
         )
         # FIX (external review, 2026-09-30, "1.5" follow-through): a hit
         # max_pages cap makes sync_okta_events return NORMALLY (no
@@ -408,7 +408,7 @@ def _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, trigger
             return
         schedule = engine.get_sync_schedule(env_name, owner=owner)
         prune_result = audit_store.prune_events(
-            env_name,
+            env_id,
             retention_days=schedule.get("retention_days"),
             max_size_mb=schedule.get("retention_max_size_mb"),
         )
@@ -569,12 +569,11 @@ def _scheduler_loop():
                 if (now_utc.hour, now_utc.minute) < (run_hour, run_minute):
                     continue  # not time yet today (UTC)
 
-                # audit_store's archive is keyed by env_name alone, not by
-                # (owner, env_name) -- two different owners' same-named
-                # environment ("dev") intentionally share one archive/
-                # sync_state row if they point at the same real tenant, same
-                # as this project's other env_name-only archive lookups.
-                state = audit_store.get_sync_state(env_name)
+                # audit_store's archive is keyed by environment_id (Phase 2
+                # SQLite migration) -- each environment_id has its own
+                # distinct sync_state row even when two different owners'
+                # environments share a display name.
+                state = audit_store.get_sync_state(environment_id)
                 last_completed = state.get("last_sync_completed_at") if state else None
                 if last_completed:
                     last_completed_date = last_completed[:10]  # "YYYY-MM-DD" prefix of the ISO (UTC) timestamp
@@ -719,22 +718,6 @@ def _require_okta_client(send_json, active_okta_client):
         )
         return False
     return True
-
-
-def _environment_visible_to(engine_owner, name):
-    """AUTHZ FIX (external review, 2026-09-30): the compliance archive
-    (audit_store.py) partitions events/sync_state by bare display name,
-    with NO ownership check anywhere on the report/history/sync-status
-    routes -- confirmed exploitable: any authenticated user could read
-    another owner's compliance data just by passing that owner's
-    environment name in ?environment=. This does not fix the archive's
-    own schema (still partitioned by display name, not a stable owner-
-    scoped ID -- a bigger migration, tracked separately) -- it closes the
-    actual disclosure by rejecting a request for any name the requester
-    doesn't own or have explicit shared access to, using this project's
-    existing list_environments_for visibility rule (same one every other
-    "what can this owner see" check in this file already uses)."""
-    return name in engine.list_environments_for(engine_owner)
 
 
 class _RequestAborted(Exception):
@@ -947,23 +930,28 @@ class Handler(SimpleHTTPRequestHandler):
                 meta = visible.get(name)
                 if meta is None:
                     return self._send_json(404, {"error": f"No environment named '{name}' visible to this user."})
+                environment_id = meta["environment_id"]
                 with _sync_jobs_lock:
-                    job = dict(_sync_jobs.get(meta["environment_id"], {"status": "idle", "steps": [], "error": None}))
-                job["sync_state"] = audit_store.get_sync_state(name)
-                job["is_first_sync"] = audit_store.is_first_sync(name)
+                    job = dict(_sync_jobs.get(environment_id, {"status": "idle", "steps": [], "error": None}))
+                job["sync_state"] = audit_store.get_sync_state(environment_id)
+                job["is_first_sync"] = audit_store.is_first_sync(environment_id)
                 return self._send_json(200, job)
 
             if path == "/api/reports":
                 import audit_store
                 environment = (qs.get("environment") or [local_env_name])[0]
-                if environment and not _environment_visible_to(engine_owner, environment):
-                    return self._send_json(404, {"error": f"No environment named '{environment}' visible to this user."})
-                reports = audit_store.list_reports()
+                environment_id = None
                 if environment:
+                    meta = engine.list_environments_for(engine_owner).get(environment)
+                    if meta is None:
+                        return self._send_json(404, {"error": f"No environment named '{environment}' visible to this user."})
+                    environment_id = meta["environment_id"]
+                reports = audit_store.list_reports()
+                if environment_id:
                     since = (qs.get("from") or [None])[0]
                     until = (qs.get("to") or [None])[0]
                     for r in reports:
-                        r["count"] = audit_store.count_events(environment, event_types=r["event_types"], since=since, until=until)
+                        r["count"] = audit_store.count_events(environment_id, event_types=r["event_types"], since=since, until=until)
                 return self._send_json(200, {"reports": reports})
 
             if path.startswith("/api/reports/"):
@@ -972,7 +960,8 @@ class Handler(SimpleHTTPRequestHandler):
                 environment = (qs.get("environment") or [local_env_name])[0]
                 if not environment:
                     return self._send_json(400, {"error": "No active environment and none specified via ?environment="})
-                if not _environment_visible_to(engine_owner, environment):
+                meta = engine.list_environments_for(engine_owner).get(environment)
+                if meta is None:
                     return self._send_json(404, {"error": f"No environment named '{environment}' visible to this user."})
                 since = (qs.get("from") or [None])[0]
                 until = (qs.get("to") or [None])[0]
@@ -981,7 +970,7 @@ class Handler(SimpleHTTPRequestHandler):
                 except ValueError:
                     return self._send_json(400, {"error": "limit must be an integer"})
                 try:
-                    rows = audit_store.run_report(report_key, environment, since=since, until=until, limit=limit)
+                    rows = audit_store.run_report(report_key, meta["environment_id"], since=since, until=until, limit=limit)
                 except KeyError as exc:
                     return self._send_json(404, {"error": str(exc)})
                 return self._send_json(200, {"report": report_key, "environment": environment, "rows": rows})
@@ -992,7 +981,8 @@ class Handler(SimpleHTTPRequestHandler):
                 environment = (qs.get("environment") or [local_env_name])[0]
                 if not environment:
                     return self._send_json(400, {"error": "No active environment and none specified via ?environment="})
-                if not _environment_visible_to(engine_owner, environment):
+                meta = engine.list_environments_for(engine_owner).get(environment)
+                if meta is None:
                     return self._send_json(404, {"error": f"No environment named '{environment}' visible to this user."})
                 # resource_name: fallback exact-displayName match for
                 # resource kinds with no discoverable log-side id at all
@@ -1009,7 +999,7 @@ class Handler(SimpleHTTPRequestHandler):
                 except ValueError:
                     return self._send_json(400, {"error": "limit must be an integer"})
                 rows = audit_store.resource_history(
-                    environment, resource_id=resource_id, resource_name=resource_name,
+                    meta["environment_id"], resource_id=resource_id, resource_name=resource_name,
                     since=since, until=until, limit=limit,
                 )
                 return self._send_json(200, {"resource_id": resource_id, "environment": environment, "rows": rows})
@@ -1088,9 +1078,9 @@ class Handler(SimpleHTTPRequestHandler):
                 # behavior (and its Okta-client requirement) -- zero
                 # regression for anyone not using the new feature yet.
                 import audit_store
-                if local_env_name and not audit_store.is_first_sync(local_env_name):
+                if local_env_id and not audit_store.is_first_sync(local_env_id):
                     report = engine.build_project_secrets_report_from_archive(
-                        local_client, local_env_name, rg_id, proj_id
+                        local_client, local_env_id, rg_id, proj_id
                     )
                     return self._send_json(200, report)
 
@@ -1379,6 +1369,9 @@ class Handler(SimpleHTTPRequestHandler):
                     schedule = engine.get_sync_schedule(name, owner=engine_owner)
                 except KeyError as exc:
                     return self._send_json(404, {"error": str(exc)})
+                meta = engine.list_environments_for(engine_owner).get(name)
+                if meta is None:
+                    return self._send_json(404, {"error": f"No environment named '{name}' visible to this user."})
                 ingestion_scope = payload.get("ingestion_scope") or schedule.get("ingestion_scope", "curated")
                 # Logging (start, and later completion/failure) now happens
                 # INSIDE _start_sync_job/_run_sync_job themselves -- see
@@ -1387,8 +1380,18 @@ class Handler(SimpleHTTPRequestHandler):
                 # scheduler's own trigger, including every way a sync can
                 # fail to even start (bad credentials, already running),
                 # which previously had no audit trail at all.
+                #
+                # BUG FIX (found during Phase 2's SQLite migration review,
+                # pre-existing since Phase 1/v5.28.0): this call was missing
+                # its required env_id positional argument entirely -- `name`
+                # was silently landing in _start_sync_job's env_id parameter
+                # and `ingestion_scope` in its env_name parameter, shifting
+                # every argument by one. Caught by inspection, not a test
+                # failure (there's no automated coverage of this specific
+                # HTTP route today) -- now passes meta["environment_id"]
+                # explicitly, matching _start_sync_job's real signature.
                 started = _start_sync_job(
-                    name, ingestion_scope, owner=engine_owner, trigger="manual",
+                    meta["environment_id"], name, ingestion_scope, owner=engine_owner, trigger="manual",
                     actor_email=actor_email, actor_sub=actor_sub,
                     client_ip=self._request_client_ip(),
                     user_agent=self.headers.get("User-Agent"),
@@ -1418,7 +1421,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # environment display name could inject rows directly into
                 # that owner's audit archive. Same cross-tenant class as
                 # the report-read leaks fixed above, just on the write side.
-                if not _environment_visible_to(engine_owner, name):
+                meta = engine.list_environments_for(engine_owner).get(name)
+                if meta is None:
                     return self._send_json(404, {"error": f"No environment named '{name}' visible to this user."})
                 try:
                     csv_path = _safe_csv_path(payload.get("csv_path"))
@@ -1428,7 +1432,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if not csv_path.is_file():
                     return self._send_json(400, {"error": f"{csv_path.name} not found on server filesystem"})
                 try:
-                    result = audit_store.import_from_csv(str(csv_path), name, ingestion_scope)
+                    result = audit_store.import_from_csv(str(csv_path), meta["environment_id"], ingestion_scope)
                 except ValueError as exc:
                     return self._send_json(400, {"error": str(exc)})
                 self._log_audit_event(actor_email, actor_sub, "sync.import_csv", {"name": name, "csv_path": csv_path.name, **result})
