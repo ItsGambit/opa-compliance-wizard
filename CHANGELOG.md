@@ -2,6 +2,41 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.28.1 — **Deletes v5.28.0's one-shot environment UUID migration code,
+now that both of this project's real installs (this machine + the
+Ubuntu server) are confirmed migrated** -- the exact "delete it once
+both installs are confirmed migrated" step that migration's own plan
+called for, done immediately rather than left as a someday item. Pure
+cleanup, no behavior change for an already-migrated install (which is
+every real install there is).
+- `load_environments()` collapsed back down to a plain loader -- the
+  two-legacy-shape detection/rekey loop and its persist-immediately logic
+  are gone; it now just reads the file and normalizes `active`/
+  `environments` to dicts if either is missing or malformed.
+- `_legacy_environment_storage_name` and `_LEGACY_STORAGE_PREFIX`
+  deleted outright (not kept as dead code).
+- `_migrate_environment_keyring_entries` deleted (its read-old/write-new/
+  verify/delete-old sequence has no caller left).
+- `keyring_get`/`keyring_delete` lost their storage-name-SHAPE fallback
+  branch (the bare pre-multi-user name, `_LEGACY_STORAGE_PREFIX`-based) --
+  that was Phase 1's own migration concern. Their separate, unrelated
+  keyring SERVICE-PREFIX fallback (`opa-secrets-wizard`, pre-5.20.0-
+  rename) stays untouched -- confirmed via live inspection on both real
+  installs during v5.28.0's verification that genuine, still-orphaned
+  credentials exist under that oldest prefix+bare-name combination, so
+  removing that fallback now would have been a real regression, not
+  cleanup.
+- `tests/test_environment_id_migration.py` deleted -- it tested the
+  removed migration code directly; the stable-contract behavior it
+  partially overlapped with (the two-owner collision scenario) is still
+  covered by `tests/test_two_owner_collision.py`, unaffected by this
+  change.
+- Live-verified after the cleanup: real `environments.json` (already
+  migrated to v5.28.0's UUID shape) still loads correctly with the exact
+  same ids, both environments' credentials still resolve, and a live
+  `GET /api/environments` call against a real running `serve.py`
+  instance returns identical output to before the cleanup.
+
 5.28.0 — **Fast-follow Phase 3 of 11 of docs/fast-follow-redesign.md
 (local-only, not pushed): every saved environment now has a real,
 stable `environment_id` (UUID4) as its primary key, replacing the

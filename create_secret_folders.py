@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.28.0
+# Version     : 5.28.1
 # =============================================================================
 
 import argparse
@@ -79,7 +79,7 @@ import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.28.0"
+SCRIPT_VERSION = "5.28.1"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -400,120 +400,26 @@ def _owner_storage_key(owner):
     return owner if owner else "__local__"
 
 
-def _legacy_environment_storage_name(owner, name):
-    """MIGRATION-ONLY: the old owner-namespaced storage key format
-    (`"{owner}::{name}"`), used solely by load_environments()'s one-time
-    rekey pass below to recognize and migrate pre-UUID environments.json
-    entries. Not a public API -- nothing else should ever construct this
-    format again. (Historically this WAS the public environment_storage_name
-    function; renamed and demoted to migration-only once every real
-    environment -- on both this project's two real installs, Windows dev
-    machine and the Ubuntu server -- is confirmed migrated to a real
-    environment_id. See docs/fast-follow-redesign.md's Phase 1.)"""
-    return f"{_owner_storage_key(owner)}::{name}"
-
-
-_LEGACY_STORAGE_PREFIX = f"{_owner_storage_key(LOCAL_OWNER_KEY)}::"
-# Still needed by keyring_get/keyring_delete's existing fallback logic
-# below, unchanged by this migration -- during the one-time migration
-# pass, _migrate_environment_keyring_entries calls keyring_get/
-# keyring_delete with an OLD-shaped storage_name (exactly what
-# _legacy_environment_storage_name produces), and that fallback logic is
-# what actually finds a real pre-existing credential regardless of which
-# of the two legacy shapes/prefixes it was stored under. Once both real
-# installs are confirmed migrated, this constant and both functions'
-# fallback branches can be deleted together, not independently.
-
-
 def load_environments():
-    """Loads the whole store and migrates it to the current shape in memory,
-    persisting any migration immediately (see the UUID-assignment step
-    below -- unlike the other migrations here, minting a random id is NOT
-    safe to leave unpersisted, since re-running it on every load would mint
-    a NEW id every time).
-
-    Migrations handled here, all one-way and permanent in spirit (every
-    legacy environment becomes indistinguishable from one created fresh
-    under the current shape once this runs):
-    - `"active"` used to be a single environment-name string
-      (pre-multi-user). It's now a dict keyed by owner (Okta `sub`, or
-      LOCAL_OWNER_KEY for unscoped/local/CLI use) so each user's active
-      environment is independent. A legacy string value becomes the
-      LOCAL_OWNER_KEY-owner's active environment, matching exactly what it
-      meant before this change existed.
-    - `environments` used to be keyed by plain name (e.g. "dev"), then by
-      `"{owner}::{name}"` (the multi-user change). Both shapes are
-      recognized by `"::" not in key` vs. a real environment_id (a UUID,
-      which never contains "::") and are migrated here to the current
-      shape: keyed by a freshly-minted `environment_id` (UUID4), with
-      `name` and `owner` stored as explicit fields on the record instead
-      of being encoded into (or absent from) the key itself. A plain-name
-      legacy entry gets owner=LOCAL_OWNER_KEY, shared=True (every
-      pre-existing environment was, in effect, usable by anyone who could
-      reach this file/process, so shared=True is what actually preserves
-      that instead of silently hiding it from every logged-in user once
-      per-user scoping goes live); an owner::name legacy entry keeps
-      whatever owner/shared it already had.
-    - Per [[project_opa_deployment_mode_live]]/this project's simplified
-      two-install deployment model: this is a one-shot migration, not a
-      permanent compatibility shim -- `_legacy_environment_storage_name`
-      and this detection logic are deleted entirely in a prompt follow-up
-      commit once both real installs (this machine + the Ubuntu server)
-      are confirmed migrated. There is no third install that could still
-      be running pre-migration code in the meantime."""
+    """Loads the whole store. `environments` is keyed by `environment_id`
+    (a UUID4, see upsert_environment), with `name` and `owner` stored as
+    explicit fields on each record -- see docs/fast-follow-redesign.md's
+    Phase 1. (This function used to also run a one-shot migration for two
+    older shapes -- pre-multi-user bare-name keys, and the pre-UUID
+    "{owner}::{name}" storage_name scheme -- removed 2026-10-01 once both
+    of this project's real installs, this machine and the Ubuntu server,
+    were confirmed migrated. There is no third install that could still
+    be running pre-migration code.)"""
     path = _environments_file_path()
     if not os.path.isfile(path):
         return {"active": {}, "environments": {}}
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
 
-    active = data.get("active")
-    if isinstance(active, str):
-        data["active"] = {_owner_storage_key(LOCAL_OWNER_KEY): active}
-    elif not isinstance(active, dict):
+    if not isinstance(data.get("active"), dict):
         data["active"] = {}
-
-    needs_migration = False
-    migrated_environments = {}
-    for key, meta in data.get("environments", {}).items():
-        # Detection is based on the presence of an explicit "name" field,
-        # NOT on whether the key looks like "owner::name" -- a real UUID4
-        # key also happens to contain no "::", so key-shape alone can't
-        # distinguish "already migrated" from "oldest pre-multi-user
-        # shape" (both have `"::" not in key`). "name" in meta is the one
-        # unambiguous signal: it's only ever set by this migration itself.
-        if "name" in meta:
-            # Already migrated (real environment_id key, name/owner fields
-            # present) -- leave untouched. Also covers the "no file on disk
-            # at all yet" / fresh-install case implicitly, since there's
-            # nothing to iterate.
-            migrated_environments[key] = meta
-            continue
-        needs_migration = True
-        meta = dict(meta)
-        if "::" not in key:
-            # Oldest shape: bare display name, no owner field, no "::" at
-            # all in the key.
-            meta.setdefault("owner", LOCAL_OWNER_KEY)
-            meta.setdefault("shared", True)
-            meta["name"] = key
-            old_storage_name = _legacy_environment_storage_name(LOCAL_OWNER_KEY, key)
-        else:
-            # Multi-user shape: "{owner}::{name}" -- owner/shared already
-            # fields, but no stable id yet and `name` only implicit in the
-            # key -- the specific shape this Phase 1 migration targets.
-            _, _, name = key.partition("::")
-            meta["name"] = name
-            old_storage_name = key
-        new_id = str(uuid.uuid4())
-        _migrate_environment_keyring_entries(old_storage_name, new_id)
-        migrated_environments[new_id] = meta
-    data["environments"] = migrated_environments
-
-    if needs_migration:
-        # Persist NOW, not lazily -- see this function's own docstring for
-        # why minting a random id must not be repeated on every load.
-        save_environments(data)
+    if not isinstance(data.get("environments"), dict):
+        data["environments"] = {}
     return data
 
 
@@ -683,37 +589,29 @@ def _keyring_get_raw(service, field):
 
 
 def keyring_get(storage_name, field):
-    """Reads a secret, with two independent, composable backward-compat
-    fallbacks -- an install that predates BOTH the multi-user change and
-    the 5.20.0 rename needs both to still resolve:
-    1. Service-name prefix: this project's keyring service prefix was
-       renamed from "opa-secrets-wizard" to "opa-compliance-wizard" at
-       5.20.0 (see KEYRING_SERVICE_PREFIX/_LEGACY_KEYRING_SERVICE_PREFIX
-       above) -- try the current prefix first, fall back to the legacy
-       one. Read-only: nothing is ever written back under the legacy
-       prefix, so a value naturally migrates to the new prefix the next
-       time it's saved (no migration script needed).
-    2. Storage-name shape: if `storage_name` is namespaced under the
-       local/unscoped owner (`__local__::<name>`) and nothing's stored
-       under that namespaced service name, also try the pre-multi-user
-       storage name (bare `<name>`, no owner prefix at all) -- every
-       environment that existed before THAT change has its real secret
-       sitting there.
-    Tries (current prefix, current name) -> (current prefix, legacy name)
-    -> (legacy prefix, current name) -> (legacy prefix, legacy name)."""
+    """Reads a secret. `storage_name` is the environment's real
+    `environment_id` (a UUID4) -- see docs/fast-follow-redesign.md's
+    Phase 1. (This used to also fall back to a pre-multi-user,
+    unnamespaced storage-name shape; that fallback branch was removed
+    2026-10-01 once both of this project's real installs were confirmed
+    migrated to a real environment_id -- see load_environments().)
+
+    Still falls back to the legacy keyring SERVICE PREFIX
+    (`opa-secrets-wizard`, pre-5.20.0-rename) -- a separate, still-live
+    concern unrelated to the Phase 1 identity migration: confirmed via
+    live inspection on 2026-10-01 that both real installs still have a
+    genuine, orphaned credential sitting under that oldest prefix+bare-
+    name combination, so this fallback stays until that's separately
+    confirmed clean. Read-only: nothing is ever written back under the
+    legacy prefix, so a value naturally migrates to the new prefix the
+    next time it's saved."""
     if not KEYRING_AVAILABLE:
         return None
 
-    names = [storage_name]
-    if storage_name.startswith(_LEGACY_STORAGE_PREFIX):
-        names.append(storage_name[len(_LEGACY_STORAGE_PREFIX):])
-    prefixes = [KEYRING_SERVICE_PREFIX, _LEGACY_KEYRING_SERVICE_PREFIX]
-
-    for prefix in prefixes:
-        for name in names:
-            value = _keyring_get_raw(_keyring_service(name, prefix), field)
-            if value is not None:
-                return value
+    for prefix in (KEYRING_SERVICE_PREFIX, _LEGACY_KEYRING_SERVICE_PREFIX):
+        value = _keyring_get_raw(_keyring_service(storage_name, prefix), field)
+        if value is not None:
+            return value
     return None
 
 
@@ -724,42 +622,6 @@ def keyring_delete(storage_name, field):
         keyring.delete_password(_keyring_service(storage_name), field)
     except Exception:
         pass
-    # Also clean up the legacy (pre-multi-user, unnamespaced) entry if this
-    # is a local/unscoped environment -- see keyring_get's matching fallback.
-    if storage_name.startswith(_LEGACY_STORAGE_PREFIX):
-        legacy_name = storage_name[len(_LEGACY_STORAGE_PREFIX):]
-        try:
-            keyring.delete_password(_keyring_service(legacy_name), field)
-        except Exception:
-            pass
-
-
-def _migrate_environment_keyring_entries(old_storage_name, new_environment_id):
-    """One-time credential migration, called only from load_environments()'s
-    migration pass: for each secret field, read under the OLD storage name
-    (via keyring_get's existing fallback logic, which already knows how to
-    find a value under either legacy shape/prefix), write under the NEW
-    environment_id, verify the round-trip by reading the new name back and
-    comparing, then delete the old entry -- read-old -> write-new -> verify
-    -> delete-old, per docs/fast-follow-redesign.md's Phase 1 design.
-
-    Deliberately does NOT delete the old entry if the round-trip
-    verification fails (logs a warning and leaves the old entry in place
-    instead) -- losing access to a real credential is a much worse outcome
-    than a harmless leftover legacy keyring entry."""
-    if not KEYRING_AVAILABLE:
-        return
-    for field in ENVIRONMENT_SECRET_FIELDS:
-        value = keyring_get(old_storage_name, field)
-        if value is None:
-            continue  # nothing stored for this field (e.g. okta_api_token is optional)
-        keyring_set(new_environment_id, field, value)
-        verify = keyring_get(new_environment_id, field)
-        if verify != value:
-            log("WARN", f"Keyring migration verification failed for field '{field}' -- "
-                         f"leaving the old entry in place rather than risking data loss.")
-            continue
-        keyring_delete(old_storage_name, field)
 
 
 def list_environments_for(owner):
