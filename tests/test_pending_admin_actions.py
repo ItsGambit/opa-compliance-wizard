@@ -23,6 +23,23 @@ ACTOR_A = "00uActorA"
 ACTOR_B = "00uActorB"
 
 
+def test_actor_sub_none_round_trips_for_local_direct_runs(tmp_audit_store):
+    """REGRESSION (found live-testing this phase, 2026-10-01): a
+    local/direct run (no login gate in front at all) legitimately has
+    actor_sub=None -- see server/serve.py's `actor_sub = None if
+    owner_key == LOCAL_OWNER_KEY_HEADER else owner_key`. The schema's
+    first draft had `actor_sub TEXT NOT NULL`, which rejected this exact
+    real case with a NOT NULL constraint error the moment /prepare was
+    hit locally. Must round-trip cleanly."""
+    audit_store.run_migrations()
+    payload = {"admin_group_id": "00gAdmin", "user_group_id": None, "restrict_login": True}
+
+    action_id = audit_store.create_pending_admin_action(None, "access_control.update", payload, ttl_seconds=900)
+    consumed = audit_store.consume_pending_admin_action(action_id, None)
+
+    assert consumed == payload
+
+
 def test_create_then_consume_round_trip_returns_the_exact_payload(tmp_audit_store):
     audit_store.run_migrations()
     payload = {"admin_group_id": "00gAdmin", "user_group_id": None, "restrict_login": True}

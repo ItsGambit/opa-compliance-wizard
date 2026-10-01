@@ -505,11 +505,21 @@ def _migration_003_pending_admin_actions(conn):
     identifier, not a row in any table this app owns (same reasoning as
     ingestion_manifests' own just-shipped precedent: don't borrow
     app_environments' ON DELETE CASCADE convention for a table that
-    isn't an environment-scoped administrative pointer)."""
+    isn't an environment-scoped administrative pointer).
+
+    actor_sub is nullable, NOT NOT NULL -- confirmed live (2026-10-01)
+    that a local/direct run (no login gate in front at all) legitimately
+    has actor_sub=None (see server/serve.py's own
+    `actor_sub = None if owner_key == LOCAL_OWNER_KEY_HEADER else
+    owner_key`, and its save route's existing comment: "A direct/local
+    run... is exempt" from the admin check, same exemption this project
+    already applies elsewhere). consume_pending_admin_action's `row[
+    "actor_sub"] != actor_sub` comparison already handles None == None
+    correctly; only the schema's own NOT NULL was too strict."""
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS pending_admin_actions (
             action_id TEXT PRIMARY KEY,
-            actor_sub TEXT NOT NULL,
+            actor_sub TEXT,
             action_type TEXT NOT NULL,
             payload_json TEXT NOT NULL,
             payload_hash TEXT NOT NULL,

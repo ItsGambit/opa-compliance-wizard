@@ -2,6 +2,25 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.31.1 — **Fixes a real bug found live-testing v5.31.0's
+`pending_admin_actions` table against this machine's own local/direct
+server run**: the schema's `actor_sub TEXT NOT NULL` rejected the
+legitimate `actor_sub=None` case (a local/direct run with no login gate
+in front at all -- `server/serve.py`'s own
+`actor_sub = None if owner_key == LOCAL_OWNER_KEY_HEADER else owner_key`,
+the same exemption the save route's admin check already applies) with a
+`NOT NULL constraint failed` the instant `/prepare` was hit without a
+real Okta session. Changed to a nullable `actor_sub TEXT` --
+`consume_pending_admin_action`'s `actor_sub` comparison already handled
+`None == None` correctly; only the schema's own constraint was too
+strict. Live-verified end-to-end after the fix on this machine's real
+local server: `/prepare` → `/save` (with a deliberately different,
+"attacker" payload in the save request body, confirming it's ignored) →
+replay attempt on the same `action_id` (confirmed rejected with
+`already_consumed`) → `GET /api/access_control` (confirmed the reviewed
+payload, not the tampered one, is what persisted). New regression test
+(`test_actor_sub_none_round_trips_for_local_direct_runs`).
+
 5.31.0 — **Fast-follow Phase 3+4 of 11 of docs/fast-follow-redesign.md:
 step-up MFA is now a real server-side transaction, not a browser-held
 replay window.** Real gap closed: previously, the step-up cookie
