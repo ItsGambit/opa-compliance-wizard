@@ -25,6 +25,7 @@ Two independent settings, confirmed with the user before building this:
   archive can still have its own (typically longer) retention cap.
 """
 import csv
+import hashlib
 import json
 import os
 import sqlite3
@@ -453,8 +454,47 @@ def _migration_001_unified_schema(conn):
     """)
 
 
+def _migration_002_ingestion_manifests(conn):
+    """Phase 6: a hash-chained ingestion batch manifest, one row per
+    sync_okta_events()/import_from_csv() call -- see
+    _record_ingestion_manifest/verify_ingestion_chain below. Pure
+    CREATE TABLE/INDEX IF NOT EXISTS -- a brand-new table, not a reshape
+    of an existing one, so (unlike migration 1) there's no column
+    rename/backfill step.
+
+    Deliberately NO FOREIGN KEY to app_environments, unlike
+    active_environments/sync_schedules -- this table is COMPLIANCE
+    EVIDENCE, same category as events/sync_state/event_targets (none of
+    which reference app_environments either), not an administrative
+    pointer. delete_environment() only ever touches app_environments
+    (confirmed: it never deletes from events/sync_state/event_targets --
+    an environment CONFIGURATION being removed must not destroy years of
+    archived audit history for that tenant). An FK with ON DELETE
+    CASCADE here would silently erase the integrity chain the moment
+    someone deleted and re-added an environment -- exactly the kind of
+    accidental, hard-to-notice evidence loss this phase exists to make
+    detectable, not cause."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS ingestion_manifests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            environment_id TEXT NOT NULL,
+            source TEXT NOT NULL,
+            since TEXT,
+            until TEXT,
+            row_count INTEGER NOT NULL,
+            batch_hash TEXT NOT NULL,
+            prev_manifest_hash TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_ingestion_manifests_env_created
+            ON ingestion_manifests (environment_id, created_at);
+    """)
+
+
 MIGRATIONS = {
     1: _migration_001_unified_schema,
+    2: _migration_002_ingestion_manifests,
 }
 
 
@@ -603,14 +643,18 @@ def _insert_rows(conn, environment_id, rows, ingestion_scope):
     same CSV a second time reported 3149 "inserted" again instead of 0,
     and doubled total_events_ingested -- fixed by switching to OR IGNORE
     + checking rowcount instead of a blind per-row counter).
-    Returns (new_row_count, max_published_seen_across_ALL_rows_scanned)
-    -- max_published still reflects every row this call looked at
-    (including ones that turned out to be duplicates), since the
-    watermark must advance based on what was FETCHED, not just what was
-    newly inserted, or a delta sync could re-scan the same already-seen
-    day forever."""
+    Returns (new_row_count, max_published_seen_across_ALL_rows_scanned,
+    new_uuids) -- max_published still reflects every row this call
+    looked at (including ones that turned out to be duplicates), since
+    the watermark must advance based on what was FETCHED, not just what
+    was newly inserted, or a delta sync could re-scan the same
+    already-seen day forever. new_uuids (Phase 6) is only the uuids of
+    rows that were genuinely new this call (cur.rowcount == 1) -- fed to
+    _record_ingestion_manifest by the caller to hash exactly what this
+    batch actually added, not every row merely scanned."""
     max_published = None
     inserted = 0
+    new_uuids = []
     with _db_lock:
         for (uuid, event_type, published, actor_id, actor_name, actor_alt, outcome, raw_json,
              resource_id, resource_alt_id, resource_type_detail, targets) in rows:
@@ -637,18 +681,84 @@ def _insert_rows(conn, environment_id, rows, ingestion_scope):
             # (cur.rowcount == 1) -- INSERT OR IGNORE is a no-op on a
             # duplicate uuid, and re-inserting the same event's targets
             # every re-run would duplicate rows with nothing to dedupe on.
-            if cur.rowcount and targets:
-                conn.executemany(
-                    """INSERT INTO event_targets
-                       (environment_id, uuid, target_id, target_alternate_id, target_display_name)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    [
-                        (environment_id, uuid, t.get("id"), t.get("alternateId"), t.get("displayName"))
-                        for t in targets
-                    ],
-                )
+            if cur.rowcount:
+                new_uuids.append(uuid)
+                if targets:
+                    conn.executemany(
+                        """INSERT INTO event_targets
+                           (environment_id, uuid, target_id, target_alternate_id, target_display_name)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        [
+                            (environment_id, uuid, t.get("id"), t.get("alternateId"), t.get("displayName"))
+                            for t in targets
+                        ],
+                    )
         conn.commit()
-    return inserted, max_published
+    return inserted, max_published, new_uuids
+
+
+def _record_ingestion_manifest(conn, environment_id, source, since, until, new_uuids):
+    """Phase 6: writes one hash-chained manifest row for a completed
+    ingestion call (one per sync_okta_events()/import_from_csv()
+    invocation, NOT per internal day-chunk -- see this phase's design
+    notes). batch_hash is a sha256 of the sorted new_uuids list -- an
+    identifier hash, not a content hash, computed once at ingestion time
+    so verify_ingestion_chain never needs to re-read `events` later (and
+    is therefore unaffected by prune_events deleting old non-curated
+    rows afterward). A batch with zero new rows still gets a row here
+    (hash of an empty list) -- "nothing new happened" is itself a
+    chained, verifiable fact, not a silent skip that would leave a gap.
+
+    Chains to the immediately preceding manifest row for this SAME
+    environment_id (by insertion order) -- not a separate mutable
+    "chain head" column, since this one-row lookup is cheap and avoids
+    a second piece of state that could drift out of sync with the table
+    it's describing. Caller must hold conn (same connection as the
+    row-insert transaction it's covering); this function commits on its
+    own since both of this phase's callers write their manifest row in
+    a separate locked section after their chunking loop, not inside
+    _insert_rows' own per-chunk lock (see sync_okta_events)."""
+    batch_hash = hashlib.sha256("\n".join(sorted(new_uuids)).encode()).hexdigest()
+    with _db_lock:
+        prev = conn.execute(
+            "SELECT batch_hash FROM ingestion_manifests WHERE environment_id = ? ORDER BY id DESC LIMIT 1",
+            (environment_id,),
+        ).fetchone()
+        conn.execute(
+            """INSERT INTO ingestion_manifests
+               (environment_id, source, since, until, row_count, batch_hash, prev_manifest_hash, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (environment_id, source, since, until, len(new_uuids), batch_hash,
+             prev["batch_hash"] if prev else None,
+             datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")),
+        )
+        conn.commit()
+    return batch_hash
+
+
+def verify_ingestion_chain(environment_id):
+    """Walks this environment's ingestion_manifests in insertion order
+    and confirms each row's prev_manifest_hash matches the preceding
+    row's batch_hash (and the first row's prev_manifest_hash is NULL) --
+    a cheap, mechanical "has this chain been tampered with" check that
+    never touches `events` (the stored hashes are the source of truth,
+    not something recomputed from live data -- see
+    _record_ingestion_manifest), so it stays fast regardless of archive
+    size. Returns {"valid": bool, "manifest_count": int, "broken_at":
+    id|None} -- broken_at is the id of the first row whose
+    prev_manifest_hash doesn't match, or None if the chain is intact (or
+    empty -- zero manifests is a valid, intact chain of nothing)."""
+    conn = _get_connection()
+    rows = conn.execute(
+        "SELECT id, batch_hash, prev_manifest_hash FROM ingestion_manifests WHERE environment_id = ? ORDER BY id ASC",
+        (environment_id,),
+    ).fetchall()
+    expected_prev = None
+    for row in rows:
+        if row["prev_manifest_hash"] != expected_prev:
+            return {"valid": False, "manifest_count": len(rows), "broken_at": row["id"]}
+        expected_prev = row["batch_hash"]
+    return {"valid": True, "manifest_count": len(rows), "broken_at": None}
 
 
 def is_first_sync(environment_id):
@@ -751,6 +861,7 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
     total_inserted = 0
     total_scanned = 0
     chunks = 0
+    all_new_uuids = []  # Phase 6: accumulated across every day-chunk, hashed into ONE manifest row for this whole call
 
     while cursor < now_dt:
         chunk_until_dt = min(cursor + timedelta(days=CHUNK_DAYS), now_dt)
@@ -765,8 +876,9 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
         total_scanned += len(events)
 
         rows = [_normalize_live_event(e) for e in events]
-        inserted, max_published = _insert_rows(conn, environment_id, rows, ingestion_scope)
+        inserted, max_published, new_uuids = _insert_rows(conn, environment_id, rows, ingestion_scope)
         total_inserted += inserted
+        all_new_uuids.extend(new_uuids)
         chunks += 1
 
         # FIX (external review, 2026-09-30, "1.5"): get_system_log logs a
@@ -797,6 +909,12 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
             )
             if on_progress:
                 on_progress("ingest", "error", f"Incomplete fetch for {chunk_since}..{chunk_until}; stopping sync.")
+            # Phase 6: an interrupted sync still produced real inserted
+            # rows (across however many chunks completed before the
+            # failing one) -- those need to be in the chain too, same
+            # "nothing new is silently invisible" reasoning as a
+            # zero-new-rows batch below.
+            _record_ingestion_manifest(conn, environment_id, "sync", original_since, chunk_until, all_new_uuids)
             return {
                 "inserted": total_inserted, "scanned": total_scanned, "since": original_since,
                 "chunks": chunks, "complete": False, "error": error_message,
@@ -818,6 +936,7 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
         cursor = chunk_until_dt
 
     _upsert_sync_state(conn, environment_id, last_sync_status="success")
+    _record_ingestion_manifest(conn, environment_id, "sync", original_since, now_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"), all_new_uuids)
     if on_progress:
         on_progress("ingest", "done", f"{total_inserted} new row(s) inserted across {chunks} day-chunk(s)")
     return {"inserted": total_inserted, "scanned": total_scanned, "since": original_since, "chunks": chunks, "complete": True}
@@ -845,7 +964,8 @@ def import_from_csv(csv_path, environment_id, ingestion_scope, on_progress=None)
     if on_progress:
         on_progress("read_csv", "done", f"{len(rows)} row(s) read")
 
-    inserted, max_published = _insert_rows(conn, environment_id, rows, ingestion_scope)
+    inserted, max_published, new_uuids = _insert_rows(conn, environment_id, rows, ingestion_scope)
+    _record_ingestion_manifest(conn, environment_id, "csv_import", None, None, new_uuids)
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     existing_state = get_sync_state(environment_id)

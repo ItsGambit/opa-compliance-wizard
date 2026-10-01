@@ -937,6 +937,19 @@ class Handler(SimpleHTTPRequestHandler):
                 job["is_first_sync"] = audit_store.is_first_sync(environment_id)
                 return self._send_json(200, job)
 
+            if path.startswith("/api/environments/") and path.endswith("/integrity"):
+                # Phase 6: cheap, mechanical "has this environment's
+                # ingestion history been tampered with" check -- walks
+                # the hash-chained ingestion_manifests table, never
+                # touches `events` itself (see
+                # audit_store.verify_ingestion_chain's docstring).
+                name = unquote(path[len("/api/environments/"):-len("/integrity")])
+                try:
+                    result = engine.verify_environment_evidence_chain(name, owner=engine_owner)
+                except KeyError as exc:
+                    return self._send_json(404, {"error": str(exc)})
+                return self._send_json(200, result)
+
             if path == "/api/reports":
                 import audit_store
                 environment = (qs.get("environment") or [local_env_name])[0]

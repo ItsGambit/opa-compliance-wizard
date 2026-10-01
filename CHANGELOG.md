@@ -2,6 +2,66 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.30.0 — **Fast-follow Phase 6 of 11 of docs/fast-follow-redesign.md:
+a hash-chained ingestion batch manifest**, giving the compliance archive
+a cheap, mechanical answer to "has this been tampered with since
+ingestion." A much smaller lift than Phases 1-2: no existing data to
+migrate, no credential logic, no two-install collision resolution --
+just a new table plus a few lines in ingestion code that already exists.
+- New `ingestion_manifests` table (migration 2 in `audit_store.py`'s
+  schema-migration registry): one row per `sync_okta_events()`/
+  `import_from_csv()` CALL (not per internal day-chunk), recording
+  `source`, `since`/`until` (sync only), `row_count`, a `batch_hash`
+  (sha256 of the batch's sorted newly-inserted event uuids), and
+  `prev_manifest_hash` chaining to the immediately preceding manifest
+  row for the same `environment_id`.
+- **Design correction made during implementation**: the initial draft
+  put a `REFERENCES app_environments(environment_id) ON DELETE CASCADE`
+  on this table, matching `active_environments`/`sync_schedules`'s
+  pattern -- wrong category. `delete_environment()` only ever touches
+  `app_environments`, never `events`/`sync_state`/`event_targets` (an
+  environment *configuration* being removed must not destroy years of
+  archived audit *history*). `ingestion_manifests` is evidence, same
+  category as those three archive tables, none of which reference
+  `app_environments` either -- an `ON DELETE CASCADE` here would have
+  silently erased the integrity chain the moment someone deleted and
+  re-added an environment. Caught immediately by the test suite (a real
+  FK IntegrityError) before reaching live code; the FK was removed
+  rather than patched around.
+- Hash computed over sorted *uuids*, not row content, at ingestion time
+  -- `verify_ingestion_chain(environment_id)` never needs to re-read
+  `events` later to recompute anything, so it stays fast regardless of
+  archive size and is unaffected by `prune_events` deleting old
+  non-curated rows afterward.
+- Manifests cover every ingested row regardless of `ingestion_scope`/
+  `is_curated` -- restricting to curated-only would create a silent gap
+  for "all"-scope installs with no real integrity benefit. A batch with
+  zero new rows (nothing new found) still gets a manifest row (hash of
+  an empty set) -- "nothing new happened" is itself a chained,
+  verifiable fact, not a silent skip. An interrupted sync (hit
+  `get_system_log`'s max_pages cap mid-run) still records a manifest
+  for whatever rows were genuinely inserted before it stopped.
+- `_insert_rows`'s return value extended from `(inserted, max_published)`
+  to `(inserted, max_published, new_uuids)` -- its only two callers
+  (`sync_okta_events`, `import_from_csv`) updated accordingly; both now
+  call the new `_record_ingestion_manifest` once per invocation.
+- New `create_secret_folders.verify_environment_evidence_chain(name,
+  owner)` wrapper (same visibility-resolution pattern as
+  `get_environment_credentials`) and a new `GET
+  /api/environments/<name>/integrity` route in `server/serve.py`,
+  following the same resolve-via-`list_environments_for` pattern every
+  other Phase 2 route already uses. No UI wiring in this phase (tracked
+  separately as Phase 10) -- a bare JSON response
+  (`{"valid": bool, "manifest_count": int, "broken_at": id|None}`) is
+  the full surface for now.
+- New `tests/test_ingestion_manifest.py`: chain-building across multiple
+  sync/CSV-import calls, the zero-new-rows case, an incomplete-chunk
+  sync still recording a manifest, independent chains per
+  `environment_id`, `verify_ingestion_chain` detecting a deliberately
+  tampered `batch_hash` (proving the mechanism actually catches
+  tampering, not just that it runs without error), and the new HTTP
+  route's success/404 paths against a live `serve.py` instance.
+
 5.29.2 — **Fixes a real data-loss bug found live deploying v5.29.1 to
 the Ubuntu server**: v5.29.0's `server/deploy.sh` update dropped
 `environments.json`/`banner_config.json`'s rsync exclude lines, reasoning

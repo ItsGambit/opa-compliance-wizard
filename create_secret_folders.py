@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.29.2
+# Version     : 5.30.0
 # =============================================================================
 
 import argparse
@@ -79,7 +79,7 @@ import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.29.2"
+SCRIPT_VERSION = "5.30.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -990,6 +990,20 @@ def get_environment_credentials(name, owner=LOCAL_OWNER_KEY):
         creds[field] = keyring_get(environment_id, field) or ""
     creds["name"] = name
     return creds
+
+
+def verify_environment_evidence_chain(name, owner=LOCAL_OWNER_KEY):
+    """Phase 6: resolves `name` to its real environment_id (same
+    visibility rule as get_environment_credentials -- a shared
+    environment resolves correctly for a non-owner caller) and walks its
+    ingestion-manifest hash chain via audit_store.verify_ingestion_chain.
+    Raises KeyError if `name` doesn't exist or isn't visible to `owner`."""
+    import audit_store
+    visible = list_environments_for(owner)
+    meta = visible.get(name)
+    if meta is None:
+        raise KeyError(f"No saved environment named '{name}'")
+    return audit_store.verify_ingestion_chain(meta["environment_id"])
 
 
 def get_active_environment_credentials(owner=LOCAL_OWNER_KEY):
