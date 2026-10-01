@@ -719,6 +719,29 @@ class Handler(SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # keep console output to our own explicit prints
 
+    def _request_client_ip(self):
+        """The real originating client IP, not this socket's own TCP peer.
+
+        FIX (confirmed real, 2026-10-01): every caller of this used to read
+        self.client_address[0] directly -- when reverse-proxied behind
+        nginx (this app's hosted-deployment mode), that is ALWAYS nginx's
+        own loopback address (127.0.0.1), never the actual browser/user --
+        nginx terminates the real TCP connection and opens a brand-new one
+        to this process. nginx already sets X-Real-IP from $remote_addr on
+        every proxied request (see nginx-opa-secrets-wizard.conf) -- it was
+        just never read. Only trust that header when _request_is_from_nginx
+        confirms the request actually transited nginx's proxy (same trust
+        boundary that already gates X-Auth-Is-Admin/X-Auth-Sub -- X-Real-IP
+        is exactly as spoofable by a direct loopback request as those are);
+        otherwise (standalone/local-only mode, no nginx in front at all)
+        fall back to the raw socket peer, which IS the real client in that
+        mode."""
+        if _request_is_from_nginx(self.headers):
+            real_ip = self.headers.get("X-Real-IP")
+            if real_ip:
+                return real_ip
+        return self.client_address[0] if self.client_address else None
+
     def _log_audit_event(self, actor_email, actor_sub, action, details=None):
         """Thin wrapper around engine.log_audit_event that fills in
         client_ip/user_agent from THIS request automatically -- added
@@ -729,7 +752,7 @@ class Handler(SimpleHTTPRequestHandler):
         hand."""
         return engine.log_audit_event(
             actor_email, actor_sub, action, details,
-            client_ip=self.client_address[0] if self.client_address else None,
+            client_ip=self._request_client_ip(),
             user_agent=self.headers.get("User-Agent"),
         )
 
@@ -1337,7 +1360,7 @@ class Handler(SimpleHTTPRequestHandler):
                 started = _start_sync_job(
                     name, ingestion_scope, owner=engine_owner, trigger="manual",
                     actor_email=actor_email, actor_sub=actor_sub,
-                    client_ip=self.client_address[0] if self.client_address else None,
+                    client_ip=self._request_client_ip(),
                     user_agent=self.headers.get("User-Agent"),
                 )
                 return self._send_json(200, {"started": started, "already_running": not started})

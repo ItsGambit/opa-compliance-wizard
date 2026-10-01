@@ -242,6 +242,33 @@ fi
 echo "==> Done. Deployed version:"
 grep -m1 'SCRIPT_VERSION = ' "$APP_DIR/create_secret_folders.py"
 
+# FIX (confirmed real, 2026-10-01): NGINX_REPO (the checked-in template)
+# can NEVER contain a real NGINX_PROXY_SECRET value -- it's a public repo
+# file. Every deploy that applies NGINX_REPO over NGINX_LIVE below was
+# therefore reverting a correctly-configured secret back to the literal
+# placeholder string, requiring a manual reapply after every single
+# deploy. Fixed here, BEFORE the drift diff/apply below even runs: read
+# whatever real secret is CURRENTLY live (NGINX_LIVE is rparikh-owned,
+# readable without sudo) and bake it into the freshly-rsynced LOCAL copy
+# at NGINX_REPO (also rparikh-owned, in $APP_DIR -- writable without sudo)
+# in place of the placeholder. The existing diff/apply logic below is
+# UNCHANGED otherwise: if nothing else in the config differs, the diff
+# now comes back clean (secret already matches) and nothing gets
+# overwritten at all; if something else DID change, the copy that gets
+# applied already carries the real secret forward. No new sudoers grant
+# needed -- both files involved here are already readable/writable by
+# this user.
+if [ -f "$NGINX_LIVE" ]; then
+  LIVE_SECRET=$(grep -oP 'set \$nginx_proxy_secret "\K[^"]*' "$NGINX_LIVE" 2>/dev/null || true)
+  if [ -n "$LIVE_SECRET" ] && [ "$LIVE_SECRET" != "REPLACE_WITH_NGINX_PROXY_SECRET_VALUE" ]; then
+    awk -v secret="$LIVE_SECRET" '
+      /set \$nginx_proxy_secret "/ { sub(/"[^"]*"/, "\"" secret "\"") }
+      { print }
+    ' "$NGINX_REPO" > "$NGINX_REPO.tmp" && mv "$NGINX_REPO.tmp" "$NGINX_REPO"
+    echo "==> Carried forward the live NGINX_PROXY_SECRET into the deployed nginx config"
+  fi
+fi
+
 if [ -f "$NGINX_LIVE" ] && ! diff -q "$NGINX_REPO" "$NGINX_LIVE" > /dev/null 2>&1; then
   echo ""
   echo "==> nginx config has drifted from what's actually live -- applying repo copy"

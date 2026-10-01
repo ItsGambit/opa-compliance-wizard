@@ -2,6 +2,44 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.27.1 — **Two real bugs found while verifying v5.27.0's deployment-mode
+work live on the hosted server: audit logs captured nginx's own loopback
+IP instead of the real client, and `deploy.sh` silently reverted a
+correctly-configured `NGINX_PROXY_SECRET` back to its placeholder on
+every deploy.**
+- **Fix: audit log client IP.** `server/serve.py`'s `_log_audit_event`
+  and the manual sync-start route both read `self.client_address[0]`
+  directly — when reverse-proxied behind nginx (this app's hosted-
+  deployment mode), that is always nginx's own loopback address
+  (`127.0.0.1`), never the real browser/user, since nginx terminates the
+  real TCP connection and opens a new one to this process. nginx already
+  sets `X-Real-IP` from `$remote_addr` on every proxied request (see
+  `nginx-opa-secrets-wizard.conf`) — it was just never read. New shared
+  `Handler._request_client_ip()` reads that header, but ONLY when
+  `_request_is_from_nginx` confirms the request actually transited
+  nginx's proxy (same trust boundary already gating `X-Auth-Is-Admin`/
+  `X-Auth-Sub` — `X-Real-IP` is exactly as spoofable by a direct loopback
+  request as those are); standalone/local-only mode (no nginx in front at
+  all) is unaffected, since the raw socket peer IS the real client there.
+- **Fix: `deploy.sh` no longer reverts `NGINX_PROXY_SECRET`.** The
+  checked-in nginx template (`server/nginx-opa-secrets-wizard.conf`) can
+  never contain a real secret value — it's a public repo file, so it ships
+  with a literal placeholder. Every prior deploy that detected "drift"
+  against this template and applied it over the live config was
+  therefore reverting a correctly-configured secret back to that
+  placeholder, requiring a manual reapply after every single deploy.
+  Fixed by having `deploy.sh` read whatever secret is currently live and
+  bake it into the freshly-rsynced local copy of the template BEFORE the
+  existing drift-diff/apply logic runs — if nothing else in the config
+  changed, the diff now comes back clean and nothing gets overwritten at
+  all; if something else did change, the copy that gets applied already
+  carries the real secret forward. Needed no new sudoers grant — both
+  files involved are already readable/writable by the deploying user
+  without `sudo`.
+- Both bugs were found live, immediately after v5.27.0's `DEPLOYMENT_MODE`
+  rollout to the hosted server surfaced them in practice — not found via
+  code review alone.
+
 5.27.0 — **First automated test suite (pytest, backend), plus an explicit
 `DEPLOYMENT_MODE=local|hosted` startup guard.** First two items from the
 fast-follow architecture plan's own suggested sequencing — regression
