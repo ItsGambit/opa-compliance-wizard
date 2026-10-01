@@ -17,6 +17,17 @@ const RESOURCE_TYPE_DETAIL_LABEL: Record<string, string> = {
   // event for a Salesforce account -- not seen during initial probing,
   // found via this session's own Playwright verification pass instead.
   MANAGED_SAAS_APP_SERVICE_ACCOUNT: 'SaaS Service Account',
+  // confirmed live 2026-10-01 against a 50-event real sample of
+  // user.authentication.auth_via_mfa (see audit_store._resource_fields):
+  // the real `factor` values seen were SIGNED_NONCE (36), OKTA_VERIFY_PUSH
+  // (13), PASSWORD_AS_FACTOR (1), and one lowercase `signed_nonce` (1) --
+  // Okta's own data is case-inconsistent for the same factor, so both
+  // cases are mapped to the same label rather than showing two distinct
+  // rows for what's really one factor type.
+  SIGNED_NONCE: 'Okta Verify (FastPass)',
+  signed_nonce: 'Okta Verify (FastPass)',
+  OKTA_VERIFY_PUSH: 'Okta Verify (Push)',
+  PASSWORD_AS_FACTOR: 'Password',
 }
 
 function resourceTypeLabel(row: { resource_type: string; resource_type_detail: string }): string {

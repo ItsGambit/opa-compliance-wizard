@@ -38,9 +38,10 @@ export function AboutDialog({ open: openProp, onOpenChange }: Props = {}) {
 
           <div className="flex flex-col gap-3 text-xs text-text-dim leading-relaxed">
             <p>
-              An unofficial, community tool for generating SOC 2 / SOX / ISO 27001
-              compliance evidence from Okta Privileged Access (OPA) and core Okta
-              audit history — plus building and managing OPA secret folders, resource
+              An unofficial, community tool that helps PAM admins pull the audit
+              evidence their auditors ask for (SOC 2, SOX, ISO 27001, and similar
+              frameworks) out of Okta Privileged Access (OPA) and core Okta audit
+              history — plus building and managing OPA secret folders, resource
               groups, projects, groups, and security policies.
             </p>
             <div className="card p-3 bg-bg-hover border-warn text-text-dim">

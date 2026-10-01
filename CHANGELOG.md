@@ -2,6 +2,53 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.26.0 — **README/About wording fix (overselling what the Compliance
+Reports Dashboard produces), plus two new live-verified resource kinds:
+enrolled OPA Clients and Okta-managed Devices, now visible in Access
+Explorer's Resources tab and reflected in two new compliance reports.**
+- **Wording:** the README, About dialog, and header subtitle previously
+  implied this tool generates a finished SOC 2/SOX/ISO 27001 report. It
+  generates the underlying audit *evidence* those frameworks ask for —
+  closer to "gets a PAM admin most of the way to what their auditor
+  needs," not a certified report in itself. Reworded in all three places;
+  the "About" dialog's description is now framework-agnostic ("SOC 2,
+  SOX, ISO 27001, and similar frameworks") rather than naming exactly
+  three as if they were the only ones supported.
+- **New: Enrolled Clients.** `OpaClient.list_clients` (confirmed live
+  against the real `opa-minimal.yaml` OpenAPI spec AND a real tenant, 10
+  real clients returned) surfaces every end-user OPA client (laptop/
+  workstation running the desktop app or `sft`) enrolled for the team —
+  distinct from a managed server/gateway resource; this is what a HUMAN
+  enrolls to make SSH/RDP connections at all. New compliance report
+  "Client Enrollment" (CC6) backed by the real `pam.client.enroll`
+  eventType.
+- **New: Okta-Managed Devices.** `OktaClient.list_devices` (confirmed
+  live, `GET /api/v1/devices`) surfaces Okta's own org-wide device
+  inventory — genuinely separate from an OPA Client (a person can have
+  one without the other; confirmed by comparing both tenant's real lists,
+  which only partially overlap). Each device additionally carries its
+  real `authenticator_enrollments` (confirmed live after the org enabled
+  the underlying Okta feature mid-session; empty, not an error, on orgs
+  without it — same for `GET .../os-accounts`, also now feature-gated on
+  rather than always 401ing). New compliance report "Device Management"
+  (CC6) backed by three live-confirmed eventTypes
+  (`device.enrollment.create`, `device.lifecycle.activate`,
+  `device.user.add`) — deliberately NOT also claiming
+  suspend/unsuspend/deactivate/delete, which Okta's own device-lifecycle
+  docs describe but which never fired in this tenant's real activity
+  within the probe window; add them once a real example exists, per this
+  project's standing "never guess an eventType" rule.
+- **MFA Enforcement report enrichment:** `user.authentication.auth_via_mfa`
+  events previously had an always-blank `resource_type_detail` column
+  (this eventType's `debugContext.debugData` has no `resourceType` field
+  at all) — now surfaces the real authenticator/factor used instead
+  (confirmed live across a 50-event sample: `SIGNED_NONCE`/`signed_nonce`
+  → "Okta Verify (FastPass)", `OKTA_VERIFY_PUSH` → "Okta Verify (Push)",
+  `PASSWORD_AS_FACTOR` → "Password"), the real information an auditor
+  asking "which factor types are actually in use" needs.
+- Report count references in the README/features doc bumped 14 → 16 to
+  match (two new reports this release).
+
 5.25.1 — **Fixed a real `systemctl restart` crash-loop, and a UI color
 nit from 5.25.0.** `server/serve.py` now retries binding its port a few
 times with a short backoff before giving up — on the hosted Linux

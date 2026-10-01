@@ -5,8 +5,10 @@ import { AdConnectionRulesPanel } from './AdConnectionRulesPanel'
 import type {
   AccessActiveDirectoryAccount,
   AccessActiveDirectoryConnection,
+  AccessClient,
   AccessDatabaseAccount,
   AccessDatabaseConnection,
+  AccessDevice,
   AccessGateway,
   AccessModel,
   AccessOktaAccount,
@@ -39,6 +41,8 @@ const RESOURCE_KINDS = [
   { value: 'windows_servers', label: 'Windows Servers' },
   { value: 'linux_servers', label: 'Linux Servers' },
   { value: 'gateway_servers', label: 'Gateway Servers' },
+  { value: 'clients', label: 'Enrolled Clients' },
+  { value: 'devices', label: 'Okta-Managed Devices' },
   { value: 'okta_accounts', label: 'Okta Service Accounts' },
   { value: 'saas_accounts', label: 'SaaS Service Accounts' },
   { value: 'active_directory_accounts', label: 'Active Directory Accounts' },
@@ -88,6 +92,53 @@ function buildRows(kind: string, model: AccessModel, windowsServers: AccessServe
             State: s.state, 'Resource Group': s.resource_group_name, Project: s.project_name,
           },
         })),
+      }
+    }
+    case 'clients': {
+      // id is the real OPA client id, which IS the resource id on
+      // pam.client.enroll's own target[] (confirmed live via a real
+      // 90-day CSV export) -- clickable into the same compliance-report
+      // history drill-down as every other id-bearing resource kind here.
+      const list: AccessClient[] = model.clients
+      return {
+        headers: ['Hostname', 'User', 'OS', 'Encrypted', 'State'],
+        rows: list.map(c => ({
+          id: c.id,
+          label: c.hostname,
+          cells: [c.hostname, c.user_name, c.os, c.encrypted ? 'Yes' : 'No', c.state],
+          exportRow: {
+            Hostname: c.hostname, User: c.user_name, OS: c.os,
+            Encrypted: c.encrypted ? 'Yes' : 'No', State: c.state,
+          },
+        })),
+      }
+    }
+    case 'devices': {
+      // id is the real Okta device id, which IS the resource id on
+      // device.enrollment.create/.lifecycle.activate/.user.add's own
+      // target[] (confirmed live) -- clickable into the compliance-report
+      // history drill-down like every other id-bearing kind here. Only
+      // populated when the active environment has Okta credentials
+      // configured; empty (not an error) otherwise.
+      const list: AccessDevice[] = model.devices
+      return {
+        headers: ['Name', 'Platform', 'OS Version', 'Status', 'Disk Encryption', 'Authenticators'],
+        rows: list.map(d => {
+          const authNames = d.authenticator_enrollments.map(a => a.name).join(', ')
+          return {
+            id: d.id,
+            label: d.profile.displayName ?? d.id,
+            cells: [
+              d.profile.displayName ?? '', d.profile.platform ?? '', d.profile.osVersion ?? '',
+              d.status, d.profile.diskEncryptionType ?? '', authNames,
+            ],
+            exportRow: {
+              Name: d.profile.displayName ?? '', Platform: d.profile.platform ?? '',
+              'OS Version': d.profile.osVersion ?? '', Status: d.status,
+              'Disk Encryption': d.profile.diskEncryptionType ?? '', Authenticators: authNames,
+            },
+          }
+        }),
       }
     }
     case 'okta_accounts': {

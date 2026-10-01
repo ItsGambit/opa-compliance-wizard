@@ -119,7 +119,7 @@ export default function App() {
               </h1>
               <p className="text-xs text-text-faint mt-1">
                 {activeTab === 'reports' && reportsSubTab === 'browse' &&
-                  'SOC 2 / SOX / ISO 27001 evidence, generated from OPA + core Okta audit history.'}
+                  'Audit evidence for SOC 2 / SOX / ISO 27001 and similar frameworks, generated from OPA + core Okta audit history.'}
                 {activeTab === 'reports' && reportsSubTab === 'secrets_access' &&
                   'See who created, updated, retrieved, or deleted each secret and folder in a resource group/project.'}
                 {activeTab === 'access' &&

@@ -100,6 +100,30 @@ COMPLIANCE_EVENT_TYPES = {
     "pam.service_account.password_rotation.end": "credential_rotation",
     "pam.security_policy.create": "pam_policy_modifications",
     "pam.security_policy.update": "pam_policy_modifications",
+    # confirmed real (90-day CSV export, patlabs): a human's local OPA
+    # client (laptop/workstation running the desktop app or `sft`)
+    # enrolling to be able to make SSH/RDP connections at all -- a CC6
+    # access-control signal distinct from pam_sessions (which is "did they
+    # connect" after this already happened), not previously covered by
+    # any report.
+    "pam.client.enroll": "pam_client_enrollment",
+    # confirmed real (live System Log scan, patlabs, 2026-10-01): Okta's
+    # own org-wide DEVICE lifecycle, separate from pam.client.enroll above
+    # (an OPA client is the PAM connection agent; an Okta Device is the
+    # underlying managed/unmanaged hardware MFA'd against) -- a CC6
+    # device-trust signal, not previously covered by any report. ONLY
+    # these three are live-confirmed with a real example this session --
+    # Okta's own device-lifecycle docs describe five states (Created,
+    # Active, Suspended, Deactivated, Deleted) and five transitions
+    # (activate, suspend, unsuspend, deactivate, delete), so
+    # device.lifecycle.suspend/.unsuspend/.deactivate/.delete almost
+    # certainly also exist, but none fired in this tenant's real activity
+    # within the probe window -- deliberately NOT guessed into this dict
+    # per this project's standing rule (every entry here must be
+    # live-confirmed, not inferred). Add them once a real example exists.
+    "device.enrollment.create": "device_management",
+    "device.lifecycle.activate": "device_management",
+    "device.user.add": "device_management",
 }
 
 INGESTION_SCOPES = ("curated", "all")
@@ -188,6 +212,16 @@ COMPLIANCE_REPORTS = {
         "label": "PAM Policy Modifications",
         "control": "CC8",
         "description": "OPA security policy create/update.",
+    },
+    "pam_client_enrollment": {
+        "label": "Client Enrollment",
+        "control": "CC6",
+        "description": "A user's local OPA client (laptop/workstation) enrolling to connect to privileged resources. See also the Access Explorer's Resources tab for the current live roster of enrolled clients.",
+    },
+    "device_management": {
+        "label": "Device Management",
+        "control": "CC6",
+        "description": "Okta-managed device enrollment and user association -- device-trust evidence, separate from OPA client enrollment above. Known gap: only enrollment/activation/user-add are covered; suspend/unsuspend/deactivate/delete exist per Okta's own device-lifecycle docs but have no live-confirmed eventType yet (see COMPLIANCE_EVENT_TYPES comment). See also the Access Explorer's Resources tab for the current live device inventory.",
     },
     "ad_sync_activity": {
         "label": "Active Directory Sync Activity",
@@ -986,7 +1020,20 @@ def _resource_fields(event_type, raw):
     primary = _primary_target(event_type, targets)
     resource_id = primary.get("id") if primary else None
     resource_alternate_id = primary.get("alternateId") if primary else None
-    resource_type_detail = ((raw.get("debugContext") or {}).get("debugData") or {}).get("resourceType")
+    debug_data = (raw.get("debugContext") or {}).get("debugData") or {}
+    resource_type_detail = debug_data.get("resourceType")
+    if not resource_type_detail and event_type == "user.authentication.auth_via_mfa":
+        # confirmed live 2026-09-30 against a real tenant: this eventType's
+        # debugData has no `resourceType` field at all, but DOES carry the
+        # real authenticator/factor used (e.g. OKTA_VERIFY_PUSH,
+        # SIGNED_NONCE/FastPass, GOOGLE_AUTHENTICATOR) in `factor` --
+        # without this, the MFA Enforcement report's resource_type_detail
+        # column was always blank and fell back to the target's generic
+        # "AuthenticatorEnrollment" type for every row, which can't
+        # distinguish a push challenge from a TOTP code or a FastPass
+        # phishing-resistant verification -- real information an auditor
+        # asking "which factor types are actually in use" needs.
+        resource_type_detail = debug_data.get("factor")
     return resource_id or None, resource_alternate_id or None, resource_type_detail or None
 
 

@@ -512,6 +512,52 @@ export interface AccessActiveDirectoryConnection {
   status?: string
 }
 
+// A Client is an end user's local OPA client install (laptop/workstation
+// running the desktop app or `sft`) -- confirmed live 2026-09-30 against
+// the real opa-minimal.yaml spec AND a real tenant (patlabs, 10 real
+// enrolled clients). Distinct from a Server/Gateway: this is what a
+// HUMAN enrolls to be able to make SSH/RDP connections at all, not a
+// managed resource being connected to.
+export interface AccessClient {
+  id: string
+  user_name: string
+  description?: string
+  hostname: string
+  os: string
+  encrypted: boolean
+  deleted_at?: string | null
+  state: 'ACTIVE' | 'PENDING' | 'DELETED'
+}
+
+// Okta's own org-wide Device inventory (GET /api/v1/devices) -- confirmed
+// live 2026-10-01, deliberately kept separate from AccessClient above (OPA
+// client vs. Okta-managed device are genuinely different resources, see
+// OktaClient.list_devices' docstring). Only populated when the active
+// environment has Okta credentials configured (optional, see
+// EnvironmentSetup) -- an empty array otherwise, not an error.
+export interface AccessDevice {
+  id: string
+  status: string
+  created?: string
+  lastUpdated?: string
+  profile: {
+    displayName?: string
+    platform?: string
+    manufacturer?: string
+    model?: string
+    osVersion?: string
+    serialNumber?: string
+    registered?: boolean
+    secureHardwarePresent?: boolean
+    diskEncryptionType?: string
+  }
+  // GET /api/v1/devices/{id}/authenticator-enrollments -- confirmed live
+  // 2026-10-01, only after the user enabled the underlying Okta feature;
+  // empty (not missing) on orgs without it, see
+  // OktaClient.get_device_authenticator_enrollments' docstring.
+  authenticator_enrollments: { id: string; key: string; name: string; status: string }[]
+}
+
 // A relationship is a named grant type (e.g. "TDI_Safe_Owners"); an
 // assignment links one or more relationships to a principal (a real
 // user_group, confirmed live) plus the specific resource(s) it grants.
@@ -571,6 +617,8 @@ export interface AccessModel {
   active_directory_connections: AccessActiveDirectoryConnection[]
   assignments: AccessAssignment[]
   relationships: AccessRelationship[]
+  clients: AccessClient[]
+  devices: AccessDevice[]
 }
 
 // ── Access Explorer: AD account-discovery configuration ──────────────────

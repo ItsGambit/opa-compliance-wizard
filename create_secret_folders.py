@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.25.1
+# Version     : 5.26.0
 # =============================================================================
 
 import argparse
@@ -78,7 +78,7 @@ import urllib.request
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.25.1"
+SCRIPT_VERSION = "5.26.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -121,6 +121,16 @@ GATEWAYS_PATH = "/v1/teams/{team}/gateways"
 DATABASE_CONNECTIONS_PATH = "/v1/teams/{team}/connections/databases"
 SAAS_APP_CONNECTIONS_PATH = "/v1/teams/{team}/connections/saas_apps"
 ACTIVE_DIRECTORY_CONNECTIONS_PATH = "/v1/teams/{team}/connections/active_directory"
+# Confirmed live 2026-09-30 against the real opa-minimal.yaml OpenAPI spec
+# AND a real tenant (patlabs) -- tenant-wide, same family as the
+# connections/* paths above. A Client is an END USER's local OPA client
+# install (laptop/workstation running the OPA desktop app or `sft`), NOT
+# a managed server/gateway resource -- it's what a human enrolls to be
+# able to make SSH/RDP connections at all. Real fields confirmed live:
+# id, user_name, description, hostname, os, encrypted, deleted_at, state
+# (state is ACTIVE/PENDING/DELETED). ?all=true is required to see every
+# client across the team rather than just the caller's own.
+CLIENTS_PATH = "/v1/teams/{team}/clients"
 USERS_PATH = "/v1/teams/{team}/users"
 USER_GROUPS_PATH = USERS_PATH + "/{user_name}/groups"
 PROJECT_SERVERS_PATH = PROJECTS_PATH + "/{project_id}/servers"
@@ -1551,6 +1561,16 @@ class OpaClient:
         path = ACTIVE_DIRECTORY_CONNECTIONS_PATH.format(team=self.team_name)
         return self._list(path)
 
+    def list_clients(self):
+        """Confirmed live 2026-09-30 against a real tenant (patlabs, 10 real
+        enrolled clients returned) -- every end-user OPA client (laptop/
+        workstation) enrolled for this team, not just the caller's own
+        (requires ?all=true, per the spec's own ListClients description:
+        'By default, this only returns clients associated with the
+        requesting user')."""
+        path = CLIENTS_PATH.format(team=self.team_name) + "?all=true"
+        return self._list(path)
+
     def list_project_servers(self, resource_group_id, project_id):
         path = PROJECT_SERVERS_PATH.format(
             team=self.team_name, resource_group_id=resource_group_id, project_id=project_id
@@ -1745,6 +1765,62 @@ class OktaClient:
         their login/email -- and System Log's actor.id is that Okta
         identity id, not the PAM one."""
         return self.request("GET", f"/api/v1/users/{urllib.parse.quote(identifier, safe='')}")
+
+    def get_device_authenticator_enrollments(self, device_id):
+        """GET /api/v1/devices/{id}/authenticator-enrollments -- confirmed
+        live 2026-10-01 (initially 401'd with "Missing capability" until
+        the user enabled the underlying Okta feature flag mid-session;
+        re-confirmed working immediately after). Real shape: a list of
+        {id, type, key (e.g. "okta_verify"), name, status}, one per
+        authenticator the device itself has verified/enrolled -- distinct
+        from the user.authentication.auth_via_mfa event-level `factor`
+        field (see audit_store._resource_fields), which only shows what
+        was used in ONE sign-in, not every authenticator this device is
+        capable of using going forward."""
+        return self.request("GET", f"/api/v1/devices/{urllib.parse.quote(device_id, safe='')}/authenticator-enrollments")
+
+    def list_devices(self):
+        """GET /api/v1/devices, following Link: rel="next" (same generic
+        _parse_next_link helper the System Log pagination already uses --
+        confirmed live 2026-10-01 this header shape matches). This is
+        Okta's own org-wide DEVICE inventory (laptops/phones enrolled for
+        MFA/device-trust purposes) -- a genuinely separate thing from
+        OpaClient.list_clients' OPA Clients (the PAM connection agent a
+        human runs to make SSH/RDP connections). A person can have an
+        Okta-managed device with zero OPA clients (never touches PAM) or
+        an OPA client with no matching Okta-managed device (BYOD laptop,
+        device trust not enforced) -- confirmed live by comparing this
+        tenant's real device/client lists, which only partially overlap
+        by hostname/serial. Real fields confirmed live: id, created,
+        lastUpdated, status (ACTIVE/SUSPENDED/etc.), profile.displayName/
+        platform/manufacturer/model/osVersion/serialNumber/registered/
+        secureHardwarePresent/diskEncryptionType (not all present on every
+        platform -- e.g. iOS devices had no diskEncryptionType).
+
+        Each returned device gets an added `authenticator_enrollments` key
+        (one extra API call per device -- confirmed live this is a small,
+        per-end-user-headcount-bounded list, not per-resource like
+        folders/secrets, so this doesn't scale badly the way a naive
+        per-folder call would). A device whose enrollments can't be
+        fetched (e.g. the underlying Okta feature isn't enabled for this
+        org) gets an empty list rather than failing the whole bootstrap --
+        confirmed live this really does 401 on orgs without the feature
+        flag on, not something to let take down every other resource kind
+        in the same bootstrap pass."""
+        devices = []
+        next_path = "/api/v1/devices?limit=200"
+        while next_path:
+            resp, headers = self.request("GET", next_path, return_headers=True)
+            devices.extend(resp or [])
+            next_path = _parse_next_link(headers)
+            if next_path and next_path.startswith(self.base_url):
+                next_path = next_path[len(self.base_url):]
+        for d in devices:
+            try:
+                d["authenticator_enrollments"] = self.get_device_authenticator_enrollments(d["id"])
+            except OktaApiError:
+                d["authenticator_enrollments"] = []
+        return devices
 
     def get_system_log(self, filter_expr=None, since=None, until=None, limit=1000, sort_order="DESCENDING", max_pages=50):
         """GET /api/v1/logs, following the Link: rel="next" header until
@@ -2956,6 +3032,8 @@ ACCESS_MODEL_STEPS = [
     ("groups", "Fetching groups"),
     ("users", "Fetching users"),
     ("workload_roles", "Fetching workload roles"),
+    ("clients", "Fetching enrolled clients"),
+    ("devices", "Fetching Okta-managed devices"),
     ("projects", "Fetching projects"),
     ("index_resources", "Indexing project resources (folders, secrets, servers, accounts)"),
     ("user_groups", "Fetching user group memberships"),
@@ -2976,7 +3054,7 @@ def _report(on_progress, key, status, detail=None):
         pass
 
 
-def build_access_model(client, on_progress=None):
+def build_access_model(client, okta_client=None, on_progress=None):
     """Fetches resource groups, projects, groups, users (+ their groups),
     and every security policy, then resolves each policy rule's selectors
     down to a specific project where possible (see module notes above).
@@ -2988,6 +3066,14 @@ def build_access_model(client, on_progress=None):
     discovered, per project's server/SaaS/Okta-UD list, and per user's
     group membership -- http_json_request's rate-limit handling is what
     keeps this safe on a tenant with real data volume.
+
+    okta_client is OPTIONAL -- an environment's Okta URL/API token are
+    themselves optional (only needed for group creation, per the
+    environment setup form), so this falls back to an empty devices list
+    rather than failing the whole bootstrap when they're not configured.
+    When present, pulls Okta's own org-wide Device inventory (confirmed
+    live 2026-10-01, GET /api/v1/devices) -- a genuinely separate resource
+    from OpaClient.list_clients' OPA Clients, see list_devices' docstring.
 
     on_progress(key, status, detail), if given, is called as
     ("start"|"progress"|"done") events matching ACCESS_MODEL_STEPS above --
@@ -3066,6 +3152,15 @@ def build_access_model(client, on_progress=None):
             f"{len(saas_app_connections)} SaaS app connection(s), "
             f"{len(active_directory_connections)} AD connection(s), "
             f"{len(assignments)} assignment(s), {len(relationships)} relationship(s)")
+
+    _report(on_progress, "clients", "start")
+    clients = client.list_clients()
+    _report(on_progress, "clients", "done", f"{len(clients)} enrolled client(s)")
+
+    _report(on_progress, "devices", "start")
+    devices = okta_client.list_devices() if okta_client else []
+    _report(on_progress, "devices", "done",
+            f"{len(devices)} device(s)" if okta_client else "skipped (no Okta credentials configured)")
 
     _report(on_progress, "projects", "start")
     projects_by_rg = [(rg, client.list_projects(rg["id"])) for rg in resource_groups]
@@ -3284,6 +3379,8 @@ def build_access_model(client, on_progress=None):
         "active_directory_connections": active_directory_connections,
         "assignments": assignments,
         "relationships": relationships,
+        "clients": clients,
+        "devices": devices,
     }
 
 

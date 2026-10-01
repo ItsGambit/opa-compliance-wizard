@@ -1,14 +1,17 @@
 # OPA Compliance Wizard
 
-**A compliance evidence generator for Okta Privileged Access (OPA) and
-core Okta.** Okta's own System Log only keeps 90 days of history; most
-audits (SOC 2, SOX, ISO 27001) ask for 12 months or more. This tool
-closes that gap — it continuously archives System Log history past
-Okta's retention window and turns it into 14 pre-built, framework-mapped
-reports, so you're not stuck trying to produce evidence Okta itself has
-already aged out. It also includes the tool this project started as:
-building and managing OPA vault secret folders, resource groups,
-projects, and access policies.
+**A compliance evidence helper for Okta Privileged Access (OPA) and core
+Okta.** Okta's own System Log only keeps 90 days of history; most audits
+(SOC 2, SOX, ISO 27001) ask for 12 months or more. This tool closes that
+gap — it continuously archives System Log history past Okta's retention
+window and turns it into 16 pre-built, framework-mapped reports, giving
+PAM admins the underlying evidence their auditors ask for without
+needing to know Okta's System Log event-type names or write a query. It
+doesn't produce a finished SOC 2/SOX/ISO 27001 report on its own — it
+gets you most of the way there, and that's the direction this project is
+headed. It also includes the tool this project started as: building and
+managing OPA vault secret folders, resource groups, projects, and access
+policies.
 
 Ships as both an interactive dashboard for everyday use and a CLI for
 scripting — same underlying engine, no logic duplicated between them.
@@ -48,10 +51,13 @@ worth reporting privately.
 
 ## What it does
 
-1. **Generates compliance-ready audit reports** — SOC 2 / SOX / ISO 27001
-   evidence (MFA enforcement, provisioning, privileged access, policy
-   changes, and more) from a local, indefinitely-retained archive of Okta
-   System Log + OPA activity. **This is the primary use case.** See
+1. **Generates audit-ready evidence reports** — MFA enforcement,
+   provisioning, privileged access, policy changes, and more — from a
+   local, indefinitely-retained archive of Okta System Log + OPA
+   activity, mapped to the controls auditors ask about (SOC 2, SOX,
+   ISO 27001). This is the data PAM admins need to hand their auditors;
+   it isn't a finished SOC 2/SOX/ISO 27001 report in itself. **This is
+   the primary use case.** See
    [Compliance Reports Dashboard](docs/features.md#compliance-reports-dashboard).
 2. **Creates a tree of OPA vault secret folders** (any depth) — and, if
    needed, the resource group / project / access group they live under —

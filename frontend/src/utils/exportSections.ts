@@ -131,6 +131,22 @@ export function accessModelExportSections(model: AccessModel): ExportSection[] {
       rows: model.groups.map(g => ({ Group: g.name, Roles: g.roles.join(', ') })),
     },
     { title: 'Relationships & Assignments', rows: relationshipAssignmentRows(model) },
+    {
+      title: 'Enrolled Clients',
+      rows: model.clients.map(c => ({
+        Hostname: c.hostname, User: c.user_name, OS: c.os,
+        Encrypted: c.encrypted ? 'Yes' : 'No', State: c.state,
+      })),
+    },
+    {
+      title: 'Okta-Managed Devices',
+      rows: model.devices.map(d => ({
+        Name: d.profile.displayName ?? '', Platform: d.profile.platform ?? '',
+        'OS Version': d.profile.osVersion ?? '', Status: d.status,
+        'Disk Encryption': d.profile.diskEncryptionType ?? '',
+        Authenticators: d.authenticator_enrollments.map(a => a.name).join(', '),
+      })),
+    },
   ]
 }
 

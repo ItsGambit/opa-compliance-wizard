@@ -72,20 +72,20 @@ fixes that gap. This dashboard closes it by continuously archiving
 System Log events into a local, indefinitely-retained store (SQLite —
 see [Hosting on a server](hosting.md#hosting-on-a-server-optional) for why that
 choice, not a bigger database, is the right one here), then serving
-14 pre-built reports on top of that archive.
+16 pre-built reports on top of that archive.
 
-**The 14 reports, grouped by SOC 2 Trust Services Criteria** (each maps
+**The 16 reports, grouped by SOC 2 Trust Services Criteria** (each maps
 to a specific, live-verified set of real Okta/OPA event types — nothing
 here is a guess or a report card that will silently always read zero):
 
-- **CC6 — Access Controls:** MFA Enforcement, Session Activity,
-  Provisioning & De-provisioning, Role/Group Changes, Admin Privilege
-  Grants, JIT Access Requests
-- **CC7 — System Operations:** Threat Detection, API Token Lifecycle
-- **CC8 — Change Management:** Policy Modifications
-- **Privileged Access (OPA/PAM):** Secrets Activity, PAM JIT
-  Checkout/Checkin, Session Logins, Credential Reveals, PAM Policy
-  Modifications
+- **CC6 — Access Controls:** MFA Enforcement, Provisioning &
+  De-provisioning, Role/Group Changes, Admin Privilege Grants, JIT
+  Access Requests, PAM Secrets, PAM JIT Access (Checkout/Checkin), PAM
+  Credential Reveals, Client Enrollment, Device Management
+- **CC7 — System Operations:** Session Activity, Threat Detection, PAM
+  Sessions, Active Directory Sync Activity
+- **CC8 — Change Management:** API Token Lifecycle, Policy
+  Modifications, PAM Policy Modifications, Credential Rotation
 
 Click any report card to open its detail view: a date-range filter and
 a results table in the **four-field audit standard** — **User**,
@@ -104,13 +104,13 @@ retention indicator):
 
 - **Ingestion scope** — a real either/or choice made at the point data
   is written in, not a filter applied afterward:
-  - *Curated only* — store just the ~20 event types the 14 reports
+  - *Curated only* — store just the ~20 event types the 16 reports
     above actually use. Smallest footprint; the right default for most
     deployments, especially larger tenants with high daily event
     volume.
   - *Everything* — store every System Log event type, for teams who
     want the full tenant history available for ad-hoc investigation
-    beyond these 14 reports. Bigger archive, same reports.
+    beyond these 16 reports. Bigger archive, same reports.
 - **Retention** — a separate setting layered on top of whichever scope
   you picked: a time window (e.g. "keep 2 years"), a size cap, or both.
   Curated events are the evidence trail itself, so they're **never**

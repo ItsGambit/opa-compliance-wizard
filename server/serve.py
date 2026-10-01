@@ -266,9 +266,11 @@ def _access_job_progress(storage_name):
     return _progress
 
 
-def _run_access_job(storage_name, job_client):
+def _run_access_job(storage_name, job_client, job_okta_client):
     try:
-        result = engine.build_access_model(job_client, on_progress=_access_job_progress(storage_name))
+        result = engine.build_access_model(
+            job_client, okta_client=job_okta_client, on_progress=_access_job_progress(storage_name)
+        )
         with _access_jobs_lock:
             _access_jobs[storage_name]["status"] = "done"
             _access_jobs[storage_name]["result"] = result
@@ -1359,7 +1361,9 @@ class Handler(SimpleHTTPRequestHandler):
                     if _access_jobs.get(storage_name, {}).get("status") == "running":
                         return self._send_json(200, {"started": False, "already_running": True})
                     _access_jobs[storage_name] = {"status": "running", "steps": [], "error": None, "result": None}
-                threading.Thread(target=_run_access_job, args=(storage_name, local_client), daemon=True).start()
+                threading.Thread(
+                    target=_run_access_job, args=(storage_name, local_client, local_okta_client), daemon=True
+                ).start()
                 return self._send_json(200, {"started": True, "steps": engine.ACCESS_MODEL_STEPS})
 
             if path == "/api/resource_groups":
