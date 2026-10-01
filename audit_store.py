@@ -28,6 +28,7 @@ import csv
 import hashlib
 import json
 import os
+import secrets
 import sqlite3
 import threading
 import uuid
@@ -492,9 +493,40 @@ def _migration_002_ingestion_manifests(conn):
     """)
 
 
+def _migration_003_pending_admin_actions(conn):
+    """Phase 3: a server-held pending-action record binding a step-up MFA
+    approval to the EXACT payload that was reviewed, closing the gap
+    where a step-up cookie (valid for any payload submitted within its
+    TTL) could be used to apply a DIFFERENT access_control.json change
+    than the one the admin actually looked at -- see
+    create_pending_admin_action/consume_pending_admin_action below.
+
+    Deliberately NO FOREIGN KEY -- actor_sub is an Okta subject
+    identifier, not a row in any table this app owns (same reasoning as
+    ingestion_manifests' own just-shipped precedent: don't borrow
+    app_environments' ON DELETE CASCADE convention for a table that
+    isn't an environment-scoped administrative pointer)."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS pending_admin_actions (
+            action_id TEXT PRIMARY KEY,
+            actor_sub TEXT NOT NULL,
+            action_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            consumed_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pending_admin_actions_expires
+            ON pending_admin_actions (expires_at);
+    """)
+
+
 MIGRATIONS = {
     1: _migration_001_unified_schema,
     2: _migration_002_ingestion_manifests,
+    3: _migration_003_pending_admin_actions,
 }
 
 
@@ -531,6 +563,7 @@ def init_db():
     create_secret_folders.migrate_legacy_environments_json()
     backfill_resource_columns()
     backfill_event_targets()
+    _cleanup_expired_pending_admin_actions()
 
 
 # ---------------------------------------------------------------------------
@@ -759,6 +792,108 @@ def verify_ingestion_chain(environment_id):
             return {"valid": False, "manifest_count": len(rows), "broken_at": row["id"]}
         expected_prev = row["batch_hash"]
     return {"valid": True, "manifest_count": len(rows), "broken_at": None}
+
+
+class PendingActionError(Exception):
+    """Phase 3: raised by consume_pending_admin_action with a specific,
+    HTTP-layer-actionable `reason` -- "not_found", "expired",
+    "already_consumed", or "actor_mismatch" -- so a caller can return a
+    precise error (e.g. "your session expired, try again" vs. a generic
+    403) instead of collapsing every failure into one bare status code."""
+
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(reason)
+
+
+def create_pending_admin_action(actor_sub, action_type, payload, ttl_seconds):
+    """Mints an unguessable action_id (secrets.token_urlsafe, server-side
+    only -- never client-supplied) and stores `payload` -- the EXACT
+    settings an admin reviewed before triggering a step-up MFA
+    transaction -- server-side, keyed by that id. This is the mechanism
+    that closes the real gap confirmed in this app's step-up flow: a
+    step-up cookie, once issued, previously authorized ANY payload
+    submitted within its TTL by that sub, not specifically the one shown
+    on screen when step-up was triggered. The browser now only ever
+    carries this opaque action_id through the Okta redirect (see
+    auth_gate.py's FLOW_COOKIE/STEPUP_COOKIE), never the actual settings.
+
+    payload_hash (sha256 of the canonical, sorted-keys JSON encoding) is
+    stored as defense-in-depth alongside the action_id lookup itself --
+    not currently re-verified by consume_pending_admin_action (the
+    action_id -> payload_json binding is already exact), but gives any
+    future auditor/caller a cheap way to confirm a stored payload wasn't
+    altered after the fact without needing to trust the row's own
+    plaintext column."""
+    conn = _get_connection()
+    action_id = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    payload_json = json.dumps(payload, separators=(",", ":"))
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    payload_hash = hashlib.sha256(canonical.encode()).hexdigest()
+    with _db_lock:
+        conn.execute(
+            """INSERT INTO pending_admin_actions
+               (action_id, actor_sub, action_type, payload_json, payload_hash, created_at, expires_at, consumed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, NULL)""",
+            (action_id, actor_sub, action_type, payload_json, payload_hash,
+             now.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+             (now + timedelta(seconds=ttl_seconds)).strftime("%Y-%m-%dT%H:%M:%S.000Z")),
+        )
+        conn.commit()
+    return action_id
+
+
+def consume_pending_admin_action(action_id, actor_sub):
+    """Looks up `action_id`, verifies it belongs to `actor_sub`, hasn't
+    expired, and hasn't already been consumed -- if all three hold,
+    marks it consumed and returns the stored payload (parsed from JSON).
+    Raises PendingActionError otherwise, with a specific `reason`.
+
+    Single-use is enforced via one UPDATE ... WHERE consumed_at IS NULL
+    followed by checking cur.rowcount, inside the SAME _db_lock-held
+    transaction as the lookup -- mirrors _insert_rows' own
+    INSERT-OR-IGNORE-then-check-rowcount dedup discipline, so two
+    concurrent consume attempts for the same action_id can't both
+    observe consumed_at IS NULL and both succeed."""
+    conn = _get_connection()
+    with _db_lock:
+        row = conn.execute(
+            "SELECT * FROM pending_admin_actions WHERE action_id = ?", (action_id,)
+        ).fetchone()
+        if row is None:
+            raise PendingActionError("not_found")
+        if row["actor_sub"] != actor_sub:
+            raise PendingActionError("actor_mismatch")
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        if row["expires_at"] < now_iso:
+            raise PendingActionError("expired")
+        cur = conn.execute(
+            "UPDATE pending_admin_actions SET consumed_at = ? WHERE action_id = ? AND consumed_at IS NULL",
+            (now_iso, action_id),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            raise PendingActionError("already_consumed")
+    return json.loads(row["payload_json"])
+
+
+def _cleanup_expired_pending_admin_actions():
+    """Bounded, cheap sweep -- deletes expired-and-never-consumed rows.
+    Called once from init_db() (same place backfill_resource_columns/
+    backfill_event_targets already run on boot), not on a scheduler --
+    prevents indefinite accumulation of abandoned actions (an admin who
+    starts a step-up flow and never completes it) without needing new
+    scheduling infrastructure for what is, at this app's scale, a tiny
+    table."""
+    conn = _get_connection()
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    with _db_lock:
+        conn.execute(
+            "DELETE FROM pending_admin_actions WHERE expires_at < ? AND consumed_at IS NULL",
+            (now_iso,),
+        )
+        conn.commit()
 
 
 def is_first_sync(environment_id):

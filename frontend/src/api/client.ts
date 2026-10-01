@@ -71,11 +71,23 @@ export function fetchAccessControl(): Promise<AccessControlConfig> {
   return apiFetch('/api/access_control')
 }
 
+// Validates the proposed config and stores it server-side, keyed by an
+// opaque action_id -- the browser carries ONLY that id through the Okta
+// step-up redirect (see AccessControlDialog.tsx's handleSaveClick), never
+// the actual settings. Closes the gap where a step-up cookie could
+// previously be replayed to apply any payload, not just the one reviewed.
+export function prepareAccessControl(config: AccessControlConfig): Promise<{ action_id: string }> {
+  return apiFetch('/api/access_control/prepare', { method: 'POST', body: JSON.stringify(config) })
+}
+
 // Reachable only right after a completed step-up (fresh MFA) redirect --
 // see AccessControlDialog.tsx's save flow and nginx's dedicated
-// auth_request /verify_stepup gate on this exact path.
-export function saveAccessControl(config: AccessControlConfig): Promise<AccessControlConfig> {
-  return apiFetch('/api/access_control/save', { method: 'POST', body: JSON.stringify(config) })
+// auth_request /verify_stepup gate on this exact path. Takes no body --
+// the server retrieves the exact prepared payload via the action_id bound
+// into the step-up cookie itself (X-Auth-Action-Id), never trusting
+// anything the client sends here.
+export function saveAccessControl(): Promise<AccessControlConfig> {
+  return apiFetch('/api/access_control/save', { method: 'POST' })
 }
 
 export function saveEnvironment(values: EnvironmentFormValues): Promise<{ activated: boolean; active: string }> {

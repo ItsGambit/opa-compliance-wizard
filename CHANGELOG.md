@@ -2,6 +2,82 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.31.0 — **Fast-follow Phase 3+4 of 11 of docs/fast-follow-redesign.md:
+step-up MFA is now a real server-side transaction, not a browser-held
+replay window.** Real gap closed: previously, the step-up cookie
+`auth_gate.py` issues after a passing Identity Engine MFA challenge only
+proved "fresh MFA happened for this sub within the last 120s" -- it was
+never bound to the specific `admin_group_id`/`user_group_id`/
+`restrict_login` values the admin reviewed before clicking Save. The
+actual settings lived unsigned in the browser's `sessionStorage` and
+were POSTed fresh on return, with `/api/access_control/save` never
+comparing them against anything reviewed earlier -- once issued, a
+step-up cookie authorized **any** payload submitted by that sub within
+its TTL, not specifically the one shown on screen.
+- Researched Okta's own guidance before designing a fix: Okta's ACR
+  step-up docs only cover assurance *level* (`auth_time`/`acr` claims),
+  not transaction binding. Okta's dynamic-linking/Rich-Authorization-
+  Request guidance (FAPI 1 Advanced, PAR, JAR, mTLS, CIBA push
+  approvals) is the full-strength version of this problem -- financial-
+  grade infrastructure for a dedicated authorization server and a
+  separate approver device, a different product tier than an admin-
+  settings form on this app. The right-sized fix matches the standard
+  OAuth/OIDC `state`-parameter best practice (confirmed via Auth0's own
+  guidance): never trust a client-held copy of the pending action --
+  store the real payload server-side, keyed by an opaque id carried
+  through the redirect.
+- New `pending_admin_actions` SQLite table (migration 3,
+  `audit_store.py`): `create_pending_admin_action`/
+  `consume_pending_admin_action` mint/redeem a `secrets.token_urlsafe`
+  `action_id`, single-use (`consumed_at` set via an atomic
+  `UPDATE ... WHERE consumed_at IS NULL` + rowcount check, same dedup
+  discipline as `_insert_rows`), with a specific `PendingActionError`
+  reason (`not_found`/`expired`/`already_consumed`/`actor_mismatch`) for
+  precise, auditable rejection. Deliberately no FK to `app_environments`
+  -- `actor_sub` is an Okta subject identifier, not an environment-scoped
+  row, matching `ingestion_manifests`' own precedent. A bounded cleanup
+  sweep (`_cleanup_expired_pending_admin_actions`, called from
+  `init_db()`) removes abandoned-and-never-consumed rows.
+- `action_id` rides through `auth_gate.py`'s *existing* signed flow
+  cookie (`FLOW_COOKIE`, which already carries `state`/PKCE
+  `verifier`/`purpose`) and into the step-up cookie itself -- one more
+  field on infrastructure this app already has, not a new mechanism.
+  Surfaced to `serve.py` as `X-Auth-Action-Id` (nginx `auth_request_set`,
+  mirroring the now-removed `X-Auth-Mfa-Log-Event` pattern exactly).
+- New `POST /api/access_control/prepare` validates the proposed config
+  (`create_secret_folders.validate_access_control_config`, extracted
+  from `set_access_control_config` so both share one rule, not two
+  copies) and stores it server-side before the browser ever redirects to
+  Okta. `AccessControlDialog.tsx`'s `handleSaveClick` now calls
+  `/prepare` first and carries only the returned `action_id` through
+  `/step-up?action_id=...` -- the browser never holds the actual
+  settings again. `App.tsx`'s step-up-return handler is now a no-arg
+  finalize call; the `sessionStorage` round-trip (`PENDING_SAVE_KEY`) is
+  deleted entirely, not left as dead code.
+- `/api/access_control/save` no longer trusts its request body for the
+  settings themselves -- it consumes the pending action via
+  `X-Auth-Action-Id` and applies **exactly** the stored payload.
+  `step_up_verified: true` in the audit entry now actually means
+  something (derived from a successful consume), not hardcoded-true-by-
+  construction as before.
+- **Phase 4**: the synchronous Okta System Log corroboration lookup
+  (`_find_stepup_mfa_log_event`, up to 4 retries / ~6s of added redirect
+  latency) is removed outright -- `pending_admin_actions` is now the
+  authoritative record, so blocking the step-up redirect on Okta's own
+  log catching up bought nothing but optional corroborating evidence.
+  The existing async Audit-Log-page Refresh button
+  (`backfill_mfa_log_events`/`_lookup_mfa_log_event`/
+  `INTERNAL_API_SHARED_SECRET`'s loopback endpoint) is left exactly as-is
+  -- it already provides "best-effort corroboration, filled in later,"
+  just without a synchronous blocking call. `_mfa_log_event_from_headers`
+  and the now-dead `base64` import were removed from `server/serve.py`.
+- New `tests/test_pending_admin_actions.py` (12 tests): create/consume
+  round-trip, single-use enforcement, expiry, actor-mismatch rejection,
+  canonical-hash stability, cleanup sweep correctness, and an HTTP-level
+  test proving `/save` applies the EXACT payload prepared earlier even
+  when a tampered body is sent to `/save` itself -- the actual regression
+  this phase exists to prevent, plus a direct replay-rejection test.
+
 5.30.0 — **Fast-follow Phase 6 of 11 of docs/fast-follow-redesign.md:
 a hash-chained ingestion batch manifest**, giving the compliance archive
 a cheap, mechanical answer to "has this been tampered with since

@@ -1,19 +1,11 @@
 import { useEffect, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation } from '@tanstack/react-query'
 import { ShieldCheck, X } from 'lucide-react'
 import { toast } from '../hooks/useToast'
 import { useAccessControl } from '../api/hooks'
-import { saveAccessControl } from '../api/client'
+import { prepareAccessControl } from '../api/client'
 import type { AccessControlConfig } from '../types'
-
-// sessionStorage key for the pending form values while the browser is away
-// at Okta completing a step-up MFA challenge (see the Save button's
-// onClick below) -- App.tsx reads this back on mount when it sees
-// ?stepup_complete=1 in the URL. sessionStorage (not localStorage) is
-// deliberate: a stale pending save should never survive into a new tab or
-// a later day, only the single in-flight step-up round trip.
-export const PENDING_SAVE_KEY = 'opa-access-control-pending-save'
 
 interface Props {
   // Both optional -- omit for the self-contained trigger button (falls back
@@ -28,7 +20,6 @@ export function AccessControlDialog({ open: openProp, onOpenChange }: Props = {}
   const open = openProp ?? openState
   const setOpen = onOpenChange ?? setOpenState
   const { data: config } = useAccessControl(open)
-  const queryClient = useQueryClient()
 
   const [adminGroupId, setAdminGroupId] = useState('')
   const [userGroupId, setUserGroupId] = useState('')
@@ -45,33 +36,37 @@ export function AccessControlDialog({ open: openProp, onOpenChange }: Props = {}
     }
   }, [open, config])
 
-  const saveMutation = useMutation({
-    mutationFn: (values: AccessControlConfig) => saveAccessControl(values),
-    onSuccess: () => {
-      toast({ title: 'Access control settings saved', variant: 'success' })
-      queryClient.invalidateQueries({ queryKey: ['access_control'] })
-      setOpen(false)
+  // Phase 3: validates+stores the proposed config server-side (keyed by
+  // an opaque action_id) BEFORE ever leaving this page -- the browser
+  // carries only that id through the step-up redirect, never the actual
+  // settings (closes the gap where a step-up cookie, once issued, could
+  // previously be replayed to apply ANY payload within its TTL, not just
+  // the one shown on screen here).
+  const prepareMutation = useMutation({
+    mutationFn: (values: AccessControlConfig) => prepareAccessControl(values),
+    onSuccess: ({ action_id }) => {
+      window.location.href = `/step-up?action_id=${encodeURIComponent(action_id)}`
     },
-    onError: (err: Error) => toast({ title: 'Could not save access control settings', description: err.message, variant: 'error' }),
+    onError: (err: Error) => toast({ title: 'Could not start the save flow', description: err.message, variant: 'error' }),
   })
 
   const canSave = !restrictLogin || adminGroupId.trim() || userGroupId.trim()
 
   // Saving requires a FRESH MFA challenge, not just the existing admin
-  // session -- stash the pending values, then leave the page entirely for
-  // Okta's step-up redirect (see server/auth_gate.py's /step-up route).
-  // There's no reliable popup/iframe path for step-up given third-party
-  // cookie restrictions, and this app's ordinary login is already a full
-  // redirect, so this follows the same shape rather than inventing a new
-  // one. App.tsx picks the pending values back up on the way back in.
+  // session -- prepare the pending change server-side, then leave the
+  // page entirely for Okta's step-up redirect (see server/auth_gate.py's
+  // /step-up route). There's no reliable popup/iframe path for step-up
+  // given third-party cookie restrictions, and this app's ordinary login
+  // is already a full redirect, so this follows the same shape rather
+  // than inventing a new one. App.tsx finalizes the save on the way back
+  // in (?stepup_complete=1) -- it needs no payload of its own anymore,
+  // since the server already has the exact reviewed values.
   const handleSaveClick = () => {
-    const pending: AccessControlConfig = {
+    prepareMutation.mutate({
       admin_group_id: adminGroupId.trim() || null,
       user_group_id: userGroupId.trim() || null,
       restrict_login: restrictLogin,
-    }
-    sessionStorage.setItem(PENDING_SAVE_KEY, JSON.stringify(pending))
-    window.location.href = '/step-up'
+    })
   }
 
   return (
@@ -148,7 +143,7 @@ export function AccessControlDialog({ open: openProp, onOpenChange }: Props = {}
             <button
               type="button"
               className="btn-primary"
-              disabled={saveMutation.isPending || !canSave}
+              disabled={prepareMutation.isPending || !canSave}
               onClick={handleSaveClick}
             >
               Verify &amp; Save

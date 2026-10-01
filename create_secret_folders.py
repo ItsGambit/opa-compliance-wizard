@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.30.0
+# Version     : 5.31.0
 # =============================================================================
 
 import argparse
@@ -79,7 +79,7 @@ import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.30.0"
+SCRIPT_VERSION = "5.31.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -701,16 +701,27 @@ def get_access_control_config():
     }
 
 
-def set_access_control_config(admin_group_id, user_group_id, restrict_login):
+def validate_access_control_config(admin_group_id, user_group_id, restrict_login):
+    """Shared validation/normalization for access_control.json's three
+    fields -- extracted (Phase 3) so the new /api/access_control/prepare
+    route can validate a proposed config BEFORE minting a pending admin
+    action, using the exact same rule set_access_control_config already
+    enforces, instead of duplicating (and risking drifting from) the
+    check. Returns the normalized {admin_group_id, user_group_id,
+    restrict_login} dict; raises ValueError on an invalid combination."""
     admin_group_id = (admin_group_id or "").strip() or None
     user_group_id = (user_group_id or "").strip() or None
     if restrict_login and not admin_group_id and not user_group_id:
         raise ValueError("at least one group ID is required to restrict login")
-    config = {
+    return {
         "admin_group_id": admin_group_id,
         "user_group_id": user_group_id,
         "restrict_login": bool(restrict_login),
     }
+
+
+def set_access_control_config(admin_group_id, user_group_id, restrict_login):
+    config = validate_access_control_config(admin_group_id, user_group_id, restrict_login)
     _atomic_write_json(_access_control_file_path(), config)
     return config
 

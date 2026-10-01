@@ -4,7 +4,7 @@ import { useEnvironments, useWhoami } from './api/hooks'
 import { saveAccessControl } from './api/client'
 import { toast } from './hooks/useToast'
 import { AboutDialog } from './components/AboutDialog'
-import { AccessControlDialog, PENDING_SAVE_KEY } from './components/AccessControlDialog'
+import { AccessControlDialog } from './components/AccessControlDialog'
 import { AccessExplorer, ACCESS_SUB_TABS } from './components/AccessExplorer'
 import { AnnouncementBanner } from './components/AnnouncementBanner'
 import { AuditLogPage } from './components/AuditLogPage'
@@ -17,7 +17,6 @@ import { FolderBuilder } from './components/FolderBuilder'
 import { SecretsAccessDashboard } from './components/SecretsAccessDashboard'
 import { REPORTS_SUB_TABS, SideNav } from './components/SideNav'
 import { UserMenu } from './components/UserMenu'
-import type { AccessControlConfig } from './types'
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('reports')
@@ -34,13 +33,16 @@ export default function App() {
 
   // Completes the Access Control save flow after the browser comes back
   // from Okta's step-up (fresh MFA) redirect -- see
-  // AccessControlDialog.tsx's Save button, which stashed the pending
-  // values here and navigated away before this component could catch the
-  // response itself. Runs once per completed step-up, not on every render:
-  // the effect strips both the query param AND the sessionStorage entry
+  // AccessControlDialog.tsx's Save button, which already validated and
+  // stored the pending settings server-side (POST /api/access_control/
+  // prepare) before navigating away. This finalize call takes no payload
+  // of its own (Phase 3): the server retrieves the exact reviewed values
+  // via the action_id bound into the step-up cookie itself, never
+  // anything this component could supply. Runs once per completed
+  // step-up, not on every render -- the effect strips the query param
   // immediately, so a page refresh afterward can't accidentally replay it.
   const finishStepUpMutation = useMutation({
-    mutationFn: (values: AccessControlConfig) => saveAccessControl(values),
+    mutationFn: () => saveAccessControl(),
     onSuccess: () => {
       toast({ title: 'Access control settings saved', variant: 'success' })
       queryClient.invalidateQueries({ queryKey: ['access_control'] })
@@ -54,14 +56,7 @@ export default function App() {
     url.searchParams.delete('stepup_complete')
     window.history.replaceState({}, '', url.toString())
 
-    const pendingRaw = sessionStorage.getItem(PENDING_SAVE_KEY)
-    sessionStorage.removeItem(PENDING_SAVE_KEY)
-    if (!pendingRaw) return
-    try {
-      finishStepUpMutation.mutate(JSON.parse(pendingRaw) as AccessControlConfig)
-    } catch {
-      toast({ title: 'Could not save access control settings', description: 'The pending change was lost — please try again.', variant: 'error' })
-    }
+    finishStepUpMutation.mutate()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 

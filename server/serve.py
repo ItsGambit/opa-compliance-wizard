@@ -20,7 +20,6 @@ saves it via POST /api/environments.
 """
 
 import argparse
-import base64
 import csv as _csv
 import json
 import os
@@ -147,6 +146,15 @@ if DEPLOYMENT_MODE == "hosted" and not NGINX_PROXY_SECRET:
         "weakened trust mode. See docs/hosting.md."
     )
 
+# Phase 3: how long a prepared access_control.json change (see
+# /api/access_control/prepare) stays claimable before expiring unused.
+# Must comfortably outlive the full round trip it has to survive: Okta's
+# own flow cookie (auth_gate.py's FLOW_TTL_SECONDS, 10 min -- "redirect
+# to Okta and log in") PLUS the step-up cookie's own window after return
+# (STEPUP_TTL_SECONDS, 120s) -- 15 min gives real margin over both
+# without leaving an abandoned pending action claimable indefinitely.
+STEPUP_PREPARE_TTL_SECONDS = 15 * 60
+
 
 def _request_is_from_nginx(headers):
     """True if NGINX_PROXY_SECRET is unset (nothing to check -- standalone/
@@ -215,21 +223,6 @@ def _is_admin_from_headers(headers):
     if not _request_is_from_nginx(headers):
         return False
     return headers.get("X-Auth-Is-Admin") == "true"
-
-
-def _mfa_log_event_from_headers(headers):
-    """Decodes the Okta System Log event auth_gate.py's /verify_stepup
-    attached (base64 JSON, see that file's _find_stepup_mfa_log_event) --
-    None if absent (no step-up in this request at all) or malformed rather
-    than raising, since this is corroborating detail for the audit trail,
-    never something a save should fail over."""
-    raw = headers.get("X-Auth-Mfa-Log-Event")
-    if not raw:
-        return None
-    try:
-        return json.loads(base64.urlsafe_b64decode(raw).decode())
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
 
 
 def _lookup_mfa_log_event(actor_sub, near_iso_timestamp):
@@ -1258,6 +1251,29 @@ class Handler(SimpleHTTPRequestHandler):
                 self._log_audit_event(actor_email, actor_sub, "banner.update", config)
                 return self._send_json(200, config)
 
+            if path == "/api/access_control/prepare":
+                # Phase 3: validates the PROPOSED config and stores it
+                # server-side (audit_store.pending_admin_actions), keyed
+                # by an opaque action_id the browser carries through the
+                # Okta step-up redirect in place of the actual settings
+                # (see AccessControlDialog.tsx's handleSaveClick and
+                # auth_gate.py's /step-up). Same admin gate as /save
+                # below -- preparing a change an admin isn't allowed to
+                # make at all shouldn't even reach the point of minting a
+                # pending action for it.
+                if owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers(self.headers):
+                    return self._send_json(403, {"error": "Admin access required to change access control settings."})
+                import audit_store
+                config = engine.validate_access_control_config(
+                    payload.get("admin_group_id"),
+                    payload.get("user_group_id"),
+                    payload.get("restrict_login", False),
+                )
+                action_id = audit_store.create_pending_admin_action(
+                    actor_sub, "access_control.update", config, ttl_seconds=STEPUP_PREPARE_TTL_SECONDS
+                )
+                return self._send_json(200, {"action_id": action_id})
+
             if path == "/api/access_control/save":
                 # Admin check here too, in addition to nginx's own
                 # auth_request /verify_stepup gate on this exact path (see
@@ -1270,31 +1286,48 @@ class Handler(SimpleHTTPRequestHandler):
                 # /api/audit_log and GET /api/access_control above.
                 if owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers(self.headers):
                     return self._send_json(403, {"error": "Admin access required to change access control settings."})
+                # Phase 3 FIX (real gap, confirmed via code review before
+                # this change): previously trusted the LIVE request body
+                # for admin_group_id/user_group_id/restrict_login -- the
+                # step-up cookie only proved "fresh MFA happened for this
+                # sub within the last 120s," never that it was approving
+                # THIS specific payload. A step-up cookie, once issued,
+                # could be replayed with ANY settings submitted within its
+                # TTL. Now the request body is never trusted for the
+                # settings themselves -- the ONE payload that was actually
+                # prepared and reviewed is retrieved via the action_id
+                # bound into the step-up cookie itself (threaded through
+                # auth_gate.py's FLOW_COOKIE -> STEPUP_COOKIE, surfaced
+                # here as X-Auth-Action-Id by nginx's auth_request_set,
+                # same mechanism as X-Auth-Mfa-Log-Event).
+                import audit_store
+                action_id = self.headers.get("X-Auth-Action-Id")
+                if not action_id:
+                    return self._send_json(409, {"error": "No pending action -- start the save flow again.", "reason": "not_found"})
+                try:
+                    config = audit_store.consume_pending_admin_action(action_id, actor_sub)
+                except audit_store.PendingActionError as exc:
+                    status = 409 if exc.reason in ("already_consumed", "expired") else 403
+                    return self._send_json(status, {"error": f"Could not apply this change ({exc.reason}) -- please try again.", "reason": exc.reason})
                 config = engine.set_access_control_config(
-                    payload.get("admin_group_id"),
-                    payload.get("user_group_id"),
-                    payload.get("restrict_login", False),
+                    config["admin_group_id"], config["user_group_id"], config["restrict_login"]
                 )
-                # step_up_verified is always true here -- nginx physically
-                # cannot route a request to this path without a fresh,
-                # unexpired step-up cookie (see /verify_stepup); recorded
-                # explicitly anyway so the audit trail itself documents that
-                # this specific change was MFA-gated, not just admin-gated,
-                # matching this project's existing admin_override: true
-                # marker convention for admin-override actions.
+                # step_up_verified is now derived from having successfully
+                # consumed a real pending action bound to this exact
+                # step-up transaction -- not hardcoded-true-by-construction
+                # as before (nginx's auth_request gate still independently
+                # enforces that step-up happened at all; this marker
+                # additionally confirms THIS payload is the one reviewed).
                 #
-                # mfa_log_event is Okta's OWN System Log record of the
-                # user.authentication.auth_via_mfa event that satisfied this
-                # step-up (see auth_gate.py's _find_stepup_mfa_log_event) --
-                # None if Okta's indexing hadn't caught up yet or the query
-                # failed transiently; a miss does NOT block the save (the
-                # step-up cookie itself, verified by nginx before this
-                # request could even arrive, is what actually gates this
-                # endpoint) -- it only means this one entry's audit trail
-                # lacks Okta's own corroboration alongside this process's
-                # self-reported step_up_verified marker.
-                mfa_log_event = _mfa_log_event_from_headers(self.headers)
-                details = {**config, "step_up_verified": True, "okta_mfa_log_event": mfa_log_event}
+                # okta_mfa_log_event starts None here (Phase 4): the
+                # synchronous Okta System Log lookup that used to populate
+                # X-Auth-Mfa-Log-Event at step-up time is removed --
+                # pending_admin_actions is now the authoritative record,
+                # so that lookup's ~6s of added redirect latency bought
+                # nothing but optional corroborating evidence. The Audit
+                # Log page's Refresh button (backfill_mfa_log_events) still
+                # fills this field in asynchronously after the fact.
+                details = {**config, "step_up_verified": True, "okta_mfa_log_event": None}
                 self._log_audit_event(actor_email, actor_sub, "access_control.update", details)
                 return self._send_json(200, config)
 
