@@ -2,6 +2,18 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.29.1 — **Fixes a real crash-loop found live deploying v5.29.0 to the
+Ubuntu server**: `main()` called `_try_activate_saved_environment()`
+(which queries `active_environments`) BEFORE `audit_store.init_db()`
+(which creates that table) -- on this machine it had already been run
+manually in an earlier test, masking the bug; a genuine fresh process
+start (every systemd restart) crash-looped with "no such table:
+active_environments." Fixed by moving `init_db()` first. Caught before
+any real data was touched -- `migrate_legacy_environments_json()` never
+got to run during the crash loop, confirmed via the server's
+`audit_store.db` still showing the old pre-migration schema and all
+193,924 real events intact afterward.
+
 5.29.0 — **Fast-follow Phase 2 of 11 of docs/fast-follow-redesign.md:
 environment metadata (`environments.json`/`banner_config.json`) and the
 compliance archive (`audit_store.py`'s `events`/`sync_state`/

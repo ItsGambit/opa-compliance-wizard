@@ -1835,11 +1835,20 @@ def main():
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
 
+    # BUG FIX (found live deploying Phase 2's SQLite migration to the
+    # Ubuntu server, 2026-10-01): init_db() must run BEFORE anything
+    # touches app_environments/active_environments -- those tables don't
+    # exist until migration 1 creates them. This order was backwards
+    # (activate-then-init_db), which only "worked" by accident on a
+    # machine where init_db() had already been run manually in an earlier
+    # Python process; a real fresh process start (every systemd restart)
+    # crash-looped with "no such table: active_environments."
+    import audit_store
+    audit_store.init_db()
+
     _seen_owners.add(LOCAL_OWNER_KEY_HEADER)
     _try_activate_saved_environment(LOCAL_OWNER_KEY_HEADER)
 
-    import audit_store
-    audit_store.init_db()
     threading.Thread(target=_scheduler_loop, daemon=True).start()
 
     if not FRONTEND_DIST.exists():
