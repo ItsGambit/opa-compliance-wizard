@@ -5,13 +5,15 @@ caught the original F1/F2/F3 cross-tenant bugs (external review,
 them.
 
 Scenario: two different owners each have an environment named "dev".
-Written against the STABLE PUBLIC CONTRACT (environment_storage_name,
-_resolve_admin_target called WITH an explicit environment_id,
-_environment_visible_to, and the HTTP routes' `id` round-trip) rather
-than environments.json's on-disk shape -- per explicit instruction, this
-must keep passing unchanged once a future UUID/SQLite migration
-(fast-follow Phases 1-2) replaces storage_name with a real UUID and moves
-metadata into SQLite.
+Written against the STABLE PUBLIC CONTRACT (_resolve_admin_target called
+WITH an explicit environment_id, _environment_visible_to, and the HTTP
+routes' `id` round-trip) rather than environments.json's on-disk shape.
+
+Real ids are read back from upsert_environment's own return value (it
+returns (name, environment_id)) rather than precomputed via the retired
+environment_storage_name -- Phase 1's UUID migration means there's no
+longer a deterministic function of (owner, name) that produces the real
+id ahead of time; the system has to be asked.
 """
 import socket
 import threading
@@ -30,21 +32,21 @@ def _seed_two_owner_dev_environments(tmp_environments_file, fake_keyring):
     """Builds two "dev" environments, one per owner, directly through the
     real public API (upsert_environment) rather than hand-constructing
     environments.json's shape -- this IS part of the stable contract this
-    test is meant to survive a future storage-format migration against."""
-    engine.upsert_environment(
+    test is meant to survive a future storage-format migration against.
+    Returns (id_a, id_b, data) -- the real ids come straight from
+    upsert_environment's own return value."""
+    _, id_a = engine.upsert_environment(
         "dev",
         {"base_domain": "a.example.com", "team_name": "team-a", "key_id": "key-a", "key_secret": "secret-a"},
         owner=OWNER_A,
     )
-    engine.upsert_environment(
+    _, id_b = engine.upsert_environment(
         "dev",
         {"base_domain": "b.example.com", "team_name": "team-b", "key_id": "key-b", "key_secret": "secret-b"},
         owner=OWNER_B,
     )
     data = engine.load_environments()
-    storage_a = engine.environment_storage_name(OWNER_A, "dev")
-    storage_b = engine.environment_storage_name(OWNER_B, "dev")
-    return storage_a, storage_b, data
+    return id_a, id_b, data
 
 
 # ---------------------------------------------------------------------------
@@ -52,37 +54,37 @@ def _seed_two_owner_dev_environments(tmp_environments_file, fake_keyring):
 #    bare name.
 # ---------------------------------------------------------------------------
 def test_admin_resolves_correct_owner_by_environment_id(tmp_environments_file, fake_keyring):
-    storage_a, storage_b, data = _seed_two_owner_dev_environments(tmp_environments_file, fake_keyring)
+    id_a, id_b, data = _seed_two_owner_dev_environments(tmp_environments_file, fake_keyring)
 
-    resolved_name, meta = engine._resolve_admin_target(data, "dev", storage_b)
-    assert resolved_name == storage_b
+    found_id, meta = engine._resolve_admin_target(data, "dev", id_b)
+    assert found_id == id_b
     assert meta["base_domain"] == "b.example.com"
 
-    resolved_name, meta = engine._resolve_admin_target(data, "dev", storage_a)
-    assert resolved_name == storage_a
+    found_id, meta = engine._resolve_admin_target(data, "dev", id_a)
+    assert found_id == id_a
     assert meta["base_domain"] == "a.example.com"
 
 
 def test_admin_set_environment_shared_targets_only_the_specified_owner(tmp_environments_file, fake_keyring):
-    storage_a, storage_b, _ = _seed_two_owner_dev_environments(tmp_environments_file, fake_keyring)
+    id_a, id_b, _ = _seed_two_owner_dev_environments(tmp_environments_file, fake_keyring)
 
-    engine.set_environment_shared("dev", owner=OWNER_A, shared=True, is_admin=True, environment_id=storage_b)
+    engine.set_environment_shared("dev", owner=OWNER_A, shared=True, is_admin=True, environment_id=id_b)
 
     data = engine.load_environments()
-    assert data["environments"][storage_b]["shared"] is True
+    assert data["environments"][id_b]["shared"] is True
     # Owner A's own "dev" must be completely untouched by an admin action
     # explicitly targeting owner B's environment_id.
-    assert data["environments"][storage_a].get("shared") in (False, None)
+    assert data["environments"][id_a].get("shared") in (False, None)
 
 
 def test_admin_delete_environment_removes_only_the_targeted_owner(tmp_environments_file, fake_keyring):
-    storage_a, storage_b, _ = _seed_two_owner_dev_environments(tmp_environments_file, fake_keyring)
+    id_a, id_b, _ = _seed_two_owner_dev_environments(tmp_environments_file, fake_keyring)
 
-    engine.delete_environment("dev", owner=OWNER_A, is_admin=True, environment_id=storage_b)
+    engine.delete_environment("dev", owner=OWNER_A, is_admin=True, environment_id=id_b)
 
     data = engine.load_environments()
-    assert storage_b not in data["environments"]
-    assert storage_a in data["environments"]  # owner A's "dev" survives
+    assert id_b not in data["environments"]
+    assert id_a in data["environments"]  # owner A's "dev" survives
 
 
 # ---------------------------------------------------------------------------
@@ -114,20 +116,26 @@ def test_shared_environment_is_visible_but_private_one_is_not(tmp_environments_f
 
 
 # ---------------------------------------------------------------------------
-# 3. Access Explorer / sync job isolation (keyed by full storage_name).
+# 3. Access Explorer / sync job isolation (keyed by the real environment_id,
+#    never a bare display name). Two arbitrary ids stand in for two real
+#    environments here -- this test is about id-collision isolation itself,
+#    not about any particular stored environment, so there's no need to
+#    seed real ones via upsert_environment.
 # ---------------------------------------------------------------------------
-def test_access_and_sync_jobs_keyed_by_full_storage_name_not_bare_name():
+def test_access_and_sync_jobs_keyed_by_full_environment_id_not_bare_name():
+    import uuid
+
     import server.serve as serve
 
-    storage_a = engine.environment_storage_name(OWNER_A, "dev")
-    storage_b = engine.environment_storage_name(OWNER_B, "dev")
+    id_a = str(uuid.uuid4())
+    id_b = str(uuid.uuid4())
 
     with serve._access_jobs_lock:
-        serve._access_jobs[storage_a] = {"status": "done", "steps": [], "error": None, "result": "A's model"}
+        serve._access_jobs[id_a] = {"status": "done", "steps": [], "error": None, "result": "A's model"}
 
     with serve._access_jobs_lock:
-        job_for_a = serve._access_jobs.get(storage_a)
-        job_for_b = serve._access_jobs.get(storage_b)
+        job_for_a = serve._access_jobs.get(id_a)
+        job_for_b = serve._access_jobs.get(id_b)
 
     assert job_for_a is not None and job_for_a["result"] == "A's model"
     assert job_for_b is None  # B's job entry must not exist/leak A's result
@@ -177,50 +185,46 @@ def _admin_headers():
 
 
 def test_http_delete_with_environment_id_deletes_only_that_owners_dev(live_server, tmp_environments_file, fake_keyring):
-    storage_a = engine.environment_storage_name(OWNER_A, "dev")
-    storage_b = engine.environment_storage_name(OWNER_B, "dev")
-    engine.upsert_environment(
+    _, id_a = engine.upsert_environment(
         "dev", {"base_domain": "a.example.com", "team_name": "team-a", "key_id": "key-a", "key_secret": "secret-a"},
         owner=OWNER_A,
     )
-    engine.upsert_environment(
+    _, id_b = engine.upsert_environment(
         "dev", {"base_domain": "b.example.com", "team_name": "team-b", "key_id": "key-b", "key_secret": "secret-b"},
         owner=OWNER_B,
     )
 
     resp = requests.delete(
         f"{live_server}/api/environments/dev",
-        params={"id": storage_b},
+        params={"id": id_b},
         headers=_admin_headers(),
         timeout=5,
     )
     assert resp.status_code == 200, resp.text
 
     data = engine.load_environments()
-    assert storage_b not in data["environments"]
-    assert storage_a in data["environments"]
+    assert id_b not in data["environments"]
+    assert id_a in data["environments"]
 
 
 def test_http_share_with_environment_id_shares_only_that_owners_dev(live_server, tmp_environments_file, fake_keyring):
-    storage_a = engine.environment_storage_name(OWNER_A, "dev")
-    storage_b = engine.environment_storage_name(OWNER_B, "dev")
-    engine.upsert_environment(
+    _, id_a = engine.upsert_environment(
         "dev", {"base_domain": "a.example.com", "team_name": "team-a", "key_id": "key-a", "key_secret": "secret-a"},
         owner=OWNER_A,
     )
-    engine.upsert_environment(
+    _, id_b = engine.upsert_environment(
         "dev", {"base_domain": "b.example.com", "team_name": "team-b", "key_id": "key-b", "key_secret": "secret-b"},
         owner=OWNER_B,
     )
 
     resp = requests.post(
         f"{live_server}/api/environments/dev/share",
-        json={"shared": True, "id": storage_b},
+        json={"shared": True, "id": id_b},
         headers=_admin_headers(),
         timeout=5,
     )
     assert resp.status_code == 200, resp.text
 
     data = engine.load_environments()
-    assert data["environments"][storage_b]["shared"] is True
-    assert data["environments"][storage_a].get("shared") in (False, None)
+    assert data["environments"][id_b]["shared"] is True
+    assert data["environments"][id_a].get("shared") in (False, None)

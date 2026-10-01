@@ -9,14 +9,18 @@ export interface SyncSchedule {
 }
 
 export interface Environment {
-  // The real, owner-namespaced storage key (server/serve.py's
-  // _public_entry -- "{owner}::{name}") -- unambiguous even when two
+  // The real, stable environment_id (a random UUID4, server/serve.py's
+  // _public_entry -- see create_secret_folders.py's Phase 1 UUID
+  // migration, docs/fast-follow-redesign.md) -- unambiguous even when two
   // different owners each have an environment named the same thing
   // (confirmed exploitable without this: an admin's edit/share/delete
   // could silently target the wrong owner's environment, and the admin
-  // listing could silently drop one of two same-named entries). Send this,
-  // not `name`, on any admin-override mutation (share/delete/edit) where
-  // ambiguity is possible -- see EnvironmentManagerDialog.tsx.
+  // listing could silently drop one of two same-named entries). Carries no
+  // information about the owner or display name, unlike the retired
+  // "{owner}::{name}" storage_name this replaced -- safe to appear in a
+  // URL, browser history, or support screenshot. Send this, not `name`,
+  // on any admin-override mutation (share/delete/edit) where ambiguity is
+  // possible -- see EnvironmentManagerDialog.tsx.
   id: string
   name: string
   base_domain: string

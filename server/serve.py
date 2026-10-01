@@ -254,16 +254,24 @@ def _lookup_mfa_log_event(actor_sub, near_iso_timestamp):
 
 
 def _session_snapshot(owner_key):
-    """Returns (client, okta_client, env_name) for this owner, all None if
-    they have no active session yet. Snapshotting a dict lookup under the
-    lock, same spirit as the pre-existing single-global snapshot pattern:
-    a concurrent switch/delete for the SAME owner must not affect a request
-    already in flight for that owner."""
+    """Returns (client, okta_client, env_name, env_id) for this owner, all
+    None if they have no active session yet. Snapshotting a dict lookup
+    under the lock, same spirit as the pre-existing single-global snapshot
+    pattern: a concurrent switch/delete for the SAME owner must not affect
+    a request already in flight for that owner.
+
+    `env_id` (added for Phase 1's UUID migration) is this owner's active
+    environment's real, stable `environment_id`, resolved ONCE at
+    activation time (see activate_environment) rather than recomputed per
+    route -- every route below that needs to key _access_jobs/_sync_jobs
+    by something unambiguous reads this directly instead of calling
+    engine.environment_storage_name (removed; see
+    docs/fast-follow-redesign.md's Phase 1)."""
     with _sessions_lock:
         session = _sessions.get(owner_key)
     if session is None:
-        return None, None, None
-    return session["client"], session["okta_client"], session["env_name"]
+        return None, None, None, None
+    return session["client"], session["okta_client"], session["env_name"], session["env_id"]
 
 # Access Explorer bootstrap job -- build_access_model takes real time
 # (~30s+ on a tenant with data), so it runs in a background thread and the
@@ -275,15 +283,15 @@ def _session_snapshot(owner_key):
 # exploitable: User A starts a bootstrap against Tenant A, User B (with
 # Tenant B active, or even no environment configured) polls
 # /api/access/bootstrap/result and gets User A's tenant's access model
-# verbatim. Now keyed by `storage_name` (the requester's own ACTIVE
-# environment's real, owner-namespaced storage key -- see
-# environment_storage_name) -- a second start while THAT SAME
-# owner+environment's job is already running is still a no-op (unchanged
-# behavior for the one case that matters), but a different owner, or the
-# same owner on a different environment, always gets their own separate
-# job/result, never someone else's.
+# verbatim. Now keyed by the requester's own ACTIVE environment's real,
+# stable `environment_id` (resolved once at activation time -- see
+# activate_environment/_session_snapshot) -- a second start while THAT
+# SAME owner+environment's job is already running is still a no-op
+# (unchanged behavior for the one case that matters), but a different
+# owner, or the same owner on a different environment, always gets their
+# own separate job/result, never someone else's.
 _access_jobs_lock = threading.Lock()
-_access_jobs = {}  # storage_name -> {"status": ..., "steps": [...], "error": str|None, "result": ...}
+_access_jobs = {}  # environment_id -> {"status": ..., "steps": [...], "error": str|None, "result": ...}
 
 
 def _access_job_progress(storage_name):
@@ -318,11 +326,10 @@ def _run_access_job(storage_name, job_client, job_okta_client):
 # to _access_jobs above: two different owners with a same-named
 # environment shared one job entry, so one user's sync status/progress/
 # result was visible to, and could be silently overwritten by, another
-# user's unrelated sync. Now keyed by `storage_name` (the real, owner-
-# namespaced storage key -- see environment_storage_name), unambiguous
-# across owners.
+# user's unrelated sync. Now keyed by the real, stable `environment_id`,
+# unambiguous across owners.
 _sync_jobs_lock = threading.Lock()
-_sync_jobs = {}  # storage_name -> {"status": "idle"|"running"|"done"|"error", "steps": [...], "error": str|None}
+_sync_jobs = {}  # environment_id -> {"status": "idle"|"running"|"done"|"error", "steps": [...], "error": str|None}
 
 # Background scheduler thread state -- started once at server boot (see
 # main()), NOT per-request. Every iteration re-reads sync_schedule +
@@ -350,7 +357,7 @@ def _sync_job_progress(storage_name):
     return _progress
 
 
-def _run_sync_job(env_name, okta_client, ingestion_scope, owner, trigger="manual", actor_email=None, actor_sub=None, client_ip=None, user_agent=None):
+def _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, trigger="manual", actor_email=None, actor_sub=None, client_ip=None, user_agent=None):
     """Previously, a sync's actual outcome (success -- how many events,
     how long it took -- or failure -- what broke) lived ONLY in the
     ephemeral in-memory _sync_jobs dict, visible only while polling
@@ -365,13 +372,16 @@ def _run_sync_job(env_name, okta_client, ingestion_scope, owner, trigger="manual
     manual trigger (this function runs in its own background thread, so
     it can't read self.client_address/self.headers itself)."""
     import audit_store
-    # storage_name (owner-namespaced) is used ONLY as the in-memory
+    # env_id (the real, stable environment_id -- Phase 1 UUID migration;
+    # the caller already has it, either from the session via
+    # _session_snapshot or from _scheduler_loop's own iteration, so it's
+    # passed in rather than recomputed) is used ONLY as the in-memory
     # _sync_jobs dict key (see that dict's module-level comment for the
     # cross-owner collision this fixes) -- every audit_store/engine call
     # below still takes the bare env_name, since the archive schema
     # itself is still partitioned by display name (a separate, larger
     # migration, tracked as a fast-follow, not this fix).
-    storage_name = engine.environment_storage_name(owner, env_name)
+    storage_name = env_id
     action_prefix = "sync.scheduled" if trigger == "scheduled" else "sync.manual"
     with _sync_jobs_lock:
         _sync_jobs[storage_name] = {"status": "running", "steps": [], "error": None}
@@ -419,7 +429,7 @@ def _run_sync_job(env_name, okta_client, ingestion_scope, owner, trigger="manual
         )
 
 
-def _start_sync_job(env_name, ingestion_scope, owner=engine.LOCAL_OWNER_KEY, trigger="manual", actor_email=None, actor_sub=None, client_ip=None, user_agent=None, minutes_late=None):
+def _start_sync_job(env_id, env_name, ingestion_scope, owner=engine.LOCAL_OWNER_KEY, trigger="manual", actor_email=None, actor_sub=None, client_ip=None, user_agent=None, minutes_late=None):
     """Starts (or no-ops if already running) a background sync for one
     environment. Returns True if actually started. Builds a fresh
     OktaClient directly from stored credentials -- deliberately NOT
@@ -438,6 +448,11 @@ def _start_sync_job(env_name, ingestion_scope, owner=engine.LOCAL_OWNER_KEY, tri
     environment copy, was invisible to sync because credential lookup
     always checked the LOCAL_OWNER_KEY-owned copy instead.
 
+    `env_id` (Phase 1 UUID migration) is the real, stable environment_id
+    the caller already has (session's env_id for a manual trigger,
+    _scheduler_loop's own iteration key for a scheduled one) -- used ONLY
+    as the in-memory _sync_jobs dict key, same reasoning as _run_sync_job.
+
     `trigger` is "manual" (a logged action, e.g. from serve.py's own
     /sync/start route caller) or "scheduled" (from _scheduler_loop, no
     HTTP request/actor at all). Logging lives HERE, not at each call
@@ -450,7 +465,7 @@ def _start_sync_job(env_name, ingestion_scope, owner=engine.LOCAL_OWNER_KEY, tri
     show that). client_ip/user_agent are naturally None for a scheduled
     trigger, same as any other CLI/background-triggered audit entry in
     this project's existing convention."""
-    storage_name = engine.environment_storage_name(owner, env_name)
+    storage_name = env_id
     with _sync_jobs_lock:
         if _sync_jobs.get(storage_name, {}).get("status") == "running":
             if trigger == "scheduled":
@@ -480,7 +495,7 @@ def _start_sync_job(env_name, ingestion_scope, owner=engine.LOCAL_OWNER_KEY, tri
         start_details["minutes_late"] = minutes_late
     engine.log_audit_event(actor_email, actor_sub, f"{action_prefix}_start", start_details, client_ip=client_ip, user_agent=user_agent)
     threading.Thread(
-        target=_run_sync_job, args=(env_name, okta_client, ingestion_scope, owner),
+        target=_run_sync_job, args=(env_id, env_name, okta_client, ingestion_scope, owner),
         kwargs={"trigger": trigger, "actor_email": actor_email, "actor_sub": actor_sub, "client_ip": client_ip, "user_agent": user_agent},
         daemon=True,
     ).start()
@@ -536,8 +551,8 @@ def _scheduler_loop():
             # request but was silently starving this background loop of any
             # environment that wasn't LOCAL_OWNER_KEY's own or shared=True.
             environments = engine.list_all_environments()
-            for storage_name, meta in environments.items():
-                _, _, env_name = storage_name.partition("::")
+            for environment_id, meta in environments.items():
+                env_name = meta.get("name")
                 owner = meta.get("owner")
                 try:
                     schedule = engine.get_sync_schedule(env_name, owner=owner)
@@ -568,7 +583,7 @@ def _scheduler_loop():
 
                 minutes_late = (now_utc.hour * 60 + now_utc.minute) - (run_hour * 60 + run_minute)
                 _start_sync_job(
-                    env_name, schedule.get("ingestion_scope", "curated"), owner=owner, trigger="scheduled",
+                    environment_id, env_name, schedule.get("ingestion_scope", "curated"), owner=owner, trigger="scheduled",
                     minutes_late=minutes_late if minutes_late > SCHEDULER_LATE_THRESHOLD_MINUTES else None,
                 )
         except Exception as exc:
@@ -586,21 +601,28 @@ class StrictBindHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = False
 
 
-def _public_entry(name, meta, requesting_owner):
+def _public_entry(environment_id, name, meta, requesting_owner):
     """Non-secret fields only -- key_secret/okta_api_token never leave the
     keychain, let alone reach the browser. `requesting_owner` is the
     engine-layer owner (see _engine_owner) of whoever is asking, used only
     to compute `is_own` -- lets the frontend show "yours" vs. "shared with
-    you" without exposing anyone else's real owner id."""
-    storage_name = engine.environment_storage_name(meta.get("owner"), name)
+    you" without exposing anyone else's real owner id.
+
+    FIX (Phase 1 UUID migration): this used to MANUFACTURE the id itself
+    via engine.environment_storage_name(meta.get("owner"), name) rather
+    than reading one that's actually stored -- every caller already has
+    the real environment_id in hand (either as the dict key from
+    engine.list_all_environments()/list_environments_for(), or inside
+    meta["environment_id"] since list_environments_for now includes it),
+    so this just takes it as an explicit parameter instead."""
     return {
-        "id": storage_name,
+        "id": environment_id,
         "name": name,
         "base_domain": meta.get("base_domain", ""),
         "team_name": meta.get("team_name", ""),
         "key_id": meta.get("key_id", ""),
         "okta_url": meta.get("okta_url", ""),
-        "has_okta_token": bool(engine.keyring_get(storage_name, "okta_api_token")),
+        "has_okta_token": bool(engine.keyring_get(environment_id, "okta_api_token")),
         "preserve_logs_locally": bool(meta.get("preserve_logs_locally", False)),
         "shared": bool(meta.get("shared", False)),
         "is_own": meta.get("owner") == requesting_owner,
@@ -611,9 +633,15 @@ def _public_entry(name, meta, requesting_owner):
 def activate_environment(owner_key, name):
     """Loads `name` (visible to this owner) from the encrypted store,
     authenticates to OPA, and (if Okta credentials are present) to Okta
-    too. On success stores the new client/okta_client/env_name in this
-    owner's session slot. Raises KeyError (unknown/not visible to this
-    owner) or engine.OpaApiError (OPA auth failed)."""
+    too. On success stores the new client/okta_client/env_name/env_id in
+    this owner's session slot. Raises KeyError (unknown/not visible to
+    this owner) or engine.OpaApiError (OPA auth failed).
+
+    `env_id` (Phase 1's UUID migration) is resolved HERE, once, from
+    `creds["environment_id"]` (get_environment_credentials already
+    returns it, since it reads straight from the stored record) -- every
+    downstream route reads it back out of the session via
+    _session_snapshot instead of recomputing it per-request."""
     engine_owner = _engine_owner(owner_key)
     creds = engine.get_environment_credentials(name, owner=engine_owner)  # raises KeyError if unknown/not visible
 
@@ -623,7 +651,10 @@ def activate_environment(owner_key, name):
         new_okta_client = engine.OktaClient(creds["okta_url"], creds["okta_api_token"])
 
     with _sessions_lock:
-        _sessions[owner_key] = {"client": new_client, "okta_client": new_okta_client, "env_name": name}
+        _sessions[owner_key] = {
+            "client": new_client, "okta_client": new_okta_client,
+            "env_name": name, "env_id": creds["environment_id"],
+        }
 
     engine.set_active_environment(engine_owner, name)
     print(f"Activated environment '{name}' ({creds['base_domain']}) for owner '{owner_key}'.")
@@ -850,7 +881,7 @@ class Handler(SimpleHTTPRequestHandler):
         owner_key = _owner_key_from_headers(self.headers)
         engine_owner = _engine_owner(owner_key)
         _ensure_session_initialized(owner_key)
-        local_client, local_okta_client, local_env_name = _session_snapshot(owner_key)
+        local_client, local_okta_client, local_env_name, local_env_id = _session_snapshot(owner_key)
 
         try:
             if path == "/api/version":
@@ -879,7 +910,7 @@ class Handler(SimpleHTTPRequestHandler):
                     # Admins see EVERY stored environment, not just their
                     # own/shared ones -- list_all_environments() (added for
                     # the scheduler, see its own docstring) returns
-                    # {storage_name: meta} across every owner.
+                    # {environment_id: meta} across every owner.
                     #
                     # SECURITY FIX (external review, 2026-09-30): this used
                     # to unpack storage_key into a bare display name and
@@ -888,18 +919,18 @@ class Handler(SimpleHTTPRequestHandler):
                     # the second one silently overwrote the first in this
                     # dict, so an admin never even SAW both, let alone
                     # could act on the right one. Now keeps every entry by
-                    # its real storage_key (unambiguous), and passes each
-                    # one's TRUE display name (not a shared dict key) into
-                    # _public_entry -- two same-named environments from
-                    # different owners both survive to the response, each
-                    # with its own unique `id` (see _public_entry).
-                    envs = []
-                    for storage_key, meta in engine.list_all_environments().items():
-                        _, _, disp_name = storage_key.partition("::")
-                        envs.append(_public_entry(disp_name, meta, engine_owner))
+                    # its real id (unambiguous), and passes each one's TRUE
+                    # display name (meta["name"], not a shared dict key)
+                    # into _public_entry -- two same-named environments
+                    # from different owners both survive to the response,
+                    # each with its own unique `id` (see _public_entry).
+                    envs = [
+                        _public_entry(environment_id, meta.get("name"), meta, engine_owner)
+                        for environment_id, meta in engine.list_all_environments().items()
+                    ]
                 else:
                     visible = engine.list_environments_for(engine_owner)
-                    envs = [_public_entry(n, m, engine_owner) for n, m in visible.items()]
+                    envs = [_public_entry(m["environment_id"], n, m, engine_owner) for n, m in visible.items()]
                 return self._send_json(200, {"environments": envs, "active": local_env_name})
 
             if path == "/api/banner":
@@ -912,11 +943,12 @@ class Handler(SimpleHTTPRequestHandler):
             if path.startswith("/api/environments/") and path.endswith("/sync/status"):
                 name = unquote(path[len("/api/environments/"):-len("/sync/status")])
                 import audit_store
-                if not _environment_visible_to(engine_owner, name):
+                visible = engine.list_environments_for(engine_owner)
+                meta = visible.get(name)
+                if meta is None:
                     return self._send_json(404, {"error": f"No environment named '{name}' visible to this user."})
-                storage_name = engine.environment_storage_name(engine_owner, name)
                 with _sync_jobs_lock:
-                    job = dict(_sync_jobs.get(storage_name, {"status": "idle", "steps": [], "error": None}))
+                    job = dict(_sync_jobs.get(meta["environment_id"], {"status": "idle", "steps": [], "error": None}))
                 job["sync_state"] = audit_store.get_sync_state(name)
                 job["is_first_sync"] = audit_store.is_first_sync(name)
                 return self._send_json(200, job)
@@ -1113,9 +1145,8 @@ class Handler(SimpleHTTPRequestHandler):
                 })
 
             if path == "/api/access/bootstrap/status":
-                if not local_env_name:
+                if not local_env_id:
                     return self._send_json(200, {"status": "idle", "steps": [], "error": None})
-                storage_name = engine.environment_storage_name(engine_owner, local_env_name)
                 # Snapshot (shallow-copy the steps list) WHILE holding the
                 # lock, then serialize/send OUTSIDE it -- holding a lock
                 # through json.dumps + a socket write (self.wfile.write can
@@ -1124,16 +1155,15 @@ class Handler(SimpleHTTPRequestHandler):
                 # time. Copying `steps` also means a background append
                 # racing this read can never be observed mid-mutation.
                 with _access_jobs_lock:
-                    job = _access_jobs.get(storage_name, {"status": "idle", "steps": [], "error": None})
+                    job = _access_jobs.get(local_env_id, {"status": "idle", "steps": [], "error": None})
                     status_payload = {"status": job["status"], "steps": list(job["steps"]), "error": job["error"]}
                 return self._send_json(200, status_payload)
 
             if path == "/api/access/bootstrap/result":
-                if not local_env_name:
+                if not local_env_id:
                     return self._send_json(409, {"error": "No active environment."})
-                storage_name = engine.environment_storage_name(engine_owner, local_env_name)
                 with _access_jobs_lock:
-                    job = _access_jobs.get(storage_name)
+                    job = _access_jobs.get(local_env_id)
                     if job is None or job["status"] != "done" or job.get("result") is None:
                         return self._send_json(409, {"error": "Job is not done yet."})
                     return self._send_json(200, job["result"])
@@ -1204,7 +1234,7 @@ class Handler(SimpleHTTPRequestHandler):
         # concurrent environment switch/delete could make an in-flight
         # execute silently continue against a different (or no) tenant
         # partway through.
-        local_client, local_okta_client, _local_env_name = _session_snapshot(owner_key)
+        local_client, local_okta_client, _local_env_name, _local_env_id = _session_snapshot(owner_key)
         try:
             payload = self._read_json_body()
 
@@ -1283,7 +1313,7 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/environments":
                 is_admin = _is_admin_from_headers(self.headers)
                 try:
-                    name = engine.upsert_environment(
+                    name, _upserted_id = engine.upsert_environment(
                         payload.get("name"), payload, owner=engine_owner, is_admin=is_admin,
                         environment_id=payload.get("id"),
                     )
@@ -1407,13 +1437,12 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/access/bootstrap/start":
                 if not _require_client(self._send_json, local_client):
                     return
-                storage_name = engine.environment_storage_name(engine_owner, _local_env_name)
                 with _access_jobs_lock:
-                    if _access_jobs.get(storage_name, {}).get("status") == "running":
+                    if _access_jobs.get(_local_env_id, {}).get("status") == "running":
                         return self._send_json(200, {"started": False, "already_running": True})
-                    _access_jobs[storage_name] = {"status": "running", "steps": [], "error": None, "result": None}
+                    _access_jobs[_local_env_id] = {"status": "running", "steps": [], "error": None, "result": None}
                 threading.Thread(
-                    target=_run_access_job, args=(storage_name, local_client, local_okta_client), daemon=True
+                    target=_run_access_job, args=(_local_env_id, local_client, local_okta_client), daemon=True
                 ).start()
                 return self._send_json(200, {"started": True, "steps": engine.ACCESS_MODEL_STEPS})
 
@@ -1653,9 +1682,8 @@ class Handler(SimpleHTTPRequestHandler):
                 resources = payload.get("resources") or []
                 if not resources:
                     return self._send_json(200, {"results": {}})
-                storage_name = engine.environment_storage_name(engine_owner, _local_env_name)
                 with _access_jobs_lock:
-                    job = _access_jobs.get(storage_name)
+                    job = _access_jobs.get(_local_env_id)
                 if job is None or job.get("result") is None:
                     return self._send_json(409, {"error": "Access model not loaded yet -- run the Access Explorer bootstrap first."})
                 opa_user = next((u for u in job["result"]["users"] if u.get("id") == user_id), None)
@@ -1693,7 +1721,7 @@ class Handler(SimpleHTTPRequestHandler):
         # note in do_GET/do_POST. The environment-delete branch legitimately
         # clears this owner's session slot itself (that's the whole point
         # of that branch).
-        local_client, _local_okta_client, local_env_name = _session_snapshot(owner_key)
+        local_client, _local_okta_client, local_env_name, _local_env_id = _session_snapshot(owner_key)
         try:
             if path.startswith("/api/environments/"):
                 name = unquote(path[len("/api/environments/"):])

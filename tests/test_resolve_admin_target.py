@@ -1,40 +1,42 @@
-"""Covers environment_storage_name + _resolve_admin_target -- the
-admin-override lookup that must disambiguate two different owners' same-
-named environments by environment_id, not by a potentially-ambiguous
-by-name scan. See docs/fast-follow-redesign.md's Phase 7 for why this is
-one of the functions named as having the most direct history of silent
-breakage (the original F1/F2/F3 cross-tenant bugs, external review,
-2026-09-30)."""
+"""Covers _resolve_admin_target -- the admin-override lookup that must
+disambiguate two different owners' same-named environments by
+environment_id, not by a potentially-ambiguous by-name scan. See
+docs/fast-follow-redesign.md's Phase 7 for why this is one of the
+functions named as having the most direct history of silent breakage
+(the original F1/F2/F3 cross-tenant bugs, external review, 2026-09-30).
+
+Fixture keys use real UUID4 strings (Phase 1's environment_id format,
+not the retired "{owner}::{name}" storage_name) -- each record's `name`
+field is what _find_environment_by_name/_resolve_admin_target's fallback
+path actually reads, matching the current (post-migration) record shape."""
 import pytest
 
 import create_secret_folders as engine
 
-
-def test_environment_storage_name_namespaces_by_owner():
-    assert engine.environment_storage_name(None, "dev") == "__local__::dev"
-    assert engine.environment_storage_name("00uOWNERB", "dev") == "00uOWNERB::dev"
+ENV_ID_A = "11111111-1111-1111-1111-111111111111"
+ENV_ID_B = "22222222-2222-2222-2222-222222222222"
 
 
 def test_resolve_admin_target_prefers_explicit_environment_id():
     data = {
         "environments": {
-            "__local__::dev": {"owner": None, "base_domain": "a.example.com"},
-            "00uOWNERB::dev": {"owner": "00uOWNERB", "base_domain": "b.example.com"},
+            ENV_ID_A: {"owner": None, "name": "dev", "base_domain": "a.example.com"},
+            ENV_ID_B: {"owner": "00uOWNERB", "name": "dev", "base_domain": "b.example.com"},
         }
     }
-    storage_name, meta = engine._resolve_admin_target(data, "dev", "00uOWNERB::dev")
-    assert storage_name == "00uOWNERB::dev"
+    found_id, meta = engine._resolve_admin_target(data, "dev", ENV_ID_B)
+    assert found_id == ENV_ID_B
     assert meta["base_domain"] == "b.example.com"
 
-    storage_name, meta = engine._resolve_admin_target(data, "dev", "__local__::dev")
-    assert storage_name == "__local__::dev"
+    found_id, meta = engine._resolve_admin_target(data, "dev", ENV_ID_A)
+    assert found_id == ENV_ID_A
     assert meta["base_domain"] == "a.example.com"
 
 
 def test_resolve_admin_target_raises_on_unknown_environment_id():
-    data = {"environments": {"__local__::dev": {"owner": None}}}
+    data = {"environments": {ENV_ID_A: {"owner": None, "name": "dev"}}}
     with pytest.raises(KeyError):
-        engine._resolve_admin_target(data, "dev", "nonexistent::dev")
+        engine._resolve_admin_target(data, "dev", "nonexistent-id")
 
 
 def test_resolve_admin_target_falls_back_to_ambiguous_scan_without_id():
@@ -46,12 +48,12 @@ def test_resolve_admin_target_falls_back_to_ambiguous_scan_without_id():
     real entry rather than raising, matching backward-compat intent."""
     data = {
         "environments": {
-            "__local__::dev": {"owner": None},
-            "00uOWNERB::dev": {"owner": "00uOWNERB"},
+            ENV_ID_A: {"owner": None, "name": "dev"},
+            ENV_ID_B: {"owner": "00uOWNERB", "name": "dev"},
         }
     }
-    storage_name, meta = engine._resolve_admin_target(data, "dev", None)
-    assert storage_name in ("__local__::dev", "00uOWNERB::dev")
+    found_id, meta = engine._resolve_admin_target(data, "dev", None)
+    assert found_id in (ENV_ID_A, ENV_ID_B)
     assert meta is not None
 
 

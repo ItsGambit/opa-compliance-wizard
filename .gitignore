@@ -1,6 +1,7 @@
 # Credentials -- never committed, see README "Security: encrypted credential storage"
 .env
 environments.json
+environments.json.*
 TestCreds.txt
 ubuntuserver.txt
 

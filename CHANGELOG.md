@@ -2,6 +2,60 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.28.0 — **Fast-follow Phase 3 of 11 of docs/fast-follow-redesign.md
+(local-only, not pushed): every saved environment now has a real,
+stable `environment_id` (UUID4) as its primary key, replacing the
+`"{owner}::{name}"` storage_name string.** `storage_name` carried the
+real Okta `sub` directly into URLs, browser history, and support
+screenshots; a UUID carries no information about owner or display name.
+One-shot migration (not a permanent compatibility shim, since this
+project's install base is exactly two real instances, both directly
+controlled) -- `load_environments()` detects any pre-UUID record on
+load, mints a fresh id, migrates its keyring credentials (read-old ->
+write-new -> verify -> delete-old), and persists immediately so a random
+id is never minted twice for the same environment.
+- **Engine (`create_secret_folders.py`):** `environment_storage_name` is
+  retired (renamed to migration-only `_legacy_environment_storage_name`).
+  New `_find_own_environment(data, owner, name)` helper replaces 5
+  functions that used to recompute a storage key live from `(owner,
+  name)` -- `set_environment_shared`/`delete_environment`'s non-admin
+  branches, `set_preserve_logs_locally`, `get_sync_schedule`,
+  `set_sync_schedule` -- with a direct lookup against the stored `name`
+  field instead. `upsert_environment` now mints a real UUID4 on create
+  and returns `(name, environment_id)`. `list_environments_for` now
+  carries each record's real id forward (`meta["environment_id"]`)
+  instead of callers having to re-derive it.
+- **Server (`server/serve.py`):** `_public_entry` no longer MANUFACTURES
+  the id by calling `environment_storage_name` -- every caller already
+  has the real id in hand and passes it in directly. Session state
+  (`_sessions`) now carries `env_id` alongside `env_name`, resolved ONCE
+  at `activate_environment` time -- the 7 call sites that used to
+  recompute a storage key purely to key `_access_jobs`/`_sync_jobs`
+  (sync status/start routes, Access Explorer bootstrap status/result/
+  start, resource_access, the background scheduler loop) all read it
+  from the session/iteration instead.
+- **Tests:** new `tests/test_environment_id_migration.py` covers both
+  legacy shapes migrating correctly, idempotency (a second
+  `load_environments()` call must NOT mint a new id), and the keyring
+  credential round-trip. `tests/test_two_owner_collision.py` and
+  `tests/test_resolve_admin_target.py` updated to read real ids back
+  from the system (`upsert_environment`'s own return value) rather than
+  precomputing them via the now-retired function.
+- **Live-verified end to end** against this machine's real
+  `environments.json` (2 real environments, `dev`/`patlabs`): backed up
+  first, ran the real migration, confirmed both environments' real
+  keyring credentials (`key_secret`/`okta_api_token`) resolved correctly
+  under their new UUID service names, confirmed idempotency (a second
+  load produced the exact same ids), and confirmed via a live
+  `GET /api/environments` call that both environments activate and
+  display correctly with their new `id` field. The Ubuntu server's
+  `environments.json`/keyring secrets have NOT yet been migrated --
+  that's the next, separately verified step.
+- **Explicitly out of scope** (per locked-in plan): Phase 2 (SQLite
+  migration for environment metadata and the compliance archive) is a
+  separate future task; `audit_store.py`'s bare-display-name
+  partitioning is untouched.
+
 5.27.1 — **Two real bugs found while verifying v5.27.0's deployment-mode
 work live on the hosted server: audit logs captured nginx's own loopback
 IP instead of the real client, and `deploy.sh` silently reverted a

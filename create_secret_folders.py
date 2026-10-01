@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.27.1
+# Version     : 5.28.0
 # =============================================================================
 
 import argparse
@@ -75,10 +75,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.27.1"
+SCRIPT_VERSION = "5.28.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -399,38 +400,67 @@ def _owner_storage_key(owner):
     return owner if owner else "__local__"
 
 
-def environment_storage_name(owner, name):
-    """The real, owner-namespaced storage key for an environment. `name` is
-    just the user-facing label (two different users can each have a "dev");
-    this is what actually keys environments.json's `environments` dict and
-    the keyring service name, so names never collide across owners."""
+def _legacy_environment_storage_name(owner, name):
+    """MIGRATION-ONLY: the old owner-namespaced storage key format
+    (`"{owner}::{name}"`), used solely by load_environments()'s one-time
+    rekey pass below to recognize and migrate pre-UUID environments.json
+    entries. Not a public API -- nothing else should ever construct this
+    format again. (Historically this WAS the public environment_storage_name
+    function; renamed and demoted to migration-only once every real
+    environment -- on both this project's two real installs, Windows dev
+    machine and the Ubuntu server -- is confirmed migrated to a real
+    environment_id. See docs/fast-follow-redesign.md's Phase 1.)"""
     return f"{_owner_storage_key(owner)}::{name}"
 
 
 _LEGACY_STORAGE_PREFIX = f"{_owner_storage_key(LOCAL_OWNER_KEY)}::"
+# Still needed by keyring_get/keyring_delete's existing fallback logic
+# below, unchanged by this migration -- during the one-time migration
+# pass, _migrate_environment_keyring_entries calls keyring_get/
+# keyring_delete with an OLD-shaped storage_name (exactly what
+# _legacy_environment_storage_name produces), and that fallback logic is
+# what actually finds a real pre-existing credential regardless of which
+# of the two legacy shapes/prefixes it was stored under. Once both real
+# installs are confirmed migrated, this constant and both functions'
+# fallback branches can be deleted together, not independently.
 
 
 def load_environments():
-    """Loads the whole store and migrates it to the current shape in memory
-    (does not write the migration back until the next save_environments
-    call by some other code path -- load is otherwise side-effect-free).
+    """Loads the whole store and migrates it to the current shape in memory,
+    persisting any migration immediately (see the UUID-assignment step
+    below -- unlike the other migrations here, minting a random id is NOT
+    safe to leave unpersisted, since re-running it on every load would mint
+    a NEW id every time).
 
-    Migrations handled here, both one-way and permanent in spirit (every
-    legacy environment becomes indistinguishable from one explicitly
-    created under LOCAL_OWNER_KEY once this runs):
+    Migrations handled here, all one-way and permanent in spirit (every
+    legacy environment becomes indistinguishable from one created fresh
+    under the current shape once this runs):
     - `"active"` used to be a single environment-name string
       (pre-multi-user). It's now a dict keyed by owner (Okta `sub`, or
       LOCAL_OWNER_KEY for unscoped/local/CLI use) so each user's active
       environment is independent. A legacy string value becomes the
       LOCAL_OWNER_KEY-owner's active environment, matching exactly what it
       meant before this change existed.
-    - `environments` used to be keyed by plain name (e.g. "dev"). Any key
-      that isn't already namespaced (doesn't contain "::") is a legacy
-      entry -- rekeyed to `LOCAL_OWNER_KEY::<name>` and given
-      owner=LOCAL_OWNER_KEY, shared=True (every pre-existing environment
-      was, in effect, usable by anyone who could reach this file/process,
-      so shared=True is what actually preserves that instead of silently
-      hiding it from every logged-in user once per-user scoping goes live)."""
+    - `environments` used to be keyed by plain name (e.g. "dev"), then by
+      `"{owner}::{name}"` (the multi-user change). Both shapes are
+      recognized by `"::" not in key` vs. a real environment_id (a UUID,
+      which never contains "::") and are migrated here to the current
+      shape: keyed by a freshly-minted `environment_id` (UUID4), with
+      `name` and `owner` stored as explicit fields on the record instead
+      of being encoded into (or absent from) the key itself. A plain-name
+      legacy entry gets owner=LOCAL_OWNER_KEY, shared=True (every
+      pre-existing environment was, in effect, usable by anyone who could
+      reach this file/process, so shared=True is what actually preserves
+      that instead of silently hiding it from every logged-in user once
+      per-user scoping goes live); an owner::name legacy entry keeps
+      whatever owner/shared it already had.
+    - Per [[project_opa_deployment_mode_live]]/this project's simplified
+      two-install deployment model: this is a one-shot migration, not a
+      permanent compatibility shim -- `_legacy_environment_storage_name`
+      and this detection logic are deleted entirely in a prompt follow-up
+      commit once both real installs (this machine + the Ubuntu server)
+      are confirmed migrated. There is no third install that could still
+      be running pre-migration code in the meantime."""
     path = _environments_file_path()
     if not os.path.isfile(path):
         return {"active": {}, "environments": {}}
@@ -443,16 +473,47 @@ def load_environments():
     elif not isinstance(active, dict):
         data["active"] = {}
 
+    needs_migration = False
     migrated_environments = {}
     for key, meta in data.get("environments", {}).items():
+        # Detection is based on the presence of an explicit "name" field,
+        # NOT on whether the key looks like "owner::name" -- a real UUID4
+        # key also happens to contain no "::", so key-shape alone can't
+        # distinguish "already migrated" from "oldest pre-multi-user
+        # shape" (both have `"::" not in key`). "name" in meta is the one
+        # unambiguous signal: it's only ever set by this migration itself.
+        if "name" in meta:
+            # Already migrated (real environment_id key, name/owner fields
+            # present) -- leave untouched. Also covers the "no file on disk
+            # at all yet" / fresh-install case implicitly, since there's
+            # nothing to iterate.
+            migrated_environments[key] = meta
+            continue
+        needs_migration = True
+        meta = dict(meta)
         if "::" not in key:
-            meta = dict(meta)
+            # Oldest shape: bare display name, no owner field, no "::" at
+            # all in the key.
             meta.setdefault("owner", LOCAL_OWNER_KEY)
             meta.setdefault("shared", True)
-            migrated_environments[environment_storage_name(LOCAL_OWNER_KEY, key)] = meta
+            meta["name"] = key
+            old_storage_name = _legacy_environment_storage_name(LOCAL_OWNER_KEY, key)
         else:
-            migrated_environments[key] = meta
+            # Multi-user shape: "{owner}::{name}" -- owner/shared already
+            # fields, but no stable id yet and `name` only implicit in the
+            # key -- the specific shape this Phase 1 migration targets.
+            _, _, name = key.partition("::")
+            meta["name"] = name
+            old_storage_name = key
+        new_id = str(uuid.uuid4())
+        _migrate_environment_keyring_entries(old_storage_name, new_id)
+        migrated_environments[new_id] = meta
     data["environments"] = migrated_environments
+
+    if needs_migration:
+        # Persist NOW, not lazily -- see this function's own docstring for
+        # why minting a random id must not be repeated on every load.
+        save_environments(data)
     return data
 
 
@@ -673,6 +734,34 @@ def keyring_delete(storage_name, field):
             pass
 
 
+def _migrate_environment_keyring_entries(old_storage_name, new_environment_id):
+    """One-time credential migration, called only from load_environments()'s
+    migration pass: for each secret field, read under the OLD storage name
+    (via keyring_get's existing fallback logic, which already knows how to
+    find a value under either legacy shape/prefix), write under the NEW
+    environment_id, verify the round-trip by reading the new name back and
+    comparing, then delete the old entry -- read-old -> write-new -> verify
+    -> delete-old, per docs/fast-follow-redesign.md's Phase 1 design.
+
+    Deliberately does NOT delete the old entry if the round-trip
+    verification fails (logs a warning and leaves the old entry in place
+    instead) -- losing access to a real credential is a much worse outcome
+    than a harmless leftover legacy keyring entry."""
+    if not KEYRING_AVAILABLE:
+        return
+    for field in ENVIRONMENT_SECRET_FIELDS:
+        value = keyring_get(old_storage_name, field)
+        if value is None:
+            continue  # nothing stored for this field (e.g. okta_api_token is optional)
+        keyring_set(new_environment_id, field, value)
+        verify = keyring_get(new_environment_id, field)
+        if verify != value:
+            log("WARN", f"Keyring migration verification failed for field '{field}' -- "
+                         f"leaving the old entry in place rather than risking data loss.")
+            continue
+        keyring_delete(old_storage_name, field)
+
+
 def list_environments_for(owner):
     """Returns {name: meta} visible to `owner`: their own environments plus
     anything explicitly marked shared=True. LOCAL_OWNER_KEY is treated as
@@ -695,17 +784,23 @@ def list_environments_for(owner):
     environment merely shared by someone else -- without this ordering,
     dict iteration order alone would decide which one a caller's own
     credential lookup resolves to, which could silently authenticate
-    against the wrong tenant."""
+    against the wrong tenant.
+
+    Each returned `meta` carries its real `environment_id` (added once
+    Phase 1's UUID migration landed) alongside the rest of its fields --
+    `_public_entry` (server/serve.py) reads this directly instead of
+    re-deriving an id, which it used to have to do by (incorrectly)
+    recomputing a storage key from (owner, name)."""
     data = load_environments()
     visible = {}
-    for storage_name, meta in data["environments"].items():
-        _, _, name = storage_name.partition("::")
+    for environment_id, meta in data["environments"].items():
+        name = meta.get("name")
         if meta.get("shared") and meta.get("owner") != owner:
-            visible[name] = meta
-    for storage_name, meta in data["environments"].items():
-        _, _, name = storage_name.partition("::")
+            visible[name] = {**meta, "environment_id": environment_id}
+    for environment_id, meta in data["environments"].items():
+        name = meta.get("name")
         if meta.get("owner") == owner:
-            visible[name] = meta
+            visible[name] = {**meta, "environment_id": environment_id}
     return visible
 
 
@@ -723,11 +818,11 @@ def list_all_environments():
 
     On a genuine owner collision (two different owners each have an
     environment named the same, e.g. two users both naming one "dev"),
-    both are still returned -- keyed by their real storage_name (which
-    is already owner-namespaced), not the bare display name, so a
-    caller here always disambiguates by storage_name and never
-    silently drops one like list_environments_for's flat {name: meta}
-    would if collapsed the same way."""
+    both are still returned -- keyed by their real environment_id (a
+    UUID, unique regardless of display name or owner), not the bare
+    display name, so a caller here always disambiguates by that real id
+    and never silently drops one like list_environments_for's flat
+    {name: meta} would if collapsed the same way."""
     data = load_environments()
     return dict(data["environments"])
 
@@ -743,59 +838,93 @@ def set_active_environment(owner, name):
     save_environments(data)
 
 
+def _find_own_environment(data, owner, name):
+    """Returns (environment_id, meta) for the CALLING owner's own
+    environment with this display name, or (None, None) if they have none
+    by that name. Unlike _find_environment_by_name below, this is NOT
+    ambiguous -- it's scoped to one specific owner, where (owner, name) is
+    guaranteed unique by convention (the same uniqueness Phase 2's planned
+    SQLite schema formalizes via UNIQUE(owner_id, display_name)). This is
+    the replacement for the old environment_storage_name(owner, name)
+    direct-computation pattern everywhere a function only ever needs to
+    resolve its OWN caller's environment, never to disambiguate across
+    different owners (that's _resolve_admin_target's job, below)."""
+    for environment_id, meta in data["environments"].items():
+        if meta.get("owner") == owner and meta.get("name") == name:
+            return environment_id, meta
+    return None, None
+
+
 def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, environment_id=None):
     """Saves non-secret metadata to environments.json and secret fields to
     the OS keychain. Blank secret fields on an update leave the previously
     stored secret untouched (so editing metadata doesn't force re-entering
     credentials). Raises ValueError if required fields end up missing.
+    Returns (name, environment_id) -- environment_id is the real, stable
+    id of the environment that was just created or updated, needed by
+    callers (e.g. activate_environment) that must resolve it without a
+    second lookup.
 
     `owner` defaults to LOCAL_OWNER_KEY (no verified identity) so every
     existing call site -- the CLI, and any code that doesn't know about
     per-user scoping -- keeps working unchanged. Creating a new environment
-    always sets its `owner` to this value; updating an EXISTING environment
-    owned by someone else is refused (PermissionError) unless `is_admin`
-    is True -- an admin override edits the environment IN PLACE under its
-    own existing owner, it does not transfer ownership to the admin (an
-    admin fixing another user's broken credentials shouldn't silently
-    become that environment's new owner).
+    always sets its `owner` to this value and mints a brand-new random
+    `environment_id`; updating an EXISTING environment owned by someone
+    else is refused (PermissionError) unless `is_admin` is True -- an
+    admin override edits the environment IN PLACE under its own existing
+    owner/id, it does not transfer ownership to the admin (an admin fixing
+    another user's broken credentials shouldn't silently become that
+    environment's new owner).
 
     `environment_id`, when supplied (an admin editing an EXISTING
-    environment via the UI, which always knows its real storage_name),
-    resolves the target directly via an O(1) dict lookup -- unambiguous
-    even when two different owners share a display name. Without it (a
-    create, where no id exists yet, or a legacy caller), an admin edit
-    falls back to a by-name scan across every owner, which is genuinely
-    ambiguous in that same-display-name case (confirmed exploitable,
-    external review 2026-09-30) -- kept only for backward compatibility."""
+    environment via the UI, which always knows its real id), resolves the
+    target directly via an O(1) dict lookup -- unambiguous even when two
+    different owners share a display name. Without it (a create, where no
+    id exists yet, or a legacy caller), an admin edit falls back to a
+    by-name scan across every owner, which is genuinely ambiguous in that
+    same-display-name case (confirmed exploitable, external review
+    2026-09-30) -- kept only for backward compatibility."""
     if not name or not name.strip():
         raise ValueError("Environment name is required (e.g. dev, uat, prod).")
     name = name.strip()
     data = load_environments()
 
-    # Resolve which storage_name/owner this update actually targets. A
+    # Resolve which environment_id/owner this update actually targets. A
     # normal (non-admin) call always targets the CALLING owner's own copy
-    # -- environment_storage_name(owner, name) is correct even if no such
-    # environment exists yet (a create). An admin override editing an
-    # EXISTING environment must target whichever owner's copy actually
-    # already exists (there's no such thing as an admin "creating"
-    # someone else's environment -- only editing one that's already
-    # there) -- environment_id disambiguates this directly when supplied;
-    # otherwise falls back to the old by-name scan (ambiguous, see above).
+    # by (owner, name) -- see _find_own_environment -- correct even if no
+    # such environment exists yet (a create, handled below). An admin
+    # override editing an EXISTING environment must target whichever
+    # owner's copy actually already exists (there's no such thing as an
+    # admin "creating" someone else's environment -- only editing one
+    # that's already there) -- environment_id disambiguates this directly
+    # when supplied; otherwise falls back to the old by-name scan
+    # (ambiguous, see above).
     target_owner = owner
+    target_id = None
     if is_admin:
         if environment_id and environment_id in data["environments"]:
             target_owner = data["environments"][environment_id].get("owner")
+            target_id = environment_id
         else:
-            for storage_key, meta in data["environments"].items():
-                _, _, stored_name = storage_key.partition("::")
-                if stored_name == name:
+            for sid, meta in data["environments"].items():
+                if meta.get("name") == name:
                     target_owner = meta.get("owner")
+                    target_id = sid
                     break
-    storage_name = environment_storage_name(target_owner, name)
+    else:
+        target_id, _ = _find_own_environment(data, owner, name)
 
-    existing_meta = data["environments"].get(storage_name)
+    existing_meta = data["environments"].get(target_id) if target_id else None
     if existing_meta is not None and existing_meta.get("owner") != owner and not is_admin:
         raise PermissionError(f"Environment '{name}' is not owned by this user.")
+
+    # A create (no existing environment matched) mints a brand-new random
+    # id -- NEVER derived from (owner, name), unlike the old
+    # environment_storage_name scheme, so it carries no information about
+    # either.
+    is_create = target_id is None
+    if is_create:
+        target_id = str(uuid.uuid4())
 
     meta = dict(existing_meta or {})
     for field in ENVIRONMENT_SECRET_FIELDS:
@@ -804,29 +933,30 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, envi
         if field in fields:
             meta[field] = (fields.get(field) or "").strip()
     meta["owner"] = target_owner
+    meta["name"] = name
     meta.setdefault("shared", False)
 
     for field in ENVIRONMENT_SECRET_FIELDS:
         value = (fields.get(field) or "").strip()
         if value:
-            keyring_set(storage_name, field, value)
+            keyring_set(target_id, field, value)
         # blank + already exists -> leave the previously stored secret alone
 
     missing = [f for f in ("base_domain", "team_name", "key_id") if not meta.get(f)]
     if missing:
         raise ValueError(f"Missing required field(s): {', '.join(missing)}")
-    if not keyring_get(storage_name, "key_secret"):
+    if not keyring_get(target_id, "key_secret"):
         raise ValueError("Missing required field: key_secret")
 
-    data["environments"][storage_name] = meta
+    data["environments"][target_id] = meta
     save_environments(data)
-    return name
+    return name, target_id
 
 
 def _find_environment_by_name(data, name):
-    """Returns (storage_name, meta) for the first stored environment whose
-    display name matches, across every owner, or (None, None) if none
-    exists.
+    """Returns (environment_id, meta) for the first stored environment
+    whose display name matches, across every owner, or (None, None) if
+    none exists.
 
     SECURITY: first-match-wins across EVERY owner -- confirmed exploitable
     (external review, 2026-09-30): if two different owners each have an
@@ -836,32 +966,31 @@ def _find_environment_by_name(data, name):
     legacy admin API callers that still pass a bare name with no real
     stable ID available (see the `environment_id` param on the callers
     below) -- every serve.py route has been updated to resolve and pass a
-    real `environment_id` (the storage_name itself) instead, which is
-    unambiguous. New code should never call this."""
-    for storage_key, meta in data["environments"].items():
-        _, _, stored_name = storage_key.partition("::")
-        if stored_name == name:
-            return storage_key, meta
+    real `environment_id` instead, which is unambiguous. New code should
+    never call this."""
+    for environment_id, meta in data["environments"].items():
+        if meta.get("name") == name:
+            return environment_id, meta
     return None, None
 
 
 def _resolve_admin_target(data, name, environment_id):
     """Shared resolution for every admin-override path below. Prefers the
-    unambiguous `environment_id` (the real storage_name, e.g.
-    "00u123::dev") whenever the caller has one -- an O(1) dict lookup,
-    never a cross-owner scan. Falls back to the old, ambiguous by-name
-    scan (_find_environment_by_name) ONLY when no id was supplied, for
-    backward compatibility with any caller that hasn't been updated yet.
-    Raises KeyError if nothing matches either way."""
+    unambiguous `environment_id` (the real UUID primary key) whenever the
+    caller has one -- an O(1) dict lookup, never a cross-owner scan. Falls
+    back to the old, ambiguous by-name scan (_find_environment_by_name)
+    ONLY when no id was supplied, for backward compatibility with any
+    caller that hasn't been updated yet. Raises KeyError if nothing
+    matches either way."""
     if environment_id:
         meta = data["environments"].get(environment_id)
         if meta is None:
             raise KeyError(f"No saved environment with id '{environment_id}'")
         return environment_id, meta
-    storage_name, meta = _find_environment_by_name(data, name)
+    found_id, meta = _find_environment_by_name(data, name)
     if meta is None:
         raise KeyError(f"No saved environment named '{name}'")
-    return storage_name, meta
+    return found_id, meta
 
 
 def set_environment_shared(name, owner, shared, is_admin=False, environment_id=None):
@@ -874,10 +1003,9 @@ def set_environment_shared(name, owner, shared, is_admin=False, environment_id=N
     if not the owner and not an admin, KeyError if unknown."""
     data = load_environments()
     if is_admin:
-        storage_name, meta = _resolve_admin_target(data, name, environment_id)
+        _, meta = _resolve_admin_target(data, name, environment_id)
     else:
-        storage_name = environment_storage_name(owner, name)
-        meta = data["environments"].get(storage_name)
+        _, meta = _find_own_environment(data, owner, name)
         if meta is None:
             raise KeyError(f"No environment named '{name}' owned by this user.")
         if meta.get("owner") != owner:
@@ -896,16 +1024,15 @@ def delete_environment(name, owner=LOCAL_OWNER_KEY, is_admin=False, environment_
     override across same-named environments from different owners."""
     data = load_environments()
     if is_admin:
-        storage_name, meta = _resolve_admin_target(data, name, environment_id)
+        target_id, meta = _resolve_admin_target(data, name, environment_id)
     else:
-        storage_name = environment_storage_name(owner, name)
-        meta = data["environments"].get(storage_name)
+        target_id, meta = _find_own_environment(data, owner, name)
         if meta is None:
             raise KeyError(f"No saved environment named '{name}'")
         if meta.get("owner") != owner:
             raise PermissionError(f"Environment '{name}' is not owned by this user.")
     real_owner = meta.get("owner")
-    del data["environments"][storage_name]
+    del data["environments"][target_id]
     # Return value ("was it active") is about the CALLING owner's own
     # active slot specifically -- that's what tells serve.py whether to
     # clear the calling owner's own live client.
@@ -927,7 +1054,7 @@ def delete_environment(name, owner=LOCAL_OWNER_KEY, is_admin=False, environment_
         del data["active"][real_owner_key]
     save_environments(data)
     for field in ENVIRONMENT_SECRET_FIELDS:
-        keyring_delete(storage_name, field)
+        keyring_delete(target_id, field)
     return was_active
 
 
@@ -943,10 +1070,10 @@ def get_environment_credentials(name, owner=LOCAL_OWNER_KEY):
     meta = visible.get(name)
     if meta is None:
         raise KeyError(f"No saved environment named '{name}'")
-    storage_name = environment_storage_name(meta.get("owner"), name)
+    environment_id = meta["environment_id"]
     creds = dict(meta)
     for field in ENVIRONMENT_SECRET_FIELDS:
-        creds[field] = keyring_get(storage_name, field) or ""
+        creds[field] = keyring_get(environment_id, field) or ""
     creds["name"] = name
     return creds
 
@@ -2657,11 +2784,11 @@ def set_preserve_logs_locally(name, enabled, owner=LOCAL_OWNER_KEY):
     upsert_environment's metadata-field loop, since this is a plain
     boolean toggle, not part of the credential form. Raises KeyError if
     `name` isn't a saved environment owned by `owner`."""
-    storage_name = environment_storage_name(owner, name)
     data = load_environments()
-    if storage_name not in data["environments"]:
+    target_id, meta = _find_own_environment(data, owner, name)
+    if meta is None:
         raise KeyError(f"No saved environment named '{name}'")
-    data["environments"][storage_name]["preserve_logs_locally"] = bool(enabled)
+    data["environments"][target_id]["preserve_logs_locally"] = bool(enabled)
     save_environments(data)
 
 
@@ -2679,11 +2806,11 @@ def get_sync_schedule(name, owner=LOCAL_OWNER_KEY):
     SYNC_SCHEDULE_DEFAULTS for any field never explicitly set (so callers
     never have to guess at partial/legacy shapes). Raises KeyError if
     `name` isn't a saved environment owned by `owner`."""
-    storage_name = environment_storage_name(owner, name)
     data = load_environments()
-    if storage_name not in data["environments"]:
+    _, meta = _find_own_environment(data, owner, name)
+    if meta is None:
         raise KeyError(f"No saved environment named '{name}'")
-    stored = data["environments"][storage_name].get("sync_schedule", {})
+    stored = meta.get("sync_schedule", {})
     return {**SYNC_SCHEDULE_DEFAULTS, **stored}
 
 
@@ -2697,12 +2824,12 @@ def set_sync_schedule(name, config, owner=LOCAL_OWNER_KEY):
     ingestion_scope isn't a real choice."""
     if config.get("ingestion_scope", "curated") not in ("curated", "all"):
         raise ValueError('ingestion_scope must be "curated" or "all"')
-    storage_name = environment_storage_name(owner, name)
     data = load_environments()
-    if storage_name not in data["environments"]:
+    target_id, meta = _find_own_environment(data, owner, name)
+    if meta is None:
         raise KeyError(f"No saved environment named '{name}'")
-    merged = {**SYNC_SCHEDULE_DEFAULTS, **data["environments"][storage_name].get("sync_schedule", {}), **config}
-    data["environments"][storage_name]["sync_schedule"] = merged
+    merged = {**SYNC_SCHEDULE_DEFAULTS, **meta.get("sync_schedule", {}), **config}
+    data["environments"][target_id]["sync_schedule"] = merged
     save_environments(data)
     return merged
 
