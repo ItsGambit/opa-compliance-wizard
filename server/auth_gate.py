@@ -79,7 +79,7 @@ any are missing, rather than silently pointing at a wrong/no org):
   OKTA_ORG_URL       e.g. https://your-org.oktapreview.com
   OKTA_OIDC_CLIENT_ID  the OIDC web app's client_id (not secret, but still
                        deployment-specific -- see "Register an OIDC
-                       application" in the main README)
+                       application" in docs/hosting.md)
   DASHBOARD_ORIGIN   the public origin this dashboard is reachable at,
                      e.g. https://192.168.1.10 or https://opa.example.com
   OKTA_ADMIN_GROUP_ID  bootstrap-only default for the admin group ID --
@@ -95,7 +95,7 @@ any are missing, rather than silently pointing at a wrong/no org):
                        first boot, without requiring the dashboard to be
                        used once (chicken-and-egg) before anyone can get
                        admin rights to configure it via the UI. See "Admin
-                       access" in the main README for how to create an
+                       access" in docs/hosting.md for how to create an
                        Okta group and find its ID -- a group ID (not name)
                        is required so membership checks are one direct API
                        call, never a name-to-id lookup.
@@ -337,7 +337,7 @@ def _load_admin_check_token() -> str:
         "okta_admin_check_token",
         "store a read-only, org-wide Okta API token (Users + Groups read scope) via "
         "`keyring.set_password('opa-compliance-wizard:{OKTA_ENV_NAME}', 'okta_admin_check_token', "
-        "'<token>')`. See \"Admin access\" in the main README.",
+        "'<token>')`. See \"Admin access\" in docs/hosting.md.",
     )
 
 

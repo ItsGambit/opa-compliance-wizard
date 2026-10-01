@@ -11,8 +11,12 @@ import { getSyncProgressPercent } from '../utils/syncProgress'
 // standalone repo 2026-09-30 -- these were left pointing at the old
 // OPA/Secrets-Wizard/ monorepo path (a real dead link found live, since
 // nothing deletes an old repo's README on a split) until fixed here.
+// The README itself was later split into a short front-door README plus
+// a standalone CHANGELOG.md (public-consumption rewrite) -- the
+// Changelog link now points at that file directly instead of a
+// #changelog anchor inside README.md, which no longer exists there.
 const REPO_README_URL = 'https://github.com/ItsGambit/opa-compliance-wizard/blob/main/README.md'
-const REPO_CHANGELOG_URL = `${REPO_README_URL}#changelog`
+const REPO_CHANGELOG_URL = 'https://github.com/ItsGambit/opa-compliance-wizard/blob/main/CHANGELOG.md'
 
 export function Footer() {
   const { data: version } = useVersion()

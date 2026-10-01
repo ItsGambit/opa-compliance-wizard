@@ -115,8 +115,8 @@ AUTH_GATE_INTERNAL_URL = "http://127.0.0.1:8767"
 # this file's own module docstring) is never blocked: with it unset,
 # _request_is_from_nginx always returns True (nothing to check against),
 # identical to today's behavior. This is REQUIRED, not optional, for any
-# real hosted multi-user deployment -- see the README's "Hosting on a
-# server" section.
+# real hosted multi-user deployment -- see docs/hosting.md's "Hosting on
+# a server" section.
 NGINX_PROXY_SECRET = os.environ.get("NGINX_PROXY_SECRET")
 
 

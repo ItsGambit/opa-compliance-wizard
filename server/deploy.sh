@@ -41,8 +41,8 @@
 # .deploy-backup path, apply the repo's config over the live path, and
 # roll the backup back over the live path if `nginx -t` fails -- sudoers
 # matches each exact argument list separately, so all three need their
-# own grant, not just one), nginx -t, and systemctl reload nginx. See the
-# README's "Hosting on a server" setup for the exact rule. If that rule
+# own grant, not just one), nginx -t, and systemctl reload nginx. See
+# docs/hosting.md's "Hosting on a server" setup for the exact rule. If that rule
 # hasn't been widened yet on this server, each `sudo -n` call below fails
 # fast (same -n non-interactive behavior as the pre-existing restart
 # call) and this script prints the exact fix needed and continues rather
@@ -261,8 +261,8 @@ if [ -f "$NGINX_LIVE" ] && ! diff -q "$NGINX_REPO" "$NGINX_LIVE" > /dev/null 2>&
   # argument list can never match a path that's different every time, so
   # this cp always failed even with an otherwise-correct, intentionally
   # widened sudoers rule. Fixed by using a FIXED path next to the live
-  # config instead, so the one-time sudoers grant (see README's "Hosting
-  # on a server" setup) can actually name it.
+  # config instead, so the one-time sudoers grant (see docs/hosting.md's
+  # "Hosting on a server" setup) can actually name it.
   NGINX_BACKUP="${NGINX_LIVE}.deploy-backup"
   if sudo -n cp "$NGINX_LIVE" "$NGINX_BACKUP" 2>/dev/null \
       && sudo -n cp "$NGINX_REPO" "$NGINX_LIVE" 2>/dev/null; then
@@ -295,7 +295,7 @@ if [ "${#SUDOERS_GAPS[@]}" -gt 0 ]; then
   for gap in "${SUDOERS_GAPS[@]}"; do
     echo "      sudo $gap"
   done
-  echo "    See the README's \"Hosting on a server\" setup (step 7) for the exact"
+  echo "    See docs/hosting.md's \"Hosting on a server\" setup (step 7) for the exact"
   echo "    sudoers rule to add -- it needs THREE distinct cp invocations (backup,"
   echo "    apply, and rollback-on-failure), not just one, since sudoers matches"
   echo "    each exact argument list separately."
