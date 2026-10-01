@@ -86,8 +86,14 @@ export function activateEnvironment(name: string): Promise<{ activated: boolean;
   return apiFetch(`/api/environments/${encodeURIComponent(name)}/activate`, { method: 'POST' })
 }
 
-export function deleteEnvironment(name: string): Promise<{ deleted: string }> {
-  return apiFetch(`/api/environments/${encodeURIComponent(name)}`, { method: 'DELETE' })
+// `id` (the real owner-namespaced storage key, see Environment.id) is only
+// ever passed for an admin deleting an environment they don't own -- their
+// own environments are already unambiguous by name. Omit it (or pass
+// undefined) when deleting your own -- the backend falls back to a
+// by-name lookup scoped to the caller in that case.
+export function deleteEnvironment(name: string, id?: string): Promise<{ deleted: string }> {
+  const qs = id ? `?id=${encodeURIComponent(id)}` : ''
+  return apiFetch(`/api/environments/${encodeURIComponent(name)}${qs}`, { method: 'DELETE' })
 }
 
 export function setPreserveLogsLocally(name: string, enabled: boolean): Promise<{ name: string; preserve_logs_locally: boolean }> {
@@ -97,10 +103,12 @@ export function setPreserveLogsLocally(name: string, enabled: boolean): Promise<
   })
 }
 
-export function setEnvironmentShared(name: string, shared: boolean): Promise<{ name: string; shared: boolean }> {
+// Same `id` reasoning as deleteEnvironment above -- only needed for an
+// admin overriding another owner's environment.
+export function setEnvironmentShared(name: string, shared: boolean, id?: string): Promise<{ name: string; shared: boolean }> {
   return apiFetch(`/api/environments/${encodeURIComponent(name)}/share`, {
     method: 'POST',
-    body: JSON.stringify({ shared }),
+    body: JSON.stringify({ shared, id }),
   })
 }
 

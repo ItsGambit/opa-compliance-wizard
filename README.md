@@ -599,6 +599,22 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
      indexing lag) — without it, `POST /api/audit_log/backfill_mfa`
      silently no-ops (0 updated) rather than erroring, so this is safe to
      leave unset. Generate one with e.g. `openssl rand -hex 32`.
+   - `NGINX_PROXY_SECRET` — **required** (not optional) for `server/serve.py`
+     specifically, same `EnvironmentFile`. This is a completely different
+     secret from `INTERNAL_API_SHARED_SECRET` above (that one authenticates
+     serve.py calling INTO auth_gate.py; this one authenticates nginx
+     calling INTO serve.py — don't reuse the same value for both). Without
+     this set and matched in `nginx-opa-secrets-wizard.conf`'s
+     `$nginx_proxy_secret` (see that file's own setup comment), `serve.py`
+     trusts `X-Auth-Is-Admin`/`X-Auth-Sub` from ANY request that can reach
+     its loopback port directly — bypassing nginx, `auth_gate.py`'s login,
+     and step-up MFA entirely (confirmed exploitable by multiple
+     independent security reviews, 2026-09-30). Generate one with
+     `openssl rand -hex 32` and set the SAME value as `nginx-opa-secrets-
+     wizard.conf`'s `set $nginx_proxy_secret "...";` line. If you only ever
+     run this app standalone/locally with no nginx in front at all (this
+     app's other explicitly supported mode), leave this unset — nothing
+     is weakened in that mode, since there's no proxy boundary to spoof.
 5. If `server/serve.py` itself will be reached through a hostname/IP other
    than `127.0.0.1`/`localhost` (true for any reverse-proxied deployment),
    also set `EXTRA_ALLOWED_ORIGINS` (comma-separated) to that public
@@ -611,6 +627,73 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    its existing `opa-secrets-wizard.service` unit name as-is — nothing
    requires renaming a unit that's already running; this filename is the
    template a fresh install starts from.)
+7. **One-time sudoers setup, only if you'll use `server/deploy.sh` to
+   redeploy later** (recommended — it's the repeatable path; see that
+   file's own header comment). This grants the deploying user just the
+   few commands that script needs, nothing broader — it's deliberately a
+   one-time, human-reviewed step done directly on the server, not
+   something `deploy.sh` ever does to itself. (Why not have the script do
+   this automatically? Because it pulls and runs code from GitHub on
+   every invocation — letting it also edit sudoers would mean any future
+   commit could silently grant itself more privilege than this exact
+   list, which defeats the entire point of scoping sudo narrowly in the
+   first place.) If you skip this step, `deploy.sh` still fully deploys
+   the app and frontend either way — it just prints exactly which step it
+   couldn't run and the manual command to run instead, rather than
+   silently leaving `auth_gate.py` or nginx on stale code/config.
+
+   Step 7a. Find the exact paths to `systemctl`, `nginx`, and `cp` on
+   *your* server — sudoers rules match an exact binary path, not just a
+   command name, and these vary by distro:
+   ```bash
+   which systemctl nginx cp
+   ```
+   Note the three paths this prints — you'll use them in step 7c below.
+   (The example in step 7c uses the common Debian/Ubuntu paths
+   `/bin/systemctl`, `/usr/sbin/nginx`, `/bin/cp` — replace them if your
+   `which` output differs.)
+
+   Step 7b. Confirm the deploying Linux username (the account that will
+   actually run `./deploy.sh` — e.g. `rparikh`) and the real path to this
+   repo on the server (e.g. `/home/rparikh/opa-secrets-folders`) — you'll
+   substitute both into step 7c.
+
+   Step 7c. Open a new sudoers file for editing. **Always use `visudo`**
+   (never edit the file directly) — it validates syntax before saving, so
+   a typo here can't lock out `sudo` entirely:
+   ```bash
+   sudo visudo -f /etc/sudoers.d/opa-compliance-wizard-deploy
+   ```
+   Paste the following into the editor that opens, then replace every
+   `rparikh` with your actual deploying username (step 7b) and every
+   `/home/rparikh/opa-secrets-folders` with your actual repo path (step
+   7b) — leave `opa-secrets-wizard` and `opa-auth-gate` exactly as-is,
+   those are fixed systemd unit names, not placeholders:
+   ```
+   rparikh ALL=(ALL) NOPASSWD: /bin/systemctl restart opa-secrets-wizard, \
+     /bin/systemctl restart opa-auth-gate, \
+     /bin/cp /home/rparikh/opa-secrets-folders/server/nginx-opa-secrets-wizard.conf /etc/nginx/sites-available/opa-secrets-wizard, \
+     /usr/sbin/nginx -t, \
+     /bin/systemctl reload nginx
+   ```
+   Save and exit (same keys as your system's default editor — usually
+   `nano`: Ctrl+O then Enter, then Ctrl+X). `visudo` will refuse to save a
+   file with a syntax error and tell you so — if that happens, fix the
+   reported line rather than forcing a save.
+
+   Step 7d. Verify the rule actually works, logged in AS the deploying
+   user (not as root or your own login) — `-l` only lists what you're
+   allowed to run, without actually running (and so without restarting
+   the live app or touching nginx):
+   ```bash
+   sudo -n -l
+   ```
+   You should see all five commands from step 7c listed under
+   `NOPASSWD:`, with no password prompt. If you instead get a password
+   prompt, a `sudo: a password is required` error, or the list doesn't
+   include all five, re-open the file from step 7c and check for a typo
+   — most commonly the username, or a binary path that doesn't match
+   step 7a's `which` output exactly.
 
 **Per-user environments.** Once behind the login gate, each logged-in
 Okta identity gets their own private set of environments by default (an
@@ -964,16 +1047,124 @@ already exists is skipped, not duplicated.
 
 ## Version
 
-5.23.2 — **Scheduled compliance syncs now have a real audit trail** —
-previously a scheduled sync's start, success, failure, or even a genuine
-miss (e.g. the server was down at the scheduled time) left NO trace
-anywhere. Also: a local-time equivalent next to the sync schedule's
-"Run time (UTC)" field, a step-up MFA lookup retry (closes a real Okta
-System Log indexing-lag race), and the Audit Log's Refresh button now
-also backfills any older entry whose Okta MFA corroboration was still
-missing. See the changelog entries below for the full breakdown.
+5.24.0 — **Security remediation pass: 14 confirmed findings from
+independent reviews, plus several more found during the fix.** The
+single worst finding (flagged independently by multiple reviewers): with
+nginx in front of this app, `server/serve.py`'s loopback port trusted
+`X-Auth-Is-Admin`/`X-Auth-Sub` from ANY request that could reach it
+directly, bypassing login and step-up MFA entirely — closed with a new
+required `NGINX_PROXY_SECRET`. Three severe cross-tenant data leaks (two
+different logged-in users with same-named environments, e.g. both named
+`dev`, could see or write each other's Access Explorer results, sync
+status, and compliance report data) are fixed via one root-cause change:
+every one of those subsystems now keys off the environment's existing
+stable owner-qualified ID instead of its bare display name. See the
+changelog entry below for the full breakdown (filesystem path
+confinement for CSV import, atomic config writes, fail-closed access
+control, and several more).
 
 ### Changelog
+- **5.24.0**:
+  - **Critical: closed the nginx header-spoofing trust gap.** New
+    required `NGINX_PROXY_SECRET` env var + matching nginx
+    `X-Nginx-Proxy-Secret` header on every request proxied to
+    `server/serve.py` — without it, that process trusted
+    `X-Auth-Is-Admin`/`X-Auth-Sub` from any request reaching its loopback
+    port directly, regardless of whether it actually went through
+    nginx's login/step-up-MFA flow. See "Hosting on a server" for setup.
+  - **Critical: fixed 3 cross-tenant data leaks.** Access Explorer job
+    state, compliance-sync job state, and compliance report/history
+    queries were all previously scoped by bare environment display name
+    only — two different logged-in users with same-named environments
+    (e.g. both named `dev`) could see or interfere with each other's
+    results. Every one of these now uses the environment's existing
+    owner-qualified stable ID (already computed everywhere internally,
+    now also returned to the frontend and threaded through every
+    mutation/lookup) instead of a bare name.
+  - **Critical: config writes are now atomic.** `environments.json`,
+    `banner_config.json`, `access_control.json`, and the encrypted System
+    Log cache were all written via a plain truncating `open(path, "w")`
+    — a crash or a login landing exactly mid-write could leave a
+    corrupted file, and `auth_gate.py` previously treated a corrupted
+    (but present) `access_control.json` as "no restrictions configured,"
+    silently disabling the login-restriction gate. Writes now go through
+    a tempfile + fsync + atomic rename, and a parse failure on an
+    existing file now serves the last-known-good config from memory
+    instead of falling back to unrestricted.
+  - **High: admin environment edit/share/delete could silently target
+    the wrong owner.** Previously resolved by scanning every owner for
+    the first same-named match; now resolves directly by the stable ID
+    above (an O(1) lookup) whenever the frontend provides one.
+  - **High: `POST /api/banner` had no admin check at all** — any
+    authenticated user could publish/edit the org-wide announcement
+    banner. Added the same admin check its sibling (Access Control) already
+    had; the sidebar's banner-settings pill is now also hidden from
+    non-admins to match.
+  - **High: CSV import (`sync/import_csv`) took a server filesystem path
+    straight from the request body**, confined only by an `os.path.isfile`
+    check — no path confinement at all. Now resolves through the same
+    basename-only, project-root-confined helper the dashboard's other CSV
+    picker already used; the "Import from a CSV export" first-run choice
+    in Sync Settings now picks from that same project-folder file list
+    instead of typing a free-text path. Also found and fixed: this route
+    had **no ownership check at all** (unlike its sibling, sync status) —
+    any authenticated user could inject rows into another owner's
+    compliance archive just by guessing their environment's name.
+  - **High: `server/deploy.sh` only ever restarted the main app
+    service** — a change to `auth_gate.py` or to the nginx config could
+    sit deployed-but-not-live until a separate, easy-to-forget manual
+    step. It now also restarts `opa-auth-gate` and applies + validates
+    (`nginx -t`) + reloads the nginx config (with an automatic rollback
+    if validation fails), given a one-time, narrowly-scoped sudoers
+    grant — see the new step-by-step setup in "Hosting on a server."
+    Deploying without that grant still fully deploys the app; it just
+    prints exactly which step was skipped and the manual command to run.
+  - **Fixed a real SQLite connection leak.** `audit_store.py` kept one
+    open connection per OS thread ID forever, with the dashboard's
+    threaded HTTP server spawning a new thread per request — unbounded
+    memory/file-descriptor growth on a long-running server. Now reuses
+    exactly one connection per thread via `threading.local()`.
+  - **Fixed log pruning only ever fully deleting, never partially
+    pruning.** Retention-by-size pruning checked the on-disk file size to
+    decide when to stop, but that size only shrinks after a `VACUUM` —
+    which was running every loop iteration (a full database rewrite each
+    time, badly slow) and, worse, meant the loop's own stopping condition
+    could never actually trigger mid-run. Now checks live (non-freed)
+    data size via `PRAGMA page_count`/`freelist_count` instead, and
+    `VACUUM` runs at most once, after pruning finishes.
+  - **Fixed a sync watermark bug that could silently and permanently lose
+    events.** If a single day's System Log volume exceeded what one sync
+    chunk could page through, the chunk's results were used (and the
+    watermark advanced) exactly as if that day were fully synced —
+    Okta's System Log has no way to re-fetch an aged-out window later,
+    so anything past the page cap was gone for good. An incomplete chunk
+    now stops the sync immediately, leaves the watermark at the end of
+    the previous (complete) day, and records the failure so the next run
+    retries that exact day instead of skipping past the gap.
+  - **Fixed a frontend polling deadlock** in the Access Explorer
+    bootstrap job: polling could stop before the final result had
+    actually been fetched, in which case the UI never left its "loading"
+    state. Several `useMemo`-wrapped array derivations (Resources tab,
+    Compliance Report detail, Users tab's user picker) also now have
+    stable array references across re-renders, fixing an issue where
+    their fuzzy-search index was being needlessly rebuilt on every
+    keystroke on a large tenant.
+  - **Fixed CSV/formula injection in exported CSVs.** A cell value
+    starting with `=`, `+`, `-`, `@`, a tab, or a carriage return is
+    interpreted as an executable formula by Excel/Sheets/LibreOffice when
+    the exported file is opened — any exported field that ultimately
+    traces back to Okta System Log data (actor/resource display names)
+    could carry such a value. These are now prefixed with a leading
+    apostrophe before export, the standard neutralization.
+  - **Fixed several minor correctness bugs found during this pass:** a
+    malformed or negative `Content-Length` header could crash a request
+    handler (or, for a negative value, hang the handling thread entirely)
+    instead of returning a clean 400; several `/api/environments/{name}/...`
+    routes never URL-decoded the name segment, breaking on environments
+    with spaces or special characters in their name; admin deletion of an
+    environment now also clears the environment's real owner's active
+    pointer, not just the deleting admin's own, if it pointed at the
+    deleted environment.
 - **5.23.2**:
   - **New: scheduled sync audit trail.** `sync.scheduled_start` /
     `_completed` / `_failed` / `_skipped` entries now exist — previously
@@ -1215,7 +1406,11 @@ missing. See the changelog entries below for the full breakdown.
     still serving the old config underneath it, no error anywhere.
     `deploy.sh` now diffs its own nginx config against what's actually
     loaded and warns loudly (it can't safely auto-apply this itself, no
-    sudo access to nginx by design) if they've drifted.
+    sudo access to nginx by design) if they've drifted. **Superseded in
+    5.24.0** — `deploy.sh` now actually applies/validates/reloads it
+    (and also restarts `opa-auth-gate`) given a widened, still-narrowly-
+    scoped sudoers rule; see that release's note and the "Hosting on a
+    server" setup steps.
 - **5.19.0**:
   - **New: Compliance Reports Dashboard.** A new top-level tab
     generates 14 audit-ready reports (grouped by SOC 2 CC6/CC7/CC8,

@@ -9,6 +9,15 @@ export interface SyncSchedule {
 }
 
 export interface Environment {
+  // The real, owner-namespaced storage key (server/serve.py's
+  // _public_entry -- "{owner}::{name}") -- unambiguous even when two
+  // different owners each have an environment named the same thing
+  // (confirmed exploitable without this: an admin's edit/share/delete
+  // could silently target the wrong owner's environment, and the admin
+  // listing could silently drop one of two same-named entries). Send this,
+  // not `name`, on any admin-override mutation (share/delete/edit) where
+  // ambiguity is possible -- see EnvironmentManagerDialog.tsx.
+  id: string
   name: string
   base_domain: string
   team_name: string
@@ -141,6 +150,11 @@ export interface AccessControlConfig {
 }
 
 export interface EnvironmentFormValues {
+  // Only set when editing an EXISTING environment (see Environment.id) --
+  // an admin editing another owner's environment needs this to
+  // disambiguate from a same-named environment under a different owner.
+  // Absent on a create (no id exists yet).
+  id?: string
   name: string
   base_domain: string
   team_name: string

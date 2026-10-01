@@ -242,23 +242,53 @@ STEPUP_LOG_RETRY_DELAY_SECONDS = 2
 ACCESS_CONTROL_FILE_PATH = Path(__file__).resolve().parent.parent / "access_control.json"
 
 
+_LAST_GOOD_ACCESS_CONTROL_CONFIG = None  # see _read_access_control_config
+
+
 def _read_access_control_config() -> dict:
     """Read fresh on every callback -- a login is already a network round
     trip to Okta, so one extra stat+read is negligible, and this avoids any
     cache-staleness bug (a saved change takes effect on the very next login,
-    with zero restart of this process required). Falls back to
-    OKTA_ADMIN_GROUP_ID with no user group and restrict_login off when the
-    file doesn't exist yet (bootstrap default -- see the module docstring)."""
+    with zero restart of this process required).
+
+    SECURITY FIX (external review, 2026-09-30): this used to catch
+    `ValueError` (json.JSONDecodeError's base class) from a MALFORMED file
+    the exact same way as a genuinely MISSING one -- falling back to the
+    unrestricted bootstrap default (OKTA_ADMIN_GROUP_ID, no user group,
+    restrict_login OFF) either way. That's correct for "no file yet"
+    (nobody has configured this feature at all), but confirmed exploitable
+    for "file exists but is malformed" -- e.g. this process's own atomic-
+    write guarantee (see create_secret_folders._atomic_write_json) means a
+    normal save can never leave a truncated file on disk anymore, but a
+    disk-full mid-write, a manual edit gone wrong, or any other corruption
+    still shouldn't silently disable a real admin's login restriction.
+    Now: file-not-found still means "not configured yet" (safe bootstrap
+    default, unchanged). A file that EXISTS but fails to parse instead
+    falls back to the last config that DID parse successfully in this
+    process's lifetime -- restrictive settings stay enforced even if the
+    file becomes unreadable later. Only if this process has NEVER seen a
+    valid file at all (freshly started, and the on-disk file is already
+    corrupt) does a parse failure fall back to the bootstrap default --
+    there's no better answer available at that point, and failing every
+    login outright would be worse than a temporary bootstrap-default
+    window that a restart or a fixed file resolves."""
+    global _LAST_GOOD_ACCESS_CONTROL_CONFIG
     try:
         with open(ACCESS_CONTROL_FILE_PATH, encoding="utf-8") as f:
             data = json.load(f)
-    except (FileNotFoundError, ValueError):
+    except FileNotFoundError:
         return {"admin_group_id": OKTA_ADMIN_GROUP_ID, "user_group_id": None, "restrict_login": False}
-    return {
+    except ValueError:
+        if _LAST_GOOD_ACCESS_CONTROL_CONFIG is not None:
+            return dict(_LAST_GOOD_ACCESS_CONTROL_CONFIG)
+        return {"admin_group_id": OKTA_ADMIN_GROUP_ID, "user_group_id": None, "restrict_login": False}
+    config = {
         "admin_group_id": data.get("admin_group_id") or None,
         "user_group_id": data.get("user_group_id") or None,
         "restrict_login": bool(data.get("restrict_login", False)),
     }
+    _LAST_GOOD_ACCESS_CONTROL_CONFIG = config
+    return config
 
 
 def _load_or_create_session_key() -> bytes:

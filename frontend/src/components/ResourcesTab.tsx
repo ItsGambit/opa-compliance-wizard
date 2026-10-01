@@ -331,7 +331,13 @@ function ResourceHistoryPanel({ resourceId, resourceLabel, onClose }: { resource
   // global sync completes, via queryClient.invalidateQueries on the
   // ['resource_history'] key prefix (see Footer.tsx).
   const { data, isLoading } = useResourceHistory(resourceId, activeEnv, from, to, resourceLabel)
-  const rows = data?.rows ?? []
+  // FIX (external review, 2026-09-30): `data?.rows ?? []` creates a brand
+  // new [] literal on every render while data is still loading --
+  // useFuzzyFilter callers downstream (see e.g. ResourceRowList) rebuild
+  // their whole Fuse search index every render instead of only when the
+  // underlying data actually changes, since useMemo there keys off this
+  // array's REFERENCE, not its contents.
+  const rows = useMemo(() => data?.rows ?? [], [data])
   const [filteredRows, setFilteredRows] = useState(rows)
 
   return (

@@ -356,7 +356,15 @@ export function SideNav({
           {isAdmin && (
             <UtilityPill label="Access control" icon={ShieldCheck} onClick={() => { onOpenAccessControl(); closeDrawer() }} collapsed={collapsed} />
           )}
-          <UtilityPill label="Announcement banner" icon={Megaphone} onClick={() => { onOpenBanner(); closeDrawer() }} collapsed={collapsed} />
+          {/* Gated behind isAdmin (external review fix, 2026-09-30) --
+              changing the org-wide banner is now backend-admin-gated too
+              (see POST /api/banner in serve.py); hiding the control from a
+              non-admin here is a usability improvement, NOT the real
+              enforcement boundary -- the backend check is what actually
+              matters. */}
+          {isAdmin && (
+            <UtilityPill label="Announcement banner" icon={Megaphone} onClick={() => { onOpenBanner(); closeDrawer() }} collapsed={collapsed} />
+          )}
           <UtilityPill label="About" icon={Info} onClick={() => { onOpenAbout(); closeDrawer() }} collapsed={collapsed} />
           <UtilityPill
             label={theme === 'light' ? 'Light mode' : 'Dark mode'}

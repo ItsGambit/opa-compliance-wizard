@@ -20,17 +20,30 @@
 #   4. Rebuilds the frontend (npm ci + vite build) -- serve.py serves the
 #      built frontend/dist, so a deploy without this step ships new backend
 #      code against a stale UI.
-#   5. Restarts the systemd service and prints its status.
-#   6. Warns (does NOT auto-apply) if the repo's nginx config differs from
-#      what's actually loaded at /etc/nginx/sites-available/opa-secrets-wizard
-#      -- confirmed as a real gap 2026-09-30: nginx's config is a plain file
-#      copy, not a symlink into this repo, so a real nginx change (e.g. a
-#      new header this app now depends on) can sit committed and deployed
-#      here for a long time while nginx keeps serving the OLD config,
-#      with zero error/warning anywhere. This script has no sudo access to
-#      copy it into place or reload nginx itself (rparikh's NOPASSWD rule
-#      is scoped to opa-secrets-wizard only, deliberately) -- it just tells
-#      you loudly so you don't have to rediscover this the hard way again.
+#   5. Restarts BOTH systemd units (opa-secrets-wizard AND opa-auth-gate --
+#      see the H-4 fix note below) and prints their status.
+#   6. Applies the repo's nginx config if it differs from what's actually
+#      loaded at /etc/nginx/sites-available/opa-secrets-wizard, `nginx -t`
+#      validates it, then reloads nginx -- only if the validation passes.
+#
+# SECURITY/CORRECTNESS FIX (external review, 2026-09-30, "H-4"): this used
+# to restart ONLY opa-secrets-wizard and only WARN (never apply) on nginx
+# config drift, because the deploying user's NOPASSWD sudoers rule was
+# scoped to just that one unit. Confirmed as a real, repeatedly-hit gap
+# this session: auth_gate.py changes (e.g. the P0 NGINX_PROXY_SECRET fix)
+# or nginx conf changes landed in the repo and got rsynced to $APP_DIR by
+# this very script, but kept running under the OLD code/config until
+# someone remembered the separate manual step. Steps 5-6 below now
+# actually restart/apply instead of just warning -- this REQUIRES widening
+# the server's NOPASSWD sudoers rule beyond systemctl restart
+# opa-secrets-wizard to also cover: systemctl restart opa-auth-gate,
+# cp <repo nginx conf> /etc/nginx/sites-available/opa-secrets-wizard,
+# nginx -t, and systemctl reload nginx. If that rule hasn't been widened
+# yet on this server, each `sudo -n` call below fails fast (same -n
+# non-interactive behavior as the pre-existing restart call) and this
+# script prints the exact fix needed and continues rather than aborting
+# the whole deploy over it -- the app code/frontend is still fully
+# deployed and the main service still restarts either way.
 #
 # Safe to re-run any time; every step is idempotent.
 
@@ -39,7 +52,11 @@ set -euo pipefail
 REPO_URL="https://github.com/ItsGambit/opa-compliance-wizard.git"
 APP_DIR="/home/rparikh/opa-secrets-folders"
 SERVICE_NAME="opa-secrets-wizard"
+AUTH_GATE_SERVICE="opa-auth-gate"
+NGINX_LIVE="/etc/nginx/sites-available/opa-secrets-wizard"
+NGINX_REPO="$APP_DIR/server/nginx-opa-secrets-wizard.conf"
 TMP_DIR="$(mktemp -d)"
+SUDOERS_GAPS=()
 
 cleanup() { rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
@@ -97,17 +114,70 @@ sudo -n systemctl restart "$SERVICE_NAME"
 sleep 1
 systemctl status "$SERVICE_NAME" --no-pager -l
 
+echo "==> Restarting $AUTH_GATE_SERVICE"
+# H-4 fix: previously never restarted here at all -- any auth_gate.py
+# change deployed above kept running under the OLD code until a separate,
+# easy-to-forget manual restart. Same -n fail-fast behavior as above; if
+# the server's sudoers rule hasn't been widened to cover this unit yet,
+# don't abort the whole deploy over it -- warn and keep going, same
+# graceful-degradation shape the old nginx-drift warning used.
+if sudo -n systemctl restart "$AUTH_GATE_SERVICE" 2>/dev/null; then
+  sleep 1
+  systemctl status "$AUTH_GATE_SERVICE" --no-pager -l
+else
+  SUDOERS_GAPS+=("systemctl restart $AUTH_GATE_SERVICE")
+  echo "    (skipped -- sudoers rule doesn't cover this yet, see warning below)"
+fi
+
 echo "==> Done. Deployed version:"
 grep -m1 'SCRIPT_VERSION = ' "$APP_DIR/create_secret_folders.py"
 
-NGINX_LIVE="/etc/nginx/sites-available/opa-secrets-wizard"
-NGINX_REPO="$APP_DIR/server/nginx-opa-secrets-wizard.conf"
 if [ -f "$NGINX_LIVE" ] && ! diff -q "$NGINX_REPO" "$NGINX_LIVE" > /dev/null 2>&1; then
   echo ""
-  echo "!!! WARNING: nginx config has drifted from what's actually live. !!!"
+  echo "==> nginx config has drifted from what's actually live -- applying repo copy"
   echo "    Repo copy (just deployed): $NGINX_REPO"
-  echo "    Live copy (still serving): $NGINX_LIVE"
-  echo "    This script cannot fix this itself (no sudo for nginx)."
-  echo "    If the repo copy has a real change, run:"
-  echo "      sudo cp '$NGINX_REPO' '$NGINX_LIVE' && sudo nginx -t && sudo systemctl reload nginx"
+  echo "    Live copy (currently serving): $NGINX_LIVE"
+  # Back up the current live file BEFORE overwriting it, so a bad new
+  # config (one that fails `nginx -t`) can be rolled back immediately
+  # rather than left in place -- `nginx -t` only validates whatever is
+  # CURRENTLY at $NGINX_LIVE (sites-available files aren't standalone
+  # configs nginx -c can point at directly; they're pulled in via
+  # sites-enabled's include), so validating has to happen in-place,
+  # which means a failure must be reversible, not just reported.
+  NGINX_BACKUP="$TMP_DIR/opa-secrets-wizard.conf.live-backup"
+  if sudo -n cp "$NGINX_LIVE" "$NGINX_BACKUP" 2>/dev/null \
+      && sudo -n cp "$NGINX_REPO" "$NGINX_LIVE" 2>/dev/null; then
+    if sudo -n nginx -t 2>&1; then
+      if sudo -n systemctl reload nginx 2>/dev/null; then
+        echo "    Applied, validated, and reloaded."
+      else
+        SUDOERS_GAPS+=("systemctl reload nginx")
+        echo "    Config copied and passed 'nginx -t', but reload didn't happen"
+        echo "    (sudoers gap) -- the OLD config is still what's actually serving"
+        echo "    traffic until a reload runs. See warning below."
+      fi
+    else
+      echo "    !!! New config FAILED 'nginx -t' -- rolling back to the previous"
+      echo "    !!! live config so nginx doesn't break on its next reload/restart."
+      sudo -n cp "$NGINX_BACKUP" "$NGINX_LIVE" 2>/dev/null \
+        || echo "    !!! ROLLBACK ALSO FAILED -- $NGINX_LIVE may now be broken. Fix manually."
+    fi
+  else
+    SUDOERS_GAPS+=("cp '$NGINX_REPO' '$NGINX_LIVE' && nginx -t && systemctl reload nginx")
+    echo "    (skipped -- sudoers rule doesn't cover this yet, see warning below)"
+  fi
+fi
+
+if [ "${#SUDOERS_GAPS[@]}" -gt 0 ]; then
+  echo ""
+  echo "!!! WARNING: this server's NOPASSWD sudoers rule doesn't yet cover !!!"
+  echo "!!! everything this script needs -- the following step(s) were    !!!"
+  echo "!!! skipped and need either a widened sudoers rule or a manual run: !!!"
+  for gap in "${SUDOERS_GAPS[@]}"; do
+    echo "      sudo $gap"
+  done
+  echo "    To fix permanently, widen the deploying user's sudoers rule to also"
+  echo "    allow (visudo): systemctl restart $AUTH_GATE_SERVICE, cp to $NGINX_LIVE,"
+  echo "    nginx -t, systemctl reload nginx -- in addition to the existing"
+  echo "    systemctl restart $SERVICE_NAME rule."
 fi

@@ -104,6 +104,22 @@ export function UsersTab({ model, onUserGroupRemoved }: Props) {
   const user = model.users.find(u => u.id === userId)
   const isServiceAccount = user?.user_type === 'service'
 
+  // FIX (external review, 2026-09-30): an inline model.users.map(...) in
+  // the JSX below created a brand new array every render regardless of
+  // whether model.users actually changed -- on a tenant with a large user
+  // count, this defeats the Select component's internal useFuzzyFilter
+  // memoization (which keys off array identity) and rebuilds its whole
+  // search index on every keystroke/render, not just when the user list
+  // itself changes.
+  const userOptions = useMemo(
+    () => model.users.map(u => ({
+      value: u.id,
+      label: u.details?.full_name || u.name,
+      labelClassName: u.user_type === 'service' ? 'text-warn' : undefined,
+    })),
+    [model.users]
+  )
+
   const groupIds = useMemo(() => new Set(user?.groups.map(g => g.id) ?? []), [user])
   const grants = useMemo(() => (user ? rulesGrantedToGroupIds(model.policies, groupIds) : []), [model.policies, groupIds, user])
 
@@ -174,11 +190,7 @@ export function UsersTab({ model, onUserGroupRemoved }: Props) {
           value={userId}
           onValueChange={setUserId}
           placeholder="Select a user"
-          options={model.users.map(u => ({
-            value: u.id,
-            label: u.details?.full_name || u.name,
-            labelClassName: u.user_type === 'service' ? 'text-warn' : undefined,
-          }))}
+          options={userOptions}
         />
       </div>
 

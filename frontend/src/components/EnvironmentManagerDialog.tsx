@@ -62,8 +62,8 @@ export function EnvironmentManagerDialog({ data, open: openProp, onOpenChange, i
   })
 
   const deleteMutation = useMutation({
-    mutationFn: (name: string) => deleteEnvironment(name),
-    onSuccess: (_resp, name) => {
+    mutationFn: ({ name, id }: { name: string; id: string }) => deleteEnvironment(name, id),
+    onSuccess: (_resp, { name }) => {
       toast({ title: `Deleted '${name}'`, variant: 'default' })
       setConfirmingDelete(null)
       invalidateAll()
@@ -72,7 +72,11 @@ export function EnvironmentManagerDialog({ data, open: openProp, onOpenChange, i
   })
 
   const shareMutation = useMutation({
-    mutationFn: ({ name, shared }: { name: string; shared: boolean }) => setEnvironmentShared(name, shared),
+    // `id` (the real storage key -- see Environment.id) disambiguates an
+    // admin's share toggle from a same-named environment under a
+    // different owner; always passed since this dialog always has a full
+    // Environment object in hand.
+    mutationFn: ({ name, shared, id }: { name: string; shared: boolean; id: string }) => setEnvironmentShared(name, shared, id),
     onSuccess: (resp) => {
       toast({ title: resp.shared ? `'${resp.name}' is now shared` : `'${resp.name}' is now private`, variant: 'success' })
       invalidateAll()
@@ -108,7 +112,7 @@ export function EnvironmentManagerDialog({ data, open: openProp, onOpenChange, i
               <div className="text-xs text-text-faint">No environments saved yet.</div>
             )}
             {(data?.environments ?? []).map(env => (
-              <div key={env.name} className="card p-2.5 flex flex-col gap-1.5">
+              <div key={env.id} className="card p-2.5 flex flex-col gap-1.5">
                 <div className="flex items-center gap-2">
                   <span className="text-sm font-medium text-text">{env.name}</span>
                   {data?.active === env.name && <StatusBadge label="active" variant="exists" />}
@@ -117,7 +121,7 @@ export function EnvironmentManagerDialog({ data, open: openProp, onOpenChange, i
                       type="button"
                       title={env.shared ? 'Shared — click to make private' : 'Private — click to share with every other logged-in user'}
                       disabled={shareMutation.isPending}
-                      onClick={() => shareMutation.mutate({ name: env.name, shared: !env.shared })}
+                      onClick={() => shareMutation.mutate({ name: env.name, shared: !env.shared, id: env.id })}
                       className={`flex items-center gap-1 text-[0.6875rem] font-medium px-1.5 py-0.5 rounded border whitespace-nowrap ${
                         env.shared
                           ? 'bg-accent-dim text-accent border-accent/40'
@@ -168,7 +172,7 @@ export function EnvironmentManagerDialog({ data, open: openProp, onOpenChange, i
                     className="btn-secondary !px-1.5 !py-1 hover:!text-loss"
                     title={env.is_own || isAdmin ? 'Delete' : "Owned by another user — you can't delete it"}
                     disabled={!env.is_own && !isAdmin}
-                    onClick={() => setConfirmingDelete(env.name)}
+                    onClick={() => setConfirmingDelete(env.id)}
                   >
                     <Trash2 size={12} />
                   </button>
@@ -184,14 +188,14 @@ export function EnvironmentManagerDialog({ data, open: openProp, onOpenChange, i
                     <span className="text-[0.6875rem] text-win">Compliance sync on</span>
                   )}
                 </div>
-                {confirmingDelete === env.name && (
+                {confirmingDelete === env.id && (
                   <div className="flex items-center gap-2 text-xs text-loss">
                     Delete "{env.name}"?
                     <button
                       type="button"
                       className="btn-danger !py-0.5 !px-2"
                       disabled={deleteMutation.isPending}
-                      onClick={() => deleteMutation.mutate(env.name)}
+                      onClick={() => deleteMutation.mutate({ name: env.name, id: env.id })}
                     >
                       Yes, delete
                     </button>

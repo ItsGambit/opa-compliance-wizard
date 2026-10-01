@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { ArrowLeft } from 'lucide-react'
 import { useReport } from '../api/hooks'
 import type { ComplianceReportDef, ComplianceReportRow } from '../types'
@@ -27,7 +27,12 @@ export function ComplianceReportDetail({ def, environment, onBack }: Props) {
   // via queryClient.invalidateQueries on the ['report'] key prefix (see
   // Footer.tsx).
   const { data, isLoading } = useReport(def.key, environment, from, to)
-  const rows = data?.rows ?? []
+  // FIX (external review, 2026-09-30): see the identical note in
+  // ResourcesTab.tsx -- `data?.rows ?? []` without useMemo creates a new
+  // array reference on every render while loading, defeating
+  // ReportRowsTable's internal useFuzzyFilter memoization (which keys off
+  // array identity, not contents).
+  const rows = useMemo(() => data?.rows ?? [], [data])
 
   // ExportButtons exports whatever ReportRowsTable's own filters have
   // currently narrowed the rows down to -- same "export what's on screen"

@@ -84,6 +84,54 @@ EXTRA_ALLOWED_ORIGINS = {o.strip() for o in os.environ.get("EXTRA_ALLOWED_ORIGIN
 INTERNAL_API_SHARED_SECRET = os.environ.get("INTERNAL_API_SHARED_SECRET")
 AUTH_GATE_INTERNAL_URL = "http://127.0.0.1:8767"
 
+# SECURITY FIX (external review, 2026-09-30, flagged independently by
+# multiple reviewers as the single most severe finding): this process
+# binds 127.0.0.1:8766 and, before this fix, trusted X-Auth-Is-Admin/
+# X-Auth-Sub UNCONDITIONALLY -- nothing verified a request actually
+# transited nginx's auth_request flow (see nginx-opa-secrets-wizard.conf)
+# rather than coming from any other local process on the same machine
+# (or a hypothetical SSRF from some other local service) that simply set
+# those headers directly. Confirmed exploitable: `curl
+# http://127.0.0.1:8766/api/access_control/save -H "X-Auth-Is-Admin:
+# true"` would have been treated identically to a real nginx-forwarded
+# admin request, bypassing login, group checks, AND step-up MFA entirely.
+#
+# NGINX_PROXY_SECRET closes this: nginx is configured to set
+# X-Nginx-Proxy-Secret on every request it proxies to this port (see the
+# two `location` blocks in nginx-opa-secrets-wizard.conf that proxy to
+# 8766 -- confirmed exactly two: `location /` and
+# `location /api/access_control/save`), and _request_is_from_nginx below
+# requires a match before ANY X-Auth-* header is trusted.
+#
+# Deliberately a SEPARATE secret from INTERNAL_API_SHARED_SECRET above --
+# that one authenticates serve.py AS A CLIENT calling INTO auth_gate.py
+# (a different direction, a different trust relationship); reusing the
+# same value across two distinct authentication purposes is the kind of
+# thing that turns "rotate one secret" into "rotate everything," and a
+# leak of one no longer implies the other is compromised too.
+#
+# Optional (unset by default) so a fresh standalone/local-only run (no
+# nginx in front at all -- this app's other explicit supported mode, see
+# this file's own module docstring) is never blocked: with it unset,
+# _request_is_from_nginx always returns True (nothing to check against),
+# identical to today's behavior. This is REQUIRED, not optional, for any
+# real hosted multi-user deployment -- see the README's "Hosting on a
+# server" section.
+NGINX_PROXY_SECRET = os.environ.get("NGINX_PROXY_SECRET")
+
+
+def _request_is_from_nginx(headers):
+    """True if NGINX_PROXY_SECRET is unset (nothing to check -- standalone/
+    local-only mode, unchanged behavior) OR the request's
+    X-Nginx-Proxy-Secret header matches it exactly. False otherwise --
+    callers must then treat the request as unauthenticated/local
+    (_owner_key_from_headers already maps a missing X-Auth-Sub to
+    LOCAL_OWNER_KEY_HEADER; the real enforcement is in
+    _is_admin_from_headers below, which now calls this first)."""
+    if not NGINX_PROXY_SECRET:
+        return True
+    return headers.get("X-Nginx-Proxy-Secret") == NGINX_PROXY_SECRET
+
 # Per-owner session state, replacing what used to be three bare globals
 # (client/okta_client/active_env_name) shared by every request regardless
 # of who was asking. `owner_key` is the verified Okta `sub` from the
@@ -101,6 +149,16 @@ _seen_owners = set()  # tracks who's already had a lazy auto-activate attempt th
 
 
 def _owner_key_from_headers(headers):
+    # SECURITY: only trust X-Auth-Sub when it actually came via nginx (see
+    # NGINX_PROXY_SECRET/_request_is_from_nginx above) -- otherwise a
+    # request straight to this process's loopback port could impersonate
+    # ANY specific user's owner_key (not just admin -- see
+    # _is_admin_from_headers below for the sibling check), gaining access
+    # to that user's own/shared environments. Falling back to
+    # LOCAL_OWNER_KEY_HEADER here is safe: it's the same identity a
+    # genuine no-headers-at-all local/CLI request already gets.
+    if not _request_is_from_nginx(headers):
+        return LOCAL_OWNER_KEY_HEADER
     return headers.get("X-Auth-Sub") or LOCAL_OWNER_KEY_HEADER
 
 
@@ -117,7 +175,17 @@ def _is_admin_from_headers(headers):
     local run (no login gate in front at all) has no such header and is
     never treated as admin, since local mode already sees/manages every
     environment unscoped anyway (see list_environments_for's LOCAL_OWNER_KEY
-    handling); there's nothing further an admin flag would unlock there."""
+    handling); there's nothing further an admin flag would unlock there.
+
+    SECURITY FIX (external review, 2026-09-30): previously trusted
+    X-Auth-Is-Admin UNCONDITIONALLY -- confirmed exploitable, see
+    NGINX_PROXY_SECRET's module-level comment above for the full
+    exploit shape. Now requires _request_is_from_nginx(headers) first --
+    a request that skipped nginx (or nginx itself hasn't been configured
+    with the matching secret yet) can never be treated as admin,
+    regardless of what X-Auth-Is-Admin claims."""
+    if not _request_is_from_nginx(headers):
+        return False
     return headers.get("X-Auth-Is-Admin") == "true"
 
 
@@ -171,39 +239,60 @@ def _session_snapshot(owner_key):
 
 # Access Explorer bootstrap job -- build_access_model takes real time
 # (~30s+ on a tenant with data), so it runs in a background thread and the
-# frontend polls _access_job's status instead of holding one HTTP request
-# open the whole time. Single global job: a second start while one is
-# already running is a no-op (see /api/access/bootstrap/start), so there's
-# never more than one in flight.
-_access_job_lock = threading.Lock()
-_access_job = {"status": "idle", "steps": [], "error": None}
-_access_job_result = None  # kept out of _access_job so status polls stay small
+# frontend polls _access_jobs' status instead of holding one HTTP request
+# open the whole time.
+#
+# SECURITY FIX (external review, 2026-09-30): this used to be a single
+# GLOBAL job/result with no owner or environment key at all -- confirmed
+# exploitable: User A starts a bootstrap against Tenant A, User B (with
+# Tenant B active, or even no environment configured) polls
+# /api/access/bootstrap/result and gets User A's tenant's access model
+# verbatim. Now keyed by `storage_name` (the requester's own ACTIVE
+# environment's real, owner-namespaced storage key -- see
+# environment_storage_name) -- a second start while THAT SAME
+# owner+environment's job is already running is still a no-op (unchanged
+# behavior for the one case that matters), but a different owner, or the
+# same owner on a different environment, always gets their own separate
+# job/result, never someone else's.
+_access_jobs_lock = threading.Lock()
+_access_jobs = {}  # storage_name -> {"status": ..., "steps": [...], "error": str|None, "result": ...}
 
 
-def _access_job_progress(key, status, detail=None):
-    with _access_job_lock:
-        _access_job["steps"].append({"key": key, "status": status, "detail": detail})
+def _access_job_progress(storage_name):
+    def _progress(key, status, detail=None):
+        with _access_jobs_lock:
+            _access_jobs.setdefault(storage_name, {"status": "running", "steps": [], "error": None, "result": None})
+            _access_jobs[storage_name]["steps"].append({"key": key, "status": status, "detail": detail})
+    return _progress
 
 
-def _run_access_job(job_client):
-    global _access_job, _access_job_result
+def _run_access_job(storage_name, job_client):
     try:
-        result = engine.build_access_model(job_client, on_progress=_access_job_progress)
-        with _access_job_lock:
-            _access_job["status"] = "done"
-            _access_job_result = result
+        result = engine.build_access_model(job_client, on_progress=_access_job_progress(storage_name))
+        with _access_jobs_lock:
+            _access_jobs[storage_name]["status"] = "done"
+            _access_jobs[storage_name]["result"] = result
     except Exception as exc:
-        with _access_job_lock:
-            _access_job["status"] = "error"
-            _access_job["error"] = str(exc)
+        with _access_jobs_lock:
+            _access_jobs[storage_name]["status"] = "error"
+            _access_jobs[storage_name]["error"] = str(exc)
 
 
 # Compliance-reporting daily sync job -- one job per environment (not a
-# single global job like _access_job above, since multiple environments
-# can each have their own schedule running independently). Same
-# lock+dict+thread shape, keyed by environment name.
+# single global job like _access_jobs above already is, since multiple
+# environments can each have their own schedule running independently).
+# Same lock+dict+thread shape.
+#
+# SECURITY FIX (external review, 2026-09-30): this was keyed by bare
+# display name (env_name) -- confirmed exploitable, identical bug shape
+# to _access_jobs above: two different owners with a same-named
+# environment shared one job entry, so one user's sync status/progress/
+# result was visible to, and could be silently overwritten by, another
+# user's unrelated sync. Now keyed by `storage_name` (the real, owner-
+# namespaced storage key -- see environment_storage_name), unambiguous
+# across owners.
 _sync_jobs_lock = threading.Lock()
-_sync_jobs = {}  # env_name -> {"status": "idle"|"running"|"done"|"error", "steps": [...], "error": str|None}
+_sync_jobs = {}  # storage_name -> {"status": "idle"|"running"|"done"|"error", "steps": [...], "error": str|None}
 
 # Background scheduler thread state -- started once at server boot (see
 # main()), NOT per-request. Every iteration re-reads sync_schedule +
@@ -223,11 +312,11 @@ SCHEDULER_LATE_THRESHOLD_MINUTES = SCHEDULER_POLL_INTERVAL_SECS // 60
 _scheduler_stop_event = threading.Event()
 
 
-def _sync_job_progress(env_name):
+def _sync_job_progress(storage_name):
     def _progress(key, status, detail=None):
         with _sync_jobs_lock:
-            _sync_jobs.setdefault(env_name, {"status": "running", "steps": [], "error": None})
-            _sync_jobs[env_name]["steps"].append({"key": key, "status": status, "detail": detail})
+            _sync_jobs.setdefault(storage_name, {"status": "running", "steps": [], "error": None})
+            _sync_jobs[storage_name]["steps"].append({"key": key, "status": status, "detail": detail})
     return _progress
 
 
@@ -246,13 +335,37 @@ def _run_sync_job(env_name, okta_client, ingestion_scope, owner, trigger="manual
     manual trigger (this function runs in its own background thread, so
     it can't read self.client_address/self.headers itself)."""
     import audit_store
+    # storage_name (owner-namespaced) is used ONLY as the in-memory
+    # _sync_jobs dict key (see that dict's module-level comment for the
+    # cross-owner collision this fixes) -- every audit_store/engine call
+    # below still takes the bare env_name, since the archive schema
+    # itself is still partitioned by display name (a separate, larger
+    # migration, tracked as a fast-follow, not this fix).
+    storage_name = engine.environment_storage_name(owner, env_name)
     action_prefix = "sync.scheduled" if trigger == "scheduled" else "sync.manual"
     with _sync_jobs_lock:
-        _sync_jobs[env_name] = {"status": "running", "steps": [], "error": None}
+        _sync_jobs[storage_name] = {"status": "running", "steps": [], "error": None}
     try:
         result = audit_store.sync_okta_events(
-            okta_client, env_name, ingestion_scope, on_progress=_sync_job_progress(env_name)
+            okta_client, env_name, ingestion_scope, on_progress=_sync_job_progress(storage_name)
         )
+        # FIX (external review, 2026-09-30, "1.5" follow-through): a hit
+        # max_pages cap makes sync_okta_events return NORMALLY (no
+        # exception) with complete=False and its own last_sync_status
+        # already set to "error" in the DB -- without this check, this
+        # function's try/except treats that as indistinguishable from a
+        # real success, marking the in-memory job "done" (not "error")
+        # and logging sync.*_completed (not _failed), even though the
+        # DB-persisted sync_state and this response disagree with that.
+        if not result.get("complete", True):
+            with _sync_jobs_lock:
+                _sync_jobs[storage_name]["status"] = "error"
+                _sync_jobs[storage_name]["error"] = result.get("error") or "Sync stopped early: see sync_state for details."
+            engine.log_audit_event(
+                actor_email, actor_sub, f"{action_prefix}_failed", {"name": env_name, **result},
+                client_ip=client_ip, user_agent=user_agent,
+            )
+            return
         schedule = engine.get_sync_schedule(env_name, owner=owner)
         prune_result = audit_store.prune_events(
             env_name,
@@ -260,16 +373,16 @@ def _run_sync_job(env_name, okta_client, ingestion_scope, owner, trigger="manual
             max_size_mb=schedule.get("retention_max_size_mb"),
         )
         with _sync_jobs_lock:
-            _sync_jobs[env_name]["status"] = "done"
-            _sync_jobs[env_name]["result"] = {**result, **prune_result}
+            _sync_jobs[storage_name]["status"] = "done"
+            _sync_jobs[storage_name]["result"] = {**result, **prune_result}
         engine.log_audit_event(
             actor_email, actor_sub, f"{action_prefix}_completed", {"name": env_name, **result, **prune_result},
             client_ip=client_ip, user_agent=user_agent,
         )
     except Exception as exc:
         with _sync_jobs_lock:
-            _sync_jobs[env_name]["status"] = "error"
-            _sync_jobs[env_name]["error"] = str(exc)
+            _sync_jobs[storage_name]["status"] = "error"
+            _sync_jobs[storage_name]["error"] = str(exc)
         engine.log_audit_event(
             actor_email, actor_sub, f"{action_prefix}_failed", {"name": env_name, "error": str(exc)},
             client_ip=client_ip, user_agent=user_agent,
@@ -307,8 +420,9 @@ def _start_sync_job(env_name, ingestion_scope, owner=engine.LOCAL_OWNER_KEY, tri
     show that). client_ip/user_agent are naturally None for a scheduled
     trigger, same as any other CLI/background-triggered audit entry in
     this project's existing convention."""
+    storage_name = engine.environment_storage_name(owner, env_name)
     with _sync_jobs_lock:
-        if _sync_jobs.get(env_name, {}).get("status") == "running":
+        if _sync_jobs.get(storage_name, {}).get("status") == "running":
             if trigger == "scheduled":
                 engine.log_audit_event(actor_email, actor_sub, "sync.scheduled_skipped", {"name": env_name, "reason": "already running"}, client_ip=client_ip, user_agent=user_agent)
             return False
@@ -317,13 +431,13 @@ def _start_sync_job(env_name, ingestion_scope, owner=engine.LOCAL_OWNER_KEY, tri
         creds = engine.get_environment_credentials(env_name, owner=owner)
     except KeyError as exc:
         with _sync_jobs_lock:
-            _sync_jobs[env_name] = {"status": "error", "steps": [], "error": str(exc)}
+            _sync_jobs[storage_name] = {"status": "error", "steps": [], "error": str(exc)}
         engine.log_audit_event(actor_email, actor_sub, f"{action_prefix}_failed", {"name": env_name, "error": str(exc)}, client_ip=client_ip, user_agent=user_agent)
         return False
     if not creds.get("okta_url") or not creds.get("okta_api_token"):
         error_msg = "No Okta URL/API token configured for this environment."
         with _sync_jobs_lock:
-            _sync_jobs[env_name] = {"status": "error", "steps": [], "error": error_msg}
+            _sync_jobs[storage_name] = {"status": "error", "steps": [], "error": error_msg}
         engine.log_audit_event(actor_email, actor_sub, f"{action_prefix}_failed", {"name": env_name, "error": error_msg}, client_ip=client_ip, user_agent=user_agent)
         return False
     okta_client = engine.OktaClient(creds["okta_url"], creds["okta_api_token"])
@@ -450,6 +564,7 @@ def _public_entry(name, meta, requesting_owner):
     you" without exposing anyone else's real owner id."""
     storage_name = engine.environment_storage_name(meta.get("owner"), name)
     return {
+        "id": storage_name,
         "name": name,
         "base_domain": meta.get("base_domain", ""),
         "team_name": meta.get("team_name", ""),
@@ -545,6 +660,22 @@ def _require_okta_client(send_json, active_okta_client):
     return True
 
 
+def _environment_visible_to(engine_owner, name):
+    """AUTHZ FIX (external review, 2026-09-30): the compliance archive
+    (audit_store.py) partitions events/sync_state by bare display name,
+    with NO ownership check anywhere on the report/history/sync-status
+    routes -- confirmed exploitable: any authenticated user could read
+    another owner's compliance data just by passing that owner's
+    environment name in ?environment=. This does not fix the archive's
+    own schema (still partitioned by display name, not a stable owner-
+    scoped ID -- a bigger migration, tracked separately) -- it closes the
+    actual disclosure by rejecting a request for any name the requester
+    doesn't own or have explicit shared access to, using this project's
+    existing list_environments_for visibility rule (same one every other
+    "what can this owner see" check in this file already uses)."""
+    return name in engine.list_environments_for(engine_owner)
+
+
 class _RequestAborted(Exception):
     """Internal control-flow signal: a response (e.g. 413/403) was already
     sent for this request, so the caller should stop processing without
@@ -618,7 +749,27 @@ class Handler(SimpleHTTPRequestHandler):
         return False
 
     def _read_json_body(self):
-        length = int(self.headers.get("Content-Length", 0))
+        # FIX (external review, 2026-09-30, "2.3"): a malformed
+        # Content-Length (non-numeric, or missing entirely in a way that
+        # produces something int() rejects) previously raised an
+        # unhandled ValueError straight out of this method -- a crafted
+        # or malformed request could crash the request handler instead of
+        # getting a clean 400. A NEGATIVE value also previously passed
+        # straight through the `> MAX_REQUEST_BODY_BYTES` check below
+        # (any negative number is less than that) and into
+        # self.rfile.read(length) with a negative argument -- CPython's
+        # socket file objects treat a negative read size as "read until
+        # EOF", which would hang this request (and this threaded server's
+        # one thread handling it) waiting for a close that normal HTTP
+        # keep-alive traffic never sends.
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._send_json(400, {"error": "Malformed Content-Length header."})
+            raise _RequestAborted()
+        if length < 0:
+            self._send_json(400, {"error": "Content-Length cannot be negative."})
+            raise _RequestAborted()
         if length > MAX_REQUEST_BODY_BYTES:
             self._send_json(413, {
                 "error": f"Request body too large (max {MAX_REQUEST_BODY_BYTES // (1024 * 1024)} MB)."
@@ -675,17 +826,27 @@ class Handler(SimpleHTTPRequestHandler):
                     # Admins see EVERY stored environment, not just their
                     # own/shared ones -- list_all_environments() (added for
                     # the scheduler, see its own docstring) returns
-                    # {storage_name: meta} across every owner; unpack the
-                    # display name back out rather than reusing
-                    # list_environments_for's normal own-or-shared filter.
-                    all_envs = engine.list_all_environments()
-                    visible = {}
-                    for storage_key, meta in all_envs.items():
+                    # {storage_name: meta} across every owner.
+                    #
+                    # SECURITY FIX (external review, 2026-09-30): this used
+                    # to unpack storage_key into a bare display name and
+                    # collapse into visible[disp_name] = meta -- if two
+                    # different owners each had an environment named "dev",
+                    # the second one silently overwrote the first in this
+                    # dict, so an admin never even SAW both, let alone
+                    # could act on the right one. Now keeps every entry by
+                    # its real storage_key (unambiguous), and passes each
+                    # one's TRUE display name (not a shared dict key) into
+                    # _public_entry -- two same-named environments from
+                    # different owners both survive to the response, each
+                    # with its own unique `id` (see _public_entry).
+                    envs = []
+                    for storage_key, meta in engine.list_all_environments().items():
                         _, _, disp_name = storage_key.partition("::")
-                        visible[disp_name] = meta
+                        envs.append(_public_entry(disp_name, meta, engine_owner))
                 else:
                     visible = engine.list_environments_for(engine_owner)
-                envs = [_public_entry(n, m, engine_owner) for n, m in visible.items()]
+                    envs = [_public_entry(n, m, engine_owner) for n, m in visible.items()]
                 return self._send_json(200, {"environments": envs, "active": local_env_name})
 
             if path == "/api/banner":
@@ -696,10 +857,13 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_json(200, engine.get_banner_config())
 
             if path.startswith("/api/environments/") and path.endswith("/sync/status"):
-                name = path[len("/api/environments/"):-len("/sync/status")]
+                name = unquote(path[len("/api/environments/"):-len("/sync/status")])
                 import audit_store
+                if not _environment_visible_to(engine_owner, name):
+                    return self._send_json(404, {"error": f"No environment named '{name}' visible to this user."})
+                storage_name = engine.environment_storage_name(engine_owner, name)
                 with _sync_jobs_lock:
-                    job = dict(_sync_jobs.get(name, {"status": "idle", "steps": [], "error": None}))
+                    job = dict(_sync_jobs.get(storage_name, {"status": "idle", "steps": [], "error": None}))
                 job["sync_state"] = audit_store.get_sync_state(name)
                 job["is_first_sync"] = audit_store.is_first_sync(name)
                 return self._send_json(200, job)
@@ -707,6 +871,8 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/reports":
                 import audit_store
                 environment = (qs.get("environment") or [local_env_name])[0]
+                if environment and not _environment_visible_to(engine_owner, environment):
+                    return self._send_json(404, {"error": f"No environment named '{environment}' visible to this user."})
                 reports = audit_store.list_reports()
                 if environment:
                     since = (qs.get("from") or [None])[0]
@@ -721,6 +887,8 @@ class Handler(SimpleHTTPRequestHandler):
                 environment = (qs.get("environment") or [local_env_name])[0]
                 if not environment:
                     return self._send_json(400, {"error": "No active environment and none specified via ?environment="})
+                if not _environment_visible_to(engine_owner, environment):
+                    return self._send_json(404, {"error": f"No environment named '{environment}' visible to this user."})
                 since = (qs.get("from") or [None])[0]
                 until = (qs.get("to") or [None])[0]
                 try:
@@ -739,6 +907,8 @@ class Handler(SimpleHTTPRequestHandler):
                 environment = (qs.get("environment") or [local_env_name])[0]
                 if not environment:
                     return self._send_json(400, {"error": "No active environment and none specified via ?environment="})
+                if not _environment_visible_to(engine_owner, environment):
+                    return self._send_json(404, {"error": f"No environment named '{environment}' visible to this user."})
                 # resource_name: fallback exact-displayName match for
                 # resource kinds with no discoverable log-side id at all
                 # (database accounts, individual AD accounts -- see
@@ -890,18 +1060,30 @@ class Handler(SimpleHTTPRequestHandler):
                 })
 
             if path == "/api/access/bootstrap/status":
-                with _access_job_lock:
-                    return self._send_json(200, {
-                        "status": _access_job["status"],
-                        "steps": _access_job["steps"],
-                        "error": _access_job["error"],
-                    })
+                if not local_env_name:
+                    return self._send_json(200, {"status": "idle", "steps": [], "error": None})
+                storage_name = engine.environment_storage_name(engine_owner, local_env_name)
+                # Snapshot (shallow-copy the steps list) WHILE holding the
+                # lock, then serialize/send OUTSIDE it -- holding a lock
+                # through json.dumps + a socket write (self.wfile.write can
+                # block on a slow/stalled client) needlessly blocks the
+                # background job's progress-appending thread the whole
+                # time. Copying `steps` also means a background append
+                # racing this read can never be observed mid-mutation.
+                with _access_jobs_lock:
+                    job = _access_jobs.get(storage_name, {"status": "idle", "steps": [], "error": None})
+                    status_payload = {"status": job["status"], "steps": list(job["steps"]), "error": job["error"]}
+                return self._send_json(200, status_payload)
 
             if path == "/api/access/bootstrap/result":
-                with _access_job_lock:
-                    if _access_job["status"] != "done" or _access_job_result is None:
+                if not local_env_name:
+                    return self._send_json(409, {"error": "No active environment."})
+                storage_name = engine.environment_storage_name(engine_owner, local_env_name)
+                with _access_jobs_lock:
+                    job = _access_jobs.get(storage_name)
+                    if job is None or job["status"] != "done" or job.get("result") is None:
                         return self._send_json(409, {"error": "Job is not done yet."})
-                    return self._send_json(200, _access_job_result)
+                    return self._send_json(200, job["result"])
 
             if path == "/api/csv_files":
                 files = sorted(p.name for p in PROJECT_ROOT.glob("*.csv"))
@@ -974,6 +1156,13 @@ class Handler(SimpleHTTPRequestHandler):
             payload = self._read_json_body()
 
             if path == "/api/banner":
+                # SECURITY FIX (external review, 2026-09-30): this had NO
+                # admin check at all -- confirmed exploitable: any
+                # authenticated user could publish/modify/disable the
+                # org-wide announcement banner. Same check every other
+                # admin-only write in this file already uses.
+                if owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers(self.headers):
+                    return self._send_json(403, {"error": "Admin access required to change the announcement banner."})
                 config = engine.set_banner_config(
                     payload.get("enabled", False),
                     payload.get("message", ""),
@@ -1041,7 +1230,10 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/environments":
                 is_admin = _is_admin_from_headers(self.headers)
                 try:
-                    name = engine.upsert_environment(payload.get("name"), payload, owner=engine_owner, is_admin=is_admin)
+                    name = engine.upsert_environment(
+                        payload.get("name"), payload, owner=engine_owner, is_admin=is_admin,
+                        environment_id=payload.get("id"),
+                    )
                 except PermissionError as exc:
                     return self._send_json(403, {"error": str(exc)})
                 self._log_audit_event(actor_email, actor_sub, "environment.upsert", {"name": name, "admin_override": is_admin})
@@ -1052,7 +1244,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_json(200, {"activated": True, "active": name})
 
             if path.startswith("/api/environments/") and path.endswith("/activate"):
-                name = path[len("/api/environments/"):-len("/activate")]
+                name = unquote(path[len("/api/environments/"):-len("/activate")])
                 try:
                     activate_environment(owner_key, name)
                 except KeyError as exc:
@@ -1063,11 +1255,14 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_json(200, {"activated": True, "active": name})
 
             if path.startswith("/api/environments/") and path.endswith("/share"):
-                name = path[len("/api/environments/"):-len("/share")]
+                name = unquote(path[len("/api/environments/"):-len("/share")])
                 shared = bool(payload.get("shared", False))
                 is_admin = _is_admin_from_headers(self.headers)
                 try:
-                    engine.set_environment_shared(name, engine_owner, shared, is_admin=is_admin)
+                    engine.set_environment_shared(
+                        name, engine_owner, shared, is_admin=is_admin,
+                        environment_id=payload.get("id"),
+                    )
                 except KeyError as exc:
                     return self._send_json(404, {"error": str(exc)})
                 except PermissionError as exc:
@@ -1076,7 +1271,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_json(200, {"name": name, "shared": shared})
 
             if path.startswith("/api/environments/") and path.endswith("/preserve_logs_locally"):
-                name = path[len("/api/environments/"):-len("/preserve_logs_locally")]
+                name = unquote(path[len("/api/environments/"):-len("/preserve_logs_locally")])
                 enabled = bool(payload.get("enabled", False))
                 try:
                     engine.set_preserve_logs_locally(name, enabled, owner=engine_owner)
@@ -1085,7 +1280,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_json(200, {"name": name, "preserve_logs_locally": enabled})
 
             if path.startswith("/api/environments/") and path.endswith("/sync_schedule"):
-                name = path[len("/api/environments/"):-len("/sync_schedule")]
+                name = unquote(path[len("/api/environments/"):-len("/sync_schedule")])
                 try:
                     saved = engine.set_sync_schedule(name, payload, owner=engine_owner)
                 except KeyError as exc:
@@ -1096,7 +1291,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_json(200, {"name": name, "sync_schedule": saved})
 
             if path.startswith("/api/environments/") and path.endswith("/sync/start"):
-                name = path[len("/api/environments/"):-len("/sync/start")]
+                name = unquote(path[len("/api/environments/"):-len("/sync/start")])
                 try:
                     schedule = engine.get_sync_schedule(name, owner=engine_owner)
                 except KeyError as exc:
@@ -1118,28 +1313,53 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_json(200, {"started": started, "already_running": not started})
 
             if path.startswith("/api/environments/") and path.endswith("/sync/import_csv"):
-                name = path[len("/api/environments/"):-len("/sync/import_csv")]
+                name = unquote(path[len("/api/environments/"):-len("/sync/import_csv")])
                 import audit_store
-                csv_path = payload.get("csv_path")
-                ingestion_scope = payload.get("ingestion_scope", "curated")
-                if not csv_path or not os.path.isfile(csv_path):
-                    return self._send_json(400, {"error": f"csv_path not found on server filesystem: {csv_path!r}"})
+                # SECURITY FIX (external review, 2026-09-30), two bugs fixed
+                # together since both gate the same route:
+                # (1) csv_path previously came straight from the request
+                # body with only an os.path.isfile() check -- no
+                # confinement at all, so any authenticated user could point
+                # this at an arbitrary server-readable file (e.g.
+                # /etc/passwd) and have its contents parsed as CSV and
+                # ingested into the compliance archive. Reuses
+                # _safe_csv_path's exact existing pattern (basename-only,
+                # .csv suffix, confined to PROJECT_ROOT) -- same tradeoff
+                # already accepted for /api/csv: the admin drops the Okta
+                # System Log export into the project root first, then
+                # picks it by bare filename, same as CsvFileBar.tsx's
+                # existing file-picker workflow for the folder-template CSV.
+                # (2) this route had NO ownership check at all, unlike its
+                # sibling /sync/status -- any authenticated user who knew
+                # (or guessed, e.g. "dev"/"prod") another owner's
+                # environment display name could inject rows directly into
+                # that owner's audit archive. Same cross-tenant class as
+                # the report-read leaks fixed above, just on the write side.
+                if not _environment_visible_to(engine_owner, name):
+                    return self._send_json(404, {"error": f"No environment named '{name}' visible to this user."})
                 try:
-                    result = audit_store.import_from_csv(csv_path, name, ingestion_scope)
+                    csv_path = _safe_csv_path(payload.get("csv_path"))
                 except ValueError as exc:
                     return self._send_json(400, {"error": str(exc)})
-                self._log_audit_event(actor_email, actor_sub, "sync.import_csv", {"name": name, "csv_path": csv_path, **result})
+                ingestion_scope = payload.get("ingestion_scope", "curated")
+                if not csv_path.is_file():
+                    return self._send_json(400, {"error": f"{csv_path.name} not found on server filesystem"})
+                try:
+                    result = audit_store.import_from_csv(str(csv_path), name, ingestion_scope)
+                except ValueError as exc:
+                    return self._send_json(400, {"error": str(exc)})
+                self._log_audit_event(actor_email, actor_sub, "sync.import_csv", {"name": name, "csv_path": csv_path.name, **result})
                 return self._send_json(200, result)
 
             if path == "/api/access/bootstrap/start":
                 if not _require_client(self._send_json, local_client):
                     return
-                global _access_job
-                with _access_job_lock:
-                    if _access_job["status"] == "running":
+                storage_name = engine.environment_storage_name(engine_owner, _local_env_name)
+                with _access_jobs_lock:
+                    if _access_jobs.get(storage_name, {}).get("status") == "running":
                         return self._send_json(200, {"started": False, "already_running": True})
-                    _access_job = {"status": "running", "steps": [], "error": None}
-                threading.Thread(target=_run_access_job, args=(local_client,), daemon=True).start()
+                    _access_jobs[storage_name] = {"status": "running", "steps": [], "error": None, "result": None}
+                threading.Thread(target=_run_access_job, args=(storage_name, local_client), daemon=True).start()
                 return self._send_json(200, {"started": True, "steps": engine.ACCESS_MODEL_STEPS})
 
             if path == "/api/resource_groups":
@@ -1378,9 +1598,12 @@ class Handler(SimpleHTTPRequestHandler):
                 resources = payload.get("resources") or []
                 if not resources:
                     return self._send_json(200, {"results": {}})
-                if _access_job_result is None:
+                storage_name = engine.environment_storage_name(engine_owner, _local_env_name)
+                with _access_jobs_lock:
+                    job = _access_jobs.get(storage_name)
+                if job is None or job.get("result") is None:
                     return self._send_json(409, {"error": "Access model not loaded yet -- run the Access Explorer bootstrap first."})
-                opa_user = next((u for u in _access_job_result["users"] if u.get("id") == user_id), None)
+                opa_user = next((u for u in job["result"]["users"] if u.get("id") == user_id), None)
                 if not opa_user:
                     return self._send_json(404, {"error": f"Unknown user id '{user_id}'"})
                 # System Log's actor.id is the Okta identity id, not this PAM
@@ -1401,7 +1624,9 @@ class Handler(SimpleHTTPRequestHandler):
 
     # -----------------------------------------------------------------
     def do_DELETE(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
         if not self._check_origin():
             return
         owner_key = _owner_key_from_headers(self.headers)
@@ -1416,10 +1641,13 @@ class Handler(SimpleHTTPRequestHandler):
         local_client, _local_okta_client, local_env_name = _session_snapshot(owner_key)
         try:
             if path.startswith("/api/environments/"):
-                name = path[len("/api/environments/"):]
+                name = unquote(path[len("/api/environments/"):])
                 is_admin = _is_admin_from_headers(self.headers)
+                environment_id = (qs.get("id") or [None])[0]
                 try:
-                    was_active = engine.delete_environment(name, owner=engine_owner, is_admin=is_admin)
+                    was_active = engine.delete_environment(
+                        name, owner=engine_owner, is_admin=is_admin, environment_id=environment_id,
+                    )
                 except PermissionError as exc:
                     return self._send_json(403, {"error": str(exc)})
                 except KeyError as exc:

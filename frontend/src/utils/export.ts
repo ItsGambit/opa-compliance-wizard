@@ -3,7 +3,23 @@ export interface ExportSection {
   rows: Record<string, string>[]
 }
 
+// SECURITY FIX (independent review, 2026-09-30): a value starting with
+// =, +, -, @, or a tab/CR is interpreted as a FORMULA by Excel/Sheets/
+// LibreOffice when a CSV is opened, not displayed as plain text --
+// classic CSV/formula injection. Every exported field here ultimately
+// comes from Okta System Log data (actor/resource display names, etc.)
+// which can contain attacker-influenced strings (e.g. a user sets their
+// own Okta display name to a formula payload) -- prefixing a leading
+// apostrophe is the standard neutralization (every major spreadsheet
+// treats a leading `'` as "force this cell to text", stripping the
+// apostrophe itself from the displayed value) and does not change what
+// a plain-text/CSV-aware reader sees.
+function neutralizeFormula(value: string): string {
+  return /^[=+\-@\t\r]/.test(value) ? `'${value}` : value
+}
+
 function csvEscape(value: string): string {
+  value = neutralizeFormula(value)
   return /[",\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value
 }
 

@@ -3,10 +3,12 @@ import * as Dialog from '@radix-ui/react-dialog'
 import { useQueryClient } from '@tanstack/react-query'
 import { CalendarClock, Cloud, FileText, Play, X } from 'lucide-react'
 import { importSyncCsv, saveSyncSchedule } from '../api/client'
+import { useCsvFiles } from '../api/hooks'
 import { useSyncJob } from '../hooks/useSyncJob'
 import { toast } from '../hooks/useToast'
 import type { Environment, IngestionScope, SyncSchedule } from '../types'
 import { getSyncProgressPercent } from '../utils/syncProgress'
+import { Select } from './Select'
 
 interface Props {
   env: Environment
@@ -40,7 +42,12 @@ export function SyncScheduleDialog({ env }: Props) {
   const [open, setOpen] = useState(false)
   const [firstRunPrompt, setFirstRunPrompt] = useState(false)
   const [firstRunChoice, setFirstRunChoice] = useState<FirstRunChoice>('backfill')
-  const [csvPath, setCsvPath] = useState('')
+  // Bare filename, not a full path -- the backend's import_csv route
+  // confines csv_path to a bare basename resolved inside PROJECT_ROOT
+  // (same _safe_csv_path pattern /api/csv already uses), so this now
+  // reuses that same file list/picker instead of a free-text path field.
+  const [csvFile, setCsvFile] = useState<string | undefined>(undefined)
+  const { data: csvFiles } = useCsvFiles()
   const queryClient = useQueryClient()
   const job = useSyncJob(env.name)
 
@@ -108,10 +115,10 @@ export function SyncScheduleDialog({ env }: Props) {
     setFirstRunPrompt(false)
     if (firstRunChoice === 'backfill') {
       job.start(config.ingestion_scope)
-    } else if (firstRunChoice === 'csv' && csvPath.trim()) {
+    } else if (firstRunChoice === 'csv' && csvFile) {
       setSaving(true)
       try {
-        const result = await importSyncCsv(env.name, csvPath.trim(), config.ingestion_scope)
+        const result = await importSyncCsv(env.name, csvFile, config.ingestion_scope)
         toast({ title: `Imported ${result.inserted} event(s) from CSV`, variant: 'success' })
         job.refreshStatus()
       } catch (err) {
@@ -296,12 +303,14 @@ export function SyncScheduleDialog({ env }: Props) {
                   <div className="flex-1">
                     <div className="text-xs font-medium text-text">Import from a CSV export</div>
                     <div className="text-[0.6875rem] text-text-faint mb-1.5">
-                      Already have a System Log CSV export? Ingest it directly — zero API calls.
+                      Already have a System Log CSV export? Drop it in the project folder, then pick it below — zero API calls.
                     </div>
                     {firstRunChoice === 'csv' && (
-                      <input
-                        type="text" className="text-input w-full" placeholder="C:\path\to\syslog_export.csv"
-                        value={csvPath} onChange={e => setCsvPath(e.target.value)}
+                      <Select
+                        value={csvFile}
+                        onValueChange={setCsvFile}
+                        placeholder="Choose a .csv file from the project folder"
+                        options={(csvFiles ?? []).map(f => ({ value: f, label: f }))}
                       />
                     )}
                   </div>
@@ -320,7 +329,7 @@ export function SyncScheduleDialog({ env }: Props) {
                 <button
                   type="button"
                   className="btn-primary"
-                  disabled={saving || (firstRunChoice === 'csv' && !csvPath.trim())}
+                  disabled={saving || (firstRunChoice === 'csv' && !csvFile)}
                   onClick={handleFirstRunContinue}
                 >
                   Continue

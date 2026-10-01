@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.23.2
+# Version     : 5.24.0
 # =============================================================================
 
 import argparse
@@ -69,6 +69,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -77,7 +78,7 @@ import urllib.request
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.23.2"
+SCRIPT_VERSION = "5.24.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -445,9 +446,60 @@ def load_environments():
     return data
 
 
+def _atomic_write_json(path, value, mode=0o600):
+    """SECURITY FIX (external review, 2026-09-30): every mutable JSON file
+    this project writes (environments.json, banner_config.json,
+    access_control.json) previously used a plain truncating `open(path,
+    "w")` -- a reader (in this case, a SEPARATE process:
+    server/auth_gate.py reading access_control.json) hitting that file
+    mid-write sees a truncated/partial file, gets a JSONDecodeError, and
+    (for access_control.json specifically) falls back to the unrestricted
+    login-bootstrap default -- confirmed exploitable: a crash or a login
+    landing exactly during a write can transiently or permanently disable
+    the login-restriction gate.
+
+    Standard write-new-file-then-rename pattern: write to a temp file in
+    the SAME directory (so the final os.replace is on the same filesystem,
+    making it atomic -- a cross-filesystem "rename" would silently
+    fall back to copy+delete, which is NOT atomic), fsync it before the
+    rename so the write is durable even across a crash between the write
+    and the rename, then os.replace -- POSIX guarantees a concurrent
+    reader always sees either the complete old file or the complete new
+    one, never a partial write, no matter when it opens the path."""
+    directory = os.path.dirname(path) or "."
+    fd, temp_path = tempfile.mkstemp(dir=directory, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(value, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temp_path, mode)
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def _atomic_write_bytes(path, data, mode=0o600):
+    """Binary-content sibling of _atomic_write_json -- same reasoning,
+    used for save_secrets_log_cache (writes Fernet-encrypted bytes, not
+    JSON)."""
+    directory = os.path.dirname(path) or "."
+    fd, temp_path = tempfile.mkstemp(dir=directory, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temp_path, mode)
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
 def save_environments(data):
-    with open(_environments_file_path(), "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    _atomic_write_json(_environments_file_path(), data)
 
 
 # ---------------------------------------------------------------------------
@@ -487,8 +539,7 @@ def set_banner_config(enabled, message, variant, dismissible):
     if enabled and not message:
         raise ValueError("message is required when the banner is enabled")
     config = {"enabled": bool(enabled), "message": message, "variant": variant, "dismissible": bool(dismissible)}
-    with open(_banner_config_path(), "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
+    _atomic_write_json(_banner_config_path(), config)
     return config
 
 
@@ -532,8 +583,7 @@ def set_access_control_config(admin_group_id, user_group_id, restrict_login):
         "user_group_id": user_group_id,
         "restrict_login": bool(restrict_login),
     }
-    with open(_access_control_file_path(), "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
+    _atomic_write_json(_access_control_file_path(), config)
     return config
 
 
@@ -683,7 +733,7 @@ def set_active_environment(owner, name):
     save_environments(data)
 
 
-def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False):
+def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, environment_id=None):
     """Saves non-secret metadata to environments.json and secret fields to
     the OS keychain. Blank secret fields on an update leave the previously
     stored secret untouched (so editing metadata doesn't force re-entering
@@ -697,7 +747,16 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False):
     is True -- an admin override edits the environment IN PLACE under its
     own existing owner, it does not transfer ownership to the admin (an
     admin fixing another user's broken credentials shouldn't silently
-    become that environment's new owner)."""
+    become that environment's new owner).
+
+    `environment_id`, when supplied (an admin editing an EXISTING
+    environment via the UI, which always knows its real storage_name),
+    resolves the target directly via an O(1) dict lookup -- unambiguous
+    even when two different owners share a display name. Without it (a
+    create, where no id exists yet, or a legacy caller), an admin edit
+    falls back to a by-name scan across every owner, which is genuinely
+    ambiguous in that same-display-name case (confirmed exploitable,
+    external review 2026-09-30) -- kept only for backward compatibility."""
     if not name or not name.strip():
         raise ValueError("Environment name is required (e.g. dev, uat, prod).")
     name = name.strip()
@@ -706,18 +765,22 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False):
     # Resolve which storage_name/owner this update actually targets. A
     # normal (non-admin) call always targets the CALLING owner's own copy
     # -- environment_storage_name(owner, name) is correct even if no such
-    # environment exists yet (a create). An admin override, though, must
-    # target whichever owner's copy actually already exists (there's no
-    # such thing as an admin "creating" someone else's environment --
-    # only editing one that's already there), found by name across every
-    # stored owner rather than assumed to be the admin's own.
+    # environment exists yet (a create). An admin override editing an
+    # EXISTING environment must target whichever owner's copy actually
+    # already exists (there's no such thing as an admin "creating"
+    # someone else's environment -- only editing one that's already
+    # there) -- environment_id disambiguates this directly when supplied;
+    # otherwise falls back to the old by-name scan (ambiguous, see above).
     target_owner = owner
     if is_admin:
-        for storage_key, meta in data["environments"].items():
-            _, _, stored_name = storage_key.partition("::")
-            if stored_name == name:
-                target_owner = meta.get("owner")
-                break
+        if environment_id and environment_id in data["environments"]:
+            target_owner = data["environments"][environment_id].get("owner")
+        else:
+            for storage_key, meta in data["environments"].items():
+                _, _, stored_name = storage_key.partition("::")
+                if stored_name == name:
+                    target_owner = meta.get("owner")
+                    break
     storage_name = environment_storage_name(target_owner, name)
 
     existing_meta = data["environments"].get(storage_name)
@@ -753,9 +816,18 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False):
 def _find_environment_by_name(data, name):
     """Returns (storage_name, meta) for the first stored environment whose
     display name matches, across every owner, or (None, None) if none
-    exists. Used by the admin-override paths below, which must locate an
-    environment by name regardless of who owns it -- ownership isn't known
-    up front the way it is for a normal, own-storage-name lookup."""
+    exists.
+
+    SECURITY: first-match-wins across EVERY owner -- confirmed exploitable
+    (external review, 2026-09-30): if two different owners each have an
+    environment named "dev", an admin override targeting "dev" by this
+    function silently acts on whichever one happens to iterate first,
+    never the one the admin actually meant. Kept ONLY as a fallback for
+    legacy admin API callers that still pass a bare name with no real
+    stable ID available (see the `environment_id` param on the callers
+    below) -- every serve.py route has been updated to resolve and pass a
+    real `environment_id` (the storage_name itself) instead, which is
+    unambiguous. New code should never call this."""
     for storage_key, meta in data["environments"].items():
         _, _, stored_name = storage_key.partition("::")
         if stored_name == name:
@@ -763,19 +835,36 @@ def _find_environment_by_name(data, name):
     return None, None
 
 
-def set_environment_shared(name, owner, shared, is_admin=False):
+def _resolve_admin_target(data, name, environment_id):
+    """Shared resolution for every admin-override path below. Prefers the
+    unambiguous `environment_id` (the real storage_name, e.g.
+    "00u123::dev") whenever the caller has one -- an O(1) dict lookup,
+    never a cross-owner scan. Falls back to the old, ambiguous by-name
+    scan (_find_environment_by_name) ONLY when no id was supplied, for
+    backward compatibility with any caller that hasn't been updated yet.
+    Raises KeyError if nothing matches either way."""
+    if environment_id:
+        meta = data["environments"].get(environment_id)
+        if meta is None:
+            raise KeyError(f"No saved environment with id '{environment_id}'")
+        return environment_id, meta
+    storage_name, meta = _find_environment_by_name(data, name)
+    if meta is None:
+        raise KeyError(f"No saved environment named '{name}'")
+    return storage_name, meta
+
+
+def set_environment_shared(name, owner, shared, is_admin=False, environment_id=None):
     """Toggles an environment's `shared` flag. Only its owner may do this
-    unless `is_admin` is True, in which case any stored environment by
-    this name can be found and toggled regardless of who owns it (see
-    _find_environment_by_name -- an admin override doesn't know the
-    target's real owner up front the way a normal call does). Raises
-    PermissionError if not the owner and not an admin, KeyError if
-    unknown."""
+    unless `is_admin` is True, in which case the target is resolved via
+    `environment_id` when the caller has one (unambiguous), falling back
+    to a by-name scan across every owner otherwise (see
+    _resolve_admin_target -- ambiguous if two owners share a display
+    name, kept only for backward compatibility). Raises PermissionError
+    if not the owner and not an admin, KeyError if unknown."""
     data = load_environments()
     if is_admin:
-        storage_name, meta = _find_environment_by_name(data, name)
-        if meta is None:
-            raise KeyError(f"No environment named '{name}'.")
+        storage_name, meta = _resolve_admin_target(data, name, environment_id)
     else:
         storage_name = environment_storage_name(owner, name)
         meta = data["environments"].get(storage_name)
@@ -787,17 +876,17 @@ def set_environment_shared(name, owner, shared, is_admin=False):
     save_environments(data)
 
 
-def delete_environment(name, owner=LOCAL_OWNER_KEY, is_admin=False):
+def delete_environment(name, owner=LOCAL_OWNER_KEY, is_admin=False, environment_id=None):
     """Removes an environment's metadata and both keychain secrets. Returns
     True if it was the active environment for THIS caller (caller should
     clear any live client for this owner). Raises KeyError if the name
     doesn't exist (for this owner, unless `is_admin`), PermissionError if
-    it exists but is owned by someone else and `is_admin` is False."""
+    it exists but is owned by someone else and `is_admin` is False. See
+    _resolve_admin_target for how `environment_id` disambiguates an admin
+    override across same-named environments from different owners."""
     data = load_environments()
     if is_admin:
-        storage_name, meta = _find_environment_by_name(data, name)
-        if meta is None:
-            raise KeyError(f"No saved environment named '{name}'")
+        storage_name, meta = _resolve_admin_target(data, name, environment_id)
     else:
         storage_name = environment_storage_name(owner, name)
         meta = data["environments"].get(storage_name)
@@ -805,15 +894,27 @@ def delete_environment(name, owner=LOCAL_OWNER_KEY, is_admin=False):
             raise KeyError(f"No saved environment named '{name}'")
         if meta.get("owner") != owner:
             raise PermissionError(f"Environment '{name}' is not owned by this user.")
+    real_owner = meta.get("owner")
     del data["environments"][storage_name]
-    # "Was it active" is checked against the CALLING owner's own active
-    # slot, not the environment's real owner -- an admin deleting someone
-    # else's environment should never accidentally read/clear that other
-    # person's active-environment pointer.
+    # Return value ("was it active") is about the CALLING owner's own
+    # active slot specifically -- that's what tells serve.py whether to
+    # clear the calling owner's own live client.
     owner_key = _owner_storage_key(owner)
     was_active = data["active"].get(owner_key) == name
     if was_active:
         del data["active"][owner_key]
+    # SEPARATELY, and regardless of who called this: if this was an admin
+    # override deleting someone ELSE's environment, that real owner's own
+    # active pointer needs clearing too if it pointed here -- otherwise it
+    # dangles, pointing at an environment that no longer exists, and that
+    # owner sees a failed auto-activation / appears unconfigured on their
+    # next login with no obvious cause (external review finding,
+    # 2026-09-30). Guarded by `real_owner != owner` so the non-admin path
+    # above (which already handled its own single owner_key) never
+    # double-clears the same key it just cleared.
+    real_owner_key = _owner_storage_key(real_owner)
+    if real_owner_key != owner_key and data["active"].get(real_owner_key) == name:
+        del data["active"][real_owner_key]
     save_environments(data)
     for field in ENVIRONMENT_SECRET_FIELDS:
         keyring_delete(storage_name, field)
@@ -1669,7 +1770,20 @@ class OktaClient:
         actor+eventType filtering -- silently returning only page 1 would
         make find_last_access_for_user miss real, more-recent-than-shown
         events for no visible reason. Found via live testing against a
-        second, busier tenant, not anticipated up front."""
+        second, busier tenant, not anticipated up front.
+
+        Returns (events, complete) -- `complete` is False when max_pages
+        was hit with more pages still remaining (the WARN below still
+        fires either way, but FIX, external review 2026-09-30, "1.5": a
+        caller that persists a watermark off this result (see
+        audit_store.sync_okta_events) MUST know when results were
+        truncated, since silently treating a truncated page as "this
+        window is fully synced" and advancing the watermark past it
+        permanently loses whatever events existed past the page cap --
+        Okta's System Log has no way to re-fetch an already-aged-out
+        window later. Every other existing caller of this method only
+        ever used the bare list and has no watermark to protect, so they
+        simply unpack `events, _complete = ...` and ignore it."""
         params = {"limit": str(limit), "sortOrder": sort_order}
         if filter_expr:
             params["filter"] = filter_expr
@@ -1690,10 +1804,11 @@ class OktaClient:
             if next_path and next_path.startswith(self.base_url):
                 next_path = next_path[len(self.base_url):]
             pages += 1
-        if next_path:
+        complete = not next_path
+        if not complete:
             log("WARN", f"get_system_log hit max_pages={max_pages} with more pages remaining; "
                          f"results are truncated to the first {len(events)} events.")
-        return events
+        return events, complete
 
 
 # ---------------------------------------------------------------------------
@@ -2337,7 +2452,10 @@ def find_last_access_for_user(okta_client, actor_user_id, resources, limit_per_r
 
         type_filter = " or ".join(f'eventType eq "{t}"' for t in mapping["event_types"])
         filter_expr = f'actor.id eq "{actor_user_id}" and ({type_filter})'
-        events = okta_client.get_system_log(filter_expr=filter_expr, since=since, limit=1000)
+        # No watermark to protect here (read-only lookup, nothing persisted)
+        # -- completeness only matters to sync_okta_events, see
+        # get_system_log's docstring.
+        events, _complete = okta_client.get_system_log(filter_expr=filter_expr, since=since, limit=1000)
 
         wanted = set(resource_ids)
         buckets = {rid: [] for rid in resource_ids}
@@ -2453,8 +2571,7 @@ def load_secrets_log_cache():
 
 def save_secrets_log_cache(data):
     encrypted = _cache_fernet().encrypt(json.dumps(data).encode("utf-8"))
-    with open(_secrets_log_cache_path(), "wb") as f:
-        f.write(encrypted)
+    _atomic_write_bytes(_secrets_log_cache_path(), encrypted)
 
 
 def set_preserve_logs_locally(name, enabled, owner=LOCAL_OWNER_KEY):
@@ -2590,7 +2707,10 @@ def build_secrets_access_report(client, okta_client, resource_group_id, project_
     )
     since = (datetime.now(timezone.utc) - timedelta(days=since_days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     filter_expr = f'target.id eq "{project_id}" and ({type_filter})'
-    events = okta_client.get_system_log(filter_expr=filter_expr, since=since, limit=1000)
+    # No watermark to protect here (read-only report, nothing persisted) --
+    # completeness only matters to sync_okta_events, see get_system_log's
+    # docstring.
+    events, _complete = okta_client.get_system_log(filter_expr=filter_expr, since=since, limit=1000)
 
     if preserve_locally and env_name:
         events = _merge_system_log_events(env_name, project_id, events)

@@ -221,8 +221,7 @@ def _audit_db_path():
 
 
 _db_lock = threading.Lock()
-_connections = {}  # thread-id -> sqlite3.Connection, since sqlite3 connections
-                    # aren't safe to share across threads without care
+_thread_local = threading.local()  # holds .conn -- one sqlite3.Connection per thread
 
 
 def _get_connection():
@@ -231,15 +230,27 @@ def _get_connection():
     write while a dashboard request reads concurrently without either
     blocking the other, which is a real requirement here (unlike
     secrets_log_cache.json's whole-file read+rewrite, which had no
-    locking story at all for exactly this concurrent-access case)."""
-    tid = threading.get_ident()
-    conn = _connections.get(tid)
+    locking story at all for exactly this concurrent-access case).
+
+    FIX (confirmed real leak, external review 2026-09-30): this used to
+    key connections in a plain module-level dict by threading.get_ident().
+    server/serve.py uses ThreadingHTTPServer, which spawns a brand-new OS
+    thread per incoming HTTP request -- every request that ever touched
+    this module opened one more sqlite3.Connection (and its OS file
+    descriptor) that NOTHING ever removed from that dict, even after the
+    thread itself exited. Unbounded memory + FD growth on a long-running
+    server. threading.local() ties the connection's lifetime to the
+    Thread object itself instead of a dict entry keyed by a recycled OS
+    thread id -- once the (short-lived, one-per-request) thread object is
+    garbage collected, its .conn attribute goes with it, with no manual
+    bookkeeping and no way to leak."""
+    conn = getattr(_thread_local, "conn", None)
     if conn is None:
         conn = sqlite3.connect(_audit_db_path(), timeout=30)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.row_factory = sqlite3.Row
-        _connections[tid] = conn
+        _thread_local.conn = conn
     return conn
 
 
@@ -558,7 +569,12 @@ def sync_okta_events(okta_client, environment, ingestion_scope, since=None, on_p
     so a mid-run crash/restart resumes from the last completed day
     instead of re-fetching the whole window or silently losing progress.
 
-    Returns {"inserted": int, "scanned": int, "since": str, "chunks": int}."""
+    Returns {"inserted": int, "scanned": int, "since": str, "chunks": int,
+    "complete": bool} -- "complete" is False if a day-chunk hit
+    get_system_log's max_pages cap (see that method's docstring); in that
+    case the sync stops early with last_sync_status="error" and the
+    watermark deliberately NOT advanced past the incomplete chunk, so the
+    next sync run retries it rather than silently skipping lost events."""
     if ingestion_scope not in INGESTION_SCOPES:
         raise ValueError(f"ingestion_scope must be one of {INGESTION_SCOPES}")
     conn = _get_connection()
@@ -584,7 +600,7 @@ def sync_okta_events(okta_client, environment, ingestion_scope, since=None, on_p
 
         if on_progress:
             on_progress("fetch", "progress", f"{chunk_since} .. {chunk_until}")
-        events = okta_client.get_system_log(
+        events, complete = okta_client.get_system_log(
             since=chunk_since, until=chunk_until, limit=1000, sort_order="ASCENDING", max_pages=200
         )
         total_scanned += len(events)
@@ -593,6 +609,39 @@ def sync_okta_events(okta_client, environment, ingestion_scope, since=None, on_p
         inserted, max_published = _insert_rows(conn, environment, rows, ingestion_scope)
         total_inserted += inserted
         chunks += 1
+
+        # FIX (external review, 2026-09-30, "1.5"): get_system_log logs a
+        # WARN when it hits max_pages with more pages still remaining, but
+        # previously returned the truncated results exactly like a
+        # complete fetch -- this loop would advance the watermark past
+        # chunk_until as if the whole day was fully ingested, silently
+        # and PERMANENTLY losing whatever events existed on the remaining
+        # page(s) (Okta's System Log has no way to re-fetch an aged-out
+        # window later). If this chunk came back incomplete, stop the
+        # whole sync here with the watermark left at the END of the
+        # PREVIOUS chunk (not this one) -- the next sync run will retry
+        # this exact chunk from scratch rather than skip past the gap.
+        if not complete:
+            error_message = (
+                f"Hit max_pages for {chunk_since}..{chunk_until} -- more events exist on this "
+                f"day than could be fetched in one sync run. Watermark NOT advanced past this "
+                f"day; the next sync will retry it. If this persists, the day's event volume may "
+                f"exceed what a single day-chunk can safely page through."
+            )
+            _upsert_sync_state(
+                conn, environment,
+                last_sync_completed_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                last_sync_status="error",
+                last_sync_error=error_message,
+                total_events_ingested=(get_sync_state(environment) or {}).get("total_events_ingested", 0) + inserted,
+                ingestion_scope=ingestion_scope,
+            )
+            if on_progress:
+                on_progress("ingest", "error", f"Incomplete fetch for {chunk_since}..{chunk_until}; stopping sync.")
+            return {
+                "inserted": total_inserted, "scanned": total_scanned, "since": original_since,
+                "chunks": chunks, "complete": False, "error": error_message,
+            }
 
         # Persist progress after EVERY chunk, not just at the end -- a
         # restart mid-backfill resumes from here instead of from scratch.
@@ -612,7 +661,7 @@ def sync_okta_events(okta_client, environment, ingestion_scope, since=None, on_p
     _upsert_sync_state(conn, environment, last_sync_status="success")
     if on_progress:
         on_progress("ingest", "done", f"{total_inserted} new row(s) inserted across {chunks} day-chunk(s)")
-    return {"inserted": total_inserted, "scanned": total_scanned, "since": original_since, "chunks": chunks}
+    return {"inserted": total_inserted, "scanned": total_scanned, "since": original_since, "chunks": chunks, "complete": True}
 
 
 def import_from_csv(csv_path, environment, ingestion_scope, on_progress=None):
@@ -687,14 +736,47 @@ def prune_events(environment, retention_days=None, max_size_mb=None):
             conn.commit()
 
     if max_size_mb is not None:
-        conn.execute("VACUUM")  # reclaim space from the deletes above before measuring
         max_bytes = max_size_mb * 1024 * 1024
         step_days = 1
+        pruned_any_by_size = False
+
+        def _live_data_bytes():
+            # PERFORMANCE FIX (external review, 2026-09-30): the loop
+            # below used to call VACUUM after every single day's delete to
+            # make os.path.getsize(...) reflect the shrink -- confirmed
+            # real: up to 3650 full-database rebuilds in the worst case
+            # (VACUUM rewrites the ENTIRE file, not just the freed pages),
+            # causing severe disk I/O thrashing and blocking every
+            # concurrent HTTP read for the whole rebuild each time.
+            #
+            # The fix is NOT simply "stop calling VACUUM" -- SQLite's
+            # DELETE never shrinks the on-disk file by itself (freed pages
+            # go to an internal freelist, the file stays the same size
+            # until something vacuums it), so removing VACUUM without
+            # also changing what this loop measures would make
+            # os.path.getsize(...) never decrease, and the loop would
+            # never detect "under the cap now" -- it would delete
+            # everything instead of stopping early once enough is freed,
+            # a functional regression, not a fix.
+            #
+            # Real fix: estimate LIVE (used, non-freed) data size directly
+            # from SQLite's own page accounting -- (page_count -
+            # freelist_count) * page_size -- which drops immediately after
+            # a DELETE + COMMIT, with NO vacuum needed to observe it. This
+            # is exactly as accurate for "should we keep pruning" as the
+            # physical file size was (the file size only ever matters
+            # because it's a proxy for how much space this data actually
+            # occupies -- this measures that directly), and costs three
+            # cheap PRAGMA reads instead of a full file rewrite.
+            page_count = conn.execute("PRAGMA page_count").fetchone()[0]
+            freelist_count = conn.execute("PRAGMA freelist_count").fetchone()[0]
+            page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+            return (page_count - freelist_count) * page_size
+
         # Walk the cutoff back further, oldest non-curated first, until under the cap
         # or nothing non-curated is left to prune.
         for _ in range(3650):  # hard safety cap -- never loop forever
-            size = os.path.getsize(_audit_db_path())
-            if size <= max_bytes:
+            if _live_data_bytes() <= max_bytes:
                 break
             remaining = conn.execute(
                 "SELECT COUNT(*) FROM events WHERE environment = ? AND is_curated = 0",
@@ -718,6 +800,11 @@ def prune_events(environment, retention_days=None, max_size_mb=None):
                 )
                 pruned_total += cur.rowcount
                 conn.commit()
+            pruned_any_by_size = True
+
+        # Reclaim the actual disk space exactly ONCE, after every delete
+        # this call is going to do -- not per-iteration.
+        if pruned_any_by_size:
             conn.execute("VACUUM")
 
     return {"pruned": pruned_total, "cutoff": cutoff}

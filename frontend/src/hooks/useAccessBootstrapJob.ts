@@ -38,8 +38,24 @@ export function useAccessBootstrapJob() {
       .then(status => {
         setState(s => ({ ...s, events: status.steps, error: status.error }))
         if (status.status === 'done') {
-          stopPolling()
-          return fetchAccessBootstrapResult().then(result => setState(s => ({ ...s, phase: 'done', result })))
+          // FIX (external review, 2026-09-30): stopPolling() used to run
+          // BEFORE this fetch, so a transient failure fetching the result
+          // (the job itself succeeded, but e.g. a network blip on this
+          // one follow-up request) left polling permanently stopped with
+          // no automatic retry -- the only recovery was the user manually
+          // clicking Retry, which restarts the whole bootstrap from
+          // scratch rather than just re-fetching an already-finished
+          // result. Stop polling only once the result fetch itself has
+          // actually resolved (success OR failure), not preemptively.
+          return fetchAccessBootstrapResult()
+            .then(result => {
+              stopPolling()
+              setState(s => ({ ...s, phase: 'done', result }))
+            })
+            .catch(err => {
+              stopPolling()
+              setState(s => ({ ...s, phase: 'error', error: err instanceof Error ? err.message : String(err) }))
+            })
         }
         if (status.status === 'error') {
           stopPolling()
