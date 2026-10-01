@@ -122,17 +122,31 @@ export function AuditLogPage() {
             const actionMatch = matches.find(m => m.key === 'action')
             const actor = entry.actor_email ?? entry.actor_sub ?? null
             const detailEntries = Object.entries(entry.details ?? {})
+            // Deploy events (deploy.started/.completed/.failed, logged by
+            // server/deploy.sh directly via engine.log_audit_event, same
+            // file/locking every other write action already uses) have no
+            // logged-in actor at all -- "local / CLI" would be misleading
+            // here, since this is a server-side script, not someone using
+            // the dashboard. Visually distinct (accent border + tinted
+            // action text) so a deploy is scannable at a glance in a feed
+            // otherwise dominated by user actions -- a different "shape"
+            // of event, not another severity level like win/loss/warn
+            // already represent.
+            const isDeployEvent = entry.action.startsWith('deploy.')
             return (
-              <div key={`${entry.timestamp}-${entry.action}`} className="card p-3 text-xs">
+              <div
+                key={`${entry.timestamp}-${entry.action}`}
+                className={`card p-3 text-xs ${isDeployEvent ? 'border-l-2 border-l-accent' : ''}`}
+              >
                 <div className="flex items-center justify-between gap-2 mb-1.5">
-                  <span className="font-medium text-text">
+                  <span className={`font-medium ${isDeployEvent ? 'text-accent' : 'text-text'}`}>
                     <HighlightedText text={entry.action} indices={actionMatch?.indices} />
                   </span>
                   <span className="text-text-faint whitespace-nowrap">{formatDateTime(entry.timestamp)}</span>
                 </div>
                 <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[0.6875rem]">
                   <span className="section-label">Actor</span>
-                  <span className="text-text-dim">{actor ?? 'local / CLI'}</span>
+                  <span className="text-text-dim">{isDeployEvent ? 'deploy.sh (server)' : actor ?? 'local / CLI'}</span>
                   <span className="section-label">Client IP</span>
                   <span className="text-text-dim">{entry.client_ip ?? '—'}</span>
                   <span className="section-label">User Agent</span>

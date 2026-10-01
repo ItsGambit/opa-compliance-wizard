@@ -174,6 +174,40 @@ fi
 # for these since exec replaced that process entirely before it could.
 trap 'rm -rf "$DEPLOY_SH_PHASE1_FROZEN_DIR" "$DEPLOY_SH_PHASE1_TMP_DIR"' EXIT
 
+# NEW (2026-10-01): surfaces deploy events (deploy.started/.completed/
+# .failed) in the dashboard's own Audit Log, same file every other write
+# action already logs to (audit_log.jsonl) -- requested so a deploy shows
+# up alongside everything else instead of being invisible outside this
+# script's own terminal output. Reuses engine.log_audit_event directly
+# (the exact same locked JSON-line-append every other call site uses, see
+# create_secret_folders.py) rather than hand-rolling a second way to
+# write that file. actor_email/actor_sub are both None -- this is a
+# system/deploy-initiated event with no logged-in human behind it, same
+# convention _run_scheduler_loop's sync.scheduler_error already uses.
+# Deliberately best-effort (|| true): a logging failure must never fail
+# or block the actual deploy.
+_log_deploy_event() {
+  local action="$1" details_json="$2"
+  "$APP_DIR/.venv/bin/python" -c "
+import sys
+sys.path.insert(0, '$APP_DIR')
+import create_secret_folders as engine
+import json
+engine.log_audit_event(None, None, '$action', json.loads('''$details_json'''))
+" 2>/dev/null || true
+}
+
+_log_deploy_event "deploy.started" '{"trigger": "deploy.sh"}'
+
+# Fires on any unhandled command failure for the rest of this script (set
+# -e's exact trigger condition) -- logs deploy.failed before this process
+# exits, so a failed deploy shows up in the Audit Log too, not just a
+# successful one. Does NOT fire for the SUDOERS_GAPS warnings above/below
+# (those are handled, non-fatal, printed-and-continue, not a script
+# failure) -- only for something that actually aborts the script, e.g.
+# pip install, npm ci, or the main systemctl restart failing outright.
+trap '_log_deploy_event "deploy.failed" "{\"trigger\": \"deploy.sh\"}"' ERR
+
 echo "==> Reinstalling Python dependencies"
 "$APP_DIR/.venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
 
@@ -266,3 +300,12 @@ if [ "${#SUDOERS_GAPS[@]}" -gt 0 ]; then
   echo "    apply, and rollback-on-failure), not just one, since sudoers matches"
   echo "    each exact argument list separately."
 fi
+
+# Reaching here means every command above succeeded (set -e would have
+# already fired the ERR trap and exited otherwise) -- clear the trap
+# before logging deploy.completed itself, so a (very unlikely) failure
+# inside _log_deploy_event's own python call can't recursively re-trigger
+# it as a deploy.failed on top of a deploy that actually succeeded.
+trap - ERR
+_DEPLOYED_VERSION="$(grep -m1 'SCRIPT_VERSION = ' "$APP_DIR/create_secret_folders.py" | sed -E 's/.*"([^"]+)".*/\1/')"
+_log_deploy_event "deploy.completed" "{\"version\": \"$_DEPLOYED_VERSION\", \"sudoers_gaps\": ${#SUDOERS_GAPS[@]}}"

@@ -1055,6 +1055,15 @@ already exists is skipped, not duplicated.
 
 ## Version
 
+5.25.0 — **New: deploys now show up in the Audit Log.** `server/deploy.sh`
+logs `deploy.started`/`deploy.completed`/`deploy.failed` entries directly
+to the same audit trail every other write action already uses — visually
+distinct (accent-colored, left-bordered) in the Audit Log page, since a
+deploy has no logged-in human actor behind it and reads differently from
+every other entry around it. Previously a deploy was only ever visible in
+`deploy.sh`'s own terminal output, invisible to anyone looking at the
+dashboard's own audit history.
+
 5.24.4 — **Fixed a stale `gnome-keyring-daemon` process pile-up on the
 hosted server.** `server/start-headless.sh` calls `gnome-keyring-daemon
 --unlock --login` on every service start/restart, but `--login` is
@@ -1063,11 +1072,12 @@ never fully initializes (per `gnome-keyring-daemon(1)`) — nothing ever
 tore down the previous invocation first, so repeated restarts (e.g.
 back-to-back `deploy.sh` runs) accumulated multiple competing daemon
 processes with none reaped, one observed still running from over a week
-earlier. This daemon pile-up was the likely cause of a crash-loop
-observed during this session's deploys (self-healing within systemd's
-retry window every time, so never a sustained outage, but worth fixing
-at the root). Fixed by killing any stray `gnome-keyring-daemon` for this
-user before starting a fresh one — safe on this box specifically because
+earlier. (A separate crash-loop pattern observed during this session's
+deploys turned out to have a different root cause — a TCP port-rebind
+race on `systemctl restart`, not this — but the daemon pile-up was a
+real, independently-confirmed leak worth fixing regardless.) Fixed by
+killing any stray `gnome-keyring-daemon` for this user before starting a
+fresh one — safe on this box specifically because
 it has no desktop/login session at all, so this script is the only thing
 that ever starts one here.
 
@@ -1109,6 +1119,15 @@ the fix (and 5.24.0's entry, right after it, for the security remediation
 pass that exposed this).
 
 ### Changelog
+- **5.25.0**:
+  - **New: deploys now show up in the Audit Log.** `server/deploy.sh`
+    logs `deploy.started`/`deploy.completed`/`deploy.failed` via the same
+    `log_audit_event` call every other write action already uses — no
+    new audit mechanism, just a new caller. The Audit Log page renders
+    these with an accent-colored left border and action text, and
+    "deploy.sh (server)" in place of an actor, since these have no
+    logged-in human behind them and would otherwise be confusingly
+    indistinguishable from a real local/CLI action.
 - **5.24.4**:
   - **Fixed `gnome-keyring-daemon` processes piling up across restarts
     on the hosted server.** `server/start-headless.sh` ran `--unlock
