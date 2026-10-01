@@ -37,13 +37,17 @@
 # actually restart/apply instead of just warning -- this REQUIRES widening
 # the server's NOPASSWD sudoers rule beyond systemctl restart
 # opa-secrets-wizard to also cover: systemctl restart opa-auth-gate,
-# cp <repo nginx conf> /etc/nginx/sites-available/opa-secrets-wizard,
-# nginx -t, and systemctl reload nginx. If that rule hasn't been widened
-# yet on this server, each `sudo -n` call below fails fast (same -n
-# non-interactive behavior as the pre-existing restart call) and this
-# script prints the exact fix needed and continues rather than aborting
-# the whole deploy over it -- the app code/frontend is still fully
-# deployed and the main service still restarts either way.
+# THREE distinct cp invocations (backup the live config to a fixed
+# .deploy-backup path, apply the repo's config over the live path, and
+# roll the backup back over the live path if `nginx -t` fails -- sudoers
+# matches each exact argument list separately, so all three need their
+# own grant, not just one), nginx -t, and systemctl reload nginx. See the
+# README's "Hosting on a server" setup for the exact rule. If that rule
+# hasn't been widened yet on this server, each `sudo -n` call below fails
+# fast (same -n non-interactive behavior as the pre-existing restart
+# call) and this script prints the exact fix needed and continues rather
+# than aborting the whole deploy over it -- the app code/frontend is
+# still fully deployed and the main service still restarts either way.
 #
 # SELF-MODIFICATION FIX (confirmed live, 2026-10-01): step 2's rsync
 # overwrites THIS file on disk while bash is still executing it -- the
@@ -178,7 +182,16 @@ if [ -f "$NGINX_LIVE" ] && ! diff -q "$NGINX_REPO" "$NGINX_LIVE" > /dev/null 2>&
   # configs nginx -c can point at directly; they're pulled in via
   # sites-enabled's include), so validating has to happen in-place,
   # which means a failure must be reversible, not just reported.
-  NGINX_BACKUP="$TMP_DIR/opa-secrets-wizard.conf.live-backup"
+  #
+  # FIX (confirmed live, 2026-10-01): this backup path previously lived
+  # inside $TMP_DIR, which mktemp -d generates fresh (a new random path)
+  # on every single run -- a sudoers rule authorizing `cp` with a fixed
+  # argument list can never match a path that's different every time, so
+  # this cp always failed even with an otherwise-correct, intentionally
+  # widened sudoers rule. Fixed by using a FIXED path next to the live
+  # config instead, so the one-time sudoers grant (see README's "Hosting
+  # on a server" setup) can actually name it.
+  NGINX_BACKUP="${NGINX_LIVE}.deploy-backup"
   if sudo -n cp "$NGINX_LIVE" "$NGINX_BACKUP" 2>/dev/null \
       && sudo -n cp "$NGINX_REPO" "$NGINX_LIVE" 2>/dev/null; then
     if sudo -n nginx -t 2>&1; then
@@ -197,7 +210,7 @@ if [ -f "$NGINX_LIVE" ] && ! diff -q "$NGINX_REPO" "$NGINX_LIVE" > /dev/null 2>&
         || echo "    !!! ROLLBACK ALSO FAILED -- $NGINX_LIVE may now be broken. Fix manually."
     fi
   else
-    SUDOERS_GAPS+=("cp '$NGINX_REPO' '$NGINX_LIVE' && nginx -t && systemctl reload nginx")
+    SUDOERS_GAPS+=("cp '$NGINX_LIVE' '$NGINX_BACKUP' && cp '$NGINX_REPO' '$NGINX_LIVE' && nginx -t && systemctl reload nginx")
     echo "    (skipped -- sudoers rule doesn't cover this yet, see warning below)"
   fi
 fi
@@ -210,8 +223,8 @@ if [ "${#SUDOERS_GAPS[@]}" -gt 0 ]; then
   for gap in "${SUDOERS_GAPS[@]}"; do
     echo "      sudo $gap"
   done
-  echo "    To fix permanently, widen the deploying user's sudoers rule to also"
-  echo "    allow (visudo): systemctl restart $AUTH_GATE_SERVICE, cp to $NGINX_LIVE,"
-  echo "    nginx -t, systemctl reload nginx -- in addition to the existing"
-  echo "    systemctl restart $SERVICE_NAME rule."
+  echo "    See the README's \"Hosting on a server\" setup (step 7) for the exact"
+  echo "    sudoers rule to add -- it needs THREE distinct cp invocations (backup,"
+  echo "    apply, and rollback-on-failure), not just one, since sudoers matches"
+  echo "    each exact argument list separately."
 fi

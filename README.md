@@ -668,11 +668,19 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    `rparikh` with your actual deploying username (step 7b) and every
    `/home/rparikh/opa-secrets-folders` with your actual repo path (step
    7b) — leave `opa-secrets-wizard` and `opa-auth-gate` exactly as-is,
-   those are fixed systemd unit names, not placeholders:
+   those are fixed systemd unit names, not placeholders. Note there are
+   **three separate `cp` lines**, not one — `deploy.sh` backs up the live
+   nginx config to a fixed `.deploy-backup` path, applies the new one,
+   and (only if `nginx -t` then fails) rolls the backup back over the
+   live path; sudoers matches each exact argument list separately, so a
+   rule for only one of these three leaves the other two silently
+   denied:
    ```
    rparikh ALL=(ALL) NOPASSWD: /bin/systemctl restart opa-secrets-wizard, \
      /bin/systemctl restart opa-auth-gate, \
+     /bin/cp /etc/nginx/sites-available/opa-secrets-wizard /etc/nginx/sites-available/opa-secrets-wizard.deploy-backup, \
      /bin/cp /home/rparikh/opa-secrets-folders/server/nginx-opa-secrets-wizard.conf /etc/nginx/sites-available/opa-secrets-wizard, \
+     /bin/cp /etc/nginx/sites-available/opa-secrets-wizard.deploy-backup /etc/nginx/sites-available/opa-secrets-wizard, \
      /usr/sbin/nginx -t, \
      /bin/systemctl reload nginx
    ```
@@ -688,10 +696,10 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    ```bash
    sudo -n -l
    ```
-   You should see all five commands from step 7c listed under
+   You should see all seven commands from step 7c listed under
    `NOPASSWD:`, with no password prompt. If you instead get a password
    prompt, a `sudo: a password is required` error, or the list doesn't
-   include all five, re-open the file from step 7c and check for a typo
+   include all seven, re-open the file from step 7c and check for a typo
    — most commonly the username, or a binary path that doesn't match
    step 7a's `which` output exactly.
 
@@ -1047,6 +1055,20 @@ already exists is skipped, not duplicated.
 
 ## Version
 
+5.24.2 — **Fixed `deploy.sh`'s nginx config backup path.** Found during
+the first real deploy after widening the server's sudoers rule per
+5.24.0/5.24.1's own instructions: the backup-before-apply step wrote to a
+path inside a freshly-`mktemp -d`'d temp dir, which is different on
+every single run — a sudoers rule naming one fixed `cp` argument list can
+never match a path that changes every time, so the backup (and therefore
+the apply) step was silently denied even with an otherwise-correct,
+intentionally-widened rule. Fixed by backing up to a fixed path next to
+the live config instead, so the sudoers rule in the README's "Hosting on
+a server" setup can actually name it. If you already widened your
+sudoers rule per the previous version's instructions, re-check it
+against the (now 3-line, not 1-line) `cp` rule in that same section —
+see this version's changelog entry below for exactly what changed.
+
 5.24.1 — **Fixed a self-modification bug in `server/deploy.sh`** found
 during the very first real deploy of 5.24.0: that script's own rsync
 step overwrites itself on disk while still running, which (for the first
@@ -1059,6 +1081,17 @@ the fix (and 5.24.0's entry, right after it, for the security remediation
 pass that exposed this).
 
 ### Changelog
+- **5.24.2**:
+  - **Fixed `deploy.sh`'s nginx config backup landing in a path that
+    changes every run.** The pre-apply backup of the live nginx config
+    was written inside that run's own `mktemp -d` temp dir — a different
+    path every single invocation, which a fixed-argument-list sudoers
+    `cp` rule can never match twice. Moved the backup to a fixed path
+    (`<live config>.deploy-backup`) next to the live file instead. The
+    sudoers rule in "Hosting on a server" (step 7) is now 3 `cp` lines
+    (backup, apply, rollback-on-failure), not 1 — re-check your rule
+    against the updated version there if you set this up under 5.24.0/
+    5.24.1's instructions.
 - **5.24.1**:
   - **Fixed `server/deploy.sh` silently skipping its own newest logic.**
     Confirmed live: the rsync step overwrites this script's own file on
