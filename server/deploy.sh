@@ -45,9 +45,43 @@
 # the whole deploy over it -- the app code/frontend is still fully
 # deployed and the main service still restarts either way.
 #
+# SELF-MODIFICATION FIX (confirmed live, 2026-10-01): step 2's rsync
+# overwrites THIS file on disk while bash is still executing it -- the
+# very first time this script's own tail grew past "warn and stop" (the
+# H-4 fix above), the deployed-on-disk copy was correctly updated to
+# 5.24.0, but every step AFTER the rsync (opa-auth-gate restart, nginx
+# apply) silently never ran: bash kept executing the OLD in-memory/
+# already-read copy for the rest of the run, not the one just written to
+# disk. This was invisible before because the old tail only ever printed
+# a warning, so a stale in-memory tail happened to produce the same
+# observable behavior as the new one would have. Fixed below by
+# re-executing from a frozen copy of THIS script in a private temp dir
+# before doing anything else -- the running process then never reads
+# from the path rsync is about to overwrite, at all.
+#
 # Safe to re-run any time; every step is idempotent.
 
 set -euo pipefail
+
+# Must happen before anything else (see "SELF-MODIFICATION FIX" above) --
+# $BASH_SOURCE is this script's own path as actually invoked; re-exec a
+# frozen copy of it from a private temp dir exactly once (the
+# DEPLOY_SH_REEXEC guard prevents infinite re-exec once already running
+# from that frozen copy).
+if [ -z "${DEPLOY_SH_REEXEC:-}" ]; then
+  _frozen_dir="$(mktemp -d)"
+  _frozen_copy="$_frozen_dir/deploy.sh"
+  cp "${BASH_SOURCE[0]}" "$_frozen_copy"
+  chmod +x "$_frozen_copy"
+  export DEPLOY_SH_REEXEC="$_frozen_dir"
+  exec "$_frozen_copy" "$@"
+fi
+# `exec` above replaces this entire process -- nothing after it in THIS
+# branch ever runs. The copy that actually continues past this point owns
+# BOTH the frozen-copy dir (DEPLOY_SH_REEXEC) and its own TMP_DIR below --
+# one single trap cleans up both at exit (a second `trap ... EXIT` would
+# silently REPLACE this one, not stack with it, so TMP_DIR's own cleanup
+# is folded in here rather than set separately below).
 
 REPO_URL="https://github.com/ItsGambit/opa-compliance-wizard.git"
 APP_DIR="/home/rparikh/opa-secrets-folders"
@@ -58,7 +92,7 @@ NGINX_REPO="$APP_DIR/server/nginx-opa-secrets-wizard.conf"
 TMP_DIR="$(mktemp -d)"
 SUDOERS_GAPS=()
 
-cleanup() { rm -rf "$TMP_DIR"; }
+cleanup() { rm -rf "$TMP_DIR" "$DEPLOY_SH_REEXEC"; }
 trap cleanup EXIT
 
 echo "==> Fetching latest from $REPO_URL"
