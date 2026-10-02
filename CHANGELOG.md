@@ -2,6 +2,71 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.35.0 — **Fast-follow Phase 8 of 11 of docs/fast-follow-redesign.md:
+production-grade serving, observability, and operational hardening —
+bundled with a full review of `server/deploy.sh`.** The "makes a 2am
+debugging session possible" phase: structured logging, a real health
+check, pinned dependencies with automated update tracking, systemd
+hardening, and several real deploy-script integrity gaps closed.
+- **Structured JSON logging with correlation IDs.** `log(level,
+  message)` (`create_secret_folders.py`) now emits one JSON object per
+  line instead of colorized plaintext — signature-compatible, so none
+  of its ~65 existing call sites needed to change. A per-request
+  correlation ID (`contextvars.ContextVar`, thread-safe across
+  `ThreadingHTTPServer`'s one-thread-per-request model) is generated at
+  the top of every `do_GET`/`do_POST`/`do_DELETE` and threaded
+  explicitly into both background job types this app spawns
+  (`_run_sync_job`, `_run_access_job` — a new thread never inherits its
+  parent's contextvars, so this has to be passed as an argument, not
+  assumed) and into `_scheduler_loop`'s own per-tick id (no request to
+  correlate a scheduled sync with, so it gets a `sched-`-prefixed id
+  instead). `server/serve.py`'s ~10 bare `print()` calls now go through
+  `engine.log()`. `server/auth_gate.py` gets its own minimal, same-shaped
+  `log()` (deliberately not shared with the engine module — a separate
+  process with no existing import relationship to it) and the same
+  per-request correlation-ID treatment on its own `do_GET`.
+- **New `/healthz` endpoint** (`server/serve.py`, unauthenticated by
+  design — see `server/nginx-opa-secrets-wizard.conf`'s matching
+  `auth_request off`): local-only checks (no live Okta call) for
+  whether the active environment's credentials can be read back and
+  whether the compliance archive is reachable. Gives an external uptime
+  monitor/load balancer something real to poll instead of inferring
+  health from `/` always 200ing.
+- **Exact-pinned `requirements.txt`** (`keyring==25.7.0`,
+  `pyjwt[crypto]==2.15.1`, both floors before this) + new
+  `.github/dependabot.yml` (pip at repo root, npm at `/frontend` since
+  that lockfile isn't at repo root) — a pin that nothing watches only
+  ever goes stale, so this ships both together.
+- **systemd hardening** on both units (`NoNewPrivileges`, `PrivateTmp`,
+  `ProtectKernelTunables`, `ProtectControlGroups`, `UMask=0077`).
+  `ProtectHome=read-only` specifically needed TWO `ReadWritePaths=`
+  carve-outs, not the one originally assumed — confirmed via
+  exploration that this app's own data files live directly under
+  `$HOME` (never deployed to a dedicated non-home directory) AND
+  `start-headless.sh`'s headless keyring daemon separately needs
+  `~/.local/share/keyrings/` to persist its unlocked state.
+- **`server/deploy.sh` integrity fixes**, from a requested full review
+  (two independent AI-generated reviews converged on the same findings):
+  the `opa-auth-gate` restart is now fatal, not a soft warning — it's
+  this app's own security-sensitive OIDC auth gate, and
+  `docs/hosting.md`'s sudoers setup already documents this restart as
+  required, so a deploy that silently failed to run it while still
+  reporting `deploy.completed` was never actually correct; nginx
+  reload-failure (distinct from the already-handled `nginx -t` failure)
+  now rolls the live file back too, so it can't silently diverge from
+  what nginx actually has loaded; a bounded retry loop confirms
+  `/api/version` reports the just-deployed version before declaring
+  success, since `systemctl status` alone can't tell "running" apart
+  from "running the OLD code" — exactly the failure class this script's
+  own self-modification/one-version-lag fixes were about; 5 patterns
+  confirmed genuinely missing from the rsync exclude list (a live,
+  current gap, verified by diffing against `.gitignore` directly, not
+  hypothetical) are now excluded. A full release-directory/rollback
+  pattern and deriving the exclude list from `.gitignore` automatically
+  were both explicitly scoped out as disproportionate to a 2-real-
+  install project — documented as deliberate deferrals in
+  `docs/fast-follow-redesign.md`, not silent gaps.
+
 5.34.0 — **Fast-follow Phase 5 of 11 of docs/fast-follow-redesign.md:
 retires `secrets_log_cache.json` + a session-wide stale-code cleanup
 sweep.** Now that `audit_store.py`'s compliance archive is a strict

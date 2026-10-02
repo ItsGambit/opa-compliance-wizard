@@ -1,0 +1,21 @@
+# Phase 8 of docs/fast-follow-redesign.md: requirements.txt now pins
+# exact versions (see that file's own comment history) instead of
+# floors -- without something watching for updates, a pin only ever
+# gets stale, trading "silently drifts" for "silently never updates."
+# Weekly, not daily -- matches this project's own low commit cadence
+# outside active fast-follow sessions; daily would be noise for a
+# 2-maintainer project.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # frontend/package-lock.json isn't at repo root -- Dependabot has no
+  # equivalent to ci.yml's own `working-directory: frontend` job
+  # default, so this needs its own explicit directory.
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"

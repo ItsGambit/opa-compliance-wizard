@@ -29,6 +29,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 import webbrowser
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -296,7 +297,11 @@ def _access_job_progress(storage_name):
     return _progress
 
 
-def _run_access_job(storage_name, job_client, job_okta_client):
+def _run_access_job(storage_name, job_client, job_okta_client, correlation_id=None):
+    # A new thread does NOT inherit the parent thread's contextvars, so
+    # the triggering request's own id (if any) has to be set again here
+    # explicitly -- same reasoning as _run_sync_job below.
+    engine.CORRELATION_ID.set(correlation_id)
     try:
         result = engine.build_access_model(
             job_client, okta_client=job_okta_client, on_progress=_access_job_progress(storage_name)
@@ -351,7 +356,7 @@ def _sync_job_progress(storage_name):
     return _progress
 
 
-def _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, trigger="manual", actor_email=None, actor_sub=None, client_ip=None, user_agent=None):
+def _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, trigger="manual", actor_email=None, actor_sub=None, client_ip=None, user_agent=None, correlation_id=None):
     """Previously, a sync's actual outcome (success -- how many events,
     how long it took -- or failure -- what broke) lived ONLY in the
     ephemeral in-memory _sync_jobs dict, visible only while polling
@@ -364,8 +369,15 @@ def _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, trigger
     client_ip/user_agent are naturally None for a scheduler trigger (no
     request exists), threaded through from the ORIGINAL request for a
     manual trigger (this function runs in its own background thread, so
-    it can't read self.client_address/self.headers itself)."""
+    it can't read self.client_address/self.headers itself).
+    correlation_id is likewise threaded through explicitly (a new
+    thread does NOT inherit its parent's contextvars) -- the triggering
+    do_POST's own id for a manual trigger, or _scheduler_loop's own
+    per-tick id for a scheduled one; set here, at the very top of this
+    thread's own body, so every log line this sync produces (including
+    everything audit_store.sync_okta_events itself logs) carries it."""
     import audit_store
+    engine.CORRELATION_ID.set(correlation_id)
     # env_id (the real, stable environment_id -- Phase 1 UUID migration;
     # the caller already has it, either from the session via
     # _session_snapshot or from _scheduler_loop's own iteration, so it's
@@ -423,7 +435,7 @@ def _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, trigger
         )
 
 
-def _start_sync_job(env_id, env_name, ingestion_scope, owner=engine.LOCAL_OWNER_KEY, trigger="manual", actor_email=None, actor_sub=None, client_ip=None, user_agent=None, minutes_late=None):
+def _start_sync_job(env_id, env_name, ingestion_scope, owner=engine.LOCAL_OWNER_KEY, trigger="manual", actor_email=None, actor_sub=None, client_ip=None, user_agent=None, minutes_late=None, correlation_id=None):
     """Starts (or no-ops if already running) a background sync for one
     environment. Returns True if actually started. Builds a fresh
     OktaClient directly from stored credentials -- deliberately NOT
@@ -490,7 +502,7 @@ def _start_sync_job(env_id, env_name, ingestion_scope, owner=engine.LOCAL_OWNER_
     engine.log_audit_event(actor_email, actor_sub, f"{action_prefix}_start", start_details, client_ip=client_ip, user_agent=user_agent)
     threading.Thread(
         target=_run_sync_job, args=(env_id, env_name, okta_client, ingestion_scope, owner),
-        kwargs={"trigger": trigger, "actor_email": actor_email, "actor_sub": actor_sub, "client_ip": client_ip, "user_agent": user_agent},
+        kwargs={"trigger": trigger, "actor_email": actor_email, "actor_sub": actor_sub, "client_ip": client_ip, "user_agent": user_agent, "correlation_id": correlation_id},
         daemon=True,
     ).start()
     return True
@@ -533,6 +545,12 @@ def _scheduler_loop():
     systemd's journal, now also gets a real audit_log.jsonl entry)."""
     import audit_store
     while not _scheduler_stop_event.is_set():
+        # No HTTP request exists to correlate this tick with (see
+        # engine.CORRELATION_ID's own docstring) -- a "sched-" prefixed
+        # id, regenerated every poll, still ties together every sync
+        # this one tick starts and everything _run_sync_job itself logs
+        # for them, without implying a request that was never made.
+        engine.CORRELATION_ID.set(f"sched-{uuid.uuid4().hex[:8]}")
         try:
             now_utc = datetime.now(timezone.utc)
             # list_all_environments(), NOT list_environments_for(LOCAL_OWNER_KEY):
@@ -578,9 +596,10 @@ def _scheduler_loop():
                 _start_sync_job(
                     environment_id, env_name, schedule.get("ingestion_scope", "curated"), owner=owner, trigger="scheduled",
                     minutes_late=minutes_late if minutes_late > SCHEDULER_LATE_THRESHOLD_MINUTES else None,
+                    correlation_id=engine.CORRELATION_ID.get(),
                 )
         except Exception as exc:
-            print(f"[scheduler] Unexpected error in scheduler loop: {exc}", flush=True)
+            engine.log("ERROR", f"[scheduler] Unexpected error in scheduler loop: {exc}")
             engine.log_audit_event(None, None, "sync.scheduler_error", {"error": str(exc)})
         _scheduler_stop_event.wait(SCHEDULER_POLL_INTERVAL_SECS)
 
@@ -649,7 +668,7 @@ def activate_environment(owner_key, name):
         }
 
     engine.set_active_environment(engine_owner, name)
-    print(f"Activated environment '{name}' ({creds['base_domain']}) for owner '{owner_key}'.")
+    engine.log("INFO", f"Activated environment '{name}' ({creds['base_domain']}) for owner '{owner_key}'.")
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +863,8 @@ class Handler(SimpleHTTPRequestHandler):
 
     # -----------------------------------------------------------------
     def do_GET(self):
+        correlation_id = uuid.uuid4().hex[:12]
+        engine.CORRELATION_ID.set(correlation_id)
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
@@ -867,6 +888,33 @@ class Handler(SimpleHTTPRequestHandler):
                 # place version is bumped (see the "bump both together"
                 # convention in the engine's header comment).
                 return self._send_json(200, {"version": engine.SCRIPT_VERSION})
+
+            if path == "/healthz":
+                # Phase 8 of docs/fast-follow-redesign.md: cheap, no-auth
+                # (see nginx-opa-secrets-wizard.conf's matching
+                # `auth_request off`) target for an external uptime
+                # monitor/load balancer -- gives it something real to
+                # poll instead of inferring health from whether `/` 200s
+                # (which it always will, even with zero environments
+                # configured or a broken archive). Deliberately avoids
+                # any live Okta API call (would make this endpoint slow
+                # and rate-limit-consuming on every poll) -- both checks
+                # below are local-only.
+                checks = {}
+                try:
+                    if local_env_name:
+                        engine.get_environment_credentials(local_env_name, owner=engine_owner)
+                    checks["active_environment_credentials"] = "ok"
+                except Exception as exc:
+                    checks["active_environment_credentials"] = f"error: {exc}"
+                try:
+                    import audit_store
+                    audit_store._get_connection().execute("SELECT 1")
+                    checks["archive_writable"] = "ok"
+                except Exception as exc:
+                    checks["archive_writable"] = f"error: {exc}"
+                status = "ok" if all(v == "ok" for v in checks.values()) else "degraded"
+                return self._send_json(200, {"status": status, "version": engine.SCRIPT_VERSION, "checks": checks})
 
             if path == "/api/whoami":
                 # Lets the frontend show who's logged in without decoding
@@ -1208,6 +1256,8 @@ class Handler(SimpleHTTPRequestHandler):
 
     # -----------------------------------------------------------------
     def do_POST(self):
+        correlation_id = uuid.uuid4().hex[:12]
+        engine.CORRELATION_ID.set(correlation_id)
         path = urlparse(self.path).path
         if not self._check_origin():
             return
@@ -1438,6 +1488,7 @@ class Handler(SimpleHTTPRequestHandler):
                     actor_email=actor_email, actor_sub=actor_sub,
                     client_ip=self._request_client_ip(),
                     user_agent=self.headers.get("User-Agent"),
+                    correlation_id=engine.CORRELATION_ID.get(),
                 )
                 return self._send_json(200, {"started": started, "already_running": not started})
 
@@ -1489,7 +1540,8 @@ class Handler(SimpleHTTPRequestHandler):
                         return self._send_json(200, {"started": False, "already_running": True})
                     _access_jobs[_local_env_id] = {"status": "running", "steps": [], "error": None, "result": None}
                 threading.Thread(
-                    target=_run_access_job, args=(_local_env_id, local_client, local_okta_client), daemon=True
+                    target=_run_access_job, args=(_local_env_id, local_client, local_okta_client),
+                    kwargs={"correlation_id": engine.CORRELATION_ID.get()}, daemon=True
                 ).start()
                 return self._send_json(200, {"started": True, "steps": engine.ACCESS_MODEL_STEPS})
 
@@ -1672,7 +1724,7 @@ class Handler(SimpleHTTPRequestHandler):
                     writer.writeheader()
                     for row in rows:
                         writer.writerow({"path": row.get("path", ""), "description": row.get("description", "")})
-                print(f"Saved {len(rows)} row(s) to {csv_path.name}")
+                engine.log("INFO", f"Saved {len(rows)} row(s) to {csv_path.name}")
                 self._log_audit_event(actor_email, actor_sub, "csv.save", {
                     "file": csv_path.name, "row_count": len(rows),
                 })
@@ -1709,7 +1761,7 @@ class Handler(SimpleHTTPRequestHandler):
                 results = engine.execute_plan(local_client, rg_id, proj_id, ordered_paths, descriptions, existing)
                 output_path = PROJECT_ROOT / f"folders_result_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
                 engine.write_results_csv(output_path, results)
-                print(f"Execute complete: results written to {output_path.name}")
+                engine.log("INFO", f"Execute complete: results written to {output_path.name}")
                 self._log_audit_event(actor_email, actor_sub, "folders.execute", {
                     "env_name": _local_env_name, "resource_group_id": rg_id, "project_id": proj_id,
                     "output_file": output_path.name, "folder_count": len(results),
@@ -1754,6 +1806,8 @@ class Handler(SimpleHTTPRequestHandler):
 
     # -----------------------------------------------------------------
     def do_DELETE(self):
+        correlation_id = uuid.uuid4().hex[:12]
+        engine.CORRELATION_ID.set(correlation_id)
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
@@ -1857,7 +1911,7 @@ def _try_activate_saved_environment(owner_key):
     try:
         activate_environment(owner_key, name)
     except Exception as exc:
-        print(f"Could not auto-activate saved environment '{name}' for owner '{owner_key}': {exc}")
+        engine.log("WARN", f"Could not auto-activate saved environment '{name}' for owner '{owner_key}': {exc}")
 
 
 def _ensure_session_initialized(owner_key):
@@ -1895,7 +1949,7 @@ def main():
     threading.Thread(target=_scheduler_loop, daemon=True).start()
 
     if not FRONTEND_DIST.exists():
-        print(f"Warning: {FRONTEND_DIST} does not exist yet -- run 'npm run build' in frontend/ first.")
+        engine.log("WARN", f"{FRONTEND_DIST} does not exist yet -- run 'npm run build' in frontend/ first.")
 
     # FIX (confirmed live, 2026-10-01): on the hosted Linux server, a
     # `systemctl restart` can start this new process before the OS has
@@ -1928,16 +1982,16 @@ def main():
             if attempt < max_bind_attempts:
                 time.sleep(bind_retry_delay_secs)
     if server is None:
-        print(f"Could not bind 127.0.0.1:{args.port} ({last_exc}) after {max_bind_attempts} attempts.")
-        print("Likely an existing server is already running on this port -- stop it (Ctrl+C in its")
-        print(f"window, or close it) and try again, or run with --port <other_port>.")
+        engine.log("ERROR", f"Could not bind 127.0.0.1:{args.port} ({last_exc}) after {max_bind_attempts} attempts. "
+                             "Likely an existing server is already running on this port -- stop it (Ctrl+C in its "
+                             "window, or close it) and try again, or run with --port <other_port>.")
         sys.exit(1)
 
     url = f"http://127.0.0.1:{args.port}/"
-    print(f"Serving OPA Compliance Wizard at {url}")
+    engine.log("SUCCESS", f"Serving OPA Compliance Wizard at {url}")
     if LOCAL_OWNER_KEY_HEADER not in _sessions:
-        print("No environment configured yet -- the dashboard will prompt you to set one up.")
-    print("Press Ctrl+C to stop.")
+        engine.log("INFO", "No environment configured yet -- the dashboard will prompt you to set one up.")
+    engine.log("INFO", "Press Ctrl+C to stop.")
 
     if not args.no_browser:
         webbrowser.open(url)
@@ -1945,7 +1999,7 @@ def main():
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nStopping.")
+        engine.log("INFO", "Stopping.")
     finally:
         server.server_close()
 

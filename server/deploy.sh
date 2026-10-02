@@ -76,6 +76,20 @@
 # last run's.
 #
 # Safe to re-run any time; every step is idempotent.
+#
+# SCOPE DECISION (Phase 8 of docs/fast-follow-redesign.md, documented
+# via two independent AI code reviews of this exact script): there is
+# still NO code-level rollback/backup of the previous app code/venv/
+# frontend build -- only the nginx config has one (see NGINX_BACKUP
+# below). A full release-directory/symlink-atomic-swap pattern would
+# add real, permanent structural complexity on top of this script's
+# already-nontrivial two-phase self-re-exec (three documented past
+# incidents already live in the comments below) for a 2-real-install
+# project where `git revert` + re-run already works today as the actual
+# recovery path. Deliberately scoped out, not an unflagged gap -- `git
+# revert <bad commit> && git push`, then re-run this script, is the
+# documented way to undo a bad deploy until/unless this list grows
+# enough to justify revisiting.
 
 set -euo pipefail
 
@@ -143,6 +157,15 @@ if [ "$DEPLOY_SH_PHASE" = "1" ]; then
   # install HAS migrated, these files no longer exist on either side of
   # the sync, so the exclude is a harmless no-op; it is NOT a no-op
   # before/during migration, which is exactly the case that broke.
+  # Phase 8 (2026-10-02): the 5 patterns below (TestCreds.txt through
+  # docs/fast-follow-redesign.md) were confirmed MISSING from this list
+  # despite all being listed in .gitignore as local-only -- a REAL,
+  # CURRENT gap (not hypothetical), same incident class as the
+  # environments.json/banner_config.json bug above: if any of these
+  # exist under $APP_DIR on the real server (plausible for
+  # TestCreds.txt/ubuntuserver.txt/folders_result_*.csv, which accumulate
+  # from ad hoc CLI usage on the server itself), the next --delete
+  # silently wipes them with no warning.
   rsync -a --delete \
     --exclude '.venv/' \
     --exclude '.git/' \
@@ -160,6 +183,11 @@ if [ "$DEPLOY_SH_PHASE" = "1" ]; then
     --exclude 'audit_store.db-shm' \
     --exclude 'audit_store.db.*' \
     --exclude '.env' \
+    --exclude 'TestCreds.txt' \
+    --exclude 'ubuntuserver.txt' \
+    --exclude 'folders_result_*.csv' \
+    --exclude '.pytest_cache/' \
+    --exclude 'docs/fast-follow-redesign.md' \
     "$SRC/" "$APP_DIR/"
 
   # git-for-windows checkouts of this repo commonly have core.fileMode=false,
@@ -235,6 +263,8 @@ echo "==> Reinstalling Python dependencies"
 echo "==> Rebuilding frontend"
 (cd "$APP_DIR/frontend" && npm ci --silent && npx vite build)
 
+_DEPLOYED_VERSION="$(grep -m1 'SCRIPT_VERSION = ' "$APP_DIR/create_secret_folders.py" | sed -E 's/.*"([^"]+)".*/\1/')"
+
 echo "==> Restarting $SERVICE_NAME"
 # -n (non-interactive): without a pseudo-TTY (e.g. run via `ssh host "cmd"`
 # rather than an interactive shell), plain `sudo` can still try to prompt
@@ -245,20 +275,52 @@ sudo -n systemctl restart "$SERVICE_NAME"
 sleep 1
 systemctl status "$SERVICE_NAME" --no-pager -l
 
+# FIX (Phase 8, 2026-10-02): `systemctl status` above only proves the
+# PROCESS is running -- it can't distinguish "running the OLD code"
+# from "running the NEW code," which is exactly the failure class the
+# self-modification/one-version-lag fixes earlier in this file's own
+# history were about. /healthz (new this phase, see server/serve.py)
+# didn't exist yet when the version endpoint below was first wired up,
+# but /api/version already did -- reuse it rather than adding a second
+# equivalent check. Bounded retry (5 attempts, 1s apart): a slow-
+# starting process shouldn't fail the deploy just for not yet being
+# ready on the very first curl.
+_version_confirmed=""
+for _attempt in 1 2 3 4 5; do
+  _live_version="$(curl -sf --max-time 2 "http://127.0.0.1:8766/api/version" 2>/dev/null | grep -oP '"version"\s*:\s*"\K[^"]*' || true)"
+  if [ "$_live_version" = "$_DEPLOYED_VERSION" ]; then
+    _version_confirmed="1"
+    break
+  fi
+  sleep 1
+done
+if [ -z "$_version_confirmed" ]; then
+  echo "ERROR: $SERVICE_NAME is active, but /api/version never reported the just-deployed" >&2
+  echo "       version ($_DEPLOYED_VERSION) after 5 attempts -- last response: '${_live_version:-<none>}'." >&2
+  exit 1
+fi
+echo "    Confirmed live and serving version $_DEPLOYED_VERSION."
+
 echo "==> Restarting $AUTH_GATE_SERVICE"
 # H-4 fix: previously never restarted here at all -- any auth_gate.py
 # change deployed above kept running under the OLD code until a separate,
-# easy-to-forget manual restart. Same -n fail-fast behavior as above; if
-# the server's sudoers rule hasn't been widened to cover this unit yet,
-# don't abort the whole deploy over it -- warn and keep going, same
-# graceful-degradation shape the old nginx-drift warning used.
-if sudo -n systemctl restart "$AUTH_GATE_SERVICE" 2>/dev/null; then
-  sleep 1
-  systemctl status "$AUTH_GATE_SERVICE" --no-pager -l
-else
-  SUDOERS_GAPS+=("systemctl restart $AUTH_GATE_SERVICE")
-  echo "    (skipped -- sudoers rule doesn't cover this yet, see warning below)"
-fi
+# easy-to-forget manual restart. Same -n fail-fast behavior as above.
+#
+# FIX (Phase 8, 2026-10-02): this used to be a soft warning
+# (SUDOERS_GAPS, continue, still report deploy.completed) on the
+# reasoning that the sudoers grant for this restart might not be in
+# place yet. That reasoning stopped being correct the moment
+# docs/hosting.md's setup documented this restart as one of the seven
+# REQUIRED grants (step 7c) -- auth_gate.py is this app's own OIDC auth
+# gate, explicitly security-sensitive, and a deploy that ships new auth
+# logic but silently fails to actually restart the process running it,
+# while still reporting success, is the wrong default. Now unconditional
+# and fatal, matching $SERVICE_NAME's own treatment above -- if the
+# sudoers rule genuinely isn't in place on a given server, this is now a
+# real deploy failure (logged via the ERR trap below), not a silent gap.
+sudo -n systemctl restart "$AUTH_GATE_SERVICE"
+sleep 1
+systemctl status "$AUTH_GATE_SERVICE" --no-pager -l
 
 echo "==> Done. Deployed version:"
 grep -m1 'SCRIPT_VERSION = ' "$APP_DIR/create_secret_folders.py"
@@ -318,10 +380,22 @@ if [ -f "$NGINX_LIVE" ] && ! diff -q "$NGINX_REPO" "$NGINX_LIVE" > /dev/null 2>&
       if sudo -n systemctl reload nginx 2>/dev/null; then
         echo "    Applied, validated, and reloaded."
       else
+        # FIX (Phase 8, 2026-10-02): this used to just warn and leave
+        # the NEW config on disk at $NGINX_LIVE with the OLD config
+        # still actually loaded in nginx's running process -- a
+        # distinct failure mode from the nginx -t failure handled in
+        # the branch below (that one already rolls back). Without this,
+        # the live FILE silently diverges from the live RUNNING config
+        # until some unrelated future reload/restart (a logrotate
+        # postrotate script, a different admin's manual reload)
+        # activates it unexpectedly. Mirrors the exact rollback already
+        # used two branches down.
         SUDOERS_GAPS+=("systemctl reload nginx")
         echo "    Config copied and passed 'nginx -t', but reload didn't happen"
-        echo "    (sudoers gap) -- the OLD config is still what's actually serving"
-        echo "    traffic until a reload runs. See warning below."
+        echo "    (sudoers gap) -- rolling the live FILE back to the previous"
+        echo "    config so it matches what's actually still running."
+        sudo -n cp "$NGINX_BACKUP" "$NGINX_LIVE" 2>/dev/null \
+          || echo "    !!! ROLLBACK ALSO FAILED -- $NGINX_LIVE may now be broken. Fix manually."
       fi
     else
       echo "    !!! New config FAILED 'nginx -t' -- rolling back to the previous"
@@ -355,5 +429,4 @@ fi
 # inside _log_deploy_event's own python call can't recursively re-trigger
 # it as a deploy.failed on top of a deploy that actually succeeded.
 trap - ERR
-_DEPLOYED_VERSION="$(grep -m1 'SCRIPT_VERSION = ' "$APP_DIR/create_secret_folders.py" | sed -E 's/.*"([^"]+)".*/\1/')"
 _log_deploy_event "deploy.completed" "{\"version\": \"$_DEPLOYED_VERSION\", \"sudoers_gaps\": ${#SUDOERS_GAPS[@]}}"

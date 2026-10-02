@@ -1,2 +1,2 @@
-keyring>=25.0
-pyjwt[crypto]>=2.8
+keyring==25.7.0
+pyjwt[crypto]==2.15.1

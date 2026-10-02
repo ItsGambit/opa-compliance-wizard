@@ -159,21 +159,47 @@ transient API error) is NOT an error; see _mfa_log_lookup's docstring.
 
 import argparse
 import base64
+import contextvars
 import hashlib
 import hmac
 import http.cookies
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import jwt
 from jwt import PyJWKClient
+
+# Phase 8 of docs/fast-follow-redesign.md: same JSON-line structured-
+# logging shape as create_secret_folders.py's own log()/CORRELATION_ID
+# (see that module's docstring for the full ThreadingHTTPServer/
+# background-thread reasoning), deliberately NOT imported from there --
+# this is a wholly separate process with no existing import relationship
+# to the engine module, and introducing one just for logging would be a
+# bigger structural change than this phase needs.
+CORRELATION_ID = contextvars.ContextVar("correlation_id", default=None)
+
+
+def log(level, message):
+    record = {
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "level": level,
+        "msg": message,
+    }
+    correlation_id = CORRELATION_ID.get()
+    if correlation_id:
+        record["correlation_id"] = correlation_id
+    stream = sys.stderr if level in ("WARN", "ERROR") else sys.stdout
+    print(json.dumps(record), file=stream)
+
 
 # Every value below is deployment-specific -- which Okta org, which OIDC
 # app, which public origin this dashboard is reachable at -- so none of it
@@ -513,6 +539,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        CORRELATION_ID.set(uuid.uuid4().hex[:12])
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
@@ -805,7 +832,7 @@ def main():
     parser.add_argument("--port", type=int, default=8767)
     args = parser.parse_args()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"Okta auth gate listening on 127.0.0.1:{args.port}, issuer={OKTA_ISSUER}")
+    log("SUCCESS", f"Okta auth gate listening on 127.0.0.1:{args.port}, issuer={OKTA_ISSUER}")
     server.serve_forever()
 
 

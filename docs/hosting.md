@@ -137,10 +137,17 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    every invocation — letting it also edit sudoers would mean any future
    commit could silently grant itself more privilege than this exact
    list, which defeats the entire point of scoping sudo narrowly in the
-   first place.) If you skip this step, `deploy.sh` still fully deploys
-   the app and frontend either way — it just prints exactly which step it
-   couldn't run and the manual command to run instead, rather than
-   silently leaving `auth_gate.py` or nginx on stale code/config.
+   first place.) **This step is no longer optional as of Phase 8
+   (2026-10-02)** — `deploy.sh` used to continue (with a printed warning)
+   if the `opa-auth-gate` restart specifically couldn't run, since
+   auth_gate.py is this app's own OIDC auth gate and a deploy that ships
+   new auth logic but silently fails to restart the process running it
+   is the wrong thing to call "completed." That restart is now
+   unconditional and fatal — skip this sudoers setup and a deploy with
+   any code change at all will fail outright at that step, not just
+   warn. (nginx config drift, the other thing this grants, still only
+   warns-and-prints-the-manual-command if its own narrower sudoers gap
+   is hit — only the auth-gate restart was escalated.)
 
    Step 7a. Find the exact paths to `systemctl`, `nginx`, and `cp` on
    *your* server — sudoers rules match an exact binary path, not just a
@@ -202,6 +209,19 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    include all seven, re-open the file from step 7c and check for a typo
    — most commonly the username, or a binary path that doesn't match
    step 7a's `which` output exactly.
+
+**Health check.** `GET /healthz` (unauthenticated by design, same
+`auth_request off` treatment as `/login`) returns `{"status": "ok"|
+"degraded", "version": ..., "checks": {...}}` — point an external uptime
+monitor or load balancer at `https://<your-host>/healthz` instead of `/`
+(which always 200s, even with zero environments configured or a broken
+archive, so it can't actually tell you anything is wrong). Checks are
+local-only (no live Okta API call, so polling it doesn't cost rate
+limit): whether the active environment's stored credentials can be read
+back, and whether the compliance archive (`audit_store.db`) is
+reachable. A failing check degrades `status` to `"degraded"` (still a
+200 — partial health info is more useful to a monitor than an opaque
+500) and names which check failed.
 
 **Per-user environments.** Once behind the login gate, each logged-in
 Okta identity gets their own private set of environments by default (an

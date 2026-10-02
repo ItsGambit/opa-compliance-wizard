@@ -13,5 +13,24 @@ ExecStart=/home/rparikh/opa-secrets-folders/server/start-headless.sh
 Restart=on-failure
 RestartSec=3
 
+# Phase 8 of docs/fast-follow-redesign.md: defense-in-depth hardening,
+# free given this already runs as an unprivileged user with no
+# capability requirements. ProtectHome=read-only (not the blanket
+# ProtectHome=false/true) PLUS two explicit ReadWritePaths= -- this
+# app's own data files (audit_store.db etc.) live directly under
+# WorkingDirectory, which is itself under $HOME, and start-headless.sh's
+# gnome-keyring-daemon --login needs read/write access to
+# ~/.local/share/keyrings/ to persist the unlocked collection across
+# restarts (see that script's own comment) -- confirmed both are real
+# conflicts a blanket ProtectHome=read-only would break, not theoretical.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ReadWritePaths=/home/rparikh/opa-secrets-folders
+ReadWritePaths=/home/rparikh/.local/share/keyrings
+ProtectKernelTunables=true
+ProtectControlGroups=true
+UMask=0077
+
 [Install]
 WantedBy=multi-user.target

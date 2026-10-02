@@ -59,10 +59,11 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.34.0
+# Version     : 5.35.0
 # =============================================================================
 
 import argparse
+import contextvars
 import csv
 import email.utils
 import json
@@ -79,7 +80,7 @@ import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.34.0"
+SCRIPT_VERSION = "5.35.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -1362,20 +1363,44 @@ RATE_LIMIT_WAIT_BUFFER_SECS = 1
 _rate_limit_lock = threading.Lock()
 _rate_limit_state = {}  # host -> {"remaining": int, "reset": int}
 
-COLOR = {
-    "INFO": "\033[0m",
-    "WARN": "\033[0;33m",
-    "ERROR": "\033[0;31m",
-    "SUCCESS": "\033[0;32m",
-    "RESET": "\033[0m",
-}
+# Phase 8 of docs/fast-follow-redesign.md: set once per inbound request
+# (server/serve.py's do_GET/do_POST/do_DELETE) or background job
+# (server/serve.py's _run_sync_job/_run_access_job, each given the
+# triggering request's own id) so every log line produced while
+# handling that one request/job carries the same id -- the thing a
+# structured-logging phase is actually for ("what happened during this
+# one click", not just "what happened at this timestamp"). A
+# ContextVar, not a plain module global, specifically because
+# ThreadingHTTPServer gives each request its own OS thread, and a
+# background sync/access-model job runs in yet another thread it starts
+# itself -- a plain global would leak one request's id into whichever
+# other thread happened to read it next. None (the default) when
+# there's no request to correlate with at all (CLI usage, this script's
+# own module-level warnings, a scheduler tick before it's generated its
+# own id -- see server/serve.py's _scheduler_loop).
+CORRELATION_ID = contextvars.ContextVar("correlation_id", default=None)
 
 
 def log(level, message):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    color = COLOR.get(level, COLOR["INFO"])
+    """Writes one JSON-line log record to stdout (WARN/ERROR to stderr,
+    matching this function's pre-Phase-8 stream split) -- machine-
+    parseable (one `json.loads` per line) instead of the previous
+    colorized `[timestamp] [LEVEL] message` plaintext, so a real log
+    aggregator (or just `jq`) can filter/group by level or
+    correlation_id without regex. Signature is UNCHANGED from before
+    this phase (still just `log(level, message)`) -- every existing
+    call site across this file/audit_store.py needed zero changes; only
+    this function's own body did."""
+    record = {
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "level": level,
+        "msg": message,
+    }
+    correlation_id = CORRELATION_ID.get()
+    if correlation_id:
+        record["correlation_id"] = correlation_id
     stream = sys.stderr if level in ("WARN", "ERROR") else sys.stdout
-    print(f"{color}[{ts}] [{level}] {message}{COLOR['RESET']}", file=stream)
+    print(json.dumps(record), file=stream)
 
 
 def die(message):

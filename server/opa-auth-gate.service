@@ -13,5 +13,21 @@ ExecStart=/home/rparikh/opa-secrets-folders/.venv/bin/python server/auth_gate.py
 Restart=on-failure
 RestartSec=3
 
+# Phase 8 of docs/fast-follow-redesign.md -- same hardening and the
+# same two ReadWritePaths= as opa-compliance-wizard.service's own
+# comment explains. This unit needs BOTH too, not just the keyring one:
+# it has no app data files of its own, but auth_gate.py's
+# _load_keyring_secret still calls into the OS keyring directly (same
+# as the wizard process), so it needs the identical
+# ~/.local/share/keyrings/ carve-out.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ReadWritePaths=/home/rparikh/opa-secrets-folders
+ReadWritePaths=/home/rparikh/.local/share/keyrings
+ProtectKernelTunables=true
+ProtectControlGroups=true
+UMask=0077
+
 [Install]
 WantedBy=multi-user.target
