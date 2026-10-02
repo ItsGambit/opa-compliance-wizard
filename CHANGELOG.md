@@ -2,6 +2,52 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.33.0 — **Fast-follow Phase 7 remainder of 11 of
+docs/fast-follow-redesign.md: frontend unit tests + CI**, the "dev-hat
+gap every other phase depends on." Five phases shipped back-to-back
+this session (1, 2, 3+4, 6, 10), each surfacing at least one real bug
+only caught by manual live-testing — this closes the automated-
+regression gap that relied on, rather than mechanized.
+- New frontend test infrastructure from scratch (vitest, jsdom,
+  `@testing-library/react`, `@testing-library/jest-dom` -- none existed
+  before this). Reuses the existing `vite.config.ts` (Vitest reads it
+  automatically) rather than a separate config file; new `npm test`
+  script (`vitest run`).
+- `frontend/src/hooks/useAccessBootstrapJob.test.ts` (5 tests): covers
+  the real, previously-fixed bug documented in that hook's own
+  comment -- `stopPolling()` used to fire before
+  `fetchAccessBootstrapResult()` even ran, so a transient network blip
+  fetching the result left polling permanently dead with no auto-retry,
+  forcing a full bootstrap restart. Tests the happy path, the exact
+  regression scenario (result-fetch failure surfaces as `error`, not
+  stuck or silently retried; a subsequent Retry cleanly restarts), the
+  `status: 'error'` path, a `/status` network failure, and interval
+  cleanup on unmount.
+- `frontend/src/utils/fuzzySearch.test.tsx` (9 tests): covers
+  `useFuzzyFilter`'s real behavioral contract (not the documented
+  `useMemo` dependency choice itself, which is a style tradeoff) -- a
+  new `items` reference always produces fresh results, matching on a
+  non-primary field (email), the empty-query "show everything
+  unfiltered" case, and a new inline `keys` array literal across
+  renders not breaking matching. Plus `HighlightedText` (empty/single/
+  multiple-range highlighting, sorted by start index). Used by six
+  components (`Select.tsx`, `ComplianceReportDetail.tsx`,
+  `ResourcesTab.tsx`, `ReportRowsTable.tsx`, `AuditLogPage.tsx`,
+  `UsersTab.tsx`) -- a regression here has a six-way blast radius.
+- New `.github/workflows/ci.yml`: two parallel jobs (backend/frontend,
+  so one failing never masks the other's signal) running on every
+  push/PR -- `pytest` + a full-repo `ast.parse` sweep (not just whatever
+  one PR touched) for backend; `tsc --noEmit` + `vitest run` + `vite
+  build` for frontend. Deliberately uses `npx vite build` directly
+  (matching `server/deploy.sh`'s own real build invocation), not `npm
+  run build`'s stricter `tsc -b` chain, which has 8 pre-existing,
+  unrelated type errors across 4 files (found during Phase 3's testing)
+  not yet cleaned up -- fixing those is a separate, future item, not
+  bundled into this phase.
+- `CONTRIBUTING.md` updated to describe both test suites and CI
+  accurately, replacing the now-stale "not yet comprehensive -- no
+  frontend tests, no CI" line.
+
 5.32.0 — **Fast-follow Phase 10 of 11 of docs/fast-follow-redesign.md:
 surfaces evidence completeness and MFA-approval state in the UI** —
 backend guarantees from Phases 2/3/6 made the data model more honest,

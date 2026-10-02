@@ -25,15 +25,24 @@ Run it with `python launch.py` from the repo root — see the main
 
 ## Before opening a PR
 
-**There is a small, backend-only `pytest` suite** (`tests/`, run with
-`pip install -r requirements-dev.txt && pytest` from the repo root) — it
-covers the functions with the most direct history of silent breakage
-(admin same-owner-name disambiguation, the P0 header-spoofing fix, the
-sync watermark, atomic-write crash safety) plus a two-owner collision
-integration test, but it is **not yet comprehensive** — no frontend
-tests, no CI. Run it if you touched any of `create_secret_folders.py`,
-`server/serve.py`, or `audit_store.py`; add a test alongside your fix if
-you can. This is the real bar for a PR to be mergeable:
+**There's a backend `pytest` suite** (`tests/`, run with
+`pip install -r requirements-dev.txt && pytest` from the repo root) and a
+**frontend `vitest` suite** (`frontend/src/**/*.test.{ts,tsx}`, run with
+`cd frontend && npm test`) — both run automatically on every push/PR via
+GitHub Actions (`.github/workflows/ci.yml`). The backend suite covers
+the functions with the most direct history of silent breakage (admin
+same-owner-name disambiguation, the P0 header-spoofing fix, the sync
+watermark, atomic-write crash safety, the Phase 3 step-up transaction
+binding) plus a two-owner collision integration test. The frontend
+suite covers the two hooks with a documented history of a real,
+once-fixed bug (`useAccessBootstrapJob`'s polling-stops-too-early fix,
+`useFuzzyFilter`'s stale-array-reference behavior). Neither is
+exhaustive — add a test alongside your fix if you touch
+`create_secret_folders.py`/`server/serve.py`/`audit_store.py` on the
+backend, or a hook/util with non-trivial state on the frontend. This is
+the real bar for a PR to be mergeable (CI runs all of it, but check
+locally before pushing so you're not waiting on a CI round-trip to find
+out):
 
 ```bash
 # Backend: run the test suite
@@ -45,6 +54,9 @@ python -c "import ast; ast.parse(open('path/to/file.py', encoding='utf-8').read(
 
 # Frontend: type-check
 cd frontend && npx tsc --noEmit
+
+# Frontend: run the test suite
+npm test
 
 # Frontend: confirm it still builds
 npx vite build

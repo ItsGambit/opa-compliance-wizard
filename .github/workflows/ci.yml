@@ -1,0 +1,57 @@
+# Phase 7 of docs/fast-follow-redesign.md (local-only, not pushed --
+# see CONTRIBUTING.md for the manual command sequence this workflow
+# mirrors). Two independent jobs so a frontend failure never masks the
+# backend's own pass/fail signal (and vice versa) -- both run in
+# parallel on GitHub's runners regardless, so this costs nothing in
+# wall-clock time.
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: pytest
+      # Scans every .py file in the repo, not just whatever a PR touched --
+      # cheap in CI, catches a syntax error introduced by an unrelated
+      # search-and-replace that a human reviewer wouldn't think to re-check.
+      - name: Confirm every Python file still parses
+        run: |
+          python -c "
+          import ast, glob
+          failures = []
+          for path in glob.glob('**/*.py', recursive=True):
+              if '.venv' in path or 'node_modules' in path:
+                  continue
+              try:
+                  ast.parse(open(path, encoding='utf-8').read())
+              except SyntaxError as exc:
+                  failures.append(f'{path}: {exc}')
+          if failures:
+              raise SystemExit('\n'.join(failures))
+          "
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm test
+      # Matches server/deploy.sh's own exact build invocation (npx vite
+      # build directly, not `npm run build`'s stricter `tsc -b` chain --
+      # that stricter mode has pre-existing, unrelated type errors not
+      # yet cleaned up, so CI mirrors what actually gets deployed).
+      - run: npx vite build
