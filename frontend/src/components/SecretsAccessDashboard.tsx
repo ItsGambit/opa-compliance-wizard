@@ -14,6 +14,9 @@ function AuditCell({ entry }: { entry: AuditEntry | null }) {
     <span className="text-text-dim">
       {entry.by ?? 'unknown'}
       <span className="text-text-faint"> · {formatDateTime(entry.at)}</span>
+      {entry.request_id && (
+        <span className="text-text-faint"> · request <code className="text-[0.625rem]">{entry.request_id}</code></span>
+      )}
     </span>
   )
 }

@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.36.2
+# Version     : 5.37.0
 # =============================================================================
 
 import argparse
@@ -80,7 +80,7 @@ import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.36.2"
+SCRIPT_VERSION = "5.37.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -2035,6 +2035,19 @@ class OktaClient:
         capable of using going forward."""
         return self.request("GET", f"/api/v1/devices/{urllib.parse.quote(device_id, safe='')}/authenticator-enrollments")
 
+    def get_device_users(self, device_id):
+        """GET /api/v1/devices/{id}/users ("List Users for Device") --
+        confirmed live 2026-10-02 against a real tenant: returns a JSON
+        LIST (never a single object -- Okta genuinely supports multiple
+        users per device, e.g. a shared/kiosk-style device; confirmed via
+        2 real devices in this tenant each with 2 associated users), one
+        entry per association: {created, managementStatus, screenLockType,
+        user: {id, status, profile: {firstName, lastName, email, login,
+        ...}, ...}}. Distinct from list_clients' user_name (that's OPA's
+        own PAM-client enrollment, a different system -- see list_devices'
+        own docstring on why the two only partially overlap)."""
+        return self.request("GET", f"/api/v1/devices/{urllib.parse.quote(device_id, safe='')}/users")
+
     def list_devices(self):
         """GET /api/v1/devices, following Link: rel="next" (same generic
         _parse_next_link helper the System Log pagination already uses --
@@ -2062,7 +2075,17 @@ class OktaClient:
         org) gets an empty list rather than failing the whole bootstrap --
         confirmed live this really does 401 on orgs without the feature
         flag on, not something to let take down every other resource kind
-        in the same bootstrap pass."""
+        in the same bootstrap pass.
+
+        Also gets an added `users` key -- a flat list of email strings
+        (via get_device_users, same per-device enrichment pattern as
+        authenticator_enrollments above, same graceful-empty-list-on-
+        failure handling). Extracted to a simple List[str] rather than
+        passing through the full nested user object, since no caller
+        needs more than a display-ready name for a read-only table
+        column -- email preferred, falling back to login, then
+        "firstName lastName", matching how actor display names are
+        resolved elsewhere in this file."""
         devices = []
         next_path = "/api/v1/devices?limit=200"
         while next_path:
@@ -2076,6 +2099,21 @@ class OktaClient:
                 d["authenticator_enrollments"] = self.get_device_authenticator_enrollments(d["id"])
             except OktaApiError:
                 d["authenticator_enrollments"] = []
+            try:
+                associations = self.get_device_users(d["id"])
+            except OktaApiError:
+                associations = []
+            users = []
+            for assoc in associations:
+                profile = (assoc.get("user") or {}).get("profile") or {}
+                name = (
+                    profile.get("email")
+                    or profile.get("login")
+                    or " ".join(part for part in (profile.get("firstName"), profile.get("lastName")) if part)
+                )
+                if name:
+                    users.append(name)
+            d["users"] = users
         return devices
 
     def get_system_log(self, filter_expr=None, since=None, until=None, limit=1000, sort_order="DESCENDING", max_pages=50):
@@ -2969,7 +3007,11 @@ def build_secrets_access_report(client, okta_client, resource_group_id, project_
         # displayName -- confirmed live against real delete events from
         # this project's own past service-account-driven testing.
         actor = event.get("actor") or {}
-        entry = {"by": actor.get("displayName") or actor.get("alternateId"), "at": event.get("published")}
+        entry = {
+            "by": actor.get("displayName") or actor.get("alternateId"),
+            "at": event.get("published"),
+            "request_id": _extract_request_id(event),
+        }
         event_type = event.get("eventType")
         if event_type.endswith(".create"):
             if bucket["created"] is None:  # events are most-recent-first; a resource has exactly one create
@@ -2981,7 +3023,7 @@ def build_secrets_access_report(client, okta_client, resource_group_id, project_
                 bucket["deleted"] = entry
         elif event_type.endswith(".reveal"):
             if len(bucket["reveals"]) < reveal_limit:
-                bucket["reveals"].append({**entry, "request_id": _extract_request_id(event)})
+                bucket["reveals"].append(entry)
 
     def _build_rows(kind, live_by_id):
         rows = []
@@ -3102,7 +3144,11 @@ def build_project_secrets_report_from_archive(client, environment_id, resource_g
             bucket["path"] = (path_target.get("displayName") or "").lstrip("/")
 
         actor = event.get("actor") or {}
-        entry = {"by": actor.get("displayName") or actor.get("alternateId"), "at": event.get("published")}
+        entry = {
+            "by": actor.get("displayName") or actor.get("alternateId"),
+            "at": event.get("published"),
+            "request_id": _extract_request_id(event),
+        }
         event_type = event.get("eventType")
         if event_type.endswith(".create"):
             if bucket["created"] is None:
@@ -3113,7 +3159,7 @@ def build_project_secrets_report_from_archive(client, environment_id, resource_g
             if bucket["deleted"] is None:
                 bucket["deleted"] = entry
         elif event_type.endswith(".reveal"):
-            bucket["reveals"].append({**entry, "request_id": _extract_request_id(event)})
+            bucket["reveals"].append(entry)
 
     def _build_rows(kind, live_by_id):
         rows = []

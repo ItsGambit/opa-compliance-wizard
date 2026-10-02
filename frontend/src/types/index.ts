@@ -116,6 +116,20 @@ export interface ComplianceReportRow {
   resource_id: string
   resource_alternate_id: string
   outcome: string
+  /** Why the outcome was what it was -- empty on most success rows, a
+   * real string on a denial/failure (e.g. "Authenticator method
+   * unanswered"). From Okta's own outcome.reason. */
+  outcome_reason: string
+  /** From Okta's own client.ipAddress -- empty for system-triggered
+   * events with no originating client (e.g. PAM credential rotation). */
+  client_ip: string
+  /** Short "{city}, {state}, {country}" string from Okta's own
+   * client.geographicalContext -- empty when client_ip is. */
+  client_geo: string
+  /** Okta's own transaction/request id for this event -- lets an admin
+   * jump from this row to the exact matching entry in Okta's own System
+   * Log UI/API for follow-up investigation. */
+  request_id: string | null
   targets: ComplianceReportTarget[]
 }
 
@@ -569,6 +583,12 @@ export interface AccessDevice {
   // empty (not missing) on orgs without it, see
   // OktaClient.get_device_authenticator_enrollments' docstring.
   authenticator_enrollments: { id: string; key: string; name: string; status: string }[]
+  // GET /api/v1/devices/{id}/users ("List Users for Device") -- confirmed
+  // live 2026-10-02 against a real tenant, a device can genuinely have
+  // MULTIPLE associated users (shared/kiosk-style device), not just one;
+  // see OktaClient.get_device_users' docstring. Flat list of display-ready
+  // name strings (email preferred), already extracted server-side.
+  users: string[]
 }
 
 // A relationship is a named grant type (e.g. "TDI_Safe_Owners"); an
@@ -741,11 +761,14 @@ export interface FolderAccessEntry {
 export interface AuditEntry {
   by: string | null
   at: string | null
-}
-
-export interface RevealEntry extends AuditEntry {
+  /** Okta's own transaction/request id for the event behind this entry --
+   * lets an admin jump to the exact matching entry in Okta's own System
+   * Log for follow-up investigation. Present on created/updated/deleted
+   * entries too, not just reveals, as of Phase 8's report-enhancement pass. */
   request_id: string | null
 }
+
+export interface RevealEntry extends AuditEntry {}
 
 export type SecretsAccessStatus = 'active' | 'deleted' | 'unknown'
 

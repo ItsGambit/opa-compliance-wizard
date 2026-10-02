@@ -2,6 +2,57 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.37.0 — **Report enhancements: request/transaction ID, device-user
+enrichment, outcome/network context, policy attribution, JIT request
+subject.** Grounded in external research (NIST SP 800-53 AU-3, PCI-DSS
+10.2.2, SOC2 CC6/CC7, ISO 27001) on what real audit reports actually
+require, cross-referenced against a full sweep of this app's own reports
+and Access Explorer tabs for "data already captured, never shown" gaps.
+Every field added here comes from data already ingested (the full raw
+Okta event, already persisted in `events.raw_json`) or one new, reliable
+Okta API call — no schema/migration changes.
+- **Request/transaction ID on every report row**, not just secret
+  reveals: `_extract_request_id` (already existed, already used for
+  reveals) is now called for created/updated/deleted entries too, and
+  for all 19 `ComplianceReportDetail` reports via `_four_field_row`. Lets
+  an admin jump from any report row to the exact matching entry in
+  Okta's own System Log for follow-up investigation. Also fixes an
+  independently-confirmed existing gap: reveals already had a request ID
+  but it was silently dropped from CSV/MD export.
+- **Okta-Managed Devices now show associated user(s)**, via a new
+  `OktaClient.get_device_users` call (`GET /api/v1/devices/{id}/users`,
+  never called by this codebase before). Confirmed live a device can
+  genuinely have multiple associated users (shared/kiosk-style device) —
+  2 of 7 real devices in this session's test tenant had 2 users each —
+  rendered as a comma-separated list, same convention already used for
+  the Authenticators column.
+- **Outcome reason + client IP/location on `ComplianceReportDetail`**:
+  `outcome.reason` (why a request was denied/blocked — e.g. a real
+  confirmed "Authenticator method unanswered"), `client.ipAddress`, and
+  `client.geographicalContext` are all already captured per-event but
+  were never surfaced; now shown as sub-lines under the Outcome and User
+  cells respectively. Directly closes the gap where the Threat Detection
+  (CC7) report could show something was blocked but never why or from
+  where.
+- **Policies tab now shows "Last modified by {user} on {date}"**, reusing
+  the exact same per-resource compliance-history lookup the Resources
+  tab's drill-down already uses — `pam.security_policy.create`/`.update`
+  events already target the policy's own id, confirmed live, so this
+  needed a new call site, not new backend plumbing.
+- **UsersTab's "last accessed" now shows outcome**, not just timestamp —
+  the field was already fetched and typed, just never rendered.
+- **JIT Access Requests report now shows the actual request subject**
+  (e.g. "Shir Aroesty is requesting Connecting to usp-srv1 as
+  dc_admin_shared") across its full create→update→resolve lifecycle,
+  instead of degrading to a non-descriptive "Task with id X was
+  resolved" string on later rows in that lifecycle — confirmed live
+  against this tenant's own real JIT request history.
+- Deliberately deferred (documented, not silently dropped): Groups tab
+  "who was added, when" — the underlying event type is unverified to
+  even fire in this project's own extensive live-verification record,
+  and there's a likely id-scheme mismatch between OPA's and Okta's own
+  group ids; needs its own live-verification pass before any UI work.
+
 5.36.2 — **Fixed a third real `ProtectHome=read-only` conflict, found
 applying Phase 8's systemd hardening to the real Ubuntu server for the
 first time.** `ProtectHome=read-only` also implicitly covers

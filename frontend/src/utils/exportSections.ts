@@ -154,7 +154,11 @@ export function accessModelExportSections(model: AccessModel): ExportSection[] {
 
 function auditCell(entry: AuditEntry | null | undefined): string {
   if (!entry) return ''
-  return `${entry.by ?? 'unknown'} — ${formatDateTime(entry.at)}`
+  const base = `${entry.by ?? 'unknown'} — ${formatDateTime(entry.at)}`
+  // Fixes a real, independently-confirmed existing gap: reveals already
+  // carried request_id before created/updated/deleted did, but this
+  // function silently dropped it for every entry type, reveals included.
+  return entry.request_id ? `${base} (request ${entry.request_id})` : base
 }
 
 function auditHistoryCell(entries: AuditEntry[]): string {
@@ -203,12 +207,16 @@ export function complianceReportRow(row: ComplianceReportRow): Record<string, st
   return {
     User: row.user,
     'User Email/ID': row.actor_alternate_id || '',
+    'Client IP': row.client_ip || '',
+    'Client Location': row.client_geo || '',
     Action: row.action,
     Timestamp: formatDateTime(row.timestamp),
+    'Request ID': row.request_id || '',
     'Affected Resource': row.resource || '—',
     'Resource Email/ID': [row.resource_alternate_id, row.resource_id].filter(v => v && v !== 'unknown').join(' / '),
     'Resource Type': row.resource_type_detail || row.resource_type || '',
     Outcome: row.outcome || '',
+    'Outcome Reason': row.outcome_reason || '',
     'Event Type': row.event_type,
   }
 }

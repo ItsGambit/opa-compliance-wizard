@@ -57,6 +57,18 @@ function resourceIdentifierLine(row: { resource: string; resource_id: string; re
   return parts.join(' · ')
 }
 
+// "Who did this and from where" together -- client IP/location from
+// Okta's own client.ipAddress/geographicalContext (see audit_store.py's
+// _four_field_row). Empty for most non-auth event types (e.g. a
+// system-triggered PAM credential rotation has no originating client at
+// all) -- omitted entirely rather than shown as an empty "from: " line.
+function clientLocationLine(row: { client_ip: string; client_geo: string }): string {
+  const parts: string[] = []
+  if (row.client_ip) parts.push(row.client_ip)
+  if (row.client_geo) parts.push(row.client_geo)
+  return parts.join(' · ')
+}
+
 function outcomeVariant(outcome: string): string {
   const o = outcome.toUpperCase()
   if (o === 'SUCCESS' || o === 'ALLOW') return 'bg-win/10 text-win'
@@ -226,11 +238,23 @@ export function ReportRowsTable({ rows, isLoading, emptyMessage, onFilteredRowsC
                         <HighlightedText text={row.actor_alternate_id} indices={altIdMatch?.indices} />
                       </div>
                     )}
+                    {clientLocationLine(row) && (
+                      <div className="text-text-faint text-[0.6875rem]" title="Client IP / location">
+                        {clientLocationLine(row)}
+                      </div>
+                    )}
                   </td>
                   <td className="px-3 py-2 text-text-dim">
                     <HighlightedText text={row.action} indices={actionMatch?.indices} />
                   </td>
-                  <td className="px-3 py-2 text-text-faint whitespace-nowrap">{formatDateTime(row.timestamp)}</td>
+                  <td className="px-3 py-2 text-text-faint whitespace-nowrap">
+                    {formatDateTime(row.timestamp)}
+                    {row.request_id && (
+                      <div className="text-[0.6875rem]" title="Okta request/transaction ID">
+                        <code className="text-[0.625rem]">{row.request_id}</code>
+                      </div>
+                    )}
+                  </td>
                   <td className="px-3 py-2 text-text-dim">
                     {row.resource ? <HighlightedText text={row.resource} indices={resourceMatch?.indices} /> : <span className="text-text-faint">—</span>}
                     {resourceTypeLabel(row) && <span className="text-text-faint text-[0.6875rem]"> ({resourceTypeLabel(row)})</span>}
@@ -251,6 +275,11 @@ export function ReportRowsTable({ rows, isLoading, emptyMessage, onFilteredRowsC
                       </span>
                     ) : (
                       <span className="text-text-faint">—</span>
+                    )}
+                    {row.outcome_reason && (
+                      <div className="text-text-faint text-[0.6875rem]" title="Why">
+                        {row.outcome_reason}
+                      </div>
                     )}
                   </td>
                 </tr>

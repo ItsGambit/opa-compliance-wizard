@@ -1,12 +1,34 @@
 import { useMemo, useState } from 'react'
+import { useEnvironments, useResourceHistory } from '../api/hooks'
 import type { AccessModel } from '../types'
 import type { ExportSection } from '../utils/export'
 import { grantRows, policySummaryRows } from '../utils/exportSections'
+import { formatDateTime } from '../utils/format'
 import { ExportButtons } from './ExportButtons'
 import { PolicyRuleCard } from './PolicyRuleCard'
 
 interface Props {
   model: AccessModel
+}
+
+/** "Last modified by {user} on {date}" for one policy -- reuses the exact
+ * same per-resource history lookup ResourcesTab's drill-down already uses
+ * (pam.security_policy.create/.update events target the policy's own id,
+ * confirmed live 2026-10-02), not a new backend call. No date range passed
+ * (full history) -- this just needs the single most recent create/update
+ * entry, not a browsable table. */
+function PolicyLastModified({ policyId }: { policyId: string }) {
+  const { data: environments } = useEnvironments()
+  const activeEnv = environments?.active
+  const { data, isLoading } = useResourceHistory(policyId, activeEnv)
+  const latest = data?.rows.find(r => r.event_type === 'pam.security_policy.create' || r.event_type === 'pam.security_policy.update')
+  if (isLoading) return null
+  if (!latest) return null
+  return (
+    <span className="text-xs text-text-faint">
+      Last modified by {latest.user} on {formatDateTime(latest.timestamp)}
+    </span>
+  )
 }
 
 export function PoliciesTab({ model }: Props) {
@@ -98,6 +120,7 @@ export function PoliciesTab({ model }: Props) {
                 </span>
               </div>
               {policy.description && <p className="text-sm text-text-dim">{policy.description}</p>}
+              <PolicyLastModified policyId={policy.id} />
 
               <div className="flex flex-col gap-1">
                 <span className="section-label">Principals</span>

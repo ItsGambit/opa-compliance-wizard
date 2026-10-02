@@ -1589,12 +1589,41 @@ def _four_field_row(event_row):
     filtered/joined on those columns (e.g. resource_history) doesn't pay
     to recompute values it already has. resource_type (the target's own
     generic `type`, e.g. "Service Account") is display-only and NOT one of
-    the stored/indexed columns, so it's still derived here."""
+    the stored/indexed columns, so it's still derived here.
+
+    request_id/outcome_reason/client_ip/client_geo are all read straight
+    from `raw` -- the full original Okta event is already persisted in
+    raw_json for every row (see events table schema), so none of these
+    needed a new ingestion/migration step, just reading what's already
+    there. Confirmed live against this project's own real archive data
+    (2026-10-02): outcome.reason is None on success, a real string on a
+    real non-success result (e.g. "Authenticator method unanswered" on a
+    real UNANSWERED MFA event); client.ipAddress/geographicalContext are
+    populated exactly as expected on every sampled auth-flow row.
+
+    accessRequestSubject gets a narrow, event-type-scoped override of
+    `resource` for the jit_access_requests report specifically: Okta's own
+    target displayName degrades to a near-useless "Task with id X was
+    resolved" on access.request.update/.resolve (confirmed live), while
+    debugContext.debugData.accessRequestSubject stays the same meaningful
+    "{user} is requesting {access} to {resource}" text across the whole
+    create->update->resolve lifecycle for one request. Scoped to this one
+    event-type family only, not a change to the generic resource-picking
+    logic every other report also uses."""
+    import create_secret_folders
     raw = event_row["raw"]
     targets = raw.get("target") or []
     primary = _primary_target(event_row["event_type"], targets)
     resource = primary.get("displayName") if primary else None
     resource_type = primary.get("type") if primary else None
+    event_type = event_row["event_type"] or ""
+    if event_type.startswith("access.request."):
+        subject = (raw.get("debugContext") or {}).get("debugData", {}).get("accessRequestSubject")
+        resource = subject or resource
+    outcome = raw.get("outcome") or {}
+    client = raw.get("client") or {}
+    geo = client.get("geographicalContext") or {}
+    client_geo = ", ".join(part for part in (geo.get("city"), geo.get("state"), geo.get("country")) if part)
     return {
         "uuid": event_row["uuid"],
         "user": event_row["actor_display_name"] or event_row["actor_alternate_id"] or event_row["actor_id"] or "unknown",
@@ -1608,6 +1637,10 @@ def _four_field_row(event_row):
         "resource_id": event_row.get("resource_id") or "",
         "resource_alternate_id": event_row.get("resource_alternate_id") or "",
         "outcome": event_row["outcome_result"] or "",
+        "outcome_reason": outcome.get("reason") or "",
+        "client_ip": client.get("ipAddress") or "",
+        "client_geo": client_geo,
+        "request_id": create_secret_folders._extract_request_id(raw),
         "targets": targets,  # full target list -- some reports need target1/2 too, e.g. PAM's Team/Server
     }
 

@@ -122,18 +122,23 @@ function buildRows(kind: string, model: AccessModel, windowsServers: AccessServe
       // configured; empty (not an error) otherwise.
       const list: AccessDevice[] = model.devices
       return {
-        headers: ['Name', 'Platform', 'OS Version', 'Status', 'Disk Encryption', 'Authenticators'],
+        headers: ['Name', 'User(s)', 'Platform', 'OS Version', 'Status', 'Disk Encryption', 'Authenticators'],
         rows: list.map(d => {
           const authNames = d.authenticator_enrollments.map(a => a.name).join(', ')
+          // A device can genuinely have multiple associated users (shared/
+          // kiosk-style device) -- confirmed live 2026-10-02, see
+          // OktaClient.get_device_users' docstring -- so this joins the
+          // whole list, same pattern as the Authenticators column above.
+          const userNames = d.users.join(', ')
           return {
             id: d.id,
             label: d.profile.displayName ?? d.id,
             cells: [
-              d.profile.displayName ?? '', d.profile.platform ?? '', d.profile.osVersion ?? '',
+              d.profile.displayName ?? '', userNames, d.profile.platform ?? '', d.profile.osVersion ?? '',
               d.status, d.profile.diskEncryptionType ?? '', authNames,
             ],
             exportRow: {
-              Name: d.profile.displayName ?? '', Platform: d.profile.platform ?? '',
+              Name: d.profile.displayName ?? '', 'User(s)': userNames, Platform: d.profile.platform ?? '',
               'OS Version': d.profile.osVersion ?? '', Status: d.status,
               'Disk Encryption': d.profile.diskEncryptionType ?? '', Authenticators: authNames,
             },

@@ -53,6 +53,7 @@ function ResourceAccessSummary({ info }: { info: ResourceAccessInfo }) {
       <span className="inline-flex items-center gap-1">
         <span>
           last accessed {formatDateTime(latest.published)}
+          {latest.outcome && <> · {latest.outcome}</>}
           {latest.request_id && <> · request <code className="text-[0.625rem]">{latest.request_id}</code></>}
         </span>
         {rest.length > 0 && (
@@ -69,6 +70,7 @@ function ResourceAccessSummary({ info }: { info: ResourceAccessInfo }) {
       {expanded && rest.map((e, i) => (
         <span key={i} className="pl-3 text-text-faint">
           {formatDateTime(e.published)}
+          {e.outcome && <> · {e.outcome}</>}
           {e.request_id && <> · request <code className="text-[0.625rem]">{e.request_id}</code></>}
         </span>
       ))}
