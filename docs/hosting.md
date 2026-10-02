@@ -127,6 +127,30 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    its existing `opa-secrets-wizard.service` unit name as-is — nothing
    requires renaming a unit that's already running; this filename is the
    template a fresh install starts from.)
+
+   **This step is a ONE-TIME manual install, not something `server/deploy.sh`
+   ever automates for you** (confirmed the hard way, 2026-10-02): unlike
+   the nginx site config, which `deploy.sh` actively diffs and re-applies
+   on every run (see that script's own nginx-apply logic), these two
+   unit files are NEVER re-copied to `/etc/systemd/system/` automatically.
+   **Any time you pull a future release that changes either `.service`
+   file** (a new hardening directive, a new `EnvironmentFile=` path,
+   etc.), you must manually re-run this step's `cp`/`daemon-reload`/
+   `restart` sequence yourself — `deploy.sh` only ever restarts the
+   units that are ALREADY installed; it has no way to know their
+   on-disk definition changed. Check `diff server/*.service
+   /etc/systemd/system/` after any deploy that touches these files, same
+   spirit as `deploy.sh`'s own nginx-drift warning. Also confirm your
+   server's live `EnvironmentFile=` path actually matches what's in
+   `/etc/systemd/system/*.service` right now (`systemctl cat
+   opa-secrets-wizard | grep EnvironmentFile`) before copying a new unit
+   file over it — an older install's unit may point at a DIFFERENT env
+   file path than what ships in a fresh template (this project's own
+   real server did, historically: `/etc/opa-secrets-wizard.env` vs.
+   `/etc/opa-compliance-wizard.env`), and blindly overwriting the unit
+   file without first merging that env file's real contents into
+   whichever path the new template expects will start the service with
+   none of its actual secrets set.
 7. **One-time sudoers setup, only if you'll use `server/deploy.sh` to
    redeploy later** (recommended — it's the repeatable path; see that
    file's own header comment). This grants the deploying user just the

@@ -2,6 +2,36 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.36.2 — **Fixed a third real `ProtectHome=read-only` conflict, found
+applying Phase 8's systemd hardening to the real Ubuntu server for the
+first time.** `ProtectHome=read-only` also implicitly covers
+`/run/user/<uid>` (the keyring daemon's own `XDG_RUNTIME_DIR`), not
+just `/home` -- confirmed live when `opa-secrets-wizard`/`opa-auth-gate`
+crash-looped with `gnome-keyring-daemon: couldn't create socket
+directory: /run/user/1000/keyring: Read-only file system` the moment
+the hardened unit files were actually applied. A third
+`ReadWritePaths=/run/user/1000` closes it, on both units.
+- Also documented a real, pre-existing operational gap this incident
+  surfaced: the two systemd unit files are a ONE-TIME manual install
+  (`docs/hosting.md` step 6) that `server/deploy.sh` never automates --
+  unlike the nginx site config, which that script actively diffs and
+  re-applies on every run, a `.service` file change requires manually
+  re-copying it to `/etc/systemd/system/` + `daemon-reload` +
+  `restart`. The server's live unit also still pointed its
+  `EnvironmentFile=` at an older, pre-rename path
+  (`/etc/opa-secrets-wizard.env`) holding the real secrets, while the
+  checked-in template points at `/etc/opa-compliance-wizard.env` --
+  applying the new template without first merging the two env files'
+  contents started both services with `KEYRING_UNLOCK_PASSWORD` unset.
+  `docs/hosting.md` step 6 now calls this out explicitly for future
+  deploys that touch either `.service` file.
+- Also rotated `INTERNAL_API_SHARED_SECRET` on the live server after
+  its value was briefly visible in a terminal session during this
+  incident's diagnosis, and tightened `/etc/opa-compliance-wizard.env`
+  from world-readable (`644`) to `600`, owned by the service's own
+  `rparikh` user (a separate, pre-existing permissions gap, fixed
+  opportunistically while already in there).
+
 5.36.1 — **`server/deploy.sh` fixes from a FOURTH, independent review**
 (same session as 5.36.0's third-party hardening pass) -- found one real
 security gap in that pass's own new safe-cleanup guard, plus three
