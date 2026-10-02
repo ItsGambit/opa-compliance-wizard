@@ -176,18 +176,18 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    `/home/rparikh/opa-secrets-folders` with your actual repo path (step
    7b) — leave `opa-secrets-wizard` and `opa-auth-gate` exactly as-is,
    those are fixed systemd unit names, not placeholders. Note there are
-   **three separate `cp` lines**, not one — `deploy.sh` backs up the live
-   nginx config to a fixed `.deploy-backup` path, applies the new one,
-   and (only if `nginx -t` then fails) rolls the backup back over the
-   live path; sudoers matches each exact argument list separately, so a
-   rule for only one of these three leaves the other two silently
-   denied:
+   **two separate `cp` lines**, not one — `deploy.sh` applies the new
+   nginx config over the live path, and (only if `nginx -t` or the
+   reload then fails) rolls its own backup — kept in the repo's own
+   `$APP_DIR`, not under `/etc/nginx`, so creating/deleting it never
+   needs sudo at all — back over the live path; sudoers matches each
+   exact argument list separately, so a rule for only one of these two
+   leaves the other silently denied:
    ```
    rparikh ALL=(ALL) NOPASSWD: /bin/systemctl restart opa-secrets-wizard, \
      /bin/systemctl restart opa-auth-gate, \
-     /bin/cp /etc/nginx/sites-available/opa-secrets-wizard /etc/nginx/sites-available/opa-secrets-wizard.deploy-backup, \
      /bin/cp /home/rparikh/opa-secrets-folders/server/nginx-opa-secrets-wizard.conf /etc/nginx/sites-available/opa-secrets-wizard, \
-     /bin/cp /etc/nginx/sites-available/opa-secrets-wizard.deploy-backup /etc/nginx/sites-available/opa-secrets-wizard, \
+     /bin/cp /home/rparikh/opa-secrets-folders/.nginx-deploy-backup /etc/nginx/sites-available/opa-secrets-wizard, \
      /usr/sbin/nginx -t, \
      /bin/systemctl reload nginx
    ```
@@ -203,10 +203,10 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    ```bash
    sudo -n -l
    ```
-   You should see all seven commands from step 7c listed under
+   You should see all six commands from step 7c listed under
    `NOPASSWD:`, with no password prompt. If you instead get a password
    prompt, a `sudo: a password is required` error, or the list doesn't
-   include all seven, re-open the file from step 7c and check for a typo
+   include all six, re-open the file from step 7c and check for a typo
    — most commonly the username, or a binary path that doesn't match
    step 7a's `which` output exactly.
 

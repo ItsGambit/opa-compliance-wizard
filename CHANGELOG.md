@@ -2,6 +2,126 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.36.0 — **`server/deploy.sh` hardened for third-party operators, not
+just our own two installs.** Every prior pass on this script (5.34.0
+through 5.35.2) reasoned about "this specific server" -- a wrong
+assumption once this is a tool other people download from GitHub and
+run on machines/distros neither of us has ever seen, as first installs
+AND as redeploys of future releases. This pass re-examined every
+previously-deferred finding from the three independent deploy.sh
+reviews under that corrected lens and implemented the ones that no
+longer hold once "control the server" isn't a safe assumption.
+- **Tool preflight checks**: every external command this script calls
+  (`git`, `rsync`, `curl`, `grep`, `awk`, `sed`, `diff`, `find`,
+  `mktemp`, `sudo`, `systemctl`, `nginx`) is confirmed present on PATH
+  BEFORE the destructive `rsync --delete` step, so a missing dependency
+  is caught before anything on disk changes, not mid-deploy. `grep -P`
+  (PCRE) support is checked separately, since GNU grep has it but it's
+  not universal (BusyBox/macOS/other distros' grep may not).
+- **`DEPLOY_SH_PHASE` and its handoff variables are now validated**,
+  not trusted blindly -- an externally-supplied `DEPLOY_SH_PHASE` value
+  other than unset/`1`/`2` now fails explicitly instead of silently
+  falling through into phase 2's logic with none of phase 1's setup
+  having run.
+- **Temp-directory cleanup now validates paths before `rm -rf`** --
+  both `mktemp -d` calls use a recognizable prefix
+  (`opa-deploy-{frozen,source}.*`), and a new `_safe_rm_rf_temp` helper
+  confirms a path matches that prefix before deleting it, so a
+  corrupted/tampered handoff variable can't turn a cleanup trap into an
+  unexpected arbitrary-path deletion.
+- **nginx config files are now validated as real regular files**
+  (rejecting symlinks, including dangling ones) before this script
+  reads from or writes to them -- `NGINX_LIVE` legitimately not
+  existing at all is still a fine, non-fatal skip (standalone/local-only
+  mode, or nginx not set up yet); only its TYPE is now checked once it
+  exists.
+- **The nginx config backup no longer lives under `/etc/nginx`, and no
+  longer needs its own sudo grant to create.** Previously backed up to
+  a fixed path inside `/etc/nginx/sites-available` (needing sudo just
+  to write there, even though the live file is already readable without
+  sudo), where it sat world-readable (containing the real
+  `NGINX_PROXY_SECRET`) indefinitely after every deploy with no
+  sudoers-free way to clean it up. Now backed up to `$APP_DIR` (which
+  the deploying user already owns): creating it needs no sudo at all,
+  it's `chmod 600`'d immediately, and it's deleted outright after a
+  successful reload. **Removes one of the three nginx-related sudoers
+  grants** (`docs/hosting.md`'s setup now documents 6 required grants,
+  not 7) -- a smaller privilege footprint for whoever is setting this up
+  on their own server.
+
+5.35.2 — **`server/deploy.sh` fixes from a THIRD, independent review of
+the same script** (same session as 5.35.0/5.35.1 -- confirmed the
+earlier nginx fatality fixes actually closed the prior gap, then found
+one real miss in that same fix pass).
+- **The main service's `/api/version` confirmation failure path never
+  logged `deploy.failed`** -- a bare `exit 1` on that path (unlike every
+  nginx failure path, already fixed in 5.35.1 to log explicitly first)
+  relied on bash's `ERR` trap, which a bare `exit` does NOT fire. A
+  deploy that got all the way through code sync, dependency install,
+  and a service restart, but never confirmed the new version was
+  actually live, exited nonzero with no matching failure event in the
+  audit log at all -- just an orphaned `deploy.started`. Now logs
+  `deploy.failed` explicitly before exiting, matching the pattern
+  already used everywhere else.
+- **Restored nginx configs are now revalidated with a second `nginx -t`**
+  after both rollback paths (validation failure and reload failure) --
+  confirms the BACKUP file itself is a valid config, not just that the
+  `cp` restoring it exited 0. Not expected to ever actually fail (the
+  old config was already serving traffic before this deploy touched
+  it), but costs one cheap extra check to confirm rather than assume.
+
+5.35.1 — **`server/deploy.sh` follow-up fixes from a second, independent
+review of the same script** (same session as Phase 8, confirmed as real
+bugs against the actual shipped code, not reiterating already-fixed
+points): a deploy where nginx validation, reload, or even the rollback
+itself failed could still end up logged as `deploy.completed`, with no
+exit code and no record of which stage actually failed.
+- **All three nginx failure paths are now unconditionally fatal**, not
+  just warned-and-continued: `nginx -t` failing, `systemctl reload
+  nginx` failing (distinct from the `nginx -t` case, which already
+  rolled back), and the whole backup/apply/validate/reload sequence
+  being denied outright by sudoers. Each path logs its own
+  `deploy.failed` with a `stage` detail before exiting -- confirmed via
+  a direct test that a bare `exit 1` does NOT fire bash's `ERR` trap, so
+  relying on that trap alone (as the three paths previously did
+  implicitly, by just printing and falling through) would have left
+  these failures unlogged even after making them fatal. `SUDOERS_GAPS`
+  is retired entirely -- nothing populates it anymore now that every
+  sudoers-gated nginx path exits instead of warning. nginx is at least
+  as security-sensitive as the `opa-auth-gate` restart (already made
+  fatal in 5.35.0) -- it's this app's own auth boundary -- so treating
+  its failures as softer than that restart's was an inconsistency, not
+  a deliberate distinction.
+- **Fixed real secret corruption in the nginx `NGINX_PROXY_SECRET`
+  carry-forward step**: `awk -v secret="$LIVE_SECRET"` was silently
+  interpreting C-style backslash escapes in the secret itself (awk's own
+  `-v` assignment behavior, confirmed via direct test -- independent of
+  anything `sub()` does), and separately feeding the secret into
+  `sub()`'s replacement-text argument, where a literal `&` means
+  "whatever matched." A secret containing either character was not
+  reproduced literally in the deployed config. `openssl rand -hex 32`
+  (the documented generation command) never produces either, so this
+  was never hit in practice -- fixed anyway by passing the secret
+  through `ENVIRON` instead of `-v` and replacing `sub()` with plain
+  `index`/`substr` string ops, neither of which has special characters
+  of its own. Verified byte-for-byte faithful for a secret containing
+  `&`, `"`, `\`, and `\t`/`\n`-shaped sequences.
+- **Fixed Python-source string interpolation in `_log_deploy_event`**:
+  shell values were previously interpolated directly into a `python -c`
+  string (quotes/backslashes/newlines in a value could produce invalid
+  Python, silently swallowed by this function's own `|| true`). Every
+  value this script actually passes is a hardcoded literal, so this was
+  never exploitable in practice -- fixed anyway by passing values
+  through the environment and a heredoc instead, which costs nothing
+  and removes the whole class of failure.
+- **Every deploy event now records the actual deployed git commit**
+  (`DEPLOY_COMMIT`, captured via `git rev-parse HEAD` right after the
+  clone, before `$TMP_DIR` is cleaned up), not just `SCRIPT_VERSION` --
+  the version is bumped by hand and can lag or not change at all in a
+  hotfix, while the commit SHA is the unambiguous answer to "what code
+  is this." Merged into every event's details centrally inside
+  `_log_deploy_event` rather than repeated at each of its 8 call sites.
+
 5.35.0 — **Fast-follow Phase 8 of 11 of docs/fast-follow-redesign.md:
 production-grade serving, observability, and operational hardening —
 bundled with a full review of `server/deploy.sh`.** The "makes a 2am
