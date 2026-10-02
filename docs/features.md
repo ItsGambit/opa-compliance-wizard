@@ -295,56 +295,16 @@ Secrets and Folders sections of whatever resource group/project is
 currently selected, plus a **Refresh** button to re-pull the report
 on demand without changing the resource group/project selection.
 
-**Preserving history past Okta's 90-day retention (pre-compliance-sync
-environments).** For an environment that hasn't yet enabled compliance
-sync, each saved environment (gear icon → environment row) can still
-opt in to the older, lighter-weight **"preserve logs locally"**
-toggle: once enabled, every report fetch for that environment merges
-newly-seen System Log events into a local cache file
-(`secrets_log_cache.json`, next to `environments.json`, git-ignored
-like it) instead of discarding them once Okta ages them out. A clear
-shield icon (green "Preserving logs locally" / grey "Local log
-preservation off") appears both in the environment manager and on the
-Secrets Access Dashboard itself, so it's never ambiguous whether a given
-report's history is capped at 90 days or extended locally. This cannot
-retroactively recover events that were already older than 90 days the
-first time the toggle is turned on for a given project — only what's
-captured from that point forward accumulates; the dashboard's own
-"based on the last N days" note is replaced with the actual local
-coverage start date once enabled, rather than continuing to imply a
-hard 90-day ceiling. **If you're setting up a new environment today,
-enable compliance sync instead** (previous section) — it supersedes
-this toggle with a single, tenant-wide archive rather than a
-per-project cache file, and everything below in this section still
-applies to it (encryption, key resolution, corrupt-cache handling).
-
-`secrets_log_cache.json` is **encrypted at rest** (Fernet/AES128-CBC via
-the `cryptography` package) — it's audit metadata (who/what/when, secret
-*names/paths*), never secret values, but it's still local history worth
-protecting from casual disk access. The encryption key itself is never
-written to disk in plaintext, and is resolved the same "server override,
-desktop fallback" way this tool already resolves OPA/Okta credentials
-(see ["Running it as a CLI instead"](hosting.md#running-it-as-a-cli-instead)):
-
-- **Standalone (desktop) use** — the key is generated once and stored in
-  the OS keychain (Windows Credential Locker / macOS Keychain / Linux
-  Secret Service), exactly like `key_secret`/`okta_api_token`. Nothing to
-  configure.
-- **Server-hosted use** — set `OPA_SECRETS_WIZARD_LOG_CACHE_KEY` to a
-  Fernet key (`python -c "from cryptography.fernet import Fernet;
-  print(Fernet.generate_key().decode())"`) via whatever your deployment
-  already uses to inject secrets (systemd `LoadCredential=`, a secrets
-  manager, etc.) — checked *before* the OS keychain, since a headless
-  Linux server has no desktop secret-service session for `keyring` to use
-  at all. Only the server process ever sees this key; it's never sent to
-  the browser.
-
-A cache file that fails to decrypt under whichever key is active (lost/
-rotated key, or none configured) is treated as unreadable history and
-started fresh — logged as a warning, never a crash. A pre-encryption
-plaintext cache file from an older version of this tool is read once as
-plaintext and transparently re-encrypted on its next write, with no data
-loss and no manual migration step.
+**Preserving history past Okta's 90-day retention.** Enable compliance
+sync (previous section) — once an environment completes its first sync,
+every report for it is sourced from `audit_store.py`'s own SQLite
+archive instead of a live, 90-day-bounded Okta System Log query, with no
+retention cap beyond that archive's own (configurable)
+`retention_days`/`retention_max_size_mb` settings. An earlier,
+lighter-weight per-project local cache (`secrets_log_cache.json`,
+Fernet-encrypted) existed before compliance sync did, but was retired in
+v5.34.0 once the archive became a strict superset of what it ever
+captured.
 
 ### Policy assignment (Folder Builder)
 

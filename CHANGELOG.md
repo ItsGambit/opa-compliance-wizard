@@ -2,6 +2,55 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.34.0 — **Fast-follow Phase 5 of 11 of docs/fast-follow-redesign.md:
+retires `secrets_log_cache.json` + a session-wide stale-code cleanup
+sweep.** Now that `audit_store.py`'s compliance archive is a strict
+superset of what the per-project local cache ever captured, the cache,
+its Fernet encryption machinery, and the "preserve logs locally" toggle
+that controlled it are all fully retired — along with three stale
+docstrings and a stale module docstring left over from earlier phases
+this session.
+- Removed `secrets_log_cache.json` and its dedicated Fernet encryption
+  (`_get_or_create_cache_encryption_key`, `_cache_fernet`,
+  `_secrets_log_cache_path`, `load_secrets_log_cache`,
+  `save_secrets_log_cache`, `_merge_system_log_events`) from
+  `create_secret_folders.py`. `build_secrets_access_report` (the live-
+  Okta-query fallback used only before an environment's first
+  compliance sync) is now a pure live-query function with no local
+  caching step; its response still carries `local_retention_enabled`/
+  `oldest_captured_at` (now unconditionally `False`/live-query-only),
+  since the frontend's report-completeness caveat text depends on both
+  fields for both the live-query and archive-backed report paths.
+- Fully retired `preserve_logs_locally` — the toggle, its
+  `app_environments` column (new migration 4:
+  `_migration_004_drop_preserve_logs_locally`, `ALTER TABLE
+  app_environments DROP COLUMN preserve_logs_locally`), its
+  `set_preserve_logs_locally` backend function, its `server/serve.py`
+  route (`/api/environments/<name>/preserve_logs_locally`), and its
+  frontend surface (`LogRetentionIndicator.tsx`,
+  `useSetPreserveLogsLocally.ts`, the two render call sites in
+  `EnvironmentManagerDialog.tsx`/`SecretsAccessDashboard.tsx`) — a real,
+  user-facing toggle whose own tooltip promised cache behavior that no
+  longer exists.
+- One-shot cleanup on `init_db()` (`_cleanup_retired_secrets_log_cache`,
+  mirroring Phase 1's own `_legacy_environment_storage_name` precedent):
+  deletes any leftover `secrets_log_cache.json` from disk and its
+  Fernet key from the OS keyring.
+- Dropped the `cryptography` dependency (`requirements.txt`) — used
+  nowhere else in the codebase outside the removed Fernet machinery.
+- Session cleanup sweep: fixed three stale docstrings in
+  `create_secret_folders.py` referencing functions deleted in earlier
+  phases this session (`load_environments()` → the real
+  `list_environments_for()`/`list_all_environments()`;
+  `_find_stepup_mfa_log_event` → the real `_query_mfa_log_event`), and
+  `server/serve.py`'s top-of-file module docstring, which still
+  described the pre-Phase-2 `environments.json`-based credential design
+  instead of the real SQLite-metadata/keyring-secrets split.
+- Also bumped `actions/checkout` (v4→v5) and `actions/setup-python`
+  (v5→v6) in CI, both newly flagged by GitHub as being force-upgraded
+  off their original Node 20 runtime — a trivial, unrelated maintenance
+  fix folded into this release rather than its own version bump.
+
 5.33.0 — **Fast-follow Phase 7 remainder of 11 of
 docs/fast-follow-redesign.md: frontend unit tests + CI**, the "dev-hat
 gap every other phase depends on." Five phases shipped back-to-back

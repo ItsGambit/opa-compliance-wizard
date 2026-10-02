@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.33.0
+# Version     : 5.34.0
 # =============================================================================
 
 import argparse
@@ -79,7 +79,7 @@ import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.33.0"
+SCRIPT_VERSION = "5.34.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -387,8 +387,8 @@ ENVIRONMENT_SECRET_FIELDS = ("key_secret", "okta_api_token")
 def _environments_file_path():
     """Only still used by migrate_legacy_environments_json() -- the
     one-shot Phase 2 import of this file's data into SQLite. Nothing else
-    reads/writes environments.json anymore (see load_environments() and
-    its siblings below, all SQL-backed as of v5.29.0)."""
+    reads/writes environments.json anymore (see list_environments_for()/
+    list_all_environments() below, all SQL-backed as of v5.29.0)."""
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "environments.json")
 
 
@@ -450,24 +450,6 @@ def _atomic_write_json(path, value, mode=0o600):
             os.unlink(temp_path)
 
 
-def _atomic_write_bytes(path, data, mode=0o600):
-    """Binary-content sibling of _atomic_write_json -- same reasoning,
-    used for save_secrets_log_cache (writes Fernet-encrypted bytes, not
-    JSON)."""
-    directory = os.path.dirname(path) or "."
-    fd, temp_path = tempfile.mkstemp(dir=directory, prefix=".tmp-")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(temp_path, mode)
-        os.replace(temp_path, path)
-    finally:
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
-
-
 # ---------------------------------------------------------------------------
 # Environment metadata, active-environment pointers, sync schedules, and
 # the announcement banner -- all SQL-backed as of v5.29.0 (Phase 2 of
@@ -494,7 +476,6 @@ def _row_to_environment_meta(row):
         "key_id": row["key_id"],
         "okta_url": row["okta_url"] or "",
         "shared": bool(row["shared"]),
-        "preserve_logs_locally": bool(row["preserve_logs_locally"]),
     }
     schedule_row = conn.execute(
         "SELECT * FROM sync_schedules WHERE environment_id = ?", (row["environment_id"],)
@@ -756,7 +737,7 @@ def keyring_get(storage_name, field):
     Phase 1. (This used to also fall back to a pre-multi-user,
     unnamespaced storage-name shape; that fallback branch was removed
     2026-10-01 once both of this project's real installs were confirmed
-    migrated to a real environment_id -- see load_environments().)
+    migrated to a real environment_id -- see list_all_environments().)
 
     Still falls back to the legacy keyring SERVICE PREFIX
     (`opa-secrets-wizard`, pre-5.20.0-rename) -- a separate, still-live
@@ -778,12 +759,21 @@ def keyring_get(storage_name, field):
 
 
 def keyring_delete(storage_name, field):
+    """Deletes a secret. Tries BOTH service prefixes keyring_get() reads
+    from (current + legacy, see its own docstring) -- a value that's
+    never been re-saved since before the 5.20.0 rename still lives under
+    the legacy prefix, and deleting only the current prefix would
+    silently no-op for it (confirmed live 2026-10-01: this previously
+    deleted nothing for the secrets_log_cache.json Fernet key, which
+    predated the rename). Each attempt is independently best-effort --
+    a missing entry under either prefix is not an error."""
     if not KEYRING_AVAILABLE:
         return
-    try:
-        keyring.delete_password(_keyring_service(storage_name), field)
-    except Exception:
-        pass
+    for prefix in (KEYRING_SERVICE_PREFIX, _LEGACY_KEYRING_SERVICE_PREFIX):
+        try:
+            keyring.delete_password(_keyring_service(storage_name, prefix), field)
+        except Exception:
+            pass
 
 
 
@@ -882,8 +872,8 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, envi
         conn.execute(
             """INSERT INTO app_environments
                (environment_id, owner_id, display_name, base_domain, team_name, key_id, okta_url,
-                shared, preserve_logs_locally, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                shared, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(environment_id) DO UPDATE SET
                    owner_id=excluded.owner_id, display_name=excluded.display_name,
                    base_domain=excluded.base_domain, team_name=excluded.team_name,
@@ -891,7 +881,7 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, envi
                    shared=excluded.shared, updated_at=excluded.updated_at""",
             (target_id, meta.get("owner"), name, meta.get("base_domain", ""), meta.get("team_name", ""),
              meta.get("key_id", ""), meta.get("okta_url", ""), int(bool(meta.get("shared"))),
-             int(bool(meta.get("preserve_logs_locally", False))), now, now),
+             now, now),
         )
         conn.commit()
     return name, target_id
@@ -1104,11 +1094,11 @@ def migrate_legacy_environments_json():
             conn.execute(
                 """INSERT OR REPLACE INTO app_environments
                    (environment_id, owner_id, display_name, base_domain, team_name, key_id, okta_url,
-                    shared, preserve_logs_locally, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    shared, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (environment_id, meta.get("owner"), meta.get("name"), meta.get("base_domain", ""),
                  meta.get("team_name", ""), meta.get("key_id", ""), meta.get("okta_url", ""),
-                 int(bool(meta.get("shared"))), int(bool(meta.get("preserve_logs_locally", False))),
+                 int(bool(meta.get("shared"))),
                  now, now),
             )
             schedule = meta.get("sync_schedule")
@@ -1210,8 +1200,7 @@ def migrate_legacy_environments_json():
 # Audit log
 # ---------------------------------------------------------------------------
 # Append-only, one JSON object per line -- audit_log.jsonl next to this
-# script, same "simple flat file over a database" pattern this project
-# already uses for secrets_log_cache.json. Written for every write/mutating
+# script. Written for every write/mutating
 # action (see server/serve.py's callers), local/CLI-triggered actions
 # included (with actor_email/actor_sub left None) so local usage is
 # auditable too, not just logged-in dashboard usage.
@@ -1270,7 +1259,7 @@ def read_audit_log(limit=200, offset=0):
 
 def backfill_mfa_log_events(lookup_fn, max_lookups=20):
     """Closes the Okta System-Log-indexing-lag gap confirmed live 2026-09-30
-    (see server/auth_gate.py's _find_stepup_mfa_log_event docstring):
+    (see server/auth_gate.py's _query_mfa_log_event docstring):
     access_control.update entries whose okta_mfa_log_event is still None
     (the corroborating event hadn't been indexed by Okta yet at save time)
     get a fresh lookup attempt every time an admin clicks Refresh on the
@@ -2802,116 +2791,6 @@ def _access_report_target(event, target_type):
     return next((t for t in (event.get("target") or []) if t.get("type") == target_type), None)
 
 
-try:
-    from cryptography.fernet import Fernet, InvalidToken
-    CRYPTOGRAPHY_AVAILABLE = True
-except ImportError:
-    CRYPTOGRAPHY_AVAILABLE = False
-
-# Env var checked BEFORE keyring for the cache-encryption key, so a headless
-# server deployment (systemd LoadCredential=, a secrets manager, etc. --
-# nothing that depends on a desktop secret-service/D-Bus session, which
-# `keyring` itself needs and a bare Ubuntu server doesn't have) can supply
-# its own key without touching the standalone/desktop path at all. Same
-# precedence idea as the rest of this file's "server-friendly override,
-# desktop-friendly default" split (see keyring_get/set above).
-SECRETS_LOG_CACHE_KEY_ENV_VAR = "OPA_SECRETS_WIZARD_LOG_CACHE_KEY"
-_SECRETS_LOG_CACHE_KEYRING_FIELD = "secrets_log_cache_key"
-_SECRETS_LOG_CACHE_KEYRING_ENV = "_shared"  # not a real saved environment name; one key for the whole cache file
-
-
-def _get_or_create_cache_encryption_key():
-    """Returns the Fernet key used to encrypt secrets_log_cache.json, as
-    bytes. Checked in order: SECRETS_LOG_CACHE_KEY_ENV_VAR (server mode --
-    caller/deployment owns key lifecycle entirely), then the OS keyring
-    (standalone/desktop mode -- generated once and stored there,
-    transparent to the user, mirrors how credential secrets already work).
-    Raises RuntimeError if neither is available, since silently falling
-    back to plaintext would defeat the point of calling this at all."""
-    env_key = os.environ.get(SECRETS_LOG_CACHE_KEY_ENV_VAR)
-    if env_key:
-        return env_key.encode("utf-8")
-
-    _require_keyring()
-    existing = keyring_get(_SECRETS_LOG_CACHE_KEYRING_ENV, _SECRETS_LOG_CACHE_KEYRING_FIELD)
-    if existing:
-        return existing.encode("utf-8")
-
-    new_key = Fernet.generate_key()
-    keyring_set(_SECRETS_LOG_CACHE_KEYRING_ENV, _SECRETS_LOG_CACHE_KEYRING_FIELD, new_key.decode("utf-8"))
-    return new_key
-
-
-def _cache_fernet():
-    if not CRYPTOGRAPHY_AVAILABLE:
-        raise RuntimeError(
-            "The 'cryptography' package is required to store Secrets Access Dashboard "
-            "history locally. Install it with: pip install cryptography"
-        )
-    return Fernet(_get_or_create_cache_encryption_key())
-
-
-def _secrets_log_cache_path():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "secrets_log_cache.json")
-
-
-def load_secrets_log_cache():
-    """Reads and decrypts secrets_log_cache.json. A file from before
-    encryption was added (plaintext JSON) is detected and transparently
-    migrated: read as plaintext once, then re-saved encrypted on the next
-    save_secrets_log_cache call (callers of load always go on to mutate +
-    save, so this doesn't need its own write). A file that fails to
-    decrypt under the CURRENT key (e.g. the keyring entry was cleared, or
-    OPA_SECRETS_WIZARD_LOG_CACHE_KEY changed/is missing after being set
-    before) is treated as unreadable history, not a crash -- logged as a
-    warning and started fresh, same "never let a cache problem take down
-    the dashboard" posture as the rest of this cache."""
-    path = _secrets_log_cache_path()
-    if not os.path.isfile(path):
-        return {}
-    with open(path, "rb") as f:
-        raw = f.read()
-    if not raw:
-        return {}
-    try:
-        return json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        pass  # not plaintext JSON -- fall through to decrypt
-    try:
-        plaintext = _cache_fernet().decrypt(raw)
-    except InvalidToken:
-        log("WARN", f"{path} could not be decrypted with the current key -- starting a fresh local cache. "
-                     "This happens if the encryption key changed or was lost; previously-cached history is "
-                     "not recoverable, but nothing else is affected.")
-        return {}
-    return json.loads(plaintext.decode("utf-8"))
-
-
-def save_secrets_log_cache(data):
-    encrypted = _cache_fernet().encrypt(json.dumps(data).encode("utf-8"))
-    _atomic_write_bytes(_secrets_log_cache_path(), encrypted)
-
-
-def set_preserve_logs_locally(name, enabled, owner=LOCAL_OWNER_KEY):
-    """Opt an environment in/out of caching Secrets Access Dashboard System
-    Log events to disk (secrets_log_cache.json) beyond Okta's 90-day
-    retention. A dedicated action rather than folded into
-    upsert_environment's metadata-field loop, since this is a plain
-    boolean toggle, not part of the credential form. Raises KeyError if
-    `name` isn't a saved environment owned by `owner`."""
-    import audit_store
-    conn = audit_store._get_connection()
-    target_id, meta = _find_own_environment_sql(conn, owner, name)
-    if meta is None:
-        raise KeyError(f"No saved environment named '{name}'")
-    with audit_store._db_lock:
-        conn.execute(
-            "UPDATE app_environments SET preserve_logs_locally = ? WHERE environment_id = ?",
-            (int(bool(enabled)), target_id),
-        )
-        conn.commit()
-
-
 SYNC_SCHEDULE_DEFAULTS = {
     "enabled": False,
     "run_time": "02:00",  # 24h local HH:MM
@@ -2938,9 +2817,8 @@ def get_sync_schedule(name, owner=LOCAL_OWNER_KEY):
 def set_sync_schedule(name, config, owner=LOCAL_OWNER_KEY):
     """Saves the environment's daily-sync configuration (enabled, run
     time, ingestion scope, retention). Own dedicated setter, deliberately
-    NOT folded into upsert_environment's metadata-field loop -- same
-    reasoning as set_preserve_logs_locally above: this is a settings
-    object, not part of the credential form. Raises KeyError if `name`
+    NOT folded into upsert_environment's metadata-field loop -- this is a
+    settings object, not part of the credential form. Raises KeyError if `name`
     isn't a saved environment owned by `owner`, ValueError if
     ingestion_scope isn't a real choice."""
     if config.get("ingestion_scope", "curated") not in ("curated", "all"):
@@ -2967,31 +2845,7 @@ def set_sync_schedule(name, config, owner=LOCAL_OWNER_KEY):
     return merged
 
 
-def _merge_system_log_events(env_name, project_id, events):
-    """Upserts freshly-fetched System Log events (keyed by their own uuid,
-    always present) into secrets_log_cache.json under
-    cache[env_name][project_id], then returns the full merged list for that
-    project -- cache entries the live 90-day query no longer returns (aged
-    out of Okta's retention) are preserved, not dropped, which is the whole
-    point of this cache. Records first_captured_at once, the first time any
-    event is ever written for this project, so the UI can be honest about
-    how far back local coverage actually goes (never further than the
-    moment this was turned on)."""
-    cache = load_secrets_log_cache()
-    project_bucket = cache.setdefault(env_name, {}).setdefault(project_id, {"first_captured_at": None, "events": {}})
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    if project_bucket["first_captured_at"] is None and events:
-        project_bucket["first_captured_at"] = now
-    for event in events:
-        uid = event.get("uuid")
-        if uid:
-            project_bucket["events"][uid] = event
-    save_secrets_log_cache(cache)
-    return list(project_bucket["events"].values())
-
-
-def build_secrets_access_report(client, okta_client, resource_group_id, project_id, since_days=90, reveal_limit=5,
-                                 preserve_locally=False, env_name=None):
+def build_secrets_access_report(client, okta_client, resource_group_id, project_id, since_days=90, reveal_limit=5):
     """For every secret and secret folder in a project -- including ones
     since deleted -- who created/updated/deleted/(for secrets) revealed it,
     and when. See SECRETS_ACCESS_REPORT_EVENT_TYPES's comment for the live
@@ -3017,23 +2871,26 @@ def build_secrets_access_report(client, okta_client, resource_group_id, project_
     evidence.
 
     Returns {"secrets": [...], "folders": [...], "since_days": since_days,
-    "local_retention_enabled": preserve_locally, "oldest_captured_at": ...}.
+    "local_retention_enabled": False, "oldest_captured_at": ...}.
     Each row: {id, name, path, status, created, updated, deleted}
     (created/deleted are {"by", "at"} or None; updated is a list of
     {"by", "at"}, most-recent-first). Secret rows additionally carry
     reveals: a list of {"by", "at", "request_id"}, most-recent-first,
     capped at reveal_limit.
 
-    If `preserve_locally` is set (with `env_name`), every event this live
-    query returns is merged into secrets_log_cache.json (see
-    _merge_system_log_events) and the merged set -- not just this call's
-    live 90-day window -- is what actually gets bucketed below, so history
-    already captured survives Okta aging it out of its own retention.
-    `oldest_captured_at` in the response is the earliest event timestamp
-    actually available (from the merged set if caching is on, else just
-    this query's own results) -- never further back than whenever caching
-    was first turned on for this project, since events already >90 days
-    old the first time can't be retroactively recovered."""
+    `local_retention_enabled` is always False here -- Phase 5 (2026-10-01)
+    retired this function's own local caching (secrets_log_cache.json);
+    this is now a pure live-Okta-query function, bounded strictly to
+    `since_days`. Only called for an environment that hasn't synced yet
+    (see server/serve.py's route) -- once ANY sync completes,
+    build_project_secrets_report_from_archive takes over permanently and
+    this function is never called again for that environment; its archive
+    already captures a strict superset of what this cache ever did, with
+    no retention limit at all. `local_retention_enabled`/
+    `oldest_captured_at` are kept in the response shape (not removed) --
+    the frontend's own caveat text ("based on the last N days..." vs.
+    "supplemented with locally-preserved history...") depends on both
+    fields regardless of which function produced them."""
     folders, secrets = fetch_all_folders_and_secrets(client, resource_group_id, project_id)
     folders_by_id = {f["id"]: f for f in folders if f.get("id")}
     secrets_by_id = {s["id"]: s for s in secrets if s.get("id")}
@@ -3047,14 +2904,6 @@ def build_secrets_access_report(client, okta_client, resource_group_id, project_
     # completeness only matters to sync_okta_events, see get_system_log's
     # docstring.
     events, _complete = okta_client.get_system_log(filter_expr=filter_expr, since=since, limit=1000)
-
-    if preserve_locally and env_name:
-        events = _merge_system_log_events(env_name, project_id, events)
-        # _merge_system_log_events returns cache.values(), insertion order,
-        # not necessarily DESCENDING -- the bucketing loop below relies on
-        # most-recent-first (first create/delete seen wins), so re-sort
-        # explicitly rather than assume dict ordering happens to match.
-        events = sorted(events, key=lambda e: e.get("published") or "", reverse=True)
     oldest_captured_at = min((e.get("published") for e in events if e.get("published")), default=None)
 
     # Per resource_kind: {resource_id: {"name":..., "path":..., "created":None,
@@ -3151,7 +3000,7 @@ def build_secrets_access_report(client, okta_client, resource_group_id, project_
         "secrets": _build_rows("secret", secrets_by_id),
         "folders": _build_rows("secret_folder", folders_by_id),
         "since_days": since_days,
-        "local_retention_enabled": bool(preserve_locally and env_name),
+        "local_retention_enabled": False,
         "oldest_captured_at": oldest_captured_at,
     }
 
@@ -3159,8 +3008,8 @@ def build_secrets_access_report(client, okta_client, resource_group_id, project_
 def build_project_secrets_report_from_archive(client, environment_id, resource_group_id, project_id):
     """Phase 5 of the compliance-reporting-dashboard plan: the same report
     as build_secrets_access_report above, but sourced from the unified
-    audit_store.py SQLite archive instead of a live Okta System Log call
-    + the bespoke secrets_log_cache.json. Requires `audit_store` to have
+    audit_store.py SQLite archive instead of a live Okta System Log call.
+    Requires `audit_store` to have
     already been populated for `environment` (via a sync or CSV import) --
     this function does not itself call Okta at all, so it works even with
     no Okta API token configured, unlike the original.

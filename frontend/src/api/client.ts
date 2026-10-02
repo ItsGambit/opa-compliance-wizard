@@ -111,13 +111,6 @@ export function deleteEnvironment(name: string, id?: string): Promise<{ deleted:
   return apiFetch(`/api/environments/${encodeURIComponent(name)}${qs}`, { method: 'DELETE' })
 }
 
-export function setPreserveLogsLocally(name: string, enabled: boolean): Promise<{ name: string; preserve_logs_locally: boolean }> {
-  return apiFetch(`/api/environments/${encodeURIComponent(name)}/preserve_logs_locally`, {
-    method: 'POST',
-    body: JSON.stringify({ enabled }),
-  })
-}
-
 // Same `id` reasoning as deleteEnvironment above -- only needed for an
 // admin overriding another owner's environment.
 export function setEnvironmentShared(name: string, shared: boolean, id?: string): Promise<{ name: string; shared: boolean }> {

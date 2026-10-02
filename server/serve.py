@@ -2,9 +2,10 @@
 Local-only server for the OPA Compliance Wizard dashboard.
 
 Serves frontend/dist/ as static files and exposes a small JSON API the React
-app uses to: manage named environments (dev/uat/prod, credentials stored
-encrypted -- see create_secret_folders.py's environments.json + keyring
-helpers, all imported as `engine` so nothing is duplicated), list/create
+app uses to: manage named environments (dev/uat/prod, metadata in SQLite via
+audit_store.py and secrets in the OS keyring -- see create_secret_folders.py's
+upsert_environment/keyring helpers, all imported as `engine` so nothing is
+duplicated), list/create
 resource groups, projects, and groups (the group-creation path goes through
 Okta's core API + Group Push, never OPA's own local-group endpoint, by
 design), load/save the folder-tree CSV, and run preview (dry-run) / execute
@@ -615,7 +616,6 @@ def _public_entry(environment_id, name, meta, requesting_owner):
         "key_id": meta.get("key_id", ""),
         "okta_url": meta.get("okta_url", ""),
         "has_okta_token": bool(engine.keyring_get(environment_id, "okta_api_token")),
-        "preserve_logs_locally": bool(meta.get("preserve_logs_locally", False)),
         "shared": bool(meta.get("shared", False)),
         "is_own": meta.get("owner") == requesting_owner,
         "sync_schedule": meta.get("sync_schedule", dict(engine.SYNC_SCHEDULE_DEFAULTS)),
@@ -1073,16 +1073,16 @@ class Handler(SimpleHTTPRequestHandler):
                 # Phase 5 of the compliance-reporting-dashboard plan: once an
                 # environment has a real compliance-sync archive (audit_store.py),
                 # this report is sourced from THAT instead of a bounded live
-                # Okta call + the bespoke secrets_log_cache.json -- strictly
-                # more complete (whole history ever ingested, no 90-day/
-                # reveal_limit cap), confirmed to produce identical bucketing
-                # output on real data before this switch. This path needs no
-                # Okta client at all (unlike the fallback below), so an
-                # environment with compliance sync set up but no live Okta
-                # token configured still works. Environments that have never
-                # run a compliance sync keep the exact original live-query
-                # behavior (and its Okta-client requirement) -- zero
-                # regression for anyone not using the new feature yet.
+                # Okta call -- strictly more complete (whole history ever
+                # ingested, no 90-day/reveal_limit cap), confirmed to produce
+                # identical bucketing output on real data before this switch.
+                # This path needs no Okta client at all (unlike the fallback
+                # below), so an environment with compliance sync set up but
+                # no live Okta token configured still works. Environments
+                # that have never run a compliance sync keep the exact
+                # original live-query behavior (and its Okta-client
+                # requirement) -- zero regression for anyone not using the
+                # new feature yet.
                 import audit_store
                 if local_env_id and not audit_store.is_first_sync(local_env_id):
                     report = engine.build_project_secrets_report_from_archive(
@@ -1092,16 +1092,8 @@ class Handler(SimpleHTTPRequestHandler):
 
                 if not _require_okta_client(self._send_json, local_okta_client):
                     return
-                preserve_locally = False
-                if local_env_name:
-                    try:
-                        env_meta = engine.get_environment_credentials(local_env_name, owner=engine_owner)
-                        preserve_locally = bool(env_meta.get("preserve_logs_locally", False))
-                    except KeyError:
-                        pass
                 report = engine.build_secrets_access_report(
                     local_client, local_okta_client, rg_id, proj_id,
-                    preserve_locally=preserve_locally, env_name=local_env_name,
                 )
                 return self._send_json(200, report)
 
@@ -1402,15 +1394,6 @@ class Handler(SimpleHTTPRequestHandler):
                     return self._send_json(403, {"error": str(exc)})
                 self._log_audit_event(actor_email, actor_sub, "environment.share", {"name": name, "shared": shared, "admin_override": is_admin})
                 return self._send_json(200, {"name": name, "shared": shared})
-
-            if path.startswith("/api/environments/") and path.endswith("/preserve_logs_locally"):
-                name = unquote(path[len("/api/environments/"):-len("/preserve_logs_locally")])
-                enabled = bool(payload.get("enabled", False))
-                try:
-                    engine.set_preserve_logs_locally(name, enabled, owner=engine_owner)
-                except KeyError as exc:
-                    return self._send_json(404, {"error": str(exc)})
-                return self._send_json(200, {"name": name, "preserve_logs_locally": enabled})
 
             if path.startswith("/api/environments/") and path.endswith("/sync_schedule"):
                 name = unquote(path[len("/api/environments/"):-len("/sync_schedule")])

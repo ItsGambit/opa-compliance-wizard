@@ -5,11 +5,6 @@ environments.json.*
 TestCreds.txt
 ubuntuserver.txt
 
-# Locally-preserved Secrets Access Dashboard System Log history (opt-in,
-# see the "preserve logs locally" setting) -- audit metadata, not a
-# credential, but still local-machine-only state that shouldn't be committed
-secrets_log_cache.json
-
 # This tool's own write-action audit trail (see engine.log_audit_event) --
 # real operational data (who did what, when) specific to whichever
 # deployment produced it, not something to ship in the repo
@@ -28,7 +23,7 @@ access_control.json
 # Compliance reporting dashboard's Okta+OPA audit archive (see
 # audit_store.py) -- real ingested tenant event history, plus SQLite's
 # own WAL/journal sidecar files, all deployment-specific local instance
-# data, same treatment as environments.json/secrets_log_cache.json
+# data, same treatment as environments.json
 audit_store.db
 audit_store.db-wal
 audit_store.db-shm

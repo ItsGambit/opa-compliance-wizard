@@ -1,11 +1,10 @@
 import { useState } from 'react'
 import { ChevronDown, ChevronUp, RefreshCw } from 'lucide-react'
-import { useEnvironments, useResourceGroups, useProjects, useSecretsAccessReport } from '../api/hooks'
+import { useResourceGroups, useProjects, useSecretsAccessReport } from '../api/hooks'
 import type { AuditEntry, FolderAccessRow, RevealEntry, SecretAccessRow, SecretsAccessStatus } from '../types'
 import { formatDateTime } from '../utils/format'
 import { secretsAccessReportExportSections } from '../utils/exportSections'
 import { ExportButtons } from './ExportButtons'
-import { LogRetentionIndicator } from './LogRetentionIndicator'
 import { Select } from './Select'
 import { StatusBadge } from './StatusBadge'
 
@@ -148,13 +147,11 @@ export function SecretsAccessDashboard() {
   const [rgId, setRgId] = useState<string | undefined>(undefined)
   const [projectId, setProjectId] = useState<string | undefined>(undefined)
 
-  const { data: environments } = useEnvironments()
   const { data: resourceGroups } = useResourceGroups(true)
   const { data: projects } = useProjects(rgId, true)
   const { data: report, isLoading, isError, error, refetch, isFetching } = useSecretsAccessReport(rgId, projectId)
 
   const project = projects?.find(p => p.id === projectId)
-  const activeEnv = environments?.environments.find(e => e.name === environments.active)
   const needsOktaToken = isError && (error as (Error & { body?: { error: string } }) | undefined)?.body?.error?.includes('Okta URL/API token')
 
   const handleRgChange = (id: string) => {
@@ -233,7 +230,6 @@ export function SecretsAccessDashboard() {
                 : <>Based on the last {report.since_days} days of Okta System Log history (Okta's retention limit) — a secret
                   with no history shown may simply be older than this window, not necessarily untouched.</>}
             </p>
-            {activeEnv && <LogRetentionIndicator enabled={activeEnv.preserve_logs_locally} />}
           </div>
 
           <div className="card p-3 flex flex-col gap-2">

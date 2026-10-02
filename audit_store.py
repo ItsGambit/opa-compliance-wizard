@@ -533,10 +533,24 @@ def _migration_003_pending_admin_actions(conn):
     """)
 
 
+def _migration_004_drop_preserve_logs_locally(conn):
+    """Phase 5 of docs/fast-follow-redesign.md: retires the
+    preserve_logs_locally toggle (and the secrets_log_cache.json/Fernet
+    machinery it controlled -- see create_secret_folders.py's
+    build_secrets_access_report) now that any environment with even one
+    completed sync gets its full, unretention-limited history from this
+    database's own archive instead. Confirmed safe to drop: not part of
+    app_environments' UNIQUE(owner_id, display_name) constraint or any
+    index, and DROP COLUMN support (SQLite 3.35.0+) is well below both
+    real installs' confirmed SQLite versions (3.46.1/3.49.1)."""
+    conn.execute("ALTER TABLE app_environments DROP COLUMN preserve_logs_locally")
+
+
 MIGRATIONS = {
     1: _migration_001_unified_schema,
     2: _migration_002_ingestion_manifests,
     3: _migration_003_pending_admin_actions,
+    4: _migration_004_drop_preserve_logs_locally,
 }
 
 
@@ -574,6 +588,24 @@ def init_db():
     backfill_resource_columns()
     backfill_event_targets()
     _cleanup_expired_pending_admin_actions()
+    _cleanup_retired_secrets_log_cache()
+
+
+def _cleanup_retired_secrets_log_cache():
+    """One-shot Phase 5 cleanup, mirroring Phase 1's own
+    _legacy_environment_storage_name precedent: deletes
+    secrets_log_cache.json (fully superseded by this database's archive
+    for any synced environment, and never load-bearing for one that
+    hasn't synced -- see build_secrets_access_report) and its dedicated
+    Fernet key from the keyring, if either still exists from before this
+    phase. Safe to call on every init_db() -- both checks are already
+    no-ops once cleaned up once."""
+    import create_secret_folders
+    path = os.path.join(os.path.dirname(os.path.abspath(create_secret_folders.__file__)), "secrets_log_cache.json")
+    if os.path.isfile(path):
+        os.remove(path)
+        create_secret_folders.log("INFO", f"Removed retired {path} -- its data is fully superseded by this database's own archive.")
+    create_secret_folders.keyring_delete("_shared", "secrets_log_cache_key")
 
 
 # ---------------------------------------------------------------------------

@@ -28,7 +28,6 @@ export interface Environment {
   key_id: string
   okta_url: string
   has_okta_token: boolean
-  preserve_logs_locally: boolean
   sync_schedule: SyncSchedule
   // Per-user environment scoping (server-hosted, logged-in deployments only --
   // both are always true for a local/standalone run, since there's only ever
@@ -779,13 +778,12 @@ export interface SecretsAccessReport {
    * can be honest about "no record" possibly meaning "older than this,"
    * not "never happened." */
   since_days: number
-  /** True if the active environment has "preserve logs locally" on --
-   * history below is supplemented from secrets_log_cache.json, not just
-   * Okta's live 90-day window. */
+  /** True if this report was sourced from the compliance-sync archive
+   * (audit_store.py, unlimited history) rather than a live, 90-day-bounded
+   * Okta System Log query -- surfaced so the UI can give an accurate
+   * completeness caveat either way. */
   local_retention_enabled: boolean
-  /** Earliest event timestamp actually available (merged cache + live
-   * query if local_retention_enabled, else just the live query) -- null
-   * if no history exists at all. Never further back than whenever local
-   * retention was first turned on for this project. */
+  /** Earliest event timestamp actually available in whichever source
+   * produced this report -- null if no history exists at all. */
   oldest_captured_at: string | null
 }

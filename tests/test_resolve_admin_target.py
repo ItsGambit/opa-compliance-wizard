@@ -25,8 +25,8 @@ def _insert_env(conn, environment_id, owner, name, base_domain="example.com"):
     conn.execute(
         """INSERT INTO app_environments
            (environment_id, owner_id, display_name, base_domain, team_name, key_id, okta_url,
-            shared, preserve_logs_locally, created_at, updated_at)
-           VALUES (?, ?, ?, ?, 'team', 'key', '', 0, 0, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z')""",
+            shared, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'team', 'key', '', 0, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z')""",
         (environment_id, owner, name, base_domain),
     )
     conn.commit()

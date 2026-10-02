@@ -6,7 +6,6 @@ import { activateEnvironment, deleteEnvironment, saveEnvironment, setEnvironment
 import { toast } from '../hooks/useToast'
 import type { ApiErrorBody, Environment, EnvironmentFormValues, EnvironmentsResponse } from '../types'
 import { EnvironmentForm } from './EnvironmentForm'
-import { LogRetentionIndicator } from './LogRetentionIndicator'
 import { StatusBadge } from './StatusBadge'
 import { SyncScheduleDialog } from './SyncScheduleDialog'
 
@@ -182,7 +181,6 @@ export function EnvironmentManagerDialog({ data, open: openProp, onOpenChange, i
                   {env.has_okta_token ? ' · Okta connected' : ' · no Okta token (can\'t create groups)'}
                 </div>
                 <div className="flex items-center gap-1.5">
-                  <LogRetentionIndicator enabled={env.preserve_logs_locally} envName={env.name} />
                   <SyncScheduleDialog env={env} />
                   {env.sync_schedule.enabled && (
                     <span className="text-[0.6875rem] text-win">Compliance sync on</span>
