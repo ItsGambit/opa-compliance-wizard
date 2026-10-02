@@ -43,8 +43,17 @@ export default function App() {
   // immediately, so a page refresh afterward can't accidentally replay it.
   const finishStepUpMutation = useMutation({
     mutationFn: () => saveAccessControl(),
-    onSuccess: () => {
-      toast({ title: 'Access control settings saved', variant: 'success' })
+    onSuccess: ({ saved_at }) => {
+      // Phase 10: confirms Phase 3's new guarantee is legible to the
+      // admin who just relied on it -- the save was approved via a
+      // validated step-up MFA transaction bound to this exact change,
+      // not just "a save happened" the same way a generic toast would
+      // read regardless of whether that protection existed at all.
+      toast({
+        title: 'Access control settings saved',
+        description: `Approved via step-up MFA at ${new Date(saved_at).toLocaleString()}`,
+        variant: 'success',
+      })
       queryClient.invalidateQueries({ queryKey: ['access_control'] })
     },
     onError: (err: Error) => toast({ title: 'Could not save access control settings', description: err.message, variant: 'error' }),

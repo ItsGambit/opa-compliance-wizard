@@ -1,5 +1,6 @@
 import type {
   AccessControlConfig,
+  AccessControlSaveResponse,
   AccessModel,
   AdConnectionDiscoveryConfig,
   ApiErrorBody,
@@ -85,8 +86,10 @@ export function prepareAccessControl(config: AccessControlConfig): Promise<{ act
 // auth_request /verify_stepup gate on this exact path. Takes no body --
 // the server retrieves the exact prepared payload via the action_id bound
 // into the step-up cookie itself (X-Auth-Action-Id), never trusting
-// anything the client sends here.
-export function saveAccessControl(): Promise<AccessControlConfig> {
+// anything the client sends here. Response includes step_up_verified/
+// saved_at (Phase 10) so App.tsx can confirm the save was approved via a
+// validated step-up transaction, not just show a generic "saved" toast.
+export function saveAccessControl(): Promise<AccessControlSaveResponse> {
   return apiFetch('/api/access_control/save', { method: 'POST' })
 }
 

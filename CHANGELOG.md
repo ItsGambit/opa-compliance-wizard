@@ -2,6 +2,37 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.32.0 — **Fast-follow Phase 10 of 11 of docs/fast-follow-redesign.md:
+surfaces evidence completeness and MFA-approval state in the UI** —
+backend guarantees from Phases 2/3/6 made the data model more honest,
+but none of it was visible to anyone using the dashboard. Exploration
+against the real code (not the doc's original framing) found the Sync
+Settings dialog already shows good running/success/error text for both
+the live job and the persisted sync state — that item was already
+done, confirmed and left alone rather than adding redundant UI.
+- **Compliance Reports** now calls the already-existing
+  `useSyncStatus(activeEnv)` hook (previously unused by this page) and
+  shows a non-dismissible notice when the active environment's most
+  recent sync failed: "This report's source data has a known gap — the
+  last sync for {environment} failed: {error}." — shown by default, not
+  opt-in, per the explicit "doesn't silently present partial data as
+  complete" requirement. Scoped to the latest sync's status (not "any
+  day in the report's window," which would need new backend date-range
+  scanning out of scope for this frontend-surfacing phase).
+- **`/api/access_control/save`'s HTTP response** now includes
+  `step_up_verified`/`saved_at` (previously these were only ever
+  written into the audit log entry, never returned to the caller) --
+  `saved_at` reuses the audit entry's own logged timestamp rather than
+  computing a second one. The post-save toast now reads "Access control
+  settings saved — Approved via step-up MFA at {time}" instead of a
+  generic message, making Phase 3's new transaction-binding guarantee
+  legible to the admin who just relied on it.
+- `tests/test_pending_admin_actions.py`'s HTTP round-trip test updated
+  for the new response shape (checks the confirmation fields' presence
+  without over-asserting their exact values, keeping the test focused
+  on what it actually verifies: the reviewed payload won, not the
+  tampered save-body).
+
 5.31.1 — **Fixes a real bug found live-testing v5.31.0's
 `pending_admin_actions` table against this machine's own local/direct
 server run**: the schema's `actor_sub TEXT NOT NULL` rejected the

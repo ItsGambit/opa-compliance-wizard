@@ -1328,8 +1328,22 @@ class Handler(SimpleHTTPRequestHandler):
                 # Log page's Refresh button (backfill_mfa_log_events) still
                 # fills this field in asynchronously after the fact.
                 details = {**config, "step_up_verified": True, "okta_mfa_log_event": None}
-                self._log_audit_event(actor_email, actor_sub, "access_control.update", details)
-                return self._send_json(200, config)
+                audit_entry = self._log_audit_event(actor_email, actor_sub, "access_control.update", details)
+                # Phase 10: step_up_verified/saved_at are returned to the
+                # CALLER too, not just logged -- previously these only
+                # ever landed in the audit entry, so the admin who just
+                # relied on Phase 3's new transaction-binding guarantee
+                # had no way to see it confirmed; AccessControlDialog/
+                # App.tsx now show it directly instead of a generic
+                # "saved" toast. okta_mfa_log_event is deliberately NOT
+                # included here -- it's always None at save time now
+                # (Phase 4 removed the synchronous lookup), so returning
+                # a field that's always null would be misleading; the
+                # audit entry remains the right place for whenever
+                # backfill_mfa_log_events fills it in later. saved_at
+                # reuses the audit entry's OWN timestamp rather than
+                # computing a second, separately-timed one.
+                return self._send_json(200, {**config, "step_up_verified": True, "saved_at": audit_entry["timestamp"]})
 
             if path == "/api/audit_log/backfill_mfa":
                 # Same admin gate as GET /api/audit_log -- this both READS

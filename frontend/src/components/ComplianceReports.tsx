@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { AlertTriangle, FileClock, KeyRound, Shield, Users } from 'lucide-react'
-import { useEnvironments, useReportDefs } from '../api/hooks'
+import { useEnvironments, useReportDefs, useSyncStatus } from '../api/hooks'
 import type { ComplianceControl, ComplianceReportDef } from '../types'
 import { ComplianceReportDetail } from './ComplianceReportDetail'
 import { complianceReportExportSections } from '../utils/exportSections'
@@ -76,6 +76,10 @@ export function ComplianceReports() {
   const { data: environments } = useEnvironments()
   const activeEnv = environments?.active
   const { data: reports } = useReportDefs(activeEnv)
+  // Phase 10: point-in-time, non-polling read (see useSyncStatus's own
+  // doc comment) -- this page just needs to know "is the data behind
+  // these reports currently degraded," not live sync progress.
+  const { data: syncStatus } = useSyncStatus(activeEnv)
   const [selectedReport, setSelectedReport] = useState<string | null>(null)
 
   if (selectedReport && reports) {
@@ -90,8 +94,28 @@ export function ComplianceReports() {
     reports: (reports ?? []).filter(r => r.control === control),
   })).filter(g => g.reports.length > 0)
 
+  const syncState = syncStatus?.sync_state
+
   return (
     <div className="flex flex-col gap-4">
+      {/* Phase 10: shown by default, not dismissible -- a compliance
+          report viewer must never silently see partial/stale data
+          presented as complete. Scoped to the MOST RECENT sync's status
+          (not "any day in this report's window"), which is what
+          sync_state actually tracks today. */}
+      {syncState?.last_sync_status === 'error' && (
+        <div className="card p-2.5 text-xs text-loss flex items-start gap-2">
+          <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+          <div>
+            This report's source data has a known gap — the last sync for{' '}
+            <span className="font-medium">{activeEnv}</span> failed: {syncState.last_sync_error}.{' '}
+            {syncState.last_synced_at
+              ? `Last successful sync: ${new Date(syncState.last_synced_at).toLocaleString()}.`
+              : 'No successful sync has completed yet.'}
+          </div>
+        </div>
+      )}
+
       <div className="flex items-center justify-end">
         <button
           type="button"

@@ -236,7 +236,14 @@ def test_prepare_then_save_applies_exactly_the_prepared_payload_not_the_save_bod
         f"{live_server}/api/access_control/save", json=tampered_body, headers=_admin_headers(action_id), timeout=5,
     )
     assert save_resp.status_code == 200, save_resp.text
-    assert save_resp.json() == reviewed  # the REVIEWED payload won, not the tampered save-body
+    save_body = save_resp.json()
+    # Phase 10: /save's response now also includes step_up_verified/saved_at
+    # (previously only logged to the audit entry) -- check the REVIEWED
+    # settings won, not the tampered save-body, without over-asserting on
+    # the exact confirmation fields' values.
+    assert {k: save_body[k] for k in reviewed} == reviewed
+    assert save_body["step_up_verified"] is True
+    assert "saved_at" in save_body
 
     get_resp = requests.get(f"{live_server}/api/access_control", headers=_admin_headers(), timeout=5)
     assert get_resp.json() == reviewed

@@ -153,6 +153,16 @@ export interface AccessControlConfig {
   restrict_login: boolean
 }
 
+// Phase 10: /api/access_control/save's response -- the config plus
+// confirmation that THIS exact change was approved via a validated
+// step-up MFA transaction (see Phase 3's pending_admin_actions), so the
+// admin who just relied on that guarantee can see it confirmed instead
+// of a generic "saved" toast.
+export interface AccessControlSaveResponse extends AccessControlConfig {
+  step_up_verified: boolean
+  saved_at: string
+}
+
 export interface EnvironmentFormValues {
   // Only set when editing an EXISTING environment (see Environment.id) --
   // an admin editing another owner's environment needs this to
