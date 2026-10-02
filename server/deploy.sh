@@ -117,7 +117,16 @@ set -euo pipefail
 # a missing command discovered mid-deploy (after the live tree is
 # already half-overwritten) is strictly worse than failing here, before
 # anything on disk has changed.
-for _cmd in git rsync curl grep awk sed diff find mktemp sudo systemctl nginx; do
+# FIX (4th independent review, 2026-10-02): the first version of this
+# list only covered this script's own more "exotic" dependencies and
+# missed several POSIX-baseline commands it also actually calls (cp,
+# chmod, rm, sleep -- all used below) and the two project-specific
+# tools the frontend/backend build steps need (npm, npx; the venv's own
+# python/pip are checked separately below, as paths, not PATH lookups).
+# realpath/dirname/basename are new as of THIS fix, needed by
+# _safe_rm_rf_temp's own path-canonicalization logic above.
+for _cmd in git rsync curl grep awk sed diff find mktemp cp chmod rm sleep \
+    realpath dirname basename npm npx sudo systemctl nginx; do
   command -v "$_cmd" >/dev/null 2>&1 || {
     echo "ERROR: required command not found on PATH: $_cmd" >&2
     exit 1
@@ -161,9 +170,22 @@ case "${DEPLOY_SH_PHASE:-}" in
     exit 2
     ;;
 esac
+# FIX (4th independent review, 2026-10-02): the first version of this
+# only validated phase 2's handoff state -- phase 1 never required
+# DEPLOY_SH_PHASE1_FROZEN_DIR even though its OWN cleanup trap
+# references it a few lines below, and phase 2 never required
+# DEPLOY_COMMIT even though a genuine phase-1-to-2 handoff always
+# exports it. Both gaps closed: every variable each phase's own later
+# logic actually depends on is now required up front, not just the
+# subset the first pass happened to check.
+if [ "${DEPLOY_SH_PHASE:-}" = "1" ]; then
+  : "${DEPLOY_SH_PHASE1_FROZEN_DIR:?DEPLOY_SH_PHASE=1 requires DEPLOY_SH_PHASE1_FROZEN_DIR to be set -- this is internal phase-handoff state, not meant to be set by a caller}"
+fi
 if [ "${DEPLOY_SH_PHASE:-}" = "2" ]; then
   : "${DEPLOY_SH_PHASE1_FROZEN_DIR:?DEPLOY_SH_PHASE=2 requires DEPLOY_SH_PHASE1_FROZEN_DIR to be set -- this is internal phase-handoff state, not meant to be set by a caller}"
   : "${DEPLOY_SH_PHASE1_TMP_DIR:?DEPLOY_SH_PHASE=2 requires DEPLOY_SH_PHASE1_TMP_DIR to be set -- this is internal phase-handoff state, not meant to be set by a caller}"
+  : "${DEPLOY_COMMIT:?DEPLOY_SH_PHASE=2 requires DEPLOY_COMMIT to be set -- this is internal phase-handoff state, not meant to be set by a caller}"
+  : "${DEPLOY_VERSION:?DEPLOY_SH_PHASE=2 requires DEPLOY_VERSION to be set -- this is internal phase-handoff state, not meant to be set by a caller}"
 fi
 
 # Used by both phases' cleanup traps below -- confirms a path is one
@@ -172,12 +194,31 @@ fi
 # corrupted/tampered DEPLOY_SH_PHASE1_FROZEN_DIR/_TMP_DIR value (however
 # unlikely in practice) can't turn an EXIT trap into an unexpected
 # arbitrary-path `rm -rf`.
+#
+# FIX (4th independent review, 2026-10-02): the first version of this
+# check matched the path's TEXT against a glob -- confirmed exploitable
+# via direct test: "$TMPDIR/opa-deploy-source.fake/../../some-other-path"
+# matches the glob textually (bash's `*` happily matches literal `/..`
+# segments) but `rm -rf` resolves the `..` itself and deletes somewhere
+# else entirely, outside the temp root. Fixed by canonicalizing (via
+# `realpath -m`, which doesn't require the path to exist) BEFORE
+# matching, and requiring the canonical path's PARENT to be exactly the
+# temp root with its basename matching the expected prefix -- not just
+# "the string looks right somewhere in there."
 _safe_rm_rf_temp() {
-  local path="$1"
+  local path="$1" temp_root canonical parent base
   [ -n "$path" ] || return 0
-  case "$path" in
-    "${TMPDIR:-/tmp}"/opa-deploy-frozen.* | "${TMPDIR:-/tmp}"/opa-deploy-source.*)
-      rm -rf -- "$path"
+  temp_root="$(realpath -m -- "${TMPDIR:-/tmp}")"
+  canonical="$(realpath -m -- "$path")"
+  parent="$(dirname -- "$canonical")"
+  base="$(basename -- "$canonical")"
+  if [ "$parent" != "$temp_root" ]; then
+    echo "WARNING: refusing to remove temp path outside $temp_root: $path" >&2
+    return 0
+  fi
+  case "$base" in
+    opa-deploy-frozen.* | opa-deploy-source.*)
+      rm -rf -- "$canonical"
       ;;
     *)
       echo "WARNING: refusing to remove unexpected temp path: $path" >&2
@@ -227,6 +268,20 @@ if [ "$DEPLOY_SH_PHASE" = "1" ]; then
   SRC="$TMP_DIR/repo"
   if [ ! -f "$SRC/create_secret_folders.py" ]; then
     echo "ERROR: expected files not found under $SRC -- check REPO_URL above." >&2
+    exit 1
+  fi
+
+  # FIX (4th independent review, 2026-10-02): previously parsed/
+  # validated SCRIPT_VERSION only AFTER rsync/pip install/npm build had
+  # already modified the live tree -- if the source's version-string
+  # format ever changed or disappeared, the failure would surface after
+  # production was already mid-upgrade. Parsed and validated here
+  # instead, against the freshly-cloned $SRC (nothing on $APP_DIR
+  # touched yet), and exported through to phase 2 so it's parsed
+  # exactly once per run, not twice.
+  DEPLOY_VERSION="$(grep -m1 'SCRIPT_VERSION = ' "$SRC/create_secret_folders.py" | sed -E 's/.*"([^"]+)".*/\1/')"
+  if [ -z "$DEPLOY_VERSION" ]; then
+    echo "ERROR: could not parse SCRIPT_VERSION from $SRC/create_secret_folders.py" >&2
     exit 1
   fi
 
@@ -314,6 +369,7 @@ if [ "$DEPLOY_SH_PHASE" = "1" ]; then
   export DEPLOY_SH_PHASE=2
   export DEPLOY_SH_PHASE1_TMP_DIR="$TMP_DIR"
   export DEPLOY_COMMIT
+  export DEPLOY_VERSION
   exec "$APP_DIR/server/deploy.sh" "$@"
 fi
 
@@ -395,7 +451,10 @@ echo "==> Reinstalling Python dependencies"
 echo "==> Rebuilding frontend"
 (cd "$APP_DIR/frontend" && npm ci --silent && npx vite build)
 
-_DEPLOYED_VERSION="$(grep -m1 'SCRIPT_VERSION = ' "$APP_DIR/create_secret_folders.py" | sed -E 's/.*"([^"]+)".*/\1/')"
+# Already parsed and validated in phase 1 (before the live tree was
+# touched at all) and exported through as DEPLOY_VERSION -- re-using it
+# here rather than re-parsing $APP_DIR's now-rsynced copy a second time.
+_DEPLOYED_VERSION="$DEPLOY_VERSION"
 
 echo "==> Restarting $SERVICE_NAME"
 # -n (non-interactive): without a pseudo-TTY (e.g. run via `ssh host "cmd"`
@@ -463,8 +522,7 @@ sudo -n systemctl restart "$AUTH_GATE_SERVICE"
 sleep 1
 systemctl status "$AUTH_GATE_SERVICE" --no-pager -l
 
-echo "==> Done. Deployed version:"
-grep -m1 'SCRIPT_VERSION = ' "$APP_DIR/create_secret_folders.py"
+echo "==> Done. Deployed version: $DEPLOY_VERSION"
 echo "    Commit: ${DEPLOY_COMMIT:-unknown}"
 
 # FIX (confirmed real, 2026-10-01): NGINX_REPO (the checked-in template)
@@ -484,18 +542,29 @@ echo "    Commit: ${DEPLOY_COMMIT:-unknown}"
 # needed -- both files involved here are already readable/writable by
 # this user.
 #
-# FIX (external review, 2026-10-02, "will run on servers neither of us
-# administers"): NGINX_LIVE legitimately not existing at all is fine --
-# standalone/local-only mode with no nginx in front, or nginx simply not
-# set up yet on this install -- and stays a non-fatal skip, same as
-# before. But if it DOES exist, require it to be a real regular file,
-# not a symlink, before this script reads from or writes to it -- same
-# for NGINX_REPO (checked into git, so this should never trip, but an
-# operator's own fork/local checkout is something we can't vouch for).
-# A symlink here on an install we don't control could point anywhere.
-if [ -L "$NGINX_REPO" ] || { [ -e "$NGINX_REPO" ] && [ ! -f "$NGINX_REPO" ]; }; then
-  echo "ERROR: $NGINX_REPO must be a regular file, not a symlink or other" >&2
-  echo "       special file type." >&2
+# FIX (4th independent review, 2026-10-02): clarifying what "standalone"
+# actually means for THIS script, since an external review correctly
+# flagged an apparent conflict between requiring nginx/systemctl in
+# preflight above and this comment's prior "nginx might legitimately be
+# absent" framing. deploy.sh itself (see this file's own header
+# comment, "Run this ON THE SERVER") is ONLY ever used for the hosted/
+# nginx-fronted deployment path documented in docs/hosting.md's
+# "Hosting on a server" section -- the genuinely standalone/no-nginx-at-
+# all mode is a SEPARATE workflow (docs/hosting.md's "Running it as a
+# CLI instead") that never invokes this script at all. So nginx/
+# systemctl being required in preflight is correct, not conflicting --
+# anyone running deploy.sh is on the hosted path and needs both
+# eventually. NGINX_REPO (checked into every clone of this repo) is
+# therefore also always expected to exist on this path -- required, not
+# skippable. NGINX_LIVE not existing YET is the one legitimately
+# non-fatal case left: a first-time server setup that hasn't reached
+# the "install the nginx site config" step of docs/hosting.md yet.
+if [ ! -f "$NGINX_REPO" ] || [ -L "$NGINX_REPO" ]; then
+  echo "ERROR: repository nginx config is missing or invalid: $NGINX_REPO --" >&2
+  echo "       deploy.sh only supports the hosted/nginx-fronted path (see" >&2
+  echo "       docs/hosting.md); this file should always exist in a real" >&2
+  echo "       checkout of this repo." >&2
+  _log_deploy_event "deploy.failed" '{"trigger": "deploy.sh", "stage": "nginx_repo_config_invalid"}'
   exit 1
 fi
 if [ -L "$NGINX_LIVE" ] || { [ -e "$NGINX_LIVE" ] && [ ! -f "$NGINX_LIVE" ]; }; then

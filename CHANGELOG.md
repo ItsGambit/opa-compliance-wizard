@@ -2,6 +2,46 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.36.1 — **`server/deploy.sh` fixes from a FOURTH, independent review**
+(same session as 5.36.0's third-party hardening pass) -- found one real
+security gap in that pass's own new safe-cleanup guard, plus three
+smaller completeness gaps.
+- **`_safe_rm_rf_temp`'s path check was bypassable with `..` traversal.**
+  The first version matched the path's TEXT against a glob
+  (`"${TMPDIR:-/tmp}"/opa-deploy-source.*`) -- confirmed via direct test
+  that `$TMPDIR/opa-deploy-source.fake/../../some-other-path` matches
+  that glob textually (bash's `*` matches literal `/..` segments) while
+  `rm -rf` resolves the `..` itself and deletes somewhere else
+  entirely, outside the intended temp root. Fixed by canonicalizing
+  both the temp root and the candidate path with `realpath -m` BEFORE
+  matching, and requiring the canonical path's parent to be exactly the
+  temp root with a matching basename -- not just "the string looks
+  right somewhere in there." (`realpath`/`dirname`/`basename` added to
+  preflight, since this fix now depends on them.)
+- **Phase-handoff validation was asymmetric**: phase 1 never required
+  `DEPLOY_SH_PHASE1_FROZEN_DIR` even though its own cleanup trap
+  references it, and phase 2 never required `DEPLOY_COMMIT`. Both now
+  validated.
+- **Preflight command list was incomplete** -- missing `cp`, `chmod`,
+  `rm`, `sleep`, `npm`, `npx` (all actually used later in the script).
+- **Clarified what "standalone" actually means for this script**, after
+  the review correctly flagged an apparent conflict between requiring
+  `nginx`/`systemctl` in preflight and an earlier comment's "nginx
+  might legitimately be absent" framing: `deploy.sh` is ONLY ever used
+  for the hosted/nginx-fronted path (`docs/hosting.md`'s "Hosting on a
+  server" section) -- the genuinely standalone/no-nginx mode is a
+  separate workflow (`docs/hosting.md`'s "Running it as a CLI instead")
+  that never invokes this script at all. So requiring both tools is
+  correct, not conflicting; `NGINX_REPO` (checked into every clone) is
+  now also required rather than silently skippable, matching that same
+  reality. Only `NGINX_LIVE` not existing YET stays legitimately
+  non-fatal (first-time server setup, nginx site not installed yet).
+- **`SCRIPT_VERSION` is now parsed and validated during phase 1**,
+  against the freshly-cloned source, before `rsync --delete` touches
+  anything on `$APP_DIR` -- previously parsed only after the live tree
+  was already mid-upgrade, so a format change/parse failure would have
+  surfaced after production was already modified, not before.
+
 5.36.0 — **`server/deploy.sh` hardened for third-party operators, not
 just our own two installs.** Every prior pass on this script (5.34.0
 through 5.35.2) reasoned about "this specific server" -- a wrong
