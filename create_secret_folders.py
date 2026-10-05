@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.39.6
+# Version     : 5.39.7
 # =============================================================================
 
 import argparse
@@ -80,7 +80,7 @@ import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.39.6"
+SCRIPT_VERSION = "5.39.7"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -383,6 +383,55 @@ KEYRING_SERVICE_PREFIX = "opa-compliance-wizard"
 _LEGACY_KEYRING_SERVICE_PREFIX = "opa-secrets-wizard"
 ENVIRONMENT_METADATA_FIELDS = ("base_domain", "team_name", "key_id", "okta_url")
 ENVIRONMENT_SECRET_FIELDS = ("key_secret", "okta_api_token")
+
+# ENG1-02 (external review, 2026-10-05): base_domain becomes OpaClient's
+# base_url as f"https://{base_domain}" verbatim, with no validation at
+# all before this fix -- a bare hostname, nothing else. No scheme (one is
+# always prepended), no path/query (nothing after the host is ever
+# meaningful here), no userinfo (an authority like
+# "real-tenant.okta.com@attacker.example.com" is a syntactically valid
+# URL whose actual host is attacker.example.com, not the tenant before
+# the @). Standard DNS label shape; real values seen include dashes and
+# multiple subdomain levels (e.g. "mxmco-3.pam.oktapreview.com").
+_BASE_DOMAIN_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$")
+
+
+def validate_base_domain(base_domain):
+    """Raises ValueError on anything that isn't a bare hostname -- see
+    this constant's own comment for why. Returns the validated value
+    (callers that want a one-line `x = validate_base_domain(x)` can)."""
+    if not _BASE_DOMAIN_RE.fullmatch(base_domain or ""):
+        raise ValueError(
+            f"base_domain must be a bare hostname (e.g. 'your-org.okta.com'), got {base_domain!r} -- "
+            "no scheme, path, query, port or '@'."
+        )
+    return base_domain
+
+
+def validate_okta_url(okta_url):
+    """okta_url is OPTIONAL (see server/serve.py's own `if
+    creds.get('okta_url')` guards) -- empty/None passes through
+    unchanged. When set, becomes OktaClient's base_url via
+    `org_url.rstrip('/')` verbatim; must be a real https:// origin with
+    nothing after the host (no path/query/fragment) and no userinfo
+    (same "...@attacker.example.com" concern as validate_base_domain)."""
+    if not okta_url:
+        return okta_url
+    parsed = urllib.parse.urlsplit(okta_url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            f"okta_url must be a bare https:// origin (e.g. 'https://your-org.okta.com'), got {okta_url!r} -- "
+            "no path, query, fragment or '@'."
+        )
+    return okta_url
 
 
 def _environments_file_path():
@@ -877,6 +926,18 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, envi
         raise ValueError(f"Missing required field(s): {', '.join(missing)}")
     if not keyring_get(target_id, "key_secret"):
         raise ValueError("Missing required field: key_secret")
+    # SECURITY FIX (external review, 2026-10-05, ENG1-02): base_domain/
+    # okta_url become OpaClient/OktaClient's base_url verbatim (f"https://
+    # {base_domain}", org_url.rstrip("/")) with no validation at all --
+    # confirmed exploitable in combination with _SAFE_OPENER's redirect
+    # guard above being the LAST line of defense, not the only one: a
+    # value containing a path/query/userinfo could still steer requests
+    # somewhere unintended even without needing a redirect at all (e.g.
+    # "real-tenant.okta.com@attacker.example.com" is a valid URL
+    # authority with an unexpected host). Validated here, at the one
+    # place every save (CLI, API, admin override) goes through.
+    validate_base_domain(meta["base_domain"])
+    validate_okta_url(meta.get("okta_url"))
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     with audit_store._db_lock:
@@ -1556,6 +1617,44 @@ def _parse_next_link(headers):
     return None
 
 
+class _NoCrossHostRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """SECURITY FIX (external review, 2026-10-05, ENG1-02): urllib's
+    default redirect handling follows a 30x to ANY Location, on ANY host,
+    on ANY scheme, and -- critically -- carries forward headers set on the
+    original Request (confirmed live: a request with an Authorization
+    header, redirected cross-host, delivers that exact header to the new
+    host). Since `base_domain` (OpaClient) and `okta_url` (OktaClient) are
+    user-supplied environment fields with no validation at save time (see
+    upsert_environment's own validate_base_domain/validate_okta_url calls
+    below), a malicious or compromised value naming a redirecting host
+    would exfiltrate this project's real OPA key_secret/Okta API token to
+    whatever host the redirect points at. Confirmed via a two-local-server
+    PoC: an unmodified urlopen() call delivered the Authorization header
+    to a second server after one 302.
+
+    This handler refuses (raises HTTPError, same as the server having
+    returned the redirect's status directly) any redirect that changes
+    scheme (https -> http) or host:port -- same-host, same-scheme
+    redirects (the overwhelmingly common legitimate case, e.g. a trailing
+    slash) still work exactly as before."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old = urllib.parse.urlsplit(req.full_url)
+        new = urllib.parse.urlsplit(newurl)
+        if (new.scheme, new.hostname, new.port) != (old.scheme, old.hostname, old.port):
+            raise urllib.error.HTTPError(
+                newurl, code,
+                f"Refusing to follow a redirect from {old.scheme}://{old.netloc} to "
+                f"{new.scheme}://{new.netloc} -- would leak this request's credentials "
+                f"to a different host.",
+                headers, fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_SAFE_OPENER = urllib.request.build_opener(_NoCrossHostRedirectHandler)
+
+
 def http_json_request(method, url, headers=None, body=None, error_cls=OpaApiError, return_headers=False):
     """Shared retrying HTTP-JSON helper used by both OpaClient and
     OktaClient, so the retry/backoff logic lives in exactly one place.
@@ -1565,7 +1664,12 @@ def http_json_request(method, url, headers=None, body=None, error_cls=OpaApiErro
     ever see a 429 in normal operation.
 
     With return_headers=True, returns (parsed_body, response_headers)
-    instead of just parsed_body -- used for Link-header pagination."""
+    instead of just parsed_body -- used for Link-header pagination.
+
+    Uses _SAFE_OPENER (ENG1-02 above), not the module-level
+    urllib.request.urlopen, so a redirect to a different host/scheme is
+    refused instead of silently carrying this request's credentials
+    there."""
     data = json.dumps(body).encode("utf-8") if body is not None else None
     headers = dict(headers or {})
     headers.setdefault("Accept", "application/json")
@@ -1584,7 +1688,7 @@ def http_json_request(method, url, headers=None, body=None, error_cls=OpaApiErro
         _wait_if_rate_limited(url)
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECS) as resp:
+            with _SAFE_OPENER.open(req, timeout=REQUEST_TIMEOUT_SECS) as resp:
                 _record_rate_limit(url, resp.headers)
                 resp_headers = resp.headers
                 raw = resp.read()

@@ -246,7 +246,30 @@ fi
 
 NGINX_LIVE="/etc/nginx/sites-available/opa-secrets-wizard"
 NGINX_REPO="$APP_DIR/server/nginx-opa-secrets-wizard.conf"
-SERVICE_NAME="opa-secrets-wizard"
+# BUG FIX (external review, 2026-10-05, OPS-01): the backend service unit
+# was renamed opa-secrets-wizard -> opa-compliance-wizard at 5.20.0, but
+# this script (and setup-second-gate.sh) still hardcoded the OLD name
+# unconditionally -- correct for an install that predates the rename
+# (this project's own real server does; docs/hosting.md explicitly says
+# that's fine, nothing requires renaming a unit that's already running),
+# but WRONG for a fresh install from the shipped
+# opa-compliance-wizard.service template, which installs under the NEW
+# name -- every restart below would target a unit that doesn't exist.
+# Detect which one is ACTUALLY installed instead of assuming either:
+# `systemctl cat` on a nonexistent unit exits nonzero with nothing on
+# stdout, so this is a safe existence check with no side effects. Prefers
+# the legacy name when BOTH somehow exist (matches this project's own
+# server, where that's the live one) -- see OPS-01's own "clean up the
+# inactive duplicate" note for why that split can happen at all.
+if systemctl cat opa-secrets-wizard >/dev/null 2>&1; then
+  SERVICE_NAME="opa-secrets-wizard"
+elif systemctl cat opa-compliance-wizard >/dev/null 2>&1; then
+  SERVICE_NAME="opa-compliance-wizard"
+else
+  echo "ERROR: neither opa-secrets-wizard.service nor opa-compliance-wizard.service" >&2
+  echo "       is installed -- see docs/hosting.md's systemd unit install step." >&2
+  exit 1
+fi
 AUTH_GATE_SERVICE="opa-auth-gate"
 
 if [ "$DEPLOY_SH_PHASE" = "1" ]; then
@@ -323,6 +346,20 @@ if [ "$DEPLOY_SH_PHASE" = "1" ]; then
   # TestCreds.txt/ubuntuserver.txt/folders_result_*.csv, which accumulate
   # from ad hoc CLI usage on the server itself), the next --delete
   # silently wipes them with no warning.
+  # BUG FIX (external review, 2026-10-05, OPS-03): the exclude list below
+  # only ever covered the ONE specific CSV name pattern this project's
+  # own code happens to generate (folders_result_*.csv) -- any OTHER
+  # *.csv an admin drops into $APP_DIR for the Folder Builder's CSV-bar
+  # workflow or /api/csv's ingestion-by-bare-filename route (see
+  # serve.py's _safe_csv_path) was never excluded at all, so the next
+  # deploy's --delete silently wiped it with no warning, same incident
+  # class as the environments.json/banner_config.json bug this same
+  # block's own history already fixed. Excluding every *.csv is simpler
+  # and strictly safer than trying to enumerate every real-world name an
+  # admin might use -- the one tracked repo CSV (folders_template.csv)
+  # needs its own include rule FIRST so rsync still updates it when the
+  # repo's own copy changes (rsync evaluates include/exclude rules in
+  # order, first match wins).
   rsync -a --delete \
     --exclude '.venv/' \
     --exclude '.git/' \
@@ -342,7 +379,8 @@ if [ "$DEPLOY_SH_PHASE" = "1" ]; then
     --exclude '.env' \
     --exclude 'TestCreds.txt' \
     --exclude 'ubuntuserver.txt' \
-    --exclude 'folders_result_*.csv' \
+    --include 'folders_template.csv' \
+    --exclude '*.csv' \
     --exclude '.pytest_cache/' \
     --exclude 'docs/fast-follow-redesign.md' \
     "$SRC/" "$APP_DIR/"

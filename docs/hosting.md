@@ -219,17 +219,29 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    Paste the following into the editor that opens, then replace every
    `<app-user>` with your actual deploying username (step 7b) and every
    `/home/<app-user>/opa-compliance-wizard` with your actual repo path
-   (step 7b) — leave `opa-secrets-wizard` and `opa-auth-gate` exactly
-   as-is, those are fixed systemd unit names, not placeholders. Note
-   there are **two separate `cp` lines**, not one — `deploy.sh` applies
-   the new nginx config over the live path, and (only if `nginx -t` or
-   the reload then fails) rolls its own backup — kept in the repo's own
-   `$APP_DIR`, not under `/etc/nginx`, so creating/deleting it never
-   needs sudo at all — back over the live path; sudoers matches each
-   exact argument list separately, so a rule for only one of these two
-   leaves the other silently denied:
+   (step 7b) — leave `opa-secrets-wizard`/`opa-compliance-wizard` and
+   `opa-auth-gate` exactly as-is, those are fixed systemd unit names, not
+   placeholders. Note there are **two separate `cp` lines**, not one —
+   `deploy.sh` applies the new nginx config over the live path, and (only
+   if `nginx -t` or the reload then fails) rolls its own backup — kept in
+   the repo's own `$APP_DIR`, not under `/etc/nginx`, so creating/
+   deleting it never needs sudo at all — back over the live path;
+   sudoers matches each exact argument list separately, so a rule for
+   only one of these two leaves the other silently denied.
+
+   **Two `systemctl restart` lines for the backend, not one** (OPS-01,
+   external review, 2026-10-05): `deploy.sh`/`setup-second-gate.sh`
+   detect WHICH of `opa-secrets-wizard`/`opa-compliance-wizard` is
+   actually installed at runtime (the unit was renamed at 5.20.0 — a
+   fresh install from this repo's own templates uses the new name; an
+   install that predates the rename keeps the old one), but sudoers
+   itself can't do that detection — it matches the literal command sudo
+   was asked to run. Keep BOTH restart lines below so the grant works
+   whichever name your install actually uses; the one that doesn't match
+   your installed unit is simply never invoked, which is harmless:
    ```
    <app-user> ALL=(ALL) NOPASSWD: /bin/systemctl restart opa-secrets-wizard, \
+     /bin/systemctl restart opa-compliance-wizard, \
      /bin/systemctl restart opa-auth-gate, \
      /bin/cp /home/<app-user>/opa-compliance-wizard/server/nginx-opa-secrets-wizard.conf /etc/nginx/sites-available/opa-secrets-wizard, \
      /bin/cp /home/<app-user>/opa-compliance-wizard/.nginx-deploy-backup /etc/nginx/sites-available/opa-secrets-wizard, \

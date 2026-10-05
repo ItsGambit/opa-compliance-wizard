@@ -64,6 +64,19 @@ NEW_SITE=/etc/nginx/sites-available/opa-$NAME
 SUDOERS=/etc/sudoers.d/opa-auth-gate-$NAME
 STAGE=$HOME/.opa-setup
 HOST=${ORIGIN#https://}
+# BUG FIX (external review, 2026-10-05, OPS-01): the backend service unit
+# was renamed opa-secrets-wizard -> opa-compliance-wizard at 5.20.0; this
+# script hardcoded the OLD name in three places (the main-env restart
+# below, and the final status table), which only works on an install
+# that predates the rename. Detect which one is ACTUALLY installed, same
+# approach as deploy.sh's own OPS-01 fix.
+if systemctl cat opa-secrets-wizard >/dev/null 2>&1; then
+  MAIN_SERVICE=opa-secrets-wizard
+elif systemctl cat opa-compliance-wizard >/dev/null 2>&1; then
+  MAIN_SERVICE=opa-compliance-wizard
+else
+  die "neither opa-secrets-wizard.service nor opa-compliance-wizard.service is installed"
+fi
 [ -f "$APP/server/gate_config.py" ] || die "this checkout has no server/gate_config.py (needs 5.38.0+)"
 [ -f "$MAIN_ENV" ] && [ -f "$MAIN_SITE" ] && [ -f "$MAIN_UNIT" ] || die "main env file, nginx site or gate unit not found"
 systemctl is-active --quiet opa-auth-gate || die "the main gate (opa-auth-gate) is not running; fix that first"
@@ -208,10 +221,10 @@ if grep -q "^EXTRA_ALLOWED_ORIGINS=.*${HOST//./\\.}" "$MAIN_ENV"; then
   ok "already allowed"
 elif grep -q "^EXTRA_ALLOWED_ORIGINS=" "$MAIN_ENV"; then
   sudo sed -i "s#^EXTRA_ALLOWED_ORIGINS=\(.*\)#EXTRA_ALLOWED_ORIGINS=\1,$ORIGIN#" "$MAIN_ENV"
-  sudo systemctl restart opa-secrets-wizard; ok "added; backend restarted"
+  sudo systemctl restart "$MAIN_SERVICE"; ok "added; backend restarted"
 else
   echo "EXTRA_ALLOWED_ORIGINS=$ORIGIN" | sudo tee -a "$MAIN_ENV" >/dev/null
-  sudo systemctl restart opa-secrets-wizard; ok "added; backend restarted"
+  sudo systemctl restart "$MAIN_SERVICE"; ok "added; backend restarted"
 fi
 
 say "7. Start the gate"
@@ -237,7 +250,7 @@ if systemctl is-active --quiet "$UNIT_NAME"; then
   esac
 fi
 [ "$TUNNEL" = 1 ] && { systemctl is-active --quiet cloudflared && ok "cloudflared running" || warn "cloudflared not running"; }
-for s in nginx opa-secrets-wizard opa-auth-gate "$UNIT_NAME" cloudflared; do
+for s in nginx "$MAIN_SERVICE" opa-auth-gate "$UNIT_NAME" cloudflared; do
   printf '   %-24s %s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null || true)"
 done
 echo; echo "Done. Backups: $B"

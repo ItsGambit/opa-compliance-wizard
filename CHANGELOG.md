@@ -2,6 +2,45 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.39.7 — **Fix: unit-name drift (OPS-01), rsync wiping user CSVs (OPS-03), credential-leaking redirects (ENG1-02).**
+Three more findings from the 2026-10-05 external review.
+- **OPS-01.** The backend unit was renamed `opa-secrets-wizard` ->
+  `opa-compliance-wizard` at 5.20.0, but `deploy.sh`/
+  `setup-second-gate.sh` still hardcoded the OLD name unconditionally --
+  correct for an install that predates the rename (this project's own
+  real server), wrong for a fresh install from the shipped
+  `opa-compliance-wizard.service` template, which every restart in both
+  scripts would then silently fail to target. Both scripts now detect
+  which unit is ACTUALLY installed (`systemctl cat`, no side effects)
+  instead of assuming either; `docs/hosting.md`'s sudoers example now
+  grants restart on both names (sudoers itself can't do runtime
+  detection -- it matches the literal command).
+- **OPS-03.** `rsync --delete`'s exclude list only ever covered the one
+  specific CSV name pattern this project's own code generates
+  (`folders_result_*.csv`) -- any OTHER `*.csv` an admin drops into
+  `$APP_DIR` for the Folder Builder's CSV-bar workflow or `/api/csv`'s
+  ingestion route was never excluded, so the next deploy silently wiped
+  it. Now excludes every `*.csv`, with an `--include` for the one
+  tracked repo file (`folders_template.csv`) so it still updates when
+  the repo's own copy changes -- verified live on the real server with a
+  throwaway temp dir (template updated, three different user-CSV shapes
+  all survived).
+- **ENG1-02.** `base_domain`/`okta_url` had no validation at all, and
+  flowed into `OpaClient`/`OktaClient`'s base URL verbatim; `urllib`'s
+  default redirect handling follows ANY redirect -- including
+  cross-host and https->http -- while carrying forward the
+  `Authorization`/`SSWS` header. Confirmed exploitable with a two-local-
+  server PoC: an unguarded request delivered its auth header to a second
+  host after one 302. Fixed with two independent layers: `validate_base_
+  domain`/`validate_okta_url` reject anything that isn't a bare hostname
+  / bare `https://` origin (rejects a path, query, port, or an
+  `@`-userinfo authority like `real-tenant.okta.com@attacker.example.com`)
+  at save time; `_SAFE_OPENER` (a custom `HTTPRedirectHandler`) refuses
+  any redirect that changes host, port, or scheme, as a defense-in-depth
+  backstop even if a bad value somehow reached the HTTP layer anyway.
+  27 new tests (`tests/test_url_redirect_safety.py`), mutation-proven
+  against the exact PoC.
+
 5.39.6 — **Fix: "Assign access" silently replaced a folder's existing rule (UI-01).**
 `AssignAccessDialog` always started from a blank form, and the server
 replaced the matched rule wholesale with whatever that blank form
