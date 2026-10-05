@@ -23,6 +23,8 @@ export function resolveFolderAccess(
           groups: policy.principals.user_groups,
           workloadRoles: policy.principals.workload_roles,
           privileges: rule.privileges,
+          conditions: rule.conditions,
+          targetCount: rule.targets.length,
         })
       }
     }

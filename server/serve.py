@@ -1691,7 +1691,14 @@ class Handler(SimpleHTTPRequestHandler):
                         return self._send_json(400, {"error": "policy_id is required to attach to an existing policy"})
                     current = local_client.get_security_policy(policy_id)
                     current["principals"] = engine.merge_principals(current.get("principals"), group_refs, workload_role_refs)
-                    engine.upsert_folder_rule_in_policy(current, folder_id, folder_name, rule_name, privileges, mfa=mfa)
+                    # UI-01: a rule whose selector already names more than
+                    # just this one folder can't be safely replaced from
+                    # this single-folder form -- refuse rather than
+                    # silently dropping the other folders' access.
+                    try:
+                        engine.upsert_folder_rule_in_policy(current, folder_id, folder_name, rule_name, privileges, mfa=mfa)
+                    except engine.MultiTargetRuleError as exc:
+                        return self._send_json(409, {"error": str(exc)})
                     local_client.update_security_policy(policy_id, current)
                     updated = local_client.get_security_policy(policy_id)
                     self._log_audit_event(actor_email, actor_sub, "policy.update", {

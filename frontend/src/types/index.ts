@@ -762,6 +762,16 @@ export interface FolderAccessEntry {
   groups: NamedRef[]
   workloadRoles: NamedRef[]
   privileges: FolderPolicyRulePrivilege[]
+  // UI-01 (external review, 2026-10-05): lets AssignAccessDialog prefill
+  // from the rule it's about to replace instead of always starting
+  // blank -- see that file's own comment for why a blank-start form was
+  // a security regression (silently dropping an existing MFA condition).
+  conditions: PolicyRuleCondition[]
+  // How many resources (folders) the matched rule's own selector names,
+  // not just this one -- > 1 means a "replace" from this single-folder
+  // form would be destructive to the OTHERS; see
+  // create_secret_folders.MultiTargetRuleError.
+  targetCount: number
 }
 
 // ── Secrets Access Dashboard ──────────────────────────────────────────────

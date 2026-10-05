@@ -136,6 +136,7 @@ export function FolderBuilder() {
           projectId={projectId}
           folderId={assigning.folderId}
           folderName={assigning.folderName}
+          existingAccess={accessByPath.get(assigning.path)}
           onSaved={handleAccessSaved}
         />
       )}

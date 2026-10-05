@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.39.5
+# Version     : 5.39.6
 # =============================================================================
 
 import argparse
@@ -80,7 +80,7 @@ import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.39.5"
+SCRIPT_VERSION = "5.39.6"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -2548,17 +2548,61 @@ def _rule_targets_folder(rule, folder_id):
     return False
 
 
+class MultiTargetRuleError(Exception):
+    """Raised by upsert_folder_rule_in_policy when the matched rule's
+    selector names more than just this one folder -- see that function's
+    docstring (UI-01) for why replacing it outright would be destructive."""
+
+
 def upsert_folder_rule_in_policy(policy, folder_id, folder_name, rule_name, privilege_flags, mfa=None):
     """Mutates and returns policy["rules"]: replaces the rule that already
     targets this exact folder (by secret_folder id), or appends a new one.
     `policy` must be the full object from get_security_policy -- PUT is a
-    full replace (see OpaClient.update_security_policy), never a patch."""
+    full replace (see OpaClient.update_security_policy), never a patch.
+
+    SECURITY/CORRECTNESS FIX (external review, 2026-10-05, UI-01): this
+    used to replace the matched rule WHOLESALE with a brand-new one built
+    from only what the current form submitted -- silently dropping any
+    non-MFA condition the form has no UI for at all (e.g. a gateway or
+    access-request condition), and -- worse -- every OTHER folder the old
+    rule's selector also named, since the new rule's selector only ever
+    lists this one folder. Two independent guards now:
+    1. Raises MultiTargetRuleError, refusing the replace outright, if the
+       matched rule's selector names MORE than this one folder -- there
+       is no safe way to "replace" a shared rule from a single-folder
+       form without silently dropping the other folders' access. The
+       caller (serve.py) turns this into a 409 telling the admin to edit
+       the rule in OPA directly.
+    2. Any condition on the matched rule whose condition_type ISN'T "mfa"
+       is always carried over into the new rule, since this form has no
+       field for those at all -- there's nothing the caller could have
+       meant to replace it WITH. The mfa condition itself is exactly what
+       `mfa` says (a dict to set/replace it, falsy to clear it) -- a real
+       user choice via the dialog's "Require MFA" checkbox, which the
+       frontend now prefills from the existing rule (see
+       AssignAccessDialog.tsx) rather than always defaulting to off, so
+       leaving it unchecked when the rule already had MFA is a genuine
+       "turn it off" action, not an accidental drop."""
+    other_conditions = []
+    for rule in policy.get("rules") or []:
+        if _rule_targets_folder(rule, folder_id):
+            selectors = (rule.get("resource_selector") or {}).get("selectors") or []
+            if len(selectors) > 1:
+                raise MultiTargetRuleError(
+                    f"The matched rule '{rule.get('name')}' targets {len(selectors)} resources, not just "
+                    f"'{folder_name}'. Edit this rule directly in OPA to avoid dropping access to the others."
+                )
+            other_conditions = [c for c in (rule.get("conditions") or []) if c.get("condition_type") != "mfa"]
+            break
+
+    conditions = other_conditions + ([build_mfa_condition(**mfa)] if mfa else [])
+
     new_rule = {
         "name": rule_name,
         "resource_type": "secret_based_resource",
         "resource_selector": build_secret_folder_selector(folder_id, folder_name),
         "privileges": [{"privilege_type": "secret", "privilege_value": build_secret_privilege(privilege_flags)}],
-        "conditions": [build_mfa_condition(**mfa)] if mfa else [],
+        "conditions": conditions,
     }
     rules = policy.setdefault("rules", [])
     for i, rule in enumerate(rules):

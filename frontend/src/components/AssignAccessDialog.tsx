@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { useMutation } from '@tanstack/react-query'
 import { AlertTriangle, Plus, X } from 'lucide-react'
@@ -6,7 +6,7 @@ import { assignFolderPolicy } from '../api/client'
 import { useGroups, useResourceGroupSecurityPolicies, useWorkloadRoles } from '../api/hooks'
 import { useCreateGroup } from '../hooks/useCreateGroup'
 import { toast } from '../hooks/useToast'
-import type { ApiErrorBody, FolderSecurityPolicy, NamedRef } from '../types'
+import type { ApiErrorBody, FolderAccessEntry, FolderSecurityPolicy, NamedRef } from '../types'
 import { GroupCreateForm } from './GroupCreateForm'
 import { Select } from './Select'
 import { ServiceAccountGroupStatus } from './ServiceAccountGroupStatus'
@@ -63,10 +63,18 @@ interface Props {
   projectId: string
   folderId: string
   folderName: string
+  /** UI-01 (external review, 2026-10-05): the rule(s) that ALREADY grant
+   * access to this folder, from FolderBuilder's own accessByPath (built
+   * by utils/folderAccess.resolveFolderAccess) -- lets this dialog
+   * prefill from the rule it's about to replace instead of always
+   * starting blank. Undefined when the folder has no existing rule at
+   * all (a genuine first-time assignment, where a blank form is
+   * correct). */
+  existingAccess?: FolderAccessEntry[]
   onSaved: (policy: FolderSecurityPolicy) => void
 }
 
-export function AssignAccessDialog({ open, onOpenChange, resourceGroupId, projectId, folderId, folderName, onSaved }: Props) {
+export function AssignAccessDialog({ open, onOpenChange, resourceGroupId, projectId, folderId, folderName, existingAccess, onSaved }: Props) {
   const [mode, setMode] = useState<'existing' | 'new'>('existing')
   const [policyId, setPolicyId] = useState<string | undefined>(undefined)
   const [name, setName] = useState('')
@@ -78,6 +86,11 @@ export function AssignAccessDialog({ open, onOpenChange, resourceGroupId, projec
   const [requireMfa, setRequireMfa] = useState(false)
   const [mfaReauthSeconds, setMfaReauthSeconds] = useState(1800)
   const [mfaAcrValues, setMfaAcrValues] = useState('urn:okta:loa:2fa:any')
+  // Tracks which policyId the form fields were last prefilled FROM, so
+  // the prefill effect below only fires once per policy selection (not
+  // on every keystroke after the user starts editing the prefilled
+  // values).
+  const [prefilledForPolicyId, setPrefilledForPolicyId] = useState<string | undefined>(undefined)
 
   const { data: policies } = useResourceGroupSecurityPolicies(resourceGroupId, open)
   const { data: allGroups } = useGroups(open)
@@ -85,6 +98,33 @@ export function AssignAccessDialog({ open, onOpenChange, resourceGroupId, projec
   const groups = (allGroups ?? []).filter(g => g.name !== 'everyone')
 
   const selectedPolicy = policies?.find(p => p.id === policyId)
+  const existingEntryForSelectedPolicy = existingAccess?.find(e => e.policyId === policyId)
+
+  // Prefill privileges/MFA/groups/workload-roles from the rule this
+  // save is actually about to replace, the moment the admin picks a
+  // policy that already has one -- a blank-start form is what let
+  // AssignAccessDialog silently drop an existing MFA condition (and
+  // every unticked privilege) before this fix. Runs once per policy
+  // selection, not on every render, so it doesn't fight the admin's own
+  // edits afterward.
+  useEffect(() => {
+    if (mode !== 'existing' || !existingEntryForSelectedPolicy || prefilledForPolicyId === policyId) return
+    setPrefilledForPolicyId(policyId)
+    const entry = existingEntryForSelectedPolicy
+    setGroupIds(new Set(entry.groups.map(g => g.id)))
+    setWorkloadRoleIds(new Set(entry.workloadRoles.map(w => w.id)))
+    const privilegeFlags: Record<string, boolean> = {}
+    for (const p of entry.privileges) for (const flag of p.flags) privilegeFlags[flag] = true
+    setPrivileges(privilegeFlags)
+    const mfaCondition = entry.conditions.find(c => c.condition_type === 'mfa')
+    setRequireMfa(!!mfaCondition)
+    if (mfaCondition) {
+      const value = mfaCondition.condition_value as { re_auth_frequency_in_seconds?: number; acr_values?: string }
+      if (typeof value.re_auth_frequency_in_seconds === 'number') setMfaReauthSeconds(value.re_auth_frequency_in_seconds)
+      if (typeof value.acr_values === 'string') setMfaAcrValues(value.acr_values)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, policyId, existingEntryForSelectedPolicy])
 
   const toggleGroup = (id: string) =>
     setGroupIds(prev => {
@@ -149,10 +189,14 @@ export function AssignAccessDialog({ open, onOpenChange, resourceGroupId, projec
       toast({ title: 'Could not save access', description: err.body?.error ?? err.message, variant: 'error' }),
   })
 
+  // UI-01: the server refuses this exact case (MultiTargetRuleError) --
+  // blocking Save here just saves the admin a round trip to find out.
+  const targetsSharedRule = !!existingEntryForSelectedPolicy && existingEntryForSelectedPolicy.targetCount > 1
   const canSave =
     (mode === 'existing' ? !!policyId : name.trim().length > 0) &&
     (groupIds.size > 0 || workloadRoleIds.size > 0) &&
-    Object.values(privileges).some(Boolean)
+    Object.values(privileges).some(Boolean) &&
+    !targetsSharedRule
 
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
@@ -203,6 +247,30 @@ export function AssignAccessDialog({ open, onOpenChange, resourceGroupId, projec
                       ))}
                     </div>
                   </div>
+                )}
+                {/* UI-01: this save REPLACES the rule below -- the form
+                    above is now prefilled from it, but the admin should
+                    still see explicitly what's about to be overwritten,
+                    especially for a rule whose own name differs from
+                    what this dialog would otherwise generate. */}
+                {existingEntryForSelectedPolicy && (
+                  existingEntryForSelectedPolicy.targetCount > 1 ? (
+                    <div className="flex items-start gap-2 text-xs text-loss bg-loss/10 border border-loss/40 rounded-md p-2 mt-1">
+                      <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+                      <span>
+                        The matched rule &ldquo;{existingEntryForSelectedPolicy.ruleName}&rdquo; also covers{' '}
+                        {existingEntryForSelectedPolicy.targetCount - 1} other folder
+                        {existingEntryForSelectedPolicy.targetCount - 1 === 1 ? '' : 's'}. Saving here would be
+                        refused by the server — edit this rule directly in OPA instead to avoid dropping access to
+                        the others.
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="text-xs text-text-faint mt-1">
+                      This will replace the existing rule &ldquo;{existingEntryForSelectedPolicy.ruleName}
+                      &rdquo; — fields above are prefilled from it.
+                    </div>
+                  )
                 )}
               </div>
             ) : (

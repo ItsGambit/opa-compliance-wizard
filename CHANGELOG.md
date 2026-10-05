@@ -2,6 +2,31 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.39.6 — **Fix: "Assign access" silently replaced a folder's existing rule (UI-01).**
+`AssignAccessDialog` always started from a blank form, and the server
+replaced the matched rule wholesale with whatever that blank form
+submitted -- silently dropping an existing MFA condition, any other
+condition type the form has no field for at all, and (worst case) every
+OTHER folder a shared rule's selector also named, since the replacement
+rule's own selector only ever lists the one folder being assigned.
+- `create_secret_folders.upsert_folder_rule_in_policy` now raises
+  `MultiTargetRuleError` -- refusing the replace outright -- when the
+  matched rule's selector names more than this one folder;
+  `server/serve.py` turns that into a `409`. Any non-mfa condition on the
+  matched rule is now always carried over (nothing the form could have
+  meant to replace it with); the mfa condition is exactly what the
+  caller's `mfa` argument says.
+- `AssignAccessDialog.tsx` now prefills privileges/groups/workload-roles/
+  MFA from the rule it's about to replace the moment an existing policy
+  is selected, and shows "this will replace the existing rule '...'" (or,
+  for a shared rule, a blocking warning instead of Save) -- a real user
+  choice to uncheck "Require MFA" is now an intentional "turn it off,"
+  not an accidental default.
+- 7 new backend tests (`tests/test_folder_access_assignment.py`),
+  mutation-proven against the two real failure modes the review
+  described. Frontend build/vitest/tsc all green (same 10 pre-existing
+  type errors as OPS-04, unaffected).
+
 5.39.5 — **Sanitize identifying details from comments, docs and templates (review section 10).**
 No behavior change -- comments, docs and systemd unit templates only.
 - Replaced a real email address in two code comments with a generic
