@@ -9,12 +9,12 @@ from server.gate_config import DEFAULT_SESSION_KEY_PATH, okta_endpoints, session
 
 
 def test_default_authorization_server_is_unchanged():
-    e = okta_endpoints("https://patlab.oktapreview.com")
-    assert e["issuer"] == "https://patlab.oktapreview.com/oauth2/default"
-    assert e["authorize"] == "https://patlab.oktapreview.com/oauth2/default/v1/authorize"
-    assert e["token"] == "https://patlab.oktapreview.com/oauth2/default/v1/token"
-    assert e["jwks"] == "https://patlab.oktapreview.com/oauth2/default/v1/keys"
-    assert e["logout"] == "https://patlab.oktapreview.com/oauth2/default/v1/logout"
+    e = okta_endpoints("https://example.oktapreview.com")
+    assert e["issuer"] == "https://example.oktapreview.com/oauth2/default"
+    assert e["authorize"] == "https://example.oktapreview.com/oauth2/default/v1/authorize"
+    assert e["token"] == "https://example.oktapreview.com/oauth2/default/v1/token"
+    assert e["jwks"] == "https://example.oktapreview.com/oauth2/default/v1/keys"
+    assert e["logout"] == "https://example.oktapreview.com/oauth2/default/v1/logout"
 
 
 def test_org_authorization_server_uses_the_org_url_as_issuer():
@@ -43,7 +43,7 @@ def test_session_key_path_defaults_to_the_existing_file():
 
 
 def test_session_key_path_is_configurable_per_gate():
-    assert session_key_path({"OPA_SESSION_KEY_PATH": "/etc/opa-gate-ruchir.key"}) == Path("/etc/opa-gate-ruchir.key")
+    assert session_key_path({"OPA_SESSION_KEY_PATH": "/etc/opa-gate-second.key"}) == Path("/etc/opa-gate-second.key")
 
 
 def test_session_key_path_must_be_absolute():

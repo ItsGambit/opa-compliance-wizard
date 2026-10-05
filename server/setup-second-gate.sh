@@ -5,7 +5,7 @@
 #
 # Run ON THE SERVER as the app user (not root, not with sudo); it uses sudo itself:
 #   bash server/setup-second-gate.sh \
-#     --name ruchir --org-url https://login.example.com --auth-server org \
+#     --name second --org-url https://login.example.com --auth-server org \
 #     --client-id 0oa... --admin-group 00g... --origin https://opa.example.com \
 #     [--port 8768] [--listen 127.0.0.1:8080] [--env-name <keyring namespace>] [--tunnel]
 #
