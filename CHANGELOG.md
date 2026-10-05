@@ -2,6 +2,32 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.39.10 — **Add missing report/query layer tests (TEST-05).**
+No production code change -- tests only. `query_events`, `count_events`,
+`run_report`, `resource_history` and `_normalize_until` had zero tests
+before this file. 8 new tests (`tests/test_report_queries.py`), each
+mutation-proven against the exact mutations the review's own harness
+found surviving:
+- Cross-tenant scoping on `query_events`/`count_events`/`run_report`/
+  `resource_history` -- reproduced the review's M47 (environment_id
+  scoping removed from the WHERE clause) and confirmed a report for one
+  environment leaked another's rows before reverting.
+- `_insert_rows`' dedup-by-uuid is `INSERT OR IGNORE`, not `OR REPLACE`
+  -- reproduced M44 and confirmed a re-ingested uuid silently overwrote
+  the original stored row before reverting.
+- `ingestion_scope="curated"` only ever writes curated event types --
+  reproduced M45 (filter removed) and confirmed a non-curated event got
+  written anyway before reverting.
+- `_normalize_until`'s day-inclusion fix: a bare `to:` date now has a
+  real test asserting it includes that day's events through 23:59:59,
+  not just up to the bare date string's own lexicographic cutoff.
+
+(`prune_events`' FOREIGN KEY fix and `run_report`/`resource_history`'s
+truncation reporting -- the rest of TEST-05's named gap -- were already
+covered by `tests/test_prune_events.py` and
+`tests/test_report_truncation.py`, added earlier in this same review
+pass.)
+
 5.39.9 — **Fix: the Access Explorer owner-isolation test was tautological (TEST-02).**
 No production code change -- tests only. `test_access_and_sync_jobs_
 keyed_by_full_environment_id_not_bare_name` populated `server.serve.
