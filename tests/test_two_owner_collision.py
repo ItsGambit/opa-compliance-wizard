@@ -182,10 +182,7 @@ def test_shared_environment_is_visible_but_private_one_is_not(tmp_schema, tmp_en
 
 # ---------------------------------------------------------------------------
 # 3. Access Explorer / sync job isolation (keyed by the real environment_id,
-#    never a bare display name). Two arbitrary ids stand in for two real
-#    environments here -- this test is about id-collision isolation itself,
-#    not about any particular stored environment, so there's no need to
-#    seed real ones via upsert_environment.
+#    never a bare display name).
 # ---------------------------------------------------------------------------
 def test_access_and_sync_jobs_keyed_by_full_environment_id_not_bare_name():
     import uuid
@@ -204,6 +201,102 @@ def test_access_and_sync_jobs_keyed_by_full_environment_id_not_bare_name():
 
     assert job_for_a is not None and job_for_a["result"] == "A's model"
     assert job_for_b is None  # B's job entry must not exist/leak A's result
+
+
+# ---------------------------------------------------------------------------
+# 3b. TEST-02 (external review, 2026-10-05): the test above is
+#     tautological -- it populates serve._access_jobs itself and asserts
+#     on a plain dict's own behavior, never calling the real
+#     /api/access/bootstrap/result route or _run_access_job. It passes
+#     whether or not the ROUTE itself is actually keyed correctly.
+#     Mutation M25 (rewriting the route to
+#     `next(iter(_access_jobs.values()), None)` -- the real,
+#     confirmed-exploitable cross-tenant leak this project's own history
+#     names, see serve.py:276-287's comment) SURVIVED against the test
+#     above. This test drives the SAME scenario through the real HTTP
+#     route with two owners each having their own active session, so a
+#     revert back to that global-lookup shape fails HERE.
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def live_server_with_sessions(tmp_schema, tmp_environments_file, fake_keyring, tmp_audit_log, monkeypatch):
+    """Same as live_server (section 4 below) but also lets the test seed
+    _sessions directly -- activate_environment itself requires a live
+    OPA/Okta connection (OpaClient.__init__ fetches a real bearer token),
+    which is out of scope for an owner-isolation test; _sessions'
+    structure is this project's own stable internal contract for "which
+    env_id is this owner's active one," not an implementation detail this
+    test invents."""
+    import server.serve as serve
+
+    monkeypatch.setattr(serve, "NGINX_PROXY_SECRET", "test-proxy-secret")
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    server_instance = serve.StrictBindHTTPServer(("127.0.0.1", port), serve.Handler)
+    thread = threading.Thread(target=server_instance.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{port}"
+
+    for _ in range(50):
+        try:
+            requests.get(base_url + "/api/environments", timeout=0.5,
+                         headers={"X-Nginx-Proxy-Secret": "test-proxy-secret"})
+            break
+        except requests.exceptions.ConnectionError:
+            time.sleep(0.1)
+
+    yield base_url, serve
+    server_instance.shutdown()
+    server_instance.server_close()
+
+
+def _user_headers(sub):
+    return {"X-Nginx-Proxy-Secret": "test-proxy-secret", "X-Auth-Sub": sub, "X-Auth-Is-Admin": "false"}
+
+
+def test_bootstrap_result_route_never_leaks_another_owners_tenant_model(live_server_with_sessions):
+    base_url, serve = live_server_with_sessions
+    id_a, id_b = "env-id-owner-a", "env-id-owner-b"
+
+    with serve._sessions_lock:
+        serve._sessions["00uOWNERA"] = {"client": None, "okta_client": None, "env_name": "dev", "env_id": id_a}
+        serve._sessions["00uOWNERB"] = {"client": None, "okta_client": None, "env_name": "dev", "env_id": id_b}
+    with serve._access_jobs_lock:
+        serve._access_jobs[id_a] = {"status": "done", "steps": [], "error": None, "result": {"tenant": "A's model"}}
+        # B's own job is deliberately NOT "done" yet -- confirms the route
+        # doesn't just return *some* done job, it returns B's own.
+
+    # Owner B polls the real route. The confirmed-exploitable regression
+    # this guards against: a global/unscoped lookup would return A's
+    # result here (the only "done" job in the dict).
+    resp = requests.get(f"{base_url}/api/access/bootstrap/result", headers=_user_headers("00uOWNERB"), timeout=5)
+    assert resp.status_code == 409  # B's own job isn't done -- never A's result
+    assert resp.json()["error"] == "Job is not done yet."
+
+    # Owner A polls the same route and gets their OWN result.
+    resp = requests.get(f"{base_url}/api/access/bootstrap/result", headers=_user_headers("00uOWNERA"), timeout=5)
+    assert resp.status_code == 200
+    assert resp.json() == {"tenant": "A's model"}
+
+
+def test_bootstrap_status_route_never_leaks_another_owners_steps(live_server_with_sessions):
+    base_url, serve = live_server_with_sessions
+    id_a, id_b = "env-id-owner-a", "env-id-owner-b"
+
+    with serve._sessions_lock:
+        serve._sessions["00uOWNERA"] = {"client": None, "okta_client": None, "env_name": "dev", "env_id": id_a}
+        serve._sessions["00uOWNERB"] = {"client": None, "okta_client": None, "env_name": "dev", "env_id": id_b}
+    with serve._access_jobs_lock:
+        serve._access_jobs[id_a] = {"status": "running", "steps": [{"key": "fetch_a", "status": "progress"}], "error": None, "result": None}
+
+    resp = requests.get(f"{base_url}/api/access/bootstrap/status", headers=_user_headers("00uOWNERB"), timeout=5)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "idle"  # B has no job of their own -- never A's "running"
+    assert body["steps"] == []
 
 
 # ---------------------------------------------------------------------------

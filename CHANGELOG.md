@@ -2,6 +2,20 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.39.9 — **Fix: the Access Explorer owner-isolation test was tautological (TEST-02).**
+No production code change -- tests only. `test_access_and_sync_jobs_
+keyed_by_full_environment_id_not_bare_name` populated `server.serve.
+_access_jobs` itself and asserted on a plain dict's own behavior,
+never calling the real `/api/access/bootstrap/result` route or
+`_run_access_job`. Mutation M25 (reverting the route to
+`next(iter(_access_jobs.values()), None)` -- the original, confirmed-
+exploitable cross-tenant leak this project's own history names)
+survived against it. Two new tests drive the same scenario through the
+real HTTP route with two owners each holding their own session:
+reproduced the M25 mutation locally and confirmed the new tests fail
+against it (owner B received owner A's leaked tenant model with a 200)
+before reverting.
+
 5.39.8 — **Fix: activating a shared environment failed after a successful auth (ENG1-03); non-deterministic name collision across shared environments (ENG1-04).**
 - **ENG1-03.** `server/serve.py`'s `activate_environment` calls
   `get_environment_credentials` first (resolves via
