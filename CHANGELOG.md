@@ -2,6 +2,18 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.38.4 — **Setup screen offers environments already available to you.**
+A new identity (e.g. someone signing in through a second Okta org's gate)
+has no active environment, so the app showed only the "Connect to Okta
+Privileged Access" form, with no way to pick an environment already shared
+with them (the environment picker lives in the gear menu, which only appears
+once configured). The setup screen now lists the caller's own and shared
+environments ("Use this environment" → the existing activate endpoint) above
+the add-new form. `frontend/src/utils/usableEnvironments.ts` decides what's
+listed: own + shared only (an admin's listing includes other owners' private
+environments, which activation can't use), one entry per name preferring the
+caller's own (activation is by name and the backend prefers it too). 3 tests.
+
 5.38.3 — **Per-gate access control for an additional Okta org.**
 Both gates read `access_control.json` (admin group, user group,
 restrict_login), which holds the MAIN org's group IDs, so the second org's
