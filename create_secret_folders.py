@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.39.7
+# Version     : 5.39.8
 # =============================================================================
 
 import argparse
@@ -80,7 +80,7 @@ import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.39.7"
+SCRIPT_VERSION = "5.39.8"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -560,13 +560,34 @@ def list_environments_for(owner):
     explicitly here via two separate queries, not left implicit.)
 
     Each returned `meta` carries its real `environment_id` -- see
-    _row_to_environment_meta."""
+    _row_to_environment_meta.
+
+    PARTIAL FIX (external review, 2026-10-05, ENG1-04): when TWO
+    DIFFERENT OWNERS each share an environment with the SAME display
+    name, both rows match the first query below, and whichever one the
+    dict comprehension assigns LAST wins -- SQLite's row order for a
+    SELECT with no ORDER BY is not guaranteed, so which shared
+    environment (and whose keyring credentials) a third party's lookup
+    actually resolves to was effectively arbitrary. `ORDER BY created_at,
+    environment_id` makes that tie-break deterministic and REPEATABLE
+    (the same two rows always resolve the same way, call after call,
+    rather than possibly flipping) -- it does not resolve the deeper
+    ambiguity (two genuinely different shared environments still can't
+    both be addressed by this flat {name: meta} shape; see
+    list_all_environments's own id-keyed alternative), which needs
+    environment_id-based addressing throughout the API, a larger change
+    tracked separately."""
     import audit_store
     conn = audit_store._get_connection()
     visible = {}
-    for row in conn.execute("SELECT * FROM app_environments WHERE shared = 1 AND owner_id IS NOT ?", (owner,)):
+    for row in conn.execute(
+        "SELECT * FROM app_environments WHERE shared = 1 AND owner_id IS NOT ? ORDER BY created_at, environment_id",
+        (owner,),
+    ):
         visible[row["display_name"]] = _row_to_environment_meta(row)
-    for row in conn.execute("SELECT * FROM app_environments WHERE owner_id IS ?", (owner,)):
+    for row in conn.execute(
+        "SELECT * FROM app_environments WHERE owner_id IS ? ORDER BY created_at, environment_id", (owner,)
+    ):
         visible[row["display_name"]] = _row_to_environment_meta(row)
     return visible
 
@@ -622,12 +643,28 @@ def set_active_environment(owner, name):
     needing to remember to clean it up by hand (which it still does
     below, for the SEPARATE case of an admin deleting a different
     owner's environment -- CASCADE only helps the CALLING owner's own
-    pointer here, see delete_environment's docstring)."""
+    pointer here, see delete_environment's docstring).
+
+    BUG FIX (external review, 2026-10-05, ENG1-03): this used to resolve
+    `name` via _find_own_environment_sql -- the CALLER's own (owner,
+    name) row only -- while get_environment_credentials (called first by
+    server/serve.py's activate_environment, which already set up a live
+    OpaClient/OktaClient and written them into the owner's session slot
+    before this function ever runs) resolves via list_environments_for,
+    which ALSO includes anything shared=True by a different owner.
+    Activating a shared environment therefore authenticated successfully
+    and populated the session, then raised KeyError here -- the request
+    failed, but left the owner's session pointed at a tenant with no
+    matching "active" pointer. Now resolves the same way
+    get_environment_credentials does, so a successful activation can
+    never fail at this specific step for an environment that's actually
+    visible to the caller."""
     import audit_store
     conn = audit_store._get_connection()
-    environment_id, _ = _find_own_environment_sql(conn, owner, name)
-    if environment_id is None:
+    meta = list_environments_for(owner).get(name)
+    if meta is None:
         raise KeyError(f"No saved environment named '{name}' owned by this user.")
+    environment_id = meta["environment_id"]
     with audit_store._db_lock:
         conn.execute(
             "INSERT OR REPLACE INTO active_environments (owner_key, environment_id) VALUES (?, ?)",

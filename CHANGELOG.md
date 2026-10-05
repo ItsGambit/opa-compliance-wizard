@@ -2,6 +2,34 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.39.8 — **Fix: activating a shared environment failed after a successful auth (ENG1-03); non-deterministic name collision across shared environments (ENG1-04).**
+- **ENG1-03.** `server/serve.py`'s `activate_environment` calls
+  `get_environment_credentials` first (resolves via
+  `list_environments_for` -- own + `shared=True`), authenticates to
+  OPA/Okta, writes the live client into the caller's session, THEN calls
+  `set_active_environment` -- which resolved by a narrower rule
+  (`_find_own_environment_sql`, the caller's own row only) and raised
+  `KeyError` for anything only visible because it's shared. A request to
+  activate a real, visible, shared environment failed outright even
+  though the harder half of the work (a live auth round trip) had
+  already succeeded. `set_active_environment` now resolves through the
+  same `list_environments_for` visibility rule.
+- **ENG1-04.** `list_environments_for` collapses every visible
+  environment into a flat `{name: meta}` dict; when two DIFFERENT owners
+  each share an environment under the SAME display name, both rows
+  matched the "shared" query with no `ORDER BY`, so which one a third
+  party's lookup resolved to (and whose credentials) was effectively
+  arbitrary -- SQLite doesn't guarantee row order for an unordered
+  `SELECT`. Added `ORDER BY created_at, environment_id` so the same
+  collision always resolves the same way, call after call. This makes
+  the collision deterministic, not ambiguous between different same-name
+  shared environments entirely -- that needs `environment_id`-based
+  addressing throughout the API/frontend, tracked as a longer-term item.
+- 7 new tests (`tests/test_activate_shared_environment.py`,
+  `tests/test_shared_environment_name_collision.py`), ENG1-03's
+  reproduced and mutation-proven against the review's exact described
+  failure.
+
 5.39.7 — **Fix: unit-name drift (OPS-01), rsync wiping user CSVs (OPS-03), credential-leaking redirects (ENG1-02).**
 Three more findings from the 2026-10-05 external review.
 - **OPS-01.** The backend unit was renamed `opa-secrets-wizard` ->
