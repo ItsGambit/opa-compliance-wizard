@@ -468,3 +468,18 @@ backs up first, and is safe to re-run. What it creates:
 
 `server/deploy.sh` restarts every enabled `opa-auth-gate-*` unit after the
 main gate, so deploys keep both gates on the same code.
+
+## Host status for monitoring (optional, 5.39.0+)
+
+`server/host_status.py` reports the server's health as JSON at `GET /__status`, on
+`127.0.0.1:8790` only: OS, uptime, load, memory, disk, the state of the systemd services you list,
+pending apt updates (security counted separately), reboot-required, the app's version and an
+overall `state` (`ok` / `warn` / `down`). It holds no secrets and takes no input.
+
+    bash server/setup-host-status.sh --services "nginx opa-secrets-wizard opa-auth-gate cloudflared"
+
+Publish it only behind an access gate. With a Cloudflare Tunnel, add an ingress rule for your
+hostname with path `^/__status$` → `http://127.0.0.1:8790` **above** the hostname's main rule, with
+the same `originRequest.access` settings, so Cloudflare Access protects it like the rest of the
+site; a monitor can then read it with an Access service token. `server/deploy.sh` restarts the
+service on every deploy once it's installed.

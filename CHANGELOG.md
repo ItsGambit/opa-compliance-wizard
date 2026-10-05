@@ -2,6 +2,23 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.39.0 — **Optional read-only host status for monitoring.**
+`server/host_status.py` (standard library only) answers `GET /__status` on
+127.0.0.1 with OS, uptime, load, memory, root-disk use, the state of a
+configured list of systemd services, pending apt updates (security ones
+counted separately), whether a reboot is required, this app's version, and
+an overall `state` (down if a listed service isn't active; warn for a
+pending reboot, security updates, or disk/memory over 90%). No secrets, no
+input beyond the path. It's meant to be published only behind an access
+gate (e.g. a Cloudflare Tunnel path rule protected by Cloudflare Access).
+- **`server/setup-host-status.sh --services "..."`** installs unit
+  `opa-host-status` (app user, `NoNewPrivileges`, no capabilities,
+  `ProtectSystem=strict`, `ProtectHome=read-only`, 64 MB) and a sudoers
+  line for deploys; the unit text is generated and validated by
+  `host_status.build_unit` (service names can't start with `-`).
+- **`deploy.sh`** restarts it when installed.
+- 20 tests (`tests/test_host_status.py`).
+
 5.38.4 — **Setup screen offers environments already available to you.**
 A new identity (e.g. someone signing in through a second Okta org's gate)
 has no active environment, so the app showed only the "Connect to Okta

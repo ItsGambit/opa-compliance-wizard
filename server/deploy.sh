@@ -537,6 +537,15 @@ for _unit in $(systemctl list-unit-files 'opa-auth-gate-*.service' --no-legend 2
   systemctl is-active --quiet "$_unit" || { echo "ERROR: $_unit did not come back up" >&2; exit 1; }
 done
 
+# 5.39.0: the optional host status service (server/setup-host-status.sh) runs host_status.py from
+# this checkout; restart it when installed so it serves the new code. Same fail-fast rule.
+if systemctl is-enabled --quiet opa-host-status 2>/dev/null; then
+  echo "==> Restarting opa-host-status"
+  sudo -n systemctl restart opa-host-status
+  sleep 1
+  systemctl is-active --quiet opa-host-status || { echo "ERROR: opa-host-status did not come back up" >&2; exit 1; }
+fi
+
 echo "==> Done. Deployed version: $DEPLOY_VERSION"
 echo "    Commit: ${DEPLOY_COMMIT:-unknown}"
 
