@@ -165,6 +165,7 @@ import hmac
 import http.cookies
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -253,12 +254,25 @@ POST_LOGOUT_REDIRECT_URI = f"{DASHBOARD_ORIGIN}/login"
 # One key per gate instance (OPA_SESSION_KEY_PATH): a second gate for another Okta org must not accept this
 # gate's session cookies. Unset = the long-standing path.
 SESSION_KEY_PATH = session_key_path(os.environ)
+# GATE-03: real action_ids are minted server-side by audit_store's
+# create_pending_admin_action via secrets.token_urlsafe(32), which only
+# ever produces URL-safe base64 characters (43 chars for 32 random
+# bytes, no padding). Anything outside this shape -- CRLF, non-ASCII, a
+# client trying to smuggle an arbitrary value through -- is rejected
+# before it enters a signed cookie or a response header.
+_ACTION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}")
 SESSION_COOKIE = "opa_wizard_session"
 FLOW_COOKIE = "opa_wizard_flow"
 STEPUP_COOKIE = "opa_wizard_stepup"
 SESSION_TTL_SECONDS = 12 * 60 * 60  # 12h -- re-login once a workday
 FLOW_TTL_SECONDS = 10 * 60  # 10 min is generous for "redirect to Okta and log in"
 STEPUP_TTL_SECONDS = 120  # short-lived on purpose -- proof of a JUST-completed MFA challenge, not a second session
+# GATE-02: how stale the ID token's auth_time may be and still count as
+# "just completed a fresh challenge". Generous enough to cover the full
+# step-up redirect round trip (Okta login page + MFA prompt + redirect
+# back) plus clock skew between this process and Okta, not an attempt to
+# pin the exact round-trip latency.
+STEPUP_MAX_AUTH_AGE_SECONDS = 300
 # Generous window for _query_mfa_log_event's actor+timing correlation,
 # used by the async Audit-Log-page backfill path (_mfa_log_lookup) --
 # covers real-world System Log ingest lag plus clock skew between this
@@ -469,7 +483,7 @@ def _sign_payload(payload: dict, ttl_seconds: int) -> str:
     return f"{body}.{mac}"
 
 
-def _verify_signed_payload(token: str) -> dict | None:
+def _verify_signed_payload(token: str, expected_typ: str | None = None) -> dict | None:
     try:
         body, mac = token.split(".", 1)
     except ValueError:
@@ -482,6 +496,19 @@ def _verify_signed_payload(token: str) -> dict | None:
     except (ValueError, json.JSONDecodeError):
         return None
     if time.time() > payload.get("exp", 0):
+        return None
+    # SECURITY FIX (external review, 2026-10-05, GATE-01): all three
+    # cookie kinds (flow/session/step-up) used to share one generic
+    # sign/verify pair with no "what kind of token is this" marker, so
+    # the flow cookie /login hands to ANY unauthenticated visitor verified
+    # equally well as a session cookie or a step-up cookie -- a pre-auth
+    # bypass confirmed exploitable end-to-end in production (replayed as
+    # opa_wizard_session, it reached serve.py's admin-exempt `__local__`
+    # owner; replayed as both session AND step-up, it also passed
+    # require_stepup with an attacker-chosen action_id). Every payload
+    # minted below now carries a "typ" claim, and a caller that knows
+    # which cookie slot it's checking must say which `typ` it expects.
+    if expected_typ is not None and payload.get("typ") != expected_typ:
         return None
     return payload
 
@@ -570,7 +597,22 @@ class Handler(BaseHTTPRequestHandler):
             # as None end-to-end, never a hard requirement at this
             # layer -- the actual enforcement that a save needs a valid,
             # unconsumed action_id lives in serve.py/audit_store.py).
-            self._start_login(purpose="step_up", action_id=query.get("action_id", [None])[0])
+            action_id = query.get("action_id", [None])[0]
+            # GATE-03 (external review, 2026-10-05): action_id used to be
+            # written straight into a response header further down the
+            # chain (/verify's X-Auth-Action-Id) with no validation at
+            # all -- a %0d%0a-containing value could inject an arbitrary
+            # extra header (e.g. a second X-Auth-Is-Admin: true) into the
+            # auth_request response nginx reads. serve.py's own
+            # create_pending_admin_action always mints a real id via
+            # secrets.token_urlsafe(32), so this regex is simply what a
+            # genuine id already looks like -- anything else is rejected
+            # before it can ride through the signed flow/step-up cookies
+            # at all.
+            if action_id is not None and not _ACTION_ID_PATTERN.fullmatch(action_id):
+                self._respond_text(400, "Invalid action_id.")
+                return
+            self._start_login(purpose="step_up", action_id=action_id)
         elif path == "/authorization-code/callback":
             self._handle_callback(query)
         elif path == "/verify":
@@ -603,7 +645,8 @@ class Handler(BaseHTTPRequestHandler):
         verifier, challenge = _pkce_pair()
         state = base64.urlsafe_b64encode(os.urandom(16)).rstrip(b"=").decode()
         flow_token = _sign_payload(
-            {"state": state, "verifier": verifier, "purpose": purpose, "action_id": action_id}, FLOW_TTL_SECONDS
+            {"typ": "flow", "state": state, "verifier": verifier, "purpose": purpose, "action_id": action_id},
+            FLOW_TTL_SECONDS,
         )
 
         params = {
@@ -634,7 +677,7 @@ class Handler(BaseHTTPRequestHandler):
         code = query.get("code", [None])[0]
         returned_state = query.get("state", [None])[0]
         flow_token = _get_cookie(self.headers, FLOW_COOKIE)
-        flow = _verify_signed_payload(flow_token) if flow_token else None
+        flow = _verify_signed_payload(flow_token, "flow") if flow_token else None
 
         if not code or not returned_state or not flow or flow.get("state") != returned_state:
             self._respond_text(400, "Invalid or expired login attempt -- please try logging in again.")
@@ -673,8 +716,28 @@ class Handler(BaseHTTPRequestHandler):
             # needs to block this redirect. See the Audit Log page's
             # Refresh button (backfill_mfa_log_events) for how that
             # corroboration can still be filled in later, asynchronously.
+            # GATE-02 (external review, 2026-10-05): a session cookie
+            # used to be accepted anywhere a step-up cookie was expected
+            # (same root cause as GATE-01 -- no "typ" marker), and even on
+            # a REAL step-up callback this code never checked whether
+            # Okta actually prompted for a fresh MFA challenge before
+            # returning: max_age=0 + acr_values are a REQUEST, not a
+            # guarantee, and the OIDC spec requires the client to verify
+            # auth_time when it sent max_age. A stale auth_time (an
+            # existing Okta SSO session silently satisfying this without
+            # any prompt) now refuses the step-up cookie outright --
+            # small clock-skew allowance, not a hard "must be instant"
+            # check, since the Okta round trip itself takes a few seconds.
+            auth_time = claims.get("auth_time")
+            if not isinstance(auth_time, (int, float)) or time.time() - auth_time > STEPUP_MAX_AUTH_AGE_SECONDS:
+                self._respond_text(
+                    401,
+                    "Step-up verification failed: Okta did not report a fresh authentication. "
+                    "Please try again.",
+                )
+                return
             stepup_token = _sign_payload(
-                {"sub": claims["sub"], "action_id": flow.get("action_id")}, STEPUP_TTL_SECONDS
+                {"typ": "stepup", "sub": claims["sub"], "action_id": flow.get("action_id")}, STEPUP_TTL_SECONDS
             )
             self.send_response(302)
             self.send_header("Set-Cookie", _cookie_header(STEPUP_COOKIE, stepup_token, max_age=STEPUP_TTL_SECONDS))
@@ -704,7 +767,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         session_token = _sign_payload(
-            {"sub": claims["sub"], "email": claims.get("email"), "id_token": tokens["id_token"], "is_admin": is_admin},
+            {"typ": "session", "sub": claims["sub"], "email": claims.get("email"),
+             "id_token": tokens["id_token"], "is_admin": is_admin},
             SESSION_TTL_SECONDS,
         )
 
@@ -716,8 +780,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _verify_session(self, require_stepup=False):
         token = _get_cookie(self.headers, SESSION_COOKIE)
-        session = _verify_signed_payload(token) if token else None
-        if not session:
+        session = _verify_signed_payload(token, "session") if token else None
+        # GATE-01: require a non-empty `sub` as well as a valid
+        # signature/type. An empty/missing sub is exactly what the
+        # pre-auth bypass produced (the gate would otherwise emit
+        # X-Auth-Sub: "", which serve.py's `headers.get("X-Auth-Sub") or
+        # LOCAL_OWNER_KEY_HEADER` maps straight to the privileged
+        # `__local__` owner) -- belt-and-suspenders with the SRV-01 fix
+        # on the serve.py side.
+        if not session or not session.get("sub"):
             self.send_response(401)
             self.end_headers()
             return
@@ -725,13 +796,13 @@ class Handler(BaseHTTPRequestHandler):
         action_id = None
         if require_stepup:
             stepup_token = _get_cookie(self.headers, STEPUP_COOKIE)
-            stepup = _verify_signed_payload(stepup_token) if stepup_token else None
+            stepup = _verify_signed_payload(stepup_token, "stepup") if stepup_token else None
             # sub must match the CURRENT session's sub -- otherwise a
             # step-up cookie left over from a previous user on a shared
             # machine/browser profile could authorize a save on behalf of
             # whoever is logged in now. A mismatch or missing/expired
             # step-up cookie is treated identically to no step-up at all.
-            if not stepup or stepup.get("sub") != session.get("sub"):
+            if not stepup or not stepup.get("sub") or stepup.get("sub") != session.get("sub"):
                 self.send_response(401)
                 self.end_headers()
                 return
@@ -816,7 +887,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _logout(self):
         token = _get_cookie(self.headers, SESSION_COOKIE)
-        session = _verify_signed_payload(token) if token else None
+        session = _verify_signed_payload(token, "session") if token else None
         id_token = session.get("id_token") if session else None
 
         clear_header = _cookie_header(SESSION_COOKIE, "", max_age=0)

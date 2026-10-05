@@ -2,6 +2,59 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.39.2 — **Fix: pre-auth authentication bypass in hosted mode (external review, 2026-10-05).**
+A full external security/correctness review of the hosted deployment found a
+Critical pre-auth bypass, CONFIRMED EXPLOITABLE IN PRODUCTION: the login
+gate signed all three cookie kinds (flow/session/step-up) with one key and
+no "what kind of cookie is this" marker, so the flow cookie `/login` hands
+to ANY unauthenticated visitor verified equally well as a session cookie.
+Replayed as `opa_wizard_session` against an admin-only route on the live
+host, it returned `200`. Combined with `serve.py` silently downgrading any
+request that failed the nginx proxy-secret check to the admin-exempt
+`__local__` owner instead of rejecting it, this was reachable over the
+network with no Okta account at all. Fixed together, both release blockers
+from the review:
+- **`server/auth_gate.py`** — every signed payload now carries a `typ`
+  claim (`flow`/`session`/`stepup`); `_verify_signed_payload` takes an
+  `expected_typ` and refuses a mismatch. `_verify_session` additionally
+  requires a non-empty `sub`. Step-up also now checks the ID token's
+  `auth_time` is fresh (`STEPUP_MAX_AUTH_AGE_SECONDS`) before issuing a
+  step-up cookie, closing the second half of the "step-up proves nothing"
+  gap (an existing Okta SSO session could otherwise silently satisfy
+  `max_age=0` with no prompt). `action_id` (from `/step-up`) is now
+  validated against the exact shape a real id has
+  (`secrets.token_urlsafe(32)`) before it can ride through a signed cookie
+  or a response header -- closes a CRLF header-injection path toward
+  nginx's `auth_request` response.
+- **`server/serve.py`** — in `hosted` mode, a request that fails
+  `_request_is_from_nginx` is now rejected with `401` before any routing,
+  rather than silently mapped to the privileged `__local__` owner.
+  `/healthz` stays exempt (nginx's template never attaches the proxy
+  secret to it either). `local` mode (the default, no nginx at all) is
+  completely unaffected.
+- **`create_secret_folders.py`** — removed the admin by-name fallback in
+  `upsert_environment`/`_resolve_admin_target` entirely (not just
+  de-prioritized). An admin "create" (which never has an `environment_id`)
+  now always targets the admin's OWN `(owner, name)` row, same as the
+  non-admin path -- it can no longer silently adopt/overwrite another
+  owner's same-named environment and write the admin's real credentials
+  into that owner's keyring entry. `set_environment_shared`/
+  `delete_environment` with `is_admin=True` and no id now also resolve to
+  the caller's own row instead of an ambiguous cross-owner scan.
+- 28 new tests: `tests/test_auth_gate.py` (new, 23 tests -- this module
+  had zero tests and 0% coverage before this release), 5 new cases in
+  `tests/test_auth_headers.py` (the SRV-01 guard), 1 new cross-owner
+  collision test in `tests/test_two_owner_collision.py`.
+- **Operational note for any existing hosted install:** after deploying
+  this version, rotate the gate's session key (`OPA_SESSION_KEY_PATH`) so
+  any outstanding cookies minted under the old, untyped scheme are
+  invalidated, and review `audit_log.jsonl` / `access_control.json` for
+  entries with a null or empty actor.
+- Deferred from this release (tracked, not forgotten): GATE-04 (second-org
+  gate admins are full admins of the shared backend), evidence-completeness
+  findings (report truncation, retention pruning, sync watermark overlap),
+  and the remaining Medium/Low findings in the review.
+
 5.39.1 — **Restarts no longer crash-loop on the port.**
 `serve.py` bound its port with `SO_REUSEADDR` off everywhere (to make a
 second instance fail loudly on Windows). On Linux that also refuses a

@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.39.1
+# Version     : 5.39.2
 # =============================================================================
 
 import argparse
@@ -80,7 +80,7 @@ import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.39.1"
+SCRIPT_VERSION = "5.39.2"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -802,11 +802,24 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, envi
     `environment_id`, when supplied (an admin editing an EXISTING
     environment via the UI, which always knows its real id), resolves the
     target directly via an O(1) lookup -- unambiguous even when two
-    different owners share a display name. Without it (a create, where no
-    id exists yet, or a legacy caller), an admin edit falls back to a
-    by-name scan across every owner, which is genuinely ambiguous in that
-    same-display-name case (confirmed exploitable, external review
-    2026-09-30) -- kept only for backward compatibility."""
+    different owners share a display name.
+
+    SECURITY FIX (external review, 2026-10-05, ENG1-01): an admin call with
+    NO environment_id used to fall back to a by-name scan across EVERY
+    owner -- and a *create* (the admin's own "add environment" form) never
+    has an id, so that ambiguous fallback was the path every admin create
+    actually took. Two colleagues both saving an environment named "dev"
+    meant whichever one existed first silently absorbed the other's
+    "create": the admin's keyring secrets got written under the OTHER
+    owner's existing row (credential capture -- that owner could now
+    activate and operate with the admin's privileged key/token), or an
+    admin's real values got overwritten by a later-arriving unprivileged
+    user's throwaway ones. Now: an admin call with no environment_id is
+    ALWAYS a create scoped to the admin's own (owner, name) -- identical to
+    the non-admin path -- never a cross-owner adoption. The by-name scan
+    is gone entirely; an admin editing an existing environment belonging to
+    someone else must pass that environment's real environment_id (which
+    the UI already has for every row it lists)."""
     if not name or not name.strip():
         raise ValueError("Environment name is required (e.g. dev, uat, prod).")
     name = name.strip()
@@ -818,18 +831,15 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, envi
     # by (owner, name) -- see _find_own_environment_sql -- correct even if
     # no such environment exists yet (a create, handled below). An admin
     # override editing an EXISTING environment must target whichever
-    # owner's copy actually already exists (there's no such thing as an
-    # admin "creating" someone else's environment -- only editing one
-    # that's already there) -- environment_id disambiguates this directly
-    # when supplied; otherwise falls back to the old by-name scan
-    # (ambiguous, see above).
+    # owner's copy actually already exists -- environment_id disambiguates
+    # this directly, and is REQUIRED for that case now (see ENG1-01 above);
+    # with no id, even an admin call resolves to the caller's own (owner,
+    # name), same as the non-admin path.
     target_owner = owner
     target_id = None
     existing_meta = None
-    if is_admin:
-        row = conn.execute("SELECT * FROM app_environments WHERE environment_id = ?", (environment_id,)).fetchone() if environment_id else None
-        if row is None:
-            row = conn.execute("SELECT * FROM app_environments WHERE display_name = ?", (name,)).fetchone()
+    if is_admin and environment_id:
+        row = conn.execute("SELECT * FROM app_environments WHERE environment_id = ?", (environment_id,)).fetchone()
         if row is not None:
             target_owner = row["owner_id"]
             target_id = row["environment_id"]
@@ -888,42 +898,43 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, envi
     return name, target_id
 
 
-def _resolve_admin_target(environment_id, name=None):
-    """Shared resolution for every admin-override path below. Prefers the
-    unambiguous `environment_id` (the real UUID primary key) whenever the
-    caller has one -- an O(1) lookup, never a cross-owner scan. Falls back
-    to an ambiguous by-name scan across every owner ONLY when no id was
-    supplied, for backward compatibility with any caller that hasn't been
-    updated yet -- SECURITY: that fallback is first-match-wins across
-    EVERY owner (confirmed exploitable, external review 2026-09-30, if
-    two different owners each have an environment named the same; new
-    code should always pass environment_id). Raises KeyError if nothing
-    matches either way."""
+def _resolve_admin_target(environment_id):
+    """Shared resolution for every CROSS-OWNER admin-override path below.
+    `environment_id` (the real UUID primary key) is now REQUIRED -- an O(1)
+    lookup, never a cross-owner scan.
+
+    SECURITY FIX (external review, 2026-10-05, ENG1-01): this used to also
+    accept a bare `name` and, when no id was supplied, fall back to a
+    by-name scan across EVERY owner -- first-match-wins, genuinely
+    ambiguous (confirmed exploitable) whenever two different owners had an
+    environment with the same display name. That fallback is removed
+    entirely, not just de-prioritized: callers that don't have a real
+    cross-owner id (i.e. every call where the admin is acting on their OWN
+    environment) now resolve through _find_own_environment_sql instead --
+    see set_environment_shared/delete_environment below -- which only ever
+    looks at that one owner's row, no scan at all. Raises KeyError if the
+    id doesn't exist."""
     import audit_store
     conn = audit_store._get_connection()
-    if environment_id:
-        row = conn.execute("SELECT * FROM app_environments WHERE environment_id = ?", (environment_id,)).fetchone()
-        if row is None:
-            raise KeyError(f"No saved environment with id '{environment_id}'")
-        return row["environment_id"], _row_to_environment_meta(row)
-    row = conn.execute("SELECT * FROM app_environments WHERE display_name = ?", (name,)).fetchone()
+    row = conn.execute("SELECT * FROM app_environments WHERE environment_id = ?", (environment_id,)).fetchone()
     if row is None:
-        raise KeyError(f"No saved environment named '{name}'")
+        raise KeyError(f"No saved environment with id '{environment_id}'")
     return row["environment_id"], _row_to_environment_meta(row)
 
 
 def set_environment_shared(name, owner, shared, is_admin=False, environment_id=None):
     """Toggles an environment's `shared` flag. Only its owner may do this
-    unless `is_admin` is True, in which case the target is resolved via
-    `environment_id` when the caller has one (unambiguous), falling back
-    to a by-name scan across every owner otherwise (see
-    _resolve_admin_target -- ambiguous if two owners share a display
-    name, kept only for backward compatibility). Raises PermissionError
-    if not the owner and not an admin, KeyError if unknown."""
+    unless `is_admin` is True. An admin with a real cross-owner
+    `environment_id` (editing a row that isn't theirs) resolves it
+    unambiguously via _resolve_admin_target; an admin with NO id -- same as
+    a non-admin -- always acts on their OWN (owner, name) row, never a
+    cross-owner scan by name (see ENG1-01 in _resolve_admin_target's
+    docstring). Raises PermissionError if not the owner and not an admin,
+    KeyError if unknown."""
     import audit_store
     conn = audit_store._get_connection()
-    if is_admin:
-        target_id, meta = _resolve_admin_target(environment_id, name)
+    if is_admin and environment_id:
+        target_id, meta = _resolve_admin_target(environment_id)
     else:
         target_id, meta = _find_own_environment_sql(conn, owner, name)
         if meta is None:
@@ -939,10 +950,11 @@ def delete_environment(name, owner=LOCAL_OWNER_KEY, is_admin=False, environment_
     """Removes an environment's metadata and both keychain secrets. Returns
     True if it was the active environment for THIS caller (caller should
     clear any live client for this owner). Raises KeyError if the name
-    doesn't exist (for this owner, unless `is_admin`), PermissionError if
-    it exists but is owned by someone else and `is_admin` is False. See
-    _resolve_admin_target for how `environment_id` disambiguates an admin
-    override across same-named environments from different owners.
+    doesn't exist (for this owner, unless `is_admin` with a real
+    cross-owner id), PermissionError if it exists but is owned by someone
+    else and `is_admin` is False. See _resolve_admin_target's docstring
+    (ENG1-01) for why a bare admin override with no id now always resolves
+    to the CALLER's own row, never a cross-owner scan by name.
 
     `active_environments.environment_id REFERENCES app_environments
     ON DELETE CASCADE` means the DELETE below automatically removes EVERY
@@ -954,8 +966,8 @@ def delete_environment(name, owner=LOCAL_OWNER_KEY, is_admin=False, environment_
     pointer -- SQLite guarantees that now)."""
     import audit_store
     conn = audit_store._get_connection()
-    if is_admin:
-        target_id, meta = _resolve_admin_target(environment_id, name)
+    if is_admin and environment_id:
+        target_id, meta = _resolve_admin_target(environment_id)
     else:
         target_id, meta = _find_own_environment_sql(conn, owner, name)
         if meta is None:

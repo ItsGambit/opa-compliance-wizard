@@ -49,3 +49,74 @@ def test_owner_key_trusted_with_matching_proxy_secret(monkeypatch):
         {"X-Auth-Sub": "00uREALUSER", "X-Nginx-Proxy-Secret": "real-secret"}
     )
     assert owner_key == "00uREALUSER"
+
+
+# ---------------------------------------------------------------------------
+# SRV-01 (external review, 2026-10-05): CONFIRMED EXPLOITABLE IN PRODUCTION.
+# In hosted mode, a request that fails the nginx proxy-secret check used to
+# be silently DOWNGRADED to the privileged `__local__` owner instead of
+# being rejected -- and every admin-only route's guard
+# (`owner_key != LOCAL_OWNER_KEY_HEADER and not is_admin`) treats
+# `__local__` as exempt. Combined with GATE-01 (any gate-signed cookie
+# verifying as a session cookie), this let an unauthenticated caller with
+# no Okta account read/write admin-only routes over the network. The fix:
+# _reject_if_hosted_without_nginx must return True (401) for exactly this
+# shape of request, and False for every case that must stay working.
+# ---------------------------------------------------------------------------
+class _FakeHandler:
+    """Minimal stand-in for Handler -- _reject_if_hosted_without_nginx only
+    needs .headers and ._send_json; using the real HTTP handler class here
+    would require a live socket for no benefit."""
+
+    def __init__(self, headers):
+        self.headers = headers
+        self.sent = None
+
+    def _send_json(self, status, payload):
+        self.sent = (status, payload)
+
+
+def test_hosted_mode_rejects_request_with_no_proxy_secret(monkeypatch):
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    monkeypatch.setattr(serve, "NGINX_PROXY_SECRET", "real-secret")
+    handler = _FakeHandler({})
+    assert serve._reject_if_hosted_without_nginx(handler, "/api/audit_log") is True
+    assert handler.sent[0] == 401
+
+
+def test_hosted_mode_rejects_request_with_wrong_proxy_secret(monkeypatch):
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    monkeypatch.setattr(serve, "NGINX_PROXY_SECRET", "real-secret")
+    handler = _FakeHandler({"X-Nginx-Proxy-Secret": "wrong"})
+    assert serve._reject_if_hosted_without_nginx(handler, "/api/access_control") is True
+    assert handler.sent[0] == 401
+
+
+def test_hosted_mode_allows_request_with_matching_proxy_secret(monkeypatch):
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    monkeypatch.setattr(serve, "NGINX_PROXY_SECRET", "real-secret")
+    handler = _FakeHandler({"X-Nginx-Proxy-Secret": "real-secret"})
+    assert serve._reject_if_hosted_without_nginx(handler, "/api/audit_log") is False
+    assert handler.sent is None
+
+
+def test_hosted_mode_still_allows_healthz_with_no_proxy_secret(monkeypatch):
+    """/healthz's nginx location has auth_request off and never sets
+    X-Nginx-Proxy-Secret either (see nginx-opa-secrets-wizard.conf) -- an
+    external uptime monitor has no Okta session and this route holds no
+    tenant data, so it must stay reachable even in hosted mode."""
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    monkeypatch.setattr(serve, "NGINX_PROXY_SECRET", "real-secret")
+    handler = _FakeHandler({})
+    assert serve._reject_if_hosted_without_nginx(handler, "/healthz") is False
+    assert handler.sent is None
+
+
+def test_local_mode_never_rejects_regardless_of_proxy_secret_header(monkeypatch):
+    """local mode (the default, no nginx at all) must be byte-for-byte
+    unaffected -- this guard only ever fires in hosted mode."""
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "local")
+    monkeypatch.setattr(serve, "NGINX_PROXY_SECRET", None)
+    handler = _FakeHandler({})
+    assert serve._reject_if_hosted_without_nginx(handler, "/api/audit_log") is False
+    assert handler.sent is None

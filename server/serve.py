@@ -207,6 +207,39 @@ def _engine_owner(owner_key):
     return engine.LOCAL_OWNER_KEY if owner_key == LOCAL_OWNER_KEY_HEADER else owner_key
 
 
+def _reject_if_hosted_without_nginx(handler, path):
+    """SECURITY FIX (external review, 2026-10-05, SRV-01): in hosted mode, a
+    request that fails the nginx proxy-secret check used to be silently
+    DOWNGRADED to the privileged `__local__` owner (see
+    _owner_key_from_headers above) instead of being rejected outright --
+    and every admin-only route's guard is `owner_key != LOCAL_OWNER_KEY_HEADER
+    and not is_admin`, so `__local__` sails straight through as the exempt
+    local operator. Combined with GATE-01 (auth_gate.py accepting any
+    gate-signed cookie as a session), this was reachable from the network
+    with no Okta account at all -- confirmed live in production: a replayed
+    flow cookie against `GET /api/audit_log` returned 200.
+
+    DEPLOYMENT_MODE == "hosted" means this process REQUIRES a real nginx +
+    Okta gate in front of it (enforced at startup -- see the
+    NGINX_PROXY_SECRET check above); a request that didn't actually transit
+    that flow is UNAUTHENTICATED, not local, and must be rejected before any
+    routing happens -- never silently treated as the local super-owner.
+    `local` mode (the default, no nginx at all) is completely unaffected:
+    _request_is_from_nginx always returns True when NGINX_PROXY_SECRET is
+    unset, so this never fires there.
+
+    `/healthz` is the one deliberate exception: its nginx location has
+    `auth_request off` and -- unlike every other location -- never sets
+    X-Nginx-Proxy-Secret either (see nginx-opa-secrets-wizard.conf), since
+    it exists for an external uptime monitor/load balancer with no Okta
+    session to present. It holds no tenant data of its own, so staying
+    reachable here costs nothing."""
+    if DEPLOYMENT_MODE == "hosted" and path != "/healthz" and not _request_is_from_nginx(handler.headers):
+        handler._send_json(401, {"error": "Authentication required."})
+        return True
+    return False
+
+
 def _is_admin_from_headers(headers):
     """True only when auth_gate.py's verified /verify subrequest set
     X-Auth-Is-Admin: true (see nginx-opa-secrets-wizard.conf) -- a direct/
@@ -875,6 +908,8 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
+        if _reject_if_hosted_without_nginx(self, path):
+            return
         # Snapshot this owner's active client(s) ONCE at the start of this
         # request. Sessions are per-owner now (see _sessions above), but the
         # same reasoning still applies: a concurrent request for the SAME
@@ -1266,6 +1301,8 @@ class Handler(SimpleHTTPRequestHandler):
         correlation_id = uuid.uuid4().hex[:12]
         engine.CORRELATION_ID.set(correlation_id)
         path = urlparse(self.path).path
+        if _reject_if_hosted_without_nginx(self, path):
+            return
         if not self._check_origin():
             return
         owner_key = _owner_key_from_headers(self.headers)
@@ -1818,6 +1855,8 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
+        if _reject_if_hosted_without_nginx(self, path):
+            return
         if not self._check_origin():
             return
         owner_key = _owner_key_from_headers(self.headers)

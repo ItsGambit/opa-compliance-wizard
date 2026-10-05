@@ -105,6 +105,54 @@ def test_admin_delete_environment_removes_only_the_targeted_owner(tmp_schema, tm
 
 
 # ---------------------------------------------------------------------------
+# 1b. ENG1-01 (external review, 2026-10-05): an admin "create" (no
+#     environment_id -- a create never has one) must create the ADMIN's
+#     own environment, never silently adopt/overwrite another owner's
+#     same-named one. This is the confirmed-exploitable credential-capture
+#     path: before the fix, upsert_environment(is_admin=True, no id) fell
+#     back to a by-name scan across every owner, so an admin's real
+#     privileged secrets landed in a non-admin's existing "prod"/"dev" row.
+# ---------------------------------------------------------------------------
+ADMIN = "00uADMIN"
+
+
+def test_admin_create_with_colliding_name_never_touches_other_owners_environment(
+    tmp_schema, tmp_environments_file, fake_keyring
+):
+    # Owner B already has a "prod" with their own (unprivileged) secrets.
+    engine.upsert_environment(
+        "prod",
+        {"base_domain": "victim.example.com", "team_name": "team-b", "key_id": "key-b", "key_secret": "secret-b"},
+        owner=OWNER_B,
+    )
+
+    # Admin "creates" an environment also named "prod" with no id -- the
+    # exact shape of a real "add environment" form submission.
+    name, admin_env_id = engine.upsert_environment(
+        "prod",
+        {"base_domain": "admin.example.com", "team_name": "team-admin", "key_id": "key-admin",
+         "key_secret": "ADMIN-PRIVILEGED-SECRET"},
+        owner=ADMIN,
+        is_admin=True,
+    )
+
+    all_envs = engine.list_all_environments()
+    # Owner B's row is untouched: still their own domain/secret, still a
+    # SEPARATE environment_id from whatever the admin's create produced.
+    victim_meta = next(m for m in all_envs.values() if m["owner"] == OWNER_B and m["name"] == "prod")
+    assert victim_meta["base_domain"] == "victim.example.com"
+    assert engine.keyring_get(victim_meta["environment_id"], "key_secret") == "secret-b"
+
+    # The admin's own create landed under the admin's OWN owner, as a
+    # genuinely separate row -- never adopting owner B's existing one.
+    assert admin_env_id != victim_meta["environment_id"]
+    admin_meta = all_envs[admin_env_id]
+    assert admin_meta["owner"] == ADMIN
+    assert admin_meta["base_domain"] == "admin.example.com"
+    assert engine.keyring_get(admin_env_id, "key_secret") == "ADMIN-PRIVILEGED-SECRET"
+
+
+# ---------------------------------------------------------------------------
 # 2. Non-admin visibility must not leak.
 # ---------------------------------------------------------------------------
 def test_private_environment_not_visible_to_other_owner(tmp_schema, tmp_environments_file, fake_keyring):
