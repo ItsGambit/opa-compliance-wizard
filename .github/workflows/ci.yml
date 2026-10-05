@@ -37,6 +37,17 @@ jobs:
               raise SystemExit('\n'.join(failures))
           "
 
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Deploy and server setup scripts run as root-adjacent on the server: a syntax error or a
+      # ShellCheck error-level finding (e.g. an unquoted expansion that splits) must fail CI.
+      - name: bash -n every shell script
+        run: for f in $(git ls-files '*.sh'); do bash -n "$f" || exit 1; done
+      - name: ShellCheck (errors)
+        run: shellcheck --severity=error $(git ls-files '*.sh')
+
   frontend:
     runs-on: ubuntu-latest
     defaults:

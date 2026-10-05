@@ -2,6 +2,33 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.38.1 — **Second Okta org: setup script, deploy support, shell checks in CI.**
+Follow-up to 5.38.0 so an additional gate is set up and kept current
+through the normal GitHub → `server/deploy.sh` path instead of by hand.
+- **`server/setup-second-gate.sh`** (new): one-time, idempotent setup of an
+  additional gate for another Okta org. Args, not secrets, on the command
+  line (`--name --org-url --auth-server --client-id --admin-group --origin
+  [--port --listen --env-name --tunnel]`); the Okta client secret is read
+  from a staged 600 file (`~/.opa-setup/<name>-client-secret`, shredded) and
+  the read-only admin-check token with hidden input. Backs up first; creates
+  `/etc/opa-compliance-wizard-<name>.env` (shares only
+  KEYRING_UNLOCK_PASSWORD and NGINX_PROXY_SECRET with the main file), its
+  own session-key folder, keyring entries under
+  `opa-compliance-wizard:<env-name>`, unit `opa-auth-gate-<name>`, a narrow
+  sudoers grant to restart it (for deploy.sh), and nginx site
+  `opa-<name>`; adds the origin to EXTRA_ALLOWED_ORIGINS. Optional
+  `--tunnel` installs cloudflared with a staged token. The main gate, env
+  file and nginx site are never replaced.
+- **`server/nginx_second_site.py`** (new): builds that nginx site from the
+  LIVE main site (so the proxy secret is copied, never typed), keeping every
+  auth rule and only changing listen address, hostname, TLS handling and
+  the gate port. 10 tests (`tests/test_nginx_second_site.py`) run it against
+  the repo's real nginx template.
+- **`server/deploy.sh`**: after the main gate, also restarts every
+  *enabled* `opa-auth-gate-*` unit, fail-fast like the main gate.
+- **CI**: new `shell` job — `bash -n` and ShellCheck (error level) on every
+  tracked `.sh` file.
+
 5.38.0 — **Second Okta org on the same server (optional, off by default).**
 Two new optional settings for `server/auth_gate.py`, read through the new
 side-effect-free `server/gate_config.py`, let a SECOND auth gate instance

@@ -428,29 +428,40 @@ for every path. When run with `--execute`, also writes a results CSV
 `skipped_exists`, or `error`.
 
 
-## Serving a second Okta org (optional, 5.38.0)
+## Serving a second Okta org (optional, 5.38.0+)
 
 One server can sign people in through two Okta orgs, sharing the same app
-and data: run a second `auth_gate.py` instance with its own settings and
-let nginx pick the gate by hostname. The first gate is untouched.
+and data: a second `auth_gate.py` instance with its own settings, and an
+nginx site per hostname. The first gate, its env file and nginx site are
+untouched.
 
-- Second EnvironmentFile (e.g. `/etc/opa-compliance-wizard-<name>.env`)
-  with its own `OKTA_ORG_URL`, `OKTA_OIDC_CLIENT_ID`, `OKTA_ADMIN_GROUP_ID`,
-  `DASHBOARD_ORIGIN` (that hostname), `OKTA_ENV_NAME` (a different keyring
-  namespace: store that org's `okta_client_secret` and
-  `okta_admin_check_token` under `opa-compliance-wizard:<name>`), plus:
-  - `OPA_SESSION_KEY_PATH` — **required for the second gate**: its own key
-    file, so neither gate accepts the other's sessions.
-  - `OKTA_AUTH_SERVER=org` when the org signs in on a custom domain.
-  - The same `KEYRING_UNLOCK_PASSWORD` and `NGINX_PROXY_SECRET` as the
-    main file (same keyring, same nginx-to-backend secret).
-- Second systemd unit running `server/auth_gate.py --port 8768` (any free
-  loopback port) with that EnvironmentFile.
-- A separate nginx `server` block for that hostname: same locations as the
-  main config, but the `/login`, `/logout`, `/verify*`, `/step-up` and
-  `/authorization-code/callback` proxies point at the second gate's port.
-  Keep it in its own sites file so `server/deploy.sh` (which manages the
-  main site file) never overwrites it.
-- Add the hostname to `EXTRA_ALLOWED_ORIGINS` for `serve.py`.
-- `server/deploy.sh` restarts only `opa-auth-gate`; restart the second gate
-  yourself after a deploy (`sudo systemctl restart <its unit>`).
+**Set it up with `server/setup-second-gate.sh`** (5.38.1), as the app user:
+
+```bash
+mkdir -p ~/.opa-setup && chmod 700 ~/.opa-setup
+# put the new Okta app's client secret in ~/.opa-setup/<name>-client-secret (chmod 600)
+bash ~/opa-secrets-folders/server/setup-second-gate.sh \
+  --name <name> --org-url https://<org or custom domain> --auth-server org \
+  --client-id <Okta client id> --admin-group <Okta group id> --origin https://<hostname> \
+  [--port 8768] [--listen 127.0.0.1:8080] [--tunnel]
+```
+
+It asks for sudo and for the read-only Okta admin-check token (hidden),
+backs up first, and is safe to re-run. What it creates:
+
+- `/etc/opa-compliance-wizard-<name>.env`: that org's `OKTA_ORG_URL`,
+  `OKTA_OIDC_CLIENT_ID`, `OKTA_ADMIN_GROUP_ID`, `DASHBOARD_ORIGIN`,
+  `OKTA_ENV_NAME` (its own keyring namespace), `OKTA_AUTH_SERVER`,
+  `OPA_SESSION_KEY_PATH` (its own key: neither gate accepts the other's
+  sessions), plus the same `KEYRING_UNLOCK_PASSWORD` and
+  `NGINX_PROXY_SECRET` as the main file.
+- systemd unit `opa-auth-gate-<name>` (copy of the main unit on another
+  port) and a sudoers grant so `server/deploy.sh` can restart it.
+- nginx site `opa-<name>` built by `server/nginx_second_site.py` from the
+  live main site: same rules, listening on `--listen` (loopback by default,
+  for a Cloudflare Tunnel; TLS ends in front of it), sign-in routes pointed
+  at the new gate. `deploy.sh` doesn't manage this file.
+- The hostname added to `EXTRA_ALLOWED_ORIGINS` for `serve.py`.
+
+`server/deploy.sh` restarts every enabled `opa-auth-gate-*` unit after the
+main gate, so deploys keep both gates on the same code.

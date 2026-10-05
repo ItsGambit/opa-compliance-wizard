@@ -522,6 +522,21 @@ sudo -n systemctl restart "$AUTH_GATE_SERVICE"
 sleep 1
 systemctl status "$AUTH_GATE_SERVICE" --no-pager -l
 
+# 5.38.1: additional auth gates for other Okta orgs (server/setup-second-gate.sh,
+# units named opa-auth-gate-<name>) run the same auth_gate.py, so they must be
+# restarted too or they keep serving the old code. Only ENABLED units: a gate
+# that setup-second-gate.sh created but couldn't start yet (missing keyring
+# secrets) is skipped. Same fail-fast rule as the main gate above; the sudoers
+# grant for each one is added by setup-second-gate.sh.
+for _unit in $(systemctl list-unit-files 'opa-auth-gate-*.service' --no-legend 2>/dev/null | awk '{print $1}'); do
+  _unit="${_unit%.service}"
+  systemctl is-enabled --quiet "$_unit" 2>/dev/null || continue
+  echo "==> Restarting $_unit (additional Okta org gate)"
+  sudo -n systemctl restart "$_unit"
+  sleep 1
+  systemctl is-active --quiet "$_unit" || { echo "ERROR: $_unit did not come back up" >&2; exit 1; }
+done
+
 echo "==> Done. Deployed version: $DEPLOY_VERSION"
 echo "    Commit: ${DEPLOY_COMMIT:-unknown}"
 
