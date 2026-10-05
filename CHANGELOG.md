@@ -2,6 +2,16 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.39.1 — **Restarts no longer crash-loop on the port.**
+`serve.py` bound its port with `SO_REUSEADDR` off everywhere (to make a
+second instance fail loudly on Windows). On Linux that also refuses a
+restart while the old process's closed connections are in TIME_WAIT (up to
+60 s), so a `systemctl restart` under traffic crash-looped and the 5.39.0
+deploy stopped at deploy.sh's version check (OPA came back by itself about
+a minute later). Port reuse is now on except on Windows; on POSIX it still
+refuses binding over a live listener. 2 tests (`tests/test_strict_bind.py`;
+the TIME_WAIT one fails on the old setting).
+
 5.39.0 — **Optional read-only host status for monitoring.**
 `server/host_status.py` (standard library only) answers `GET /__status` on
 127.0.0.1 with OS, uptime, load, memory, root-disk use, the state of a

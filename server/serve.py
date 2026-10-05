@@ -610,7 +610,14 @@ class StrictBindHTTPServer(ThreadingHTTPServer):
     # another process is already actively listening on, instead of raising
     # "address already in use". Disabling it makes the OSError-on-bind check
     # in main() actually fire consistently on Windows, Mac, and Linux.
-    allow_reuse_address = False
+    #
+    # 5.39.1: except on POSIX, where SO_REUSEADDR does NOT allow binding over
+    # an active listener (a second instance still fails with "address already
+    # in use") -- it only lets a restart bind while the old process's closed
+    # connections sit in TIME_WAIT (up to 60 s). Without it, every
+    # `systemctl restart` under traffic crash-looped until those expired and
+    # deploy.sh's 5-second version check failed the deploy (seen live, 5.39.0).
+    allow_reuse_address = os.name != "nt"
 
 
 def _public_entry(environment_id, name, meta, requesting_owner):
