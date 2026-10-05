@@ -122,13 +122,19 @@ def test_resuming_after_incomplete_chunk_retries_same_window(tmp_audit_store, tm
     # day 1's one event's published time, in this case.
     assert retained_watermark == day1_since
 
-    # Resume with since=None -- must pick up exactly at the retained
+    # Resume with since=None -- must pick up AT OR BEFORE the retained
     # watermark (day 1's completion), i.e. retry day 2's window, not skip
-    # past it to day 3+ and not restart from 90 days ago. Only the FIRST
-    # call's `since` matters for this assertion -- its `until` naturally
-    # differs run-to-run (each call caps `until` at its OWN wall-clock
-    # "now", and real time passes between the two sync_okta_events calls
-    # in this test), which is expected, not a regression. FakeOktaClient
+    # past it to day 3+ and not restart from 90 days ago. DATA-02 (external
+    # review, 2026-10-05): resuming from a stored watermark now starts
+    # WATERMARK_OVERLAP_SECONDS before it, not exactly at it, so an event
+    # indexed by Okta just after a prior sync already ran past its
+    # `published` time still gets picked up on the next sync (INSERT OR
+    # IGNORE's existing dedup-by-uuid makes the re-scanned overlap free of
+    # duplicates). Only the FIRST call's `since` matters for this
+    # assertion -- its `until` naturally differs run-to-run (each call
+    # caps `until` at its OWN wall-clock "now" minus the safety lag, and
+    # real time passes between the two sync_okta_events calls in this
+    # test), which is expected, not a regression. FakeOktaClient
     # auto-completes any further trailing chunk needed to reach "now"
     # (see its docstring).
     second_client = FakeOktaClient([
@@ -138,7 +144,12 @@ def test_resuming_after_incomplete_chunk_retries_same_window(tmp_audit_store, tm
     assert second_result["complete"] is True
 
     retried_since = second_client.calls[0][0]
-    assert retried_since == retained_watermark  # resumes from day 1's end, not day 2's end or 90 days ago
+    assert retried_since <= retained_watermark  # resumes at/before day 1's end, never after it
+    expected_earliest = (
+        datetime.fromisoformat(retained_watermark.replace("Z", "+00:00"))
+        - timedelta(seconds=audit_store.WATERMARK_OVERLAP_SECONDS)
+    ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    assert retried_since == expected_earliest
 
     final_state = audit_store.get_sync_state(environment)
     assert final_state["last_sync_status"] == "success"

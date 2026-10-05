@@ -37,11 +37,41 @@ def test_sign_in_routes_use_the_additional_gate(site):
 
 
 def test_backend_auth_rules_and_secret_are_kept(site):
-    assert site.count("127.0.0.1:8766") == MAIN.count("127.0.0.1:8766")
+    # GATE-04: the main site's /api/access_control/save location (one of
+    # the main site's two proxy_pass-to-8766 routes) is dropped entirely --
+    # replaced by a flat deny -- so the additional gate's site proxies to
+    # 8766 one route fewer than the main site. See
+    # test_access_control_is_denied_entirely below for the actual
+    # cross-org privilege-escalation fix this is testing.
+    assert site.count("127.0.0.1:8766") == MAIN.count("127.0.0.1:8766") - 1
     assert 'set $nginx_proxy_secret "s3cr3t-live-value";' in site
     https_block = [b for b in server_blocks(MAIN) if re.search(r"listen\s+443", b)][0]
-    for rule in ("auth_request /verify;", "auth_request /verify_stepup;", "X-Nginx-Proxy-Secret"):
-        assert site.count(rule) == https_block.count(rule)
+    # auth_request /verify_stepup and the step-up X-Auth-Action-Id plumbing
+    # lived ONLY in the now-removed /api/access_control/save block.
+    assert site.count("auth_request /verify;") == https_block.count("auth_request /verify;")
+    assert site.count("auth_request /verify_stepup;") == 0
+    assert https_block.count("auth_request /verify_stepup;") >= 1
+
+
+# ---------------------------------------------------------------------------
+# GATE-04 (external review, 2026-10-05): an additional gate shares the SAME
+# backend as the main gate -- serve.py has no notion of which gate
+# authenticated a request -- so a user admin in the SECOND org's admin
+# group used to be a full admin of the shared backend, including the MAIN
+# org's own access_control.json (admin group, user group, restrict_login).
+# The dashboard's Access control page only ever edits that one, default
+# file, so there's no "this gate's own access control" to redirect writes
+# to instead -- the fix is to make the whole route unreachable from an
+# additional gate's hostname.
+# ---------------------------------------------------------------------------
+def test_access_control_is_denied_entirely(site):
+    assert "location /api/access_control {" in site
+    assert re.search(r"location /api/access_control \{\s*return 403;", site)
+    # The main site's own, more specific .../save location must NOT
+    # survive -- nginx matches the LONGEST prefix location, so if it did,
+    # it would win over the blanket deny for exactly the one route (the
+    # write endpoint) that matters most.
+    assert "location /api/access_control/save" not in site
 
 
 @pytest.mark.parametrize("kwargs", [

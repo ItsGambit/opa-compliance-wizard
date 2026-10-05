@@ -1071,11 +1071,24 @@ class Handler(SimpleHTTPRequestHandler):
                     limit = min(int((qs.get("limit") or [1000])[0]), 5000)
                 except ValueError:
                     return self._send_json(400, {"error": "limit must be an integer"})
+                # DATA-06 (external review, 2026-10-05): SQLite's LIMIT
+                # with a negative value means "no limit at all," not an
+                # error -- so `?limit=-1` used to silently remove the
+                # 5000-row cap this min() exists to enforce. Reject it
+                # the same way a non-integer limit already is.
+                if limit < 1:
+                    return self._send_json(400, {"error": "limit must be a positive integer"})
                 try:
-                    rows = audit_store.run_report(report_key, meta["environment_id"], since=since, until=until, limit=limit)
+                    result = audit_store.run_report(report_key, meta["environment_id"], since=since, until=until, limit=limit)
                 except KeyError as exc:
                     return self._send_json(404, {"error": str(exc)})
-                return self._send_json(200, {"report": report_key, "environment": environment, "rows": rows})
+                # UI-03/DATA-07: total/truncated let the frontend show
+                # "Showing newest N of M" instead of presenting a capped
+                # result as the complete evidence window.
+                return self._send_json(200, {
+                    "report": report_key, "environment": environment,
+                    "rows": result["rows"], "total": result["total"], "truncated": result["truncated"],
+                })
 
             if path.startswith("/api/resources/") and path.endswith("/history"):
                 import audit_store
@@ -1100,11 +1113,16 @@ class Handler(SimpleHTTPRequestHandler):
                     limit = min(int((qs.get("limit") or [1000])[0]), 5000)
                 except ValueError:
                     return self._send_json(400, {"error": "limit must be an integer"})
-                rows = audit_store.resource_history(
+                if limit < 1:  # DATA-06, same reasoning as /api/reports/{key} above
+                    return self._send_json(400, {"error": "limit must be a positive integer"})
+                result = audit_store.resource_history(
                     meta["environment_id"], resource_id=resource_id, resource_name=resource_name,
                     since=since, until=until, limit=limit,
                 )
-                return self._send_json(200, {"resource_id": resource_id, "environment": environment, "rows": rows})
+                return self._send_json(200, {
+                    "resource_id": resource_id, "environment": environment,
+                    "rows": result["rows"], "total": result["total"], "truncated": result["truncated"],
+                })
 
             if path.startswith("/api/active_directory_connections/") and path.endswith("/discovery_config"):
                 if not _require_client(self._send_json, local_client):

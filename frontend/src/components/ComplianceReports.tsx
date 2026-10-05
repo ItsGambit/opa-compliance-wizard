@@ -6,6 +6,24 @@ import { ComplianceReportDetail } from './ComplianceReportDetail'
 import { complianceReportExportSections } from '../utils/exportSections'
 import { exportSections } from '../utils/export'
 import { runReport } from '../api/client'
+import { toast } from '../hooks/useToast'
+
+// UI-03/DATA-07 (external review, 2026-10-05): both export paths below
+// call runReport with no `from`/`to` and no `limit`, so a tenant with
+// more than the server's default 1000-row cap for that report used to
+// write a silently-partial CSV with no indication the file was missing
+// its oldest rows. There's no truncation UI here the way the detail
+// view's ReportRowsTable has (this is a direct-to-file export, not a
+// table render) -- a toast after the fact is the simplest honest signal
+// without blocking the export outright.
+function warnIfTruncated(label: string, truncated: boolean, total: number, shown: number) {
+  if (!truncated) return
+  toast({
+    title: `Export of "${label}" is incomplete`,
+    description: `Showing the newest ${shown.toLocaleString()} of ${total.toLocaleString()} events. Open the report and narrow the date range to export the rest.`,
+    variant: 'error',
+  })
+}
 
 const CONTROL_LABELS: Record<ComplianceControl, string> = {
   CC6: 'Access Controls — CC6',
@@ -62,6 +80,7 @@ function ReportCard({ def, environment, onClick }: { def: ComplianceReportDef; e
         onClick={async e => {
           e.stopPropagation()
           const resp = await runReport(def.key, environment)
+          warnIfTruncated(def.label, resp.truncated, resp.total, resp.rows.length)
           const sections = complianceReportExportSections(def.label, resp.rows)
           exportSections(sections, 'csv', `opa-report-${def.key}`)
         }}
@@ -125,6 +144,7 @@ export function ComplianceReports() {
             const sections = await Promise.all(
               reports.map(async def => {
                 const resp = await runReport(def.key, activeEnv)
+                warnIfTruncated(def.label, resp.truncated, resp.total, resp.rows.length)
                 return { title: def.label, rows: resp.rows.map(r => ({
                   User: r.user, Action: r.action, Timestamp: r.timestamp, 'Affected Resource': r.resource, Outcome: r.outcome,
                 })) }

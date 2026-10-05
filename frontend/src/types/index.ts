@@ -133,19 +133,30 @@ export interface ComplianceReportRow {
   targets: ComplianceReportTarget[]
 }
 
+// UI-03/DATA-07 (external review, 2026-10-05): rows is capped at `limit`
+// (1000 by default, 5000 max) server-side -- total is the REAL, uncapped
+// count for the same filters (audit_store.count_events), and truncated is
+// true whenever rows.length < total. Without these, a report silently
+// held only the newest `limit` events with nothing on screen saying so,
+// dropping the oldest part of a long evidence window.
 export interface ComplianceReportResponse {
   report: string
   environment: string
   rows: ComplianceReportRow[]
+  total: number
+  truncated: boolean
 }
 
 /** GET /api/resources/{id}/history -- same ComplianceReportRow shape as
  * every report, just scoped to one resource's own id instead of one
- * report_key's event types. See audit_store.resource_history. */
+ * report_key's event types. See audit_store.resource_history.
+ * total/truncated: see ComplianceReportResponse's comment above. */
 export interface ResourceHistoryResponse {
   resource_id: string
   environment: string
   rows: ComplianceReportRow[]
+  total: number
+  truncated: boolean
 }
 
 export type BannerVariant = 'info' | 'warning' | 'danger'

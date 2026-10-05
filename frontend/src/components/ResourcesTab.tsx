@@ -427,6 +427,8 @@ function ResourceHistoryPanel({ resourceId, resourceLabel, onClose }: { resource
         isLoading={isLoading}
         emptyMessage="No compliance-report activity found for this resource in this date range."
         onFilteredRowsChange={setFilteredRows}
+        total={data?.total}
+        truncated={data?.truncated}
       />
     </div>
   )

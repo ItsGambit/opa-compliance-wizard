@@ -454,8 +454,7 @@ backs up first, and is safe to re-run. What it creates:
   `OKTA_ENV_NAME` (its own keyring namespace), `OKTA_AUTH_SERVER`,
   `OPA_SESSION_KEY_PATH` (its own key: neither gate accepts the other's
   sessions), `OPA_ACCESS_CONTROL_PATH` (its own access control: admin group =
-  `--admin-group`, sign-in restricted to it; the dashboard's Access control
-  page only edits the main gate's `access_control.json`), plus the same
+  `--admin-group`, sign-in restricted to it), plus the same
   `KEYRING_UNLOCK_PASSWORD` and
   `NGINX_PROXY_SECRET` as the main file.
 - systemd unit `opa-auth-gate-<name>` (copy of the main unit on another
@@ -465,6 +464,17 @@ backs up first, and is safe to re-run. What it creates:
   for a Cloudflare Tunnel; TLS ends in front of it), sign-in routes pointed
   at the new gate. `deploy.sh` doesn't manage this file.
 - The hostname added to `EXTRA_ALLOWED_ORIGINS` for `serve.py`.
+
+**Access control is main-org-only (GATE-04, 5.39.4+).** `serve.py` shares
+one backend across every gate and has no notion of which gate authenticated
+a request, so an admin in the SECOND org's admin group would otherwise be a
+full admin of the shared backend -- including the MAIN org's own
+`access_control.json` (its admin group, user group, and `restrict_login`).
+`server/nginx_second_site.py` closes this at the edge: the generated site
+for an additional gate answers `403` on `/api/access_control` (read and
+write) instead of proxying it, so that route is reachable only through the
+main gate's own site. There is no per-gate equivalent to redirect it to --
+the dashboard's Access control page only ever edits the one, default file.
 
 `server/deploy.sh` restarts every enabled `opa-auth-gate-*` unit after the
 main gate, so deploys keep both gates on the same code.

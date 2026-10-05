@@ -75,6 +75,8 @@ export function ComplianceReportDetail({ def, environment, onBack }: Props) {
         isLoading={isLoading}
         emptyMessage="No events found in this date range."
         onFilteredRowsChange={setFilteredRows}
+        total={data?.total}
+        truncated={data?.truncated}
       />
     </div>
   )

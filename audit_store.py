@@ -995,13 +995,40 @@ def _upsert_sync_state(conn, environment_id, **fields):
 
 CHUNK_DAYS = 1  # window size for the day-by-day walk below
 
+# BUG FIX (external review, 2026-10-05, DATA-02): the System Log is
+# eventually consistent -- an event can become queryable moments AFTER a
+# sync already ran past its `published` time. The old code let the final
+# chunk's `until` reach the literal wall-clock "now" and set the watermark
+# from whatever was actually returned, so an event indexed a few seconds
+# late, with a `published` time just behind the watermark, was never
+# fetched again -- permanently, since Okta's own 90-day retention makes
+# the gap unrecoverable later. For a tool whose entire purpose is complete
+# audit evidence, silent omission is the worst failure mode.
+#
+# Two independent guards, both from the review's own recommendation:
+# - SAFETY_LAG: a sync's chunking never asks Okta for events newer than
+#   "now minus this", so a run never advances the watermark into a window
+#   Okta might still be indexing.
+# - WATERMARK_OVERLAP: resuming from a STORED watermark (since=None) starts
+#   a bit before it, not exactly at it, re-scanning a window that was
+#   already fully synced -- INSERT OR IGNORE's existing dedup-by-uuid
+#   makes this free of duplicates, so overlap costs nothing but a few
+#   re-scanned rows per run.
+# Neither applies to an explicitly-passed `since` (a caller -- e.g. a
+# manual CSV backfill comparison, or a test -- asked for a specific start
+# point on purpose; only the automatic resume-from-watermark path needs
+# the safety margin).
+SAFETY_LAG_SECONDS = 5 * 60
+WATERMARK_OVERLAP_SECONDS = 60 * 60
+
 
 def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, on_progress=None):
     """Pulls System Log events from the real Okta API via the EXISTING
     OktaClient.get_system_log (pagination + rate-limit handling already
     built in, shared with every other Okta call in this project) and
     ingests them. `since` defaults to 90 days ago if this is the first
-    sync for `environment_id`, else resumes from the last watermark.
+    sync for `environment_id`, else resumes from just before the last
+    watermark (see WATERMARK_OVERLAP_SECONDS above).
 
     Walks the window one day at a time (via get_system_log's `until`)
     rather than one unbounded call -- confirmed live 2026-09-29: a
@@ -1014,6 +1041,7 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
     persists the watermark after EVERY chunk (not just at the very end),
     so a mid-run crash/restart resumes from the last completed day
     instead of re-fetching the whole window or silently losing progress.
+    The walk never reaches literal "now" -- see SAFETY_LAG_SECONDS above.
 
     Returns {"inserted": int, "scanned": int, "since": str, "chunks": int,
     "complete": bool} -- "complete" is False if a day-chunk hit
@@ -1028,20 +1056,21 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
     if since is None:
         state = get_sync_state(environment_id)
         if state and state.get("last_synced_at"):
-            since = state["last_synced_at"]
+            watermark_dt = datetime.fromisoformat(state["last_synced_at"].replace("Z", "+00:00"))
+            since = (watermark_dt - timedelta(seconds=WATERMARK_OVERLAP_SECONDS)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
         else:
             since = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
     original_since = since
-    now_dt = datetime.now(timezone.utc)
+    safe_now_dt = datetime.now(timezone.utc) - timedelta(seconds=SAFETY_LAG_SECONDS)
     cursor = datetime.fromisoformat(since.replace("Z", "+00:00"))
     total_inserted = 0
     total_scanned = 0
     chunks = 0
     all_new_uuids = []  # Phase 6: accumulated across every day-chunk, hashed into ONE manifest row for this whole call
 
-    while cursor < now_dt:
-        chunk_until_dt = min(cursor + timedelta(days=CHUNK_DAYS), now_dt)
+    while cursor < safe_now_dt:
+        chunk_until_dt = min(cursor + timedelta(days=CHUNK_DAYS), safe_now_dt)
         chunk_since = cursor.strftime("%Y-%m-%dT%H:%M:%S.000Z")
         chunk_until = chunk_until_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
@@ -1113,7 +1142,7 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
         cursor = chunk_until_dt
 
     _upsert_sync_state(conn, environment_id, last_sync_status="success")
-    _record_ingestion_manifest(conn, environment_id, "sync", original_since, now_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"), all_new_uuids)
+    _record_ingestion_manifest(conn, environment_id, "sync", original_since, safe_now_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"), all_new_uuids)
     if on_progress:
         on_progress("ingest", "done", f"{total_inserted} new row(s) inserted across {chunks} day-chunk(s)")
     return {"inserted": total_inserted, "scanned": total_scanned, "since": original_since, "chunks": chunks, "complete": True}
@@ -1165,6 +1194,21 @@ def import_from_csv(csv_path, environment_id, ingestion_scope, on_progress=None)
     return {"inserted": inserted, "scanned": len(rows)}
 
 
+def _delete_pruned_targets(conn, environment_id, events_where_sql, events_where_params):
+    """Deletes every event_targets row whose (environment_id, uuid) is
+    about to be pruned from events by the SAME where-clause -- must run
+    BEFORE the events DELETE in the same transaction, since event_targets'
+    FOREIGN KEY (environment_id, uuid) REFERENCES events(environment_id,
+    uuid) raises IntegrityError on an events delete that still has
+    children (DATA-01). Caller already holds _db_lock."""
+    conn.execute(
+        f"""DELETE FROM event_targets WHERE environment_id = ? AND uuid IN (
+                SELECT uuid FROM events WHERE environment_id = ? {events_where_sql}
+            )""",
+        (environment_id, environment_id, *events_where_params),
+    )
+
+
 def prune_events(environment_id, retention_days=None, max_size_mb=None):
     """Deletes non-curated rows older than retention_days. Curated rows
     (is_curated=1) are NEVER auto-pruned regardless of ingestion_scope --
@@ -1184,6 +1228,17 @@ def prune_events(environment_id, retention_days=None, max_size_mb=None):
         cutoff_dt = datetime.now(timezone.utc) - timedelta(days=retention_days)
         cutoff = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
         with _db_lock:
+            # BUG FIX (external review, 2026-10-05, DATA-01): event_targets
+            # has a FOREIGN KEY on (environment_id, uuid) -> events, and
+            # _insert_rows writes a target row for nearly every real Okta
+            # event -- so the very first prune that matched a row with a
+            # target used to raise sqlite3.IntegrityError, which meant
+            # retention pruning NEVER actually deleted anything on a fresh
+            # install, the DB grew without bound, and _run_sync_job logged
+            # a perfectly successful sync as a failure every single day.
+            # Children deleted first, in the SAME transaction as the
+            # parent delete, same as any other cascade-by-hand.
+            _delete_pruned_targets(conn, environment_id, "AND is_curated = 0 AND published < ?", (cutoff,))
             cur = conn.execute(
                 "DELETE FROM events WHERE environment_id = ? AND is_curated = 0 AND published < ?",
                 (environment_id, cutoff),
@@ -1250,6 +1305,8 @@ def prune_events(environment_id, retention_days=None, max_size_mb=None):
                 datetime.fromisoformat(oldest.replace("Z", "+00:00")) + timedelta(days=step_days)
             ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
             with _db_lock:
+                # DATA-01, same reasoning as the retention_days branch above.
+                _delete_pruned_targets(conn, environment_id, "AND is_curated = 0 AND published < ?", (step_cutoff,))
                 cur = conn.execute(
                     "DELETE FROM events WHERE environment_id = ? AND is_curated = 0 AND published < ?",
                     (environment_id, step_cutoff),
@@ -1283,6 +1340,19 @@ def _normalize_until(until):
     return until
 
 
+def _require_positive_limit(limit):
+    """BUG FIX (external review, 2026-10-05, DATA-06): SQLite's `LIMIT`
+    with a NEGATIVE value means "no limit at all" (confirmed: `LIMIT -5`
+    on a 10-row table returns all 10), not "zero" or an error -- so a
+    negative `limit` silently removed the row cap this function exists to
+    enforce, rather than rejecting the request. `limit=0` is also
+    nonsensical for these callers (every one wants at least the newest
+    row) and is rejected the same way, matching UI-03/DATA-07's
+    recommendation. Raises ValueError; callers map that to an HTTP 400."""
+    if not isinstance(limit, int) or limit < 1:
+        raise ValueError(f"limit must be a positive integer, got {limit!r}")
+
+
 def query_events(environment_id, event_types=None, since=None, until=None, actor_id=None, resource_id=None, limit=1000):
     """Generic report query -- used by every COMPLIANCE_REPORTS preset in
     Phase 4, and by resource_history below. Returns raw rows (dicts with
@@ -1296,6 +1366,7 @@ def query_events(environment_id, event_types=None, since=None, until=None, actor
     resource kinds confirmed live to just be the same value twice, but
     matching both covers any kind where they'd genuinely differ) and uses
     idx_events_env_resource_id, so this stays fast even on a large archive."""
+    _require_positive_limit(limit)
     conn = _get_connection()
     until = _normalize_until(until)
     clauses = ["environment_id = ?"]
@@ -1646,14 +1717,27 @@ def _four_field_row(event_row):
 
 
 def run_report(report_key, environment_id, since=None, until=None, limit=1000):
-    """Runs one named COMPLIANCE_REPORTS preset and returns rows shaped to
-    the four-field standard. Raises KeyError if report_key isn't a real
-    report."""
+    """Runs one named COMPLIANCE_REPORTS preset and returns
+    {"rows": [...], "total": int, "truncated": bool} shaped to the
+    four-field standard. Raises KeyError if report_key isn't a real
+    report, ValueError if limit isn't a positive integer.
+
+    UI-03/DATA-07 (external review, 2026-10-05): report rows were
+    silently capped at `limit` (1000 by default) with nothing in the
+    response saying so -- a report card's own count (count_events, no
+    cap) could read e.g. 4,812 while the detail view and every export
+    built from it silently held only the newest 1,000, dropping the
+    OLDEST part of a 90-day evidence window without warning. `total`
+    (the real, uncapped count for the same filters) and `truncated` let
+    the frontend show "Showing newest N of M" instead of presenting a
+    partial result as complete."""
     if report_key not in COMPLIANCE_REPORTS:
         raise KeyError(f"Unknown report: {report_key!r}")
+    _require_positive_limit(limit)
     event_types = _event_types_for_report(report_key)
     rows = query_events(environment_id, event_types=event_types, since=since, until=until, limit=limit)
-    return [_four_field_row(r) for r in rows]
+    total = count_events(environment_id, event_types=event_types, since=since, until=until)
+    return {"rows": [_four_field_row(r) for r in rows], "total": total, "truncated": total > len(rows)}
 
 
 def resource_history(environment_id, resource_id=None, resource_name=None, since=None, until=None, limit=1000):
@@ -1694,10 +1778,15 @@ def resource_history(environment_id, resource_id=None, resource_name=None, since
     against a real Salesforce account and two Okta service accounts.
 
     At least one of resource_id/resource_name must be given (both empty
-    means "nothing to look up" -- returns [] rather than every event
-    ever)."""
+    means "nothing to look up" -- returns the empty-result shape rather
+    than every event ever).
+
+    Returns {"rows": [...], "total": int, "truncated": bool} -- see
+    run_report's docstring for why (UI-03/DATA-07, external review,
+    2026-10-05). Raises ValueError if limit isn't a positive integer."""
+    _require_positive_limit(limit)
     if not resource_id and not resource_name:
-        return []
+        return {"rows": [], "total": 0, "truncated": False}
     conn = _get_connection()
     until_norm = _normalize_until(until)
     match_clauses = []
@@ -1716,18 +1805,22 @@ def resource_history(environment_id, resource_id=None, resource_name=None, since
     if until_norm:
         clauses.append("e.published <= ?")
         params.append(until_norm)
+    where_sql = " AND ".join(clauses)
+    join_sql = (
+        "FROM events e JOIN event_targets t "
+        "ON e.environment_id = t.environment_id AND e.uuid = t.uuid WHERE " + where_sql
+    )
+    total = conn.execute(f"SELECT COUNT(DISTINCT e.uuid) {join_sql}", params).fetchone()[0]
     sql = (
         "SELECT DISTINCT e.uuid, e.event_type, e.published, e.actor_id, e.actor_display_name, "
         "e.actor_alternate_id, e.outcome_result, e.resource_id, e.resource_alternate_id, "
-        "e.resource_type_detail, e.raw_json FROM events e JOIN event_targets t "
-        "ON e.environment_id = t.environment_id AND e.uuid = t.uuid WHERE "
-        + " AND ".join(clauses)
-        + " ORDER BY e.published DESC LIMIT ?"
+        f"e.resource_type_detail, e.raw_json {join_sql}"
+        " ORDER BY e.published DESC LIMIT ?"
     )
-    params.append(limit)
     out = []
-    for row in conn.execute(sql, params):
+    for row in conn.execute(sql, params + [limit]):
         d = dict(row)
         d["raw"] = json.loads(d.pop("raw_json"))
         out.append(d)
-    return [_four_field_row(r) for r in out]
+    rows = [_four_field_row(r) for r in out]
+    return {"rows": rows, "total": total, "truncated": total > len(rows)}

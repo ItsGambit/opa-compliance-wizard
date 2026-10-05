@@ -2,6 +2,57 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.39.4 — **Fix: four more findings from the 2026-10-05 external review (GATE-04, DATA-01, DATA-02, UI-03/DATA-06).**
+Follow-up to 5.39.2/5.39.3's P0 blockers -- the review's remaining
+deferred items that affect evidence completeness and the second-org gate.
+- **GATE-04 (cross-org privilege escalation).** An additional gate's
+  admin group used to be a full admin of the SHARED backend, including
+  the main org's own `access_control.json` -- `server/nginx_second_site.py`
+  now generates a flat `403` on `/api/access_control` (both read and
+  write) for every additional gate's site, instead of proxying it. There
+  is no per-gate equivalent to redirect it to; the dashboard's Access
+  control page only ever edits the one, default file. 1 new test.
+- **DATA-01 (retention pruning always failed).** `prune_events` raised
+  `sqlite3.IntegrityError` on ANY non-curated row that had a target
+  (`event_targets` has a FOREIGN KEY on events) -- which is nearly every
+  real Okta event, so retention never actually deleted anything on a
+  fresh install and the archive grew without bound. Fixed by deleting the
+  matching `event_targets` rows first, in the same transaction, in both
+  the retention-days and size-cap code paths. 4 new tests, mutation-proven
+  against the exact `IntegrityError` the review reproduced.
+- **DATA-02 (sync watermark permanently skipped late-indexed events).**
+  The System Log is eventually consistent; a sync's final chunk used to
+  reach literal wall-clock "now" and set the watermark from whatever came
+  back, so an event Okta indexed moments late (with a `published` time
+  just behind the watermark) was never fetched again -- permanently,
+  since Okta's own 90-day retention makes the gap unrecoverable later.
+  Fixed with two margins: `SAFETY_LAG_SECONDS` (a sync's chunking never
+  asks for events newer than "now minus 5 minutes") and
+  `WATERMARK_OVERLAP_SECONDS` (resuming from a stored watermark starts an
+  hour before it, not exactly at it -- `INSERT OR IGNORE`'s existing
+  dedup-by-uuid makes the overlap free of duplicates). Only the automatic
+  resume-from-watermark path is affected; an explicitly-passed `since` is
+  unchanged. 4 new tests plus 1 existing test updated for the new,
+  intentional resume semantics.
+- **UI-03/DATA-06/DATA-07 (reports silently capped, negative limit
+  uncapped them entirely).** `query_events`/`run_report`/`resource_history`
+  now reject `limit < 1` (SQLite's `LIMIT -1` means "no limit," not an
+  error -- confirmed and demonstrated directly in the new tests).
+  `run_report`/`resource_history` return `{"rows", "total", "truncated"}`
+  instead of a bare list; `/api/reports/{key}` and
+  `/api/resources/{id}/history` surface `total`/`truncated` in the JSON
+  response and reject a non-positive `?limit=`. `ReportRowsTable` shows a
+  "Showing newest N of M" notice when truncated (used by both the report
+  detail view and the Resources tab's per-resource history); the report
+  card's quick-export and "Export all" buttons toast a warning when the
+  exported CSV is incomplete, since those paths write directly to a file
+  with no table to show a banner in. 12 new backend tests
+  (`tests/test_report_truncation.py`), frontend types/vitest/build all
+  green.
+- 21 new backend tests total this release; full suite green on CI
+  (Linux); `tsc -b`'s 10 pre-existing type errors (OPS-04, a separate,
+  already-tracked finding) are unchanged by this release.
+
 5.39.3 — **Fix: 5.39.2's own SRV-01 guard blocked deploy.sh's restart check.**
 Caught live during the 5.39.2 deploy itself: `deploy.sh`'s restart-
 confirmation step calls `http://127.0.0.1:8766/api/version` directly,

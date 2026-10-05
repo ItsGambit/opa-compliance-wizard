@@ -84,6 +84,16 @@ interface Props {
    * filtered set back out, e.g. for ExportButtons -- "export what's on
    * screen", same convention this table already established. */
   onFilteredRowsChange?: (rows: ComplianceReportRow[]) => void
+  /** UI-03/DATA-07 (external review, 2026-10-05): the real, uncapped
+   * count for the current filters (ComplianceReportResponse/
+   * ResourceHistoryResponse's own `total`) and whether `rows` is a
+   * partial result (`truncated`). Both callers of this table pass these
+   * straight through from the API response -- a report/history view used
+   * to present a server-side-capped `rows` as if it were the complete
+   * evidence window, with nothing on screen saying otherwise. Omit both
+   * (or pass truncated=false) when the caller has no such concept. */
+  total?: number
+  truncated?: boolean
 }
 
 /** The filterable report-rows table -- extracted out of
@@ -95,7 +105,7 @@ interface Props {
  * Outcome dropdown, same as before this extraction) -- callers only see
  * the rendered table plus, optionally, the filtered rows via
  * onFilteredRowsChange. */
-export function ReportRowsTable({ rows, isLoading, emptyMessage, onFilteredRowsChange }: Props) {
+export function ReportRowsTable({ rows, isLoading, emptyMessage, onFilteredRowsChange, total, truncated }: Props) {
   const [userFilter, setUserFilter] = useState('')
   const [actionFilter, setActionFilter] = useState('')
   const [resourceFilter, setResourceFilter] = useState('')
@@ -152,6 +162,12 @@ export function ReportRowsTable({ rows, isLoading, emptyMessage, onFilteredRowsC
 
   return (
     <div className="card p-0 overflow-x-auto">
+      {truncated && !isLoading && (
+        <div className="px-3 py-2 text-[0.6875rem] text-warn bg-warn/10 border-b border-border">
+          Showing the newest {rows.length.toLocaleString()} of {(total ?? rows.length).toLocaleString()} events in
+          this date range. Narrow the date range or export in smaller windows to see the rest.
+        </div>
+      )}
       {isLoading ? (
         <div className="p-4 text-sm text-text-faint">Loading…</div>
       ) : rows.length === 0 ? (
