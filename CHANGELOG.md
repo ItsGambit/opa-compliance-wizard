@@ -2,6 +2,26 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.38.2 — **Fix: second gate could inherit the main gate's env file.**
+`server/setup-second-gate.sh` (5.38.1) edited the copied systemd unit with
+line-anchored `sed` patterns. On a server whose live `opa-auth-gate.service`
+is indented (systemd accepts that), the `EnvironmentFile=` and
+`ReadWritePaths=` edits silently didn't apply while the unanchored `--port`
+edit did, so the second gate ran with the MAIN env file: main org, shared
+session key. Its own verify step caught it (the second hostname's login
+redirected to the main org). Fixed:
+- **`server/unit_second_gate.py`** (new) generates the unit from the live
+  main unit, handling indentation, writing a clean unindented unit, and
+  validating it (exactly one `EnvironmentFile=` = the new file, no reference
+  to the main env file, the new `--port`, the key-folder `ReadWritePaths=`).
+  13 tests (`tests/test_unit_second_gate.py`) cover the repo template and an
+  indented copy; reintroducing the old behaviour fails 3 of them.
+- **`server/setup-second-gate.sh`**: uses it; an existing unit that doesn't
+  use the gate's own env file is stopped, backed up and regenerated (never
+  kept); refuses to start a gate whose loaded `EnvironmentFiles` isn't its
+  own; if the final check sees the login going to the wrong org, it stops
+  and disables the gate and exits non-zero (was only a warning).
+
 5.38.1 — **Second Okta org: setup script, deploy support, shell checks in CI.**
 Follow-up to 5.38.0 so an additional gate is set up and kept current
 through the normal GitHub → `server/deploy.sh` path instead of by hand.
