@@ -2,6 +2,17 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.39.3 — **Fix: 5.39.2's own SRV-01 guard blocked deploy.sh's restart check.**
+Caught live during the 5.39.2 deploy itself: `deploy.sh`'s restart-
+confirmation step calls `http://127.0.0.1:8766/api/version` directly,
+bypassing nginx entirely, specifically to prove `serve.py` came back up --
+but 5.39.2's new hosted-mode guard (`_reject_if_hosted_without_nginx`)
+had no exception for it, so every deploy would now fail that check even
+though the restart succeeded. `/api/version` returns only a version
+string (no tenant data, no admin check) -- same risk class as the
+existing `/healthz` exception, so it's exempted the same way. 1 new test
+(`test_hosted_mode_still_allows_api_version_with_no_proxy_secret`).
+
 5.39.2 — **Fix: pre-auth authentication bypass in hosted mode (external review, 2026-10-05).**
 A full external security/correctness review of the hosted deployment found a
 Critical pre-auth bypass, CONFIRMED EXPLOITABLE IN PRODUCTION: the login

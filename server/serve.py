@@ -228,13 +228,19 @@ def _reject_if_hosted_without_nginx(handler, path):
     _request_is_from_nginx always returns True when NGINX_PROXY_SECRET is
     unset, so this never fires there.
 
-    `/healthz` is the one deliberate exception: its nginx location has
-    `auth_request off` and -- unlike every other location -- never sets
-    X-Nginx-Proxy-Secret either (see nginx-opa-secrets-wizard.conf), since
-    it exists for an external uptime monitor/load balancer with no Okta
-    session to present. It holds no tenant data of its own, so staying
-    reachable here costs nothing."""
-    if DEPLOYMENT_MODE == "hosted" and path != "/healthz" and not _request_is_from_nginx(handler.headers):
+    `/healthz` and `/api/version` are the two deliberate exceptions.
+    `/healthz`'s nginx location has `auth_request off` and -- unlike every
+    other location -- never sets X-Nginx-Proxy-Secret either (see
+    nginx-opa-secrets-wizard.conf), since it exists for an external uptime
+    monitor/load balancer with no Okta session to present. `/api/version`
+    is `deploy.sh`'s own restart-confirmation check (see that script's
+    `_live_version` curl): it deliberately calls `http://127.0.0.1:8766`
+    directly, bypassing nginx entirely, specifically to prove serve.py
+    itself came back up after a restart -- requiring the proxy secret
+    there would make every deploy fail this exact guard. Both routes
+    return only a version string / non-tenant health summary, no admin
+    check, no owner-scoped data -- staying reachable here costs nothing."""
+    if DEPLOYMENT_MODE == "hosted" and path not in ("/healthz", "/api/version") and not _request_is_from_nginx(handler.headers):
         handler._send_json(401, {"error": "Authentication required."})
         return True
     return False

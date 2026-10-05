@@ -120,3 +120,18 @@ def test_local_mode_never_rejects_regardless_of_proxy_secret_header(monkeypatch)
     handler = _FakeHandler({})
     assert serve._reject_if_hosted_without_nginx(handler, "/api/audit_log") is False
     assert handler.sent is None
+
+
+def test_hosted_mode_still_allows_api_version_with_no_proxy_secret(monkeypatch):
+    """REGRESSION (caught live during the 2026-10-05 v5.39.2 deploy):
+    deploy.sh's own restart-confirmation check calls
+    http://127.0.0.1:8766/api/version DIRECTLY, bypassing nginx entirely,
+    specifically to prove serve.py itself came back up -- requiring the
+    proxy secret here would make this guard fail every single deploy.
+    /api/version returns only a version string, no tenant data, no admin
+    check -- same risk class as /healthz."""
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    monkeypatch.setattr(serve, "NGINX_PROXY_SECRET", "real-secret")
+    handler = _FakeHandler({})
+    assert serve._reject_if_hosted_without_nginx(handler, "/api/version") is False
+    assert handler.sent is None
