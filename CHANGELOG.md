@@ -2,6 +2,25 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.38.0 — **Second Okta org on the same server (optional, off by default).**
+Two new optional settings for `server/auth_gate.py`, read through the new
+side-effect-free `server/gate_config.py`, let a SECOND auth gate instance
+serve another Okta org from the same server and the same app/data, next to
+the existing gate. Unset, both keep the long-standing behaviour exactly.
+- **`OKTA_AUTH_SERVER`**: which Okta authorization server issues login
+  tokens. Unset/`default` = `{OKTA_ORG_URL}/oauth2/default` (unchanged).
+  `org` = Okta's org authorization server, whose issuer is the org URL
+  itself: needed with a custom domain (e.g. `https://login.example.com`),
+  where the default server's issuer can be the `*.okta.com` URL and token
+  validation would otherwise fail. Any other value is a custom
+  authorization server ID; anything malformed refuses to start.
+- **`OPA_SESSION_KEY_PATH`**: per-gate session-signing key (absolute path;
+  unset = `/etc/opa-secrets-wizard-session.key`, unchanged). Two gates
+  sharing one key would accept each other's session cookies, so a session
+  from one org would be valid on the other org's address.
+- Tests: `tests/test_gate_config.py` (7). Docs: `docs/hosting.md`
+  "Serving a second Okta org".
+
 5.37.0 — **Report enhancements: request/transaction ID, device-user
 enrichment, outcome/network context, policy attribution, JIT request
 subject.** Grounded in external research (NIST SP 800-53 AU-3, PCI-DSS

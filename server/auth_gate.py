@@ -178,6 +178,11 @@ from pathlib import Path
 import jwt
 from jwt import PyJWKClient
 
+try:  # run as a script (systemd: python server/auth_gate.py)
+    from gate_config import okta_endpoints, session_key_path
+except ImportError:  # imported as server.auth_gate
+    from server.gate_config import okta_endpoints, session_key_path
+
 # Phase 8 of docs/fast-follow-redesign.md: same JSON-line structured-
 # logging shape as create_secret_folders.py's own log()/CORRELATION_ID
 # (see that module's docstring for the full ThreadingHTTPServer/
@@ -218,11 +223,15 @@ def _require_env(name):
 
 
 OKTA_ORG_URL = _require_env("OKTA_ORG_URL")  # e.g. https://your-org.oktapreview.com
-OKTA_ISSUER = f"{OKTA_ORG_URL}/oauth2/default"
-OKTA_AUTHORIZE_URL = f"{OKTA_ISSUER}/v1/authorize"
-OKTA_TOKEN_URL = f"{OKTA_ISSUER}/v1/token"
-OKTA_JWKS_URL = f"{OKTA_ISSUER}/v1/keys"
-OKTA_LOGOUT_URL = f"{OKTA_ISSUER}/v1/logout"
+# "default" (unset) = {org}/oauth2/default as always; "org" = the org authorization server (issuer = the org
+# URL, e.g. a custom domain). See server/gate_config.py.
+OKTA_AUTH_SERVER = os.environ.get("OKTA_AUTH_SERVER", "default")
+_ENDPOINTS = okta_endpoints(OKTA_ORG_URL, OKTA_AUTH_SERVER)
+OKTA_ISSUER = _ENDPOINTS["issuer"]
+OKTA_AUTHORIZE_URL = _ENDPOINTS["authorize"]
+OKTA_TOKEN_URL = _ENDPOINTS["token"]
+OKTA_JWKS_URL = _ENDPOINTS["jwks"]
+OKTA_LOGOUT_URL = _ENDPOINTS["logout"]
 OKTA_CLIENT_ID = _require_env("OKTA_OIDC_CLIENT_ID")  # not secret, but still deployment-specific
 OKTA_ADMIN_GROUP_ID = _require_env("OKTA_ADMIN_GROUP_ID")  # Okta group ID -- members get admin rights
 OKTA_ENV_NAME = os.environ.get("OKTA_ENV_NAME", "default")  # keyring service suffix -- see create_secret_folders.py convention
@@ -241,7 +250,9 @@ DASHBOARD_ORIGIN = _require_env("DASHBOARD_ORIGIN")  # e.g. https://192.168.1.10
 REDIRECT_URI = f"{DASHBOARD_ORIGIN}/authorization-code/callback"
 POST_LOGOUT_REDIRECT_URI = f"{DASHBOARD_ORIGIN}/login"
 
-SESSION_KEY_PATH = Path("/etc/opa-secrets-wizard-session.key")
+# One key per gate instance (OPA_SESSION_KEY_PATH): a second gate for another Okta org must not accept this
+# gate's session cookies. Unset = the long-standing path.
+SESSION_KEY_PATH = session_key_path(os.environ)
 SESSION_COOKIE = "opa_wizard_session"
 FLOW_COOKIE = "opa_wizard_flow"
 STEPUP_COOKIE = "opa_wizard_stepup"
