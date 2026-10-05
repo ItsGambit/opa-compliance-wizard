@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from server.gate_config import DEFAULT_SESSION_KEY_PATH, okta_endpoints, session_key_path
+from server.gate_config import DEFAULT_SESSION_KEY_PATH, access_control_path, okta_endpoints, session_key_path
 
 
 def test_default_authorization_server_is_unchanged():
@@ -49,3 +49,21 @@ def test_session_key_path_is_configurable_per_gate():
 def test_session_key_path_must_be_absolute():
     with pytest.raises(RuntimeError):
         session_key_path({"OPA_SESSION_KEY_PATH": "relative.key"})
+
+
+DEFAULT_AC = Path("/home/app/opa/access_control.json")
+
+
+def test_access_control_path_defaults_to_the_app_file():
+    assert access_control_path({}, DEFAULT_AC) == DEFAULT_AC
+    assert access_control_path({"OPA_ACCESS_CONTROL_PATH": ""}, DEFAULT_AC) == DEFAULT_AC
+
+
+def test_access_control_path_is_configurable_per_gate():
+    env = {"OPA_ACCESS_CONTROL_PATH": "/etc/opa-auth-gate-second/access_control.json"}
+    assert access_control_path(env, DEFAULT_AC) == Path("/etc/opa-auth-gate-second/access_control.json")
+
+
+def test_access_control_path_must_be_absolute():
+    with pytest.raises(RuntimeError):
+        access_control_path({"OPA_ACCESS_CONTROL_PATH": "access_control.json"}, DEFAULT_AC)

@@ -179,9 +179,9 @@ import jwt
 from jwt import PyJWKClient
 
 try:  # run as a script (systemd: python server/auth_gate.py)
-    from gate_config import okta_endpoints, session_key_path
+    from gate_config import access_control_path, okta_endpoints, session_key_path
 except ImportError:  # imported as server.auth_gate
-    from server.gate_config import okta_endpoints, session_key_path
+    from server.gate_config import access_control_path, okta_endpoints, session_key_path
 
 # Phase 8 of docs/fast-follow-redesign.md: same JSON-line structured-
 # logging shape as create_secret_folders.py's own log()/CORRELATION_ID
@@ -286,7 +286,9 @@ STEPUP_LOG_LOOKBACK_SECONDS = 120
 # POST /api/access_control/save (server/serve.py) calling
 # create_secret_folders.set_access_control_config -- auth_gate.py never
 # writes it, avoiding any dual-writer race between the two processes.
-ACCESS_CONTROL_FILE_PATH = Path(__file__).resolve().parent.parent / "access_control.json"
+# Per gate instance (OPA_ACCESS_CONTROL_PATH, 5.38.3): an additional gate for another Okta org must not check
+# the main org's group IDs. Unset = access_control.json next to the app, as always.
+ACCESS_CONTROL_FILE_PATH = access_control_path(os.environ, Path(__file__).resolve().parent.parent / "access_control.json")
 
 
 _LAST_GOOD_ACCESS_CONTROL_CONFIG = None  # see _read_access_control_config

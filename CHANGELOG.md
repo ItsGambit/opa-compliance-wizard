@@ -2,6 +2,21 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.38.3 — **Per-gate access control for an additional Okta org.**
+Both gates read `access_control.json` (admin group, user group,
+restrict_login), which holds the MAIN org's group IDs, so the second org's
+gate looked for its users in the main org's groups and refused everyone
+("You don't have access to this dashboard").
+- **`OPA_ACCESS_CONTROL_PATH`** (optional; unset = `access_control.json`,
+  unchanged) via `gate_config.access_control_path`. 3 tests.
+- **`setup-second-gate.sh`** writes the gate's own
+  `/etc/opa-auth-gate-<name>/access_control.json` (600): admin group =
+  `--admin-group`, no user group, `restrict_login: true` (only that group's
+  members get in, as admins), and sets `OPA_ACCESS_CONTROL_PATH` in the
+  gate's env file (also for existing installs).
+- Limitation: the dashboard's Access control page (`serve.py`) edits only the
+  default file; change an additional gate's file on the server.
+
 5.38.2 — **Fix: second gate could inherit the main gate's env file.**
 `server/setup-second-gate.sh` (5.38.1) edited the copied systemd unit with
 line-anchored `sed` patterns. On a server whose live `opa-auth-gate.service`

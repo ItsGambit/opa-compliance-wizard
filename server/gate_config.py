@@ -15,6 +15,11 @@ Okta org on the same server, alongside the existing one:
 - OPA_SESSION_KEY_PATH gives each gate instance its own session-signing key.
   Two gates sharing one key would accept each other's session cookies, so a
   session from one org would be valid on the other org's address.
+- OPA_ACCESS_CONTROL_PATH (5.38.3) gives each gate its own access-control file
+  (admin group, user group, restrict_login). The default access_control.json
+  holds the MAIN org's group IDs; another org's gate checking those IDs would
+  refuse everyone (or, worse with a coincidental ID, admit the wrong people).
+  The dashboard's Access control page (serve.py) only edits the default file.
 """
 import re
 from pathlib import Path
@@ -49,4 +54,12 @@ def session_key_path(env):
     path = Path(env.get("OPA_SESSION_KEY_PATH") or DEFAULT_SESSION_KEY_PATH)
     if not path.is_absolute():
         raise RuntimeError(f"OPA_SESSION_KEY_PATH must be an absolute path, got {str(path)!r}")
+    return path
+
+
+def access_control_path(env, default):
+    """Where this gate instance reads its access control (absolute path); default = access_control.json."""
+    path = Path(env.get("OPA_ACCESS_CONTROL_PATH") or default)
+    if not path.is_absolute():
+        raise RuntimeError(f"OPA_ACCESS_CONTROL_PATH must be an absolute path, got {str(path)!r}")
     return path

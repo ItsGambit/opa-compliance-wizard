@@ -453,7 +453,10 @@ backs up first, and is safe to re-run. What it creates:
   `OKTA_OIDC_CLIENT_ID`, `OKTA_ADMIN_GROUP_ID`, `DASHBOARD_ORIGIN`,
   `OKTA_ENV_NAME` (its own keyring namespace), `OKTA_AUTH_SERVER`,
   `OPA_SESSION_KEY_PATH` (its own key: neither gate accepts the other's
-  sessions), plus the same `KEYRING_UNLOCK_PASSWORD` and
+  sessions), `OPA_ACCESS_CONTROL_PATH` (its own access control: admin group =
+  `--admin-group`, sign-in restricted to it; the dashboard's Access control
+  page only edits the main gate's `access_control.json`), plus the same
+  `KEYRING_UNLOCK_PASSWORD` and
   `NGINX_PROXY_SECRET` as the main file.
 - systemd unit `opa-auth-gate-<name>` (copy of the main unit on another
   port) and a sudoers grant so `server/deploy.sh` can restart it.

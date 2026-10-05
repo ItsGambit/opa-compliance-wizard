@@ -108,6 +108,7 @@ if [ ! -f "$NEW_ENV" ]; then
     echo "OKTA_ENV_NAME=$ENV_NAME"
     echo "DASHBOARD_ORIGIN=$ORIGIN"
     echo "OPA_SESSION_KEY_PATH=$KEY_DIR/session.key"
+    echo "OPA_ACCESS_CONTROL_PATH=$KEY_DIR/access_control.json"
     echo "DEPLOYMENT_MODE=hosted"
     # Shared with the main gate: the same keyring unlock password and nginx-to-backend secret.
     grep -E '^(KEYRING_UNLOCK_PASSWORD|NGINX_PROXY_SECRET)=' "$MAIN_ENV"
@@ -119,6 +120,20 @@ else
 fi
 sudo install -d -o "$APP_USER" -g "$APP_USER" -m 700 "$KEY_DIR"
 ok "own session-key folder $KEY_DIR"
+# Own access control (5.38.3): this org's admin group, sign-in restricted to it. The main
+# access_control.json holds the main org's group IDs and must not be used by this gate.
+AC_FILE=$KEY_DIR/access_control.json
+if [ ! -f "$AC_FILE" ]; then
+  printf '{"admin_group_id": "%s", "user_group_id": null, "restrict_login": true}\n' "$ADMIN_GROUP" > "$AC_FILE"
+  chmod 600 "$AC_FILE"
+  ok "own access control $AC_FILE (admins: $ADMIN_GROUP, sign-in restricted to them)"
+else
+  ok "own access control $AC_FILE already exists (left as is)"
+fi
+if ! grep -q "^OPA_ACCESS_CONTROL_PATH=" "$NEW_ENV"; then
+  echo "OPA_ACCESS_CONTROL_PATH=$AC_FILE" >> "$NEW_ENV"
+  ok "added OPA_ACCESS_CONTROL_PATH to $NEW_ENV"
+fi
 
 keyring_py() {
   env XDG_RUNTIME_DIR=/run/user/$APP_UID DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$APP_UID/bus \
