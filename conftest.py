@@ -2,8 +2,8 @@
 
 No test anywhere in this suite may touch the REAL environments.json,
 audit_store.db, or OS keychain -- those hold live credentials
-(base_domain/team_name/key_id for the dev/patlabs environments) and real
-tenant data. Every fixture below exists specifically to redirect this
+(base_domain/team_name/key_id for a developer's own real environments)
+and real tenant data. Every fixture below exists specifically to redirect this
 project's module-level, hardcoded file paths and OS-keyring calls to
 disposable per-test substitutes.
 """
@@ -20,8 +20,8 @@ import create_secret_folders as engine
 @pytest.fixture
 def tmp_environments_file(tmp_path, monkeypatch):
     """Redirects environments.json to a disposable temp file so no test
-    can ever read or write the real one (which holds live dev/patlabs
-    credentials metadata)."""
+    can ever read or write the real one (which holds live real
+    environments' credentials metadata)."""
     path = tmp_path / "environments.json"
     monkeypatch.setattr(engine, "_environments_file_path", lambda: str(path))
     return path

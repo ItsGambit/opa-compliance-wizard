@@ -1,8 +1,8 @@
 #!/bin/bash
 # Repeatable deploy: pulls the latest OPA Compliance Wizard from GitHub and
 # reinstalls it in place on this server. Run this ON THE SERVER (as the
-# `rparikh` user, or whichever user owns /home/rparikh/opa-secrets-folders
-# and the systemd service), not from your own machine.
+# app's deploy user -- whichever user owns $APP_DIR below and the systemd
+# service), not from your own machine.
 #
 #   ./deploy.sh
 #
@@ -555,9 +555,9 @@ echo "    Commit: ${DEPLOY_COMMIT:-unknown}"
 # therefore reverting a correctly-configured secret back to the literal
 # placeholder string, requiring a manual reapply after every single
 # deploy. Fixed here, BEFORE the drift diff/apply below even runs: read
-# whatever real secret is CURRENTLY live (NGINX_LIVE is rparikh-owned,
+# whatever real secret is CURRENTLY live (NGINX_LIVE is app-user-owned,
 # readable without sudo) and bake it into the freshly-rsynced LOCAL copy
-# at NGINX_REPO (also rparikh-owned, in $APP_DIR -- writable without sudo)
+# at NGINX_REPO (also app-user-owned, in $APP_DIR -- writable without sudo)
 # in place of the placeholder. The existing diff/apply logic below is
 # UNCHANGED otherwise: if nothing else in the config differs, the diff
 # now comes back clean (secret already matches) and nothing gets

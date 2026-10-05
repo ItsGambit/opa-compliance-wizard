@@ -486,7 +486,7 @@ def _start_sync_job(env_id, env_name, ingestion_scope, owner=engine.LOCAL_OWNER_
     under (the requesting session's identity for a manual "Sync now",
     or whatever the scheduler loop found it under) -- this environment
     can be a per-user, non-shared copy (e.g. a logged-in Okta identity's
-    own `patlabs`, distinct from a shared `__local__::patlabs`), and its
+    own `prod`, distinct from a shared `__local__::prod`), and its
     Okta API token lives in the OS keychain under that exact owner's
     storage key. Silently defaulting to LOCAL_OWNER_KEY here previously
     caused a real bug: an admin's token, saved onto their own per-user
@@ -594,7 +594,7 @@ def _scheduler_loop():
             now_utc = datetime.now(timezone.utc)
             # list_all_environments(), NOT list_environments_for(LOCAL_OWNER_KEY):
             # a per-user, non-shared environment (e.g. a logged-in Okta
-            # identity's own private copy of "patlabs") owns its own
+            # identity's own private copy of "prod") owns its own
             # sync_schedule and Okta token just like a shared one does, and
             # the scheduler must still find and run it -- list_environments_for
             # deliberately hides another owner's non-shared environments from

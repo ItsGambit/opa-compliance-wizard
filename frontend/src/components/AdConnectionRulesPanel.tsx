@@ -27,7 +27,7 @@ function describeRuleSettings(settings: { matching_criteria: Record<string, bool
 /** Discovery configuration for one Active Directory connection -- explains
  * WHY an individual AD account got discovered/matched to an Okta user at
  * all (confirmed live 2026-09-30 this is exactly how real accounts like
- * a1ruchir.parikh@usp.atkoepd.com were matched). A genuinely different
+ * user1.lastname@example.com were matched). A genuinely different
  * UX shape from ResourceHistoryPanel (that's "show me compliance events,"
  * this is "show me discovery configuration") -- not a variant of it. */
 export function AdConnectionRulesPanel({ connectionId, connectionLabel, onClose }: { connectionId: string; connectionLabel: string; onClose: () => void }) {

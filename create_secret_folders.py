@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.39.4
+# Version     : 5.39.5
 # =============================================================================
 
 import argparse
@@ -80,7 +80,7 @@ import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.39.4"
+SCRIPT_VERSION = "5.39.5"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -124,7 +124,7 @@ DATABASE_CONNECTIONS_PATH = "/v1/teams/{team}/connections/databases"
 SAAS_APP_CONNECTIONS_PATH = "/v1/teams/{team}/connections/saas_apps"
 ACTIVE_DIRECTORY_CONNECTIONS_PATH = "/v1/teams/{team}/connections/active_directory"
 # Confirmed live 2026-09-30 against the real opa-minimal.yaml OpenAPI spec
-# AND a real tenant (patlabs) -- tenant-wide, same family as the
+# AND a real tenant -- tenant-wide, same family as the
 # connections/* paths above. A Client is an END USER's local OPA client
 # install (laptop/workstation running the OPA desktop app or `sft`), NOT
 # a managed server/gateway resource -- it's what a human enrolls to be
@@ -138,7 +138,7 @@ USER_GROUPS_PATH = USERS_PATH + "/{user_name}/groups"
 PROJECT_SERVERS_PATH = PROJECTS_PATH + "/{project_id}/servers"
 PROJECT_SAAS_APP_ACCOUNTS_PATH = PROJECTS_PATH + "/{project_id}/saas_app_accounts"
 PROJECT_OKTA_UD_ACCOUNTS_PATH = PROJECTS_PATH + "/{project_id}/okta_universal_directory_accounts"
-# Both confirmed live 2026-09-30 against a real tenant (patlabs) -- neither
+# Both confirmed live 2026-09-30 against a real tenant -- neither
 # was previously used anywhere in this codebase. Same {"list": [...]}
 # collection shape as the three siblings above.
 PROJECT_ACTIVE_DIRECTORY_ACCOUNTS_PATH = PROJECTS_PATH + "/{project_id}/active_directory_accounts"
@@ -153,7 +153,7 @@ PROJECT_DATABASE_ACCOUNTS_PATH = PROJECTS_PATH + "/{project_id}/database_account
 ASSIGNMENTS_PATH = "/v1/teams/{team}/assignments"
 RELATIONSHIPS_PATH = "/v1/teams/{team}/relationships"
 # Confirmed live 2026-09-30 -- explains WHY an individual AD account (e.g.
-# a1ruchir.parikh@usp.atkoepd.com) exists as a discovered resource at all:
+# user1.lastname@example.com) exists as a discovered resource at all:
 # an AD connection's discovery `rules` (OU-scoped SHARED/INDIVIDUAL scans)
 # plus its `rule_settings` (matching_criteria -- which real Okta user
 # fields it matches by, e.g. username -- and partial_matching_criteria,
@@ -1830,7 +1830,7 @@ class OpaClient:
         return self._list(path)
 
     def list_clients(self):
-        """Confirmed live 2026-09-30 against a real tenant (patlabs, 10 real
+        """Confirmed live 2026-09-30 against a real tenant (10 real
         enrolled clients returned) -- every end-user OPA client (laptop/
         workstation) enrolled for this team, not just the caller's own
         (requires ?all=true, per the spec's own ListClients description:
@@ -1858,7 +1858,7 @@ class OpaClient:
         return self._list(path)
 
     def list_project_active_directory_accounts(self, resource_group_id, project_id):
-        """Confirmed live 2026-09-30 against a real tenant (patlabs, project
+        """Confirmed live 2026-09-30 against a real tenant (project
         Test_User_A_Project) -- real shape includes account_name,
         sam_account_name, distinguished_name, sid, domain.name, email,
         account_status_detail."""
@@ -1868,7 +1868,7 @@ class OpaClient:
         return self._list(path)
 
     def list_project_database_accounts(self, resource_group_id, project_id):
-        """Confirmed live 2026-09-30 against a real tenant (patlabs, projects
+        """Confirmed live 2026-09-30 against a real tenant (projects
         Postgresql-DB-Accounts/SQL-DB-Accounts) -- real shape includes
         account_name, database_connection.name,
         database_connection_auth_type, account_status_detail."""
@@ -2704,14 +2704,14 @@ def _resolve_selector_entry(resource_type, selector_type, selector, indexes):
 # One entry per real resource_assignments key seen live -- (id_field,
 # name_field) into a resolved {"kind":"resolved", ...} entry. Deliberately
 # a lookup table, not a hardcoded single-kind assumption: confirmed live
-# against BOTH patlabs (saas_app_account_assignments) and dev
+# against BOTH a real tenant (saas_app_account_assignments) and dev
 # (secret_or_folder_assignments) that this "this is a new feature, we'll
 # see more of this" -- new kinds are expected to keep appearing. An
 # unrecognized future key still resolves generically (see
 # _resolve_relationship_assignment_resources below) rather than being
 # silently dropped.
 _RELATIONSHIP_ASSIGNMENT_ID_NAME_FIELDS = {
-    # Confirmed live 2026-09-30 (patlabs) -- privileged_resource_id is the
+    # Confirmed live 2026-09-30 (a real tenant) -- privileged_resource_id is the
     # SaaS account's real System Log-tracking id (same field this
     # codebase already relies on elsewhere for SaaS accounts -- see
     # RESOURCE_ACCESS_EVENT_TYPES' access_tracking_id precedent).
@@ -3428,7 +3428,7 @@ def build_access_model(client, okta_client=None, on_progress=None):
                 all_okta_accounts.append({**acct, **proj_ref_named})
 
             # These two are new as of 2026-09-30 -- confirmed live against a
-            # real tenant (patlabs), not previously called anywhere in this
+            # real tenant, not previously called anywhere in this
             # codebase. Unlike servers/saas/okta above, no security-policy
             # rule selector resolves to either of these by an OPA-internal
             # id today (AD/DB selectors resolve via name/domain condition
@@ -3471,7 +3471,7 @@ def build_access_model(client, okta_client=None, on_progress=None):
         # `relationships[]` uses this as an ALTERNATE way to specify both
         # its principal and its resource target, replacing the ordinary
         # principals/resource_selector fields every other policy uses.
-        # Every OTHER real policy (confirmed: 15 of 16 on patlabs, 13 of
+        # Every OTHER real policy (confirmed: 15 of 16 on a real tenant, 13 of
         # 15 on dev) has an EMPTY relationships field and is completely
         # unaffected -- effective_principals/relationship_resolutions stay
         # None for those, and the code below falls through to the

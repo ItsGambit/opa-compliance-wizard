@@ -13,7 +13,7 @@ import { HighlightedText, useFuzzyFilter } from '../utils/fuzzySearch'
 const RESOURCE_TYPE_DETAIL_LABEL: Record<string, string> = {
   PAM_DATABASE_ACCOUNT: 'Database Account',
   SERVER_ACCOUNT: 'Server Account',
-  // confirmed live 2026-09-30 via a real patlabs pam.resource.checkout
+  // confirmed live 2026-09-30 via a real tenant's pam.resource.checkout
   // event for a Salesforce account -- not seen during initial probing,
   // found via this session's own Playwright verification pass instead.
   MANAGED_SAAS_APP_SERVICE_ACCOUNT: 'SaaS Service Account',

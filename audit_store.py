@@ -37,7 +37,7 @@ from datetime import datetime, timedelta, timezone
 # ---------------------------------------------------------------------------
 # Verified compliance event-type mapping (Phase 1 of the plan -- every
 # entry here was confirmed to actually exist via live probing against
-# real tenants (dev + patlabs), not assumed from the audit-requirements
+# real tenants (dev + a real production tenant), not assumed from the audit-requirements
 # guide, which got many exact event names wrong (see plan for the full
 # guide-vs-reality comparison). Curated/allow-listed events are the ones
 # that (a) never get pruned regardless of retention settings, and (b)
@@ -96,21 +96,21 @@ COMPLIANCE_EVENT_TYPES = {
     # a real CC7 system-operations signal, not previously covered by any
     # report.
     "pam.active_directory.account_discovery.complete": "ad_sync_activity",
-    # confirmed live 2026-09-30: real, high-volume (55 combined events/90d
-    # on patlabs) service-account credential rotation lifecycle, not
-    # previously covered by any report.
+    # confirmed live 2026-09-30: real, high-volume service-account
+    # credential rotation lifecycle on a real tenant, not previously
+    # covered by any report.
     "pam.service_account.password_rotation.start": "credential_rotation",
     "pam.service_account.password_rotation.end": "credential_rotation",
     "pam.security_policy.create": "pam_policy_modifications",
     "pam.security_policy.update": "pam_policy_modifications",
-    # confirmed real (90-day CSV export, patlabs): a human's local OPA
+    # confirmed real (90-day CSV export, a real tenant): a human's local OPA
     # client (laptop/workstation running the desktop app or `sft`)
     # enrolling to be able to make SSH/RDP connections at all -- a CC6
     # access-control signal distinct from pam_sessions (which is "did they
     # connect" after this already happened), not previously covered by
     # any report.
     "pam.client.enroll": "pam_client_enrollment",
-    # confirmed real (live System Log scan, patlabs, 2026-10-01): Okta's
+    # confirmed real (live System Log scan, a real tenant, 2026-10-01): Okta's
     # own org-wide DEVICE lifecycle, separate from pam.client.enroll above
     # (an OPA client is the PAM connection agent; an Okta Device is the
     # underlying managed/unmanaged hardware MFA'd against) -- a CC6
@@ -1426,8 +1426,8 @@ def count_events(environment_id, event_types=None, since=None, until=None):
 
 
 # Full per-event-type audit, 2026-09-30, against two real 90-day System
-# Log CSV exports from patlabs (55,857 + 56,478 rows -- far higher sample
-# size than a live API pull for every event type at once). "Skip a
+# Log CSV exports from a real tenant (55,857 + 56,478 rows -- far higher
+# sample size than a live API pull for every event type at once). "Skip a
 # leading Team" was the ORIGINAL fix, but a full audit of every mapped
 # event type's real target-type ordering found it's genuinely
 # event-type-specific, not just "skip Team" -- several events have a
@@ -1751,8 +1751,8 @@ def resource_history(environment_id, resource_id=None, resource_name=None, since
     that matches only the ONE target _primary_target() picked as "the"
     resource for the event's four-field-standard row, which is correct
     for an ordinary report row but wrong here: a real bug found
-    2026-09-30 live against patlabs is that a genuine Server target (e.g.
-    usp-srv1) can coexist on an event alongside a Server Account target
+    2026-09-30 live against a real tenant is that a genuine Server target
+    (e.g. a server named srv1) can coexist on an event alongside a Server Account target
     _primary_target prefers, so resource_id alone silently drops the
     Server's own id and a click on it found zero history despite real
     activity existing. This instead JOINs event_targets (one row per REAL

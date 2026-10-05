@@ -4,12 +4,12 @@ After=network.target
 
 [Service]
 Type=simple
-User=rparikh
-WorkingDirectory=/home/rparikh/opa-secrets-folders
+User=__APP_USER__
+WorkingDirectory=__APP_DIR__
 EnvironmentFile=/etc/opa-compliance-wizard.env
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
-ExecStart=/home/rparikh/opa-secrets-folders/server/start-headless.sh
+ExecStart=__APP_DIR__/server/start-headless.sh
 Restart=on-failure
 RestartSec=3
 
@@ -31,8 +31,8 @@ RestartSec=3
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=read-only
-ReadWritePaths=/home/rparikh/opa-secrets-folders
-ReadWritePaths=/home/rparikh/.local/share/keyrings
+ReadWritePaths=__APP_DIR__
+ReadWritePaths=__APP_USER_HOME__/.local/share/keyrings
 ReadWritePaths=/run/user/1000
 ProtectKernelTunables=true
 ProtectControlGroups=true

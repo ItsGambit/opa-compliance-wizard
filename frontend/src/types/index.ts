@@ -414,7 +414,7 @@ export interface AccessPolicy {
 }
 
 // ── Access Explorer: tenant-wide resource inventory (Resources sub-tab) ──
-// All six live-verified 2026-09-30 against a real tenant (patlabs). Servers
+// All six live-verified 2026-09-30 against a real tenant. Servers
 // cover Windows/Linux/Gateway in one shape -- os_type distinguishes
 // Windows/Linux, and a gateway is just a server whose services[] includes
 // "broker" (confirmed live -- NOT a separate resource type/API).
@@ -552,7 +552,7 @@ export interface AccessActiveDirectoryConnection {
 
 // A Client is an end user's local OPA client install (laptop/workstation
 // running the desktop app or `sft`) -- confirmed live 2026-09-30 against
-// the real opa-minimal.yaml spec AND a real tenant (patlabs, 10 real
+// the real opa-minimal.yaml spec AND a real tenant (10 real
 // enrolled clients). Distinct from a Server/Gateway: this is what a
 // HUMAN enrolls to be able to make SSH/RDP connections at all, not a
 // managed resource being connected to.
@@ -628,7 +628,7 @@ export interface AccessAssignment {
   name: string
   description?: string
   // Real shape varies by which resource kind was granted (confirmed live:
-  // saas_app_account_assignments on patlabs, secret_or_folder_assignments
+  // saas_app_account_assignments on a real tenant, secret_or_folder_assignments
   // on dev) -- kept open since more kinds are expected to appear as this
   // OPA feature matures (see create_secret_folders.py's
   // _RELATIONSHIP_ASSIGNMENT_ID_NAME_FIELDS comment).

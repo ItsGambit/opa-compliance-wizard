@@ -128,6 +128,27 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    requires renaming a unit that's already running; this filename is the
    template a fresh install starts from.)
 
+   Both `.service` files use `__APP_USER__`/`__APP_DIR__`/
+   `__APP_USER_HOME__` placeholders (not a real username/path — this repo
+   is public and doesn't hardcode either), so fill those in before
+   installing, e.g.:
+   ```bash
+   sed -e "s|__APP_USER__|$(whoami)|g" \
+       -e "s|__APP_DIR__|$(pwd)|g" \
+       -e "s|__APP_USER_HOME__|$HOME|g" \
+       server/opa-compliance-wizard.service | sudo tee /etc/systemd/system/opa-compliance-wizard.service
+   sed -e "s|__APP_USER__|$(whoami)|g" \
+       -e "s|__APP_DIR__|$(pwd)|g" \
+       -e "s|__APP_USER_HOME__|$HOME|g" \
+       server/opa-auth-gate.service | sudo tee /etc/systemd/system/opa-auth-gate.service
+   sudo systemctl daemon-reload
+   ```
+   Run these from the repo root so `$(pwd)` resolves to the real
+   `$APP_DIR`. `server/setup-second-gate.sh` copies the LIVE unit at
+   `/etc/systemd/system/opa-auth-gate.service` to build an additional
+   gate's unit (see `server/unit_second_gate.py`), not this repo
+   template, so it's unaffected by these placeholders either way.
+
    **This step is a ONE-TIME manual install, not something `server/deploy.sh`
    ever automates for you** (confirmed the hard way, 2026-10-02): unlike
    the nginx site config, which `deploy.sh` actively diffs and re-applies
@@ -185,9 +206,9 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    `which` output differs.)
 
    Step 7b. Confirm the deploying Linux username (the account that will
-   actually run `./deploy.sh` — e.g. `rparikh`) and the real path to this
-   repo on the server (e.g. `/home/rparikh/opa-secrets-folders`) — you'll
-   substitute both into step 7c.
+   actually run `./deploy.sh` — e.g. `<app-user>`) and the real path to
+   this repo on the server (e.g. `/home/<app-user>/opa-compliance-wizard`)
+   — you'll substitute both into step 7c.
 
    Step 7c. Open a new sudoers file for editing. **Always use `visudo`**
    (never edit the file directly) — it validates syntax before saving, so
@@ -196,22 +217,22 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    sudo visudo -f /etc/sudoers.d/opa-compliance-wizard-deploy
    ```
    Paste the following into the editor that opens, then replace every
-   `rparikh` with your actual deploying username (step 7b) and every
-   `/home/rparikh/opa-secrets-folders` with your actual repo path (step
-   7b) — leave `opa-secrets-wizard` and `opa-auth-gate` exactly as-is,
-   those are fixed systemd unit names, not placeholders. Note there are
-   **two separate `cp` lines**, not one — `deploy.sh` applies the new
-   nginx config over the live path, and (only if `nginx -t` or the
-   reload then fails) rolls its own backup — kept in the repo's own
+   `<app-user>` with your actual deploying username (step 7b) and every
+   `/home/<app-user>/opa-compliance-wizard` with your actual repo path
+   (step 7b) — leave `opa-secrets-wizard` and `opa-auth-gate` exactly
+   as-is, those are fixed systemd unit names, not placeholders. Note
+   there are **two separate `cp` lines**, not one — `deploy.sh` applies
+   the new nginx config over the live path, and (only if `nginx -t` or
+   the reload then fails) rolls its own backup — kept in the repo's own
    `$APP_DIR`, not under `/etc/nginx`, so creating/deleting it never
    needs sudo at all — back over the live path; sudoers matches each
    exact argument list separately, so a rule for only one of these two
    leaves the other silently denied:
    ```
-   rparikh ALL=(ALL) NOPASSWD: /bin/systemctl restart opa-secrets-wizard, \
+   <app-user> ALL=(ALL) NOPASSWD: /bin/systemctl restart opa-secrets-wizard, \
      /bin/systemctl restart opa-auth-gate, \
-     /bin/cp /home/rparikh/opa-secrets-folders/server/nginx-opa-secrets-wizard.conf /etc/nginx/sites-available/opa-secrets-wizard, \
-     /bin/cp /home/rparikh/opa-secrets-folders/.nginx-deploy-backup /etc/nginx/sites-available/opa-secrets-wizard, \
+     /bin/cp /home/<app-user>/opa-compliance-wizard/server/nginx-opa-secrets-wizard.conf /etc/nginx/sites-available/opa-secrets-wizard, \
+     /bin/cp /home/<app-user>/opa-compliance-wizard/.nginx-deploy-backup /etc/nginx/sites-available/opa-secrets-wizard, \
      /usr/sbin/nginx -t, \
      /bin/systemctl reload nginx
    ```

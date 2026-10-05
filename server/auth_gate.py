@@ -65,7 +65,7 @@ Runs standalone on 127.0.0.1:8767, fronted by nginx's auth_request module
 
 Session cookie is a signed ("<expiry>.<hmac>") token, same scheme as this
 project's other short-lived signed tokens conceptually -- HMAC-SHA256 over a
-server-only secret in /etc/opa-secrets-wizard-session.key (root:rparikh,
+server-only secret in /etc/opa-secrets-wizard-session.key (root:<app-user>,
 0640, generated once on first run). The PKCE code_verifier + OAuth `state`
 for an in-flight login are held in a short-lived signed cookie too (nothing
 server-side to garbage-collect), since this gate is a single Python process

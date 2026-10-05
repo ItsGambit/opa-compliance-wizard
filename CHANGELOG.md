@@ -2,6 +2,30 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.39.5 — **Sanitize identifying details from comments, docs and templates (review section 10).**
+No behavior change -- comments, docs and systemd unit templates only.
+- Replaced a real email address in two code comments with a generic
+  `user1.lastname@example.com` placeholder.
+- Reworded the internal tenant name `patlabs` to "a real tenant" (or
+  dropped the specific name entirely) across ~20 comments in
+  `audit_store.py`, `create_secret_folders.py`, `conftest.py`,
+  `server/serve.py` and two frontend files -- comments only, no behavior
+  change; `conftest.py`'s own fixtures already redirect every test away
+  from any real file regardless of what the comment calls it.
+- `server/opa-auth-gate.service` and `server/opa-compliance-wizard.service`
+  (install-time templates, not read programmatically by anything in this
+  repo -- confirmed `server/setup-second-gate.sh` copies the LIVE unit
+  from `/etc/systemd/system/`, never these files) now use
+  `__APP_USER__`/`__APP_DIR__`/`__APP_USER_HOME__` placeholders instead of
+  a real username and path; `docs/hosting.md` documents a `sed` install
+  step for filling them in. `docs/hosting.md`'s sudoers example (already
+  "e.g." placeholder text) now uses `<app-user>` consistently.
+  `server/deploy.sh` and `server/auth_gate.py`'s own comments were
+  reworded the same way; `server/deploy.sh`'s actual `APP_DIR=` value is
+  UNCHANGED (a real, functional path this project's own live server still
+  needs -- not a comment, left exactly as the review's own C2 caution
+  recommends).
+
 5.39.4 — **Fix: four more findings from the 2026-10-05 external review (GATE-04, DATA-01, DATA-02, UI-03/DATA-06).**
 Follow-up to 5.39.2/5.39.3's P0 blockers -- the review's remaining
 deferred items that affect evidence completeness and the second-org gate.
@@ -315,7 +339,7 @@ the hardened unit files were actually applied. A third
   its value was briefly visible in a terminal session during this
   incident's diagnosis, and tightened `/etc/opa-compliance-wizard.env`
   from world-readable (`644`) to `600`, owned by the service's own
-  `rparikh` user (a separate, pre-existing permissions gap, fixed
+  app user (a separate, pre-existing permissions gap, fixed
   opportunistically while already in there).
 
 5.36.1 — **`server/deploy.sh` fixes from a FOURTH, independent review**
@@ -1030,7 +1054,7 @@ id is never minted twice for the same environment.
   from the system (`upsert_environment`'s own return value) rather than
   precomputing them via the now-retired function.
 - **Live-verified end to end** against this machine's real
-  `environments.json` (2 real environments, `dev`/`patlabs`): backed up
+  `environments.json` (2 real environments, `dev`/a real tenant): backed up
   first, ran the real migration, confirmed both environments' real
   keyring credentials (`key_secret`/`okta_api_token`) resolved correctly
   under their new UUID service names, confirmed idempotency (a second
