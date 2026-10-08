@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useEnvironments, useWhoami } from './api/hooks'
 import { saveAccessControl } from './api/client'
+import { useHashRoute } from './hooks/useHashRoute'
 import { toast } from './hooks/useToast'
 import { AboutDialog } from './components/AboutDialog'
 import { AccessControlDialog } from './components/AccessControlDialog'
@@ -19,10 +20,21 @@ import { ServiceAccountsDashboard } from './components/ServiceAccountsDashboard'
 import { REPORTS_SUB_TABS, SideNav } from './components/SideNav'
 import { UserMenu } from './components/UserMenu'
 
+// Every navigable view is a hash route (see utils/route.ts) so the browser
+// keeps a history entry per in-app navigation -- the mouse back button on
+// a compliance report returns to the reports home, not out of the app.
+const ROUTE_VOCAB = {
+  tabs: ['reports', 'access', 'builder', 'audit_log'],
+  reportsSubTabs: REPORTS_SUB_TABS.map(t => t.value),
+  accessSubTabs: ACCESS_SUB_TABS.map(t => t.value),
+}
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState('reports')
-  const [accessSubTab, setAccessSubTab] = useState(ACCESS_SUB_TABS[0].value)
-  const [reportsSubTab, setReportsSubTab] = useState(REPORTS_SUB_TABS[0].value)
+  const { route, navigate } = useHashRoute(ROUTE_VOCAB)
+  const { tab: activeTab, accessSubTab, reportsSubTab } = route
+  const setActiveTab = (tab: string) => navigate({ tab })
+  const setAccessSubTab = (accessSubTab: string) => navigate({ tab: 'access', accessSubTab })
+  const setReportsSubTab = (reportsSubTab: string) => navigate({ tab: 'reports', reportsSubTab })
   const [environmentsOpen, setEnvironmentsOpen] = useState(false)
   const [bannerOpen, setBannerOpen] = useState(false)
   const [accessControlOpen, setAccessControlOpen] = useState(false)
@@ -146,7 +158,9 @@ export default function App() {
             </div>
           </header>
 
-          {activeTab === 'reports' && reportsSubTab === 'browse' && <ComplianceReports />}
+          {activeTab === 'reports' && reportsSubTab === 'browse' && (
+            <ComplianceReports selectedReport={route.reportKey} onSelectReport={key => navigate({ tab: 'reports', reportsSubTab: 'browse', reportKey: key })} />
+          )}
           {activeTab === 'reports' && reportsSubTab === 'secrets_access' && <SecretsAccessDashboard />}
           {activeTab === 'reports' && reportsSubTab === 'service_accounts' && <ServiceAccountsDashboard />}
           {activeTab === 'access' && <AccessExplorer subTab={accessSubTab} />}

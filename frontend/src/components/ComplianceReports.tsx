@@ -1,4 +1,3 @@
-import { useState } from 'react'
 import { AlertTriangle, FileClock, KeyRound, Shield, Users } from 'lucide-react'
 import { useEnvironments, useReportDefs, useSyncStatus } from '../api/hooks'
 import type { ComplianceControl, ComplianceReportDef } from '../types'
@@ -91,7 +90,16 @@ function ReportCard({ def, environment, onClick }: { def: ComplianceReportDef; e
   )
 }
 
-export function ComplianceReports() {
+interface Props {
+  /** The open report's key, or null for the home grid. Controlled by
+   * App.tsx's hash route (5.40.1) so opening a report is a browser
+   * history entry and the back button returns here instead of leaving
+   * the app. An unknown key (e.g. a stale link) just shows the grid. */
+  selectedReport: string | null
+  onSelectReport: (key: string | null) => void
+}
+
+export function ComplianceReports({ selectedReport, onSelectReport }: Props) {
   const { data: environments } = useEnvironments()
   const activeEnv = environments?.active
   const { data: reports } = useReportDefs(activeEnv)
@@ -99,12 +107,11 @@ export function ComplianceReports() {
   // doc comment) -- this page just needs to know "is the data behind
   // these reports currently degraded," not live sync progress.
   const { data: syncStatus } = useSyncStatus(activeEnv)
-  const [selectedReport, setSelectedReport] = useState<string | null>(null)
 
   if (selectedReport && reports) {
     const def = reports.find(r => r.key === selectedReport)
     if (def) {
-      return <ComplianceReportDetail def={def} environment={activeEnv} onBack={() => setSelectedReport(null)} />
+      return <ComplianceReportDetail def={def} environment={activeEnv} onBack={() => onSelectReport(null)} />
     }
   }
 
@@ -164,7 +171,7 @@ export function ComplianceReports() {
           <div className="section-label">{CONTROL_LABELS[control]}</div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             {controlReports.map(def => (
-              <ReportCard key={def.key} def={def} environment={activeEnv} onClick={() => setSelectedReport(def.key)} />
+              <ReportCard key={def.key} def={def} environment={activeEnv} onClick={() => onSelectReport(def.key)} />
             ))}
           </div>
         </div>

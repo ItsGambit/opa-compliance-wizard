@@ -32,6 +32,12 @@ Or run the two steps manually:
 cd frontend && npm run build
 cd ../server && python3 serve.py   # "python" on Windows
 ```
+**Navigation and the browser's back button.** Every view (tab, sub-tab,
+an opened compliance report) is a URL hash route such as
+`#/reports/browse/mfa_enforcement`, so Back/Forward, reload and a pasted
+link all land on the same view -- Back from a report returns to the
+Compliance Reports home (v5.40.1).
+
 The server binds `127.0.0.1` only. If the port is already taken by
 another running instance, it fails fast with a clear message instead
 of silently double-serving (see the [Changelog](../CHANGELOG.md)).

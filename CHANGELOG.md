@@ -2,6 +2,25 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.40.1 — **Fix: the browser's back button left the app instead of returning to the Compliance Reports home.**
+Navigation (top-level tab, Access Explorer / Compliance Reports sub-tab,
+and an opened compliance report) lived only in React state, so the
+browser never had an in-app history entry -- pressing Back (the mouse
+button included) from a report detail view navigated away from the
+site. Every navigable view is now a URL hash route
+(`#/reports/browse/<report_key>`, `#/reports/secrets_access`,
+`#/access/<sub_tab>`, `#/builder`, `#/audit_log`), written on every
+in-app navigation and read back on `hashchange`, so Back/Forward,
+reload and a pasted link all land on the same view -- Back from a
+report returns to the reports home. Frontend only; no API change.
+- `utils/route.ts` (parser/builder, every segment validated against the
+  known tab/sub-tab values; a report key is limited to `[A-Za-z0-9_.-]`
+  and only ever used as a lookup against the server's own report list),
+  `hooks/useHashRoute.ts` (hash is the single source of truth; the
+  initial empty/unknown hash is `replaceState`d, never pushed), `App.tsx`
+  wires it, `ComplianceReports` becomes controlled (`selectedReport` /
+  `onSelectReport`). Tests: `utils/route.test.ts` (8).
+
 5.40.0 — **Service Accounts Dashboard: SaaS app and Okta service accounts get the same per-account roster, status, history and export the Secrets Access Dashboard has.**
 Until now SaaS app service accounts and Okta Universal Directory service
 accounts only ever appeared as a live inventory (Access Explorer →
