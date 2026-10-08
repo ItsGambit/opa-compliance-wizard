@@ -2,6 +2,178 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.40.0 — **Service Accounts Dashboard: SaaS app and Okta service accounts get the same per-account roster, status, history and export the Secrets Access Dashboard has.**
+Until now SaaS app service accounts and Okta Universal Directory service
+accounts only ever appeared as a live inventory (Access Explorer →
+Resources) and as rows lumped into the generic "Service Account" bucket
+of the Credential Reveals / Credential Rotation cards, shared with server,
+database and Active Directory accounts -- no roster, no
+active/deleted/unknown status, no per-account history, no export. This
+release adds a dedicated report built to the Secrets bar, plus one
+cheap consistency fix for the generic cards.
+- **New report builder** `build_service_accounts_report_from_archive`
+  (`create_secret_folders.py`), modelled on
+  `build_project_secrets_report_from_archive`: merges the live SaaS/Okta
+  rosters (`list_project_saas_app_accounts` /
+  `list_project_okta_ud_accounts`, walked across every resource group
+  and project by the new `walk_service_account_rosters`) with the
+  compliance archive, keyed by the account's own OPA-internal id. Status
+  follows the Secrets honesty rules exactly: present live => `active`;
+  absent live => `deleted` only with a SUCCESS delete event; otherwise
+  `unknown`, never inferred. Each account carries created / updated /
+  assigned / deleted entries, password reveals, checkouts (with expiry)
+  and a rotation summary (totals by outcome, first/last, newest N rows).
+  Every entry carries the event's real outcome -- a service-account
+  create or rotation genuinely ends DEFERRED or FAILURE on real tenants.
+- **Validated, not guessed.** Built against a read-only probe of a real
+  archive (~130k rows across these event families, two environments):
+  `pam.service_account.create/.update/.delete/.assign/.password.reveal/
+  .password_rotation.start/.end` all exist with real payloads; the
+  account is the "Service Account" target (uuid id == alternateId);
+  `debugData.serviceAccountType` names the family (`APP_ACCOUNT`,
+  `OKTA_USER_ACCOUNT`, `DATABASE_ACCOUNT`, `PAM_AD_ACCOUNT`);
+  `pam.resource.checkout` shares the same target type with database
+  accounts and is told apart by `debugData.resourceType`. Because
+  reveal/rotation events are shared across all four families, every
+  event is classified before bucketing; database/AD accounts and ids
+  with no recognisable marker are excluded and COUNTED in the response
+  rather than silently dropped or guessed. No Okta UD checkout
+  `resourceType` has been observed, so an unlisted value can attach to
+  an account the report already knows but never creates one.
+- **Tenant-wide by design.** Service-account events carry no project
+  co-target (unlike secrets), so a since-deleted account's project is
+  not knowable; a per-project page could never report "deleted"
+  honestly. The dashboard filters by type (SaaS / Okta), status,
+  resource group and project client-side instead, and says how many
+  no-longer-live accounts a scope filter hides.
+- **Scales to the real rotation volume.** `password_rotation.end` was
+  115k rows (83k of them AD) in the probed archive, so it is never
+  bulk-loaded: new `audit_store.count_events_by_resource` groups on the
+  indexed `resource_id` column (chunked under SQLite's variable limit),
+  only the newest `rotation_limit` rows per account (default 25, max
+  200, `?rotation_limit=`) are read as entries, and an account that only
+  ever rotated (lifecycle predates the archive) is still discovered from
+  one raw row.
+- **New route** `GET /api/service_accounts_report` (`server/serve.py`):
+  same auth posture as `secrets_access_report` (inside the nginx /
+  owner-session gate, scoped to the caller's own active environment,
+  not admin-only), correlation-id logging with the summary counts,
+  ValueError → 400, OPA/Okta errors → 502. Archive-only by design: an
+  environment that has never synced gets a 409 with `reason:
+  "not_synced"` and guidance, not a thinner live-query fallback.
+- **New dashboard** Compliance Reports → **Service Accounts**
+  (`ServiceAccountsDashboard.tsx`): summary tiles, type / status /
+  resource group / project filters, fuzzy search, Refresh, CSV / MD
+  export of the filtered rows (`serviceAccountsReportExportSections`,
+  with a Type column so a SaaS-only or Okta-only file is one filter
+  away), expandable per-column history, and a per-account drill-down
+  into every archived event via the shared history panel (date range,
+  fuzzy filters, truncation notice and export, same as the generic
+  reports). `sync_status` / last password change are shown as
+  **informational** context only -- a freshly registered SaaS account
+  can legitimately sit NOT_SYNCED (see docs/api-notes.md) -- never as a
+  finding.
+- **Shared code, not copies.** `AuditCell` / `AuditHistoryCell` moved
+  out of `SecretsAccessDashboard.tsx` into `AuditCells.tsx`, the
+  status label/variant helpers into `utils/accessStatus.ts`, and
+  `ResourceHistoryPanel` out of `ResourcesTab.tsx` into its own file --
+  the Secrets dashboard, Resources tab and the new dashboard all render
+  through the same components. `AuditEntry` gains optional `outcome` /
+  `outcome_reason`.
+- **Generic cards tell the account families apart now.** New
+  `audit_store._resource_type_detail_fallback` (shared by
+  `_resource_fields` at ingest and `_four_field_row` at read time, so no
+  backfill migration is needed) surfaces `serviceAccountType` as
+  `resource_type_detail` on every `pam.service_account.*` row;
+  `ReportRowsTable` labels the four values (SaaS Service Account, Okta
+  Service Account, Database Account, Active Directory Account). The
+  Credential Reveals / Credential Rotation card descriptions say so and
+  point at the new dashboard. The same read-time fallback also covers
+  MFA-factor rows ingested before that branch existed.
+- **The Secrets reports get the same honesty rules.** Both Secrets
+  builders (`build_secrets_access_report` and the archive variant) now
+  share `_audit_entry` / `_record_create` / `_record_delete` with the
+  new report: a delete only counts with a SUCCESS outcome (a FAILED
+  `pam.secret.delete` used to mark a live secret "deleted"), `created`
+  prefers the successful attempt, and every Secrets entry now carries
+  `outcome` / `outcome_reason` so the shared `AuditCell` shows a
+  non-success outcome there too. A missing outcome still counts as
+  success (every real System Log event has one; only a hand-built
+  payload wouldn't).
+- **Schema migration 005** adds two indexes on `events` --
+  `(environment_id, resource_id, event_type, published)` and a covering
+  `(environment_id, event_type, resource_id, outcome_result,
+  resource_type_detail, published)`. Found with EXPLAIN QUERY PLAN during
+  this release's review: per-account newest-N reads walked the whole
+  environment newest-first (~100ms per account on a 175k-row
+  environment) and the rotation GROUP BY scanned every row with a
+  resource_id (0.5s on 515k rows; 0.014s with the covering index).
+  Plain CREATE INDEX, no data migration; a one-off few seconds on a large
+  archive at first start after upgrade. `query_events` gains
+  `match_alternate_id=False` for callers that know alternateId == id
+  (every service-account event), which is what lets those reads use the
+  index at all (the `OR resource_alternate_id` form can't).
+- **Rotation-only accounts are classified from stored markers**, not by
+  reading a raw row per id: `count_events_by_resource` also groups on
+  `resource_type_detail` (where `serviceAccountType` now lands at
+  ingest), so an id whose newest row carries an empty marker is still
+  classified by the rows that do; raw rows are only read for ids with no
+  stored marker on any row (pre-5.40.0 ingests).
+- **Honest about cut-offs and conflicts.** The response carries
+  `event_total` / `truncated` for the bulk-loaded lifecycle / reveal /
+  checkout families (same UI-03/DATA-07 convention as the generic
+  reports; the dashboard shows a notice) and
+  `warnings.conflicting_family_markers` for an id whose evidence
+  disagrees with itself (also logged with the correlation id) -- the
+  roster stays authoritative, nothing is resolved silently. Route: a
+  sync that started but never completed a chunk is still "not synced"
+  (`last_sync_completed_at`, not just a `sync_state` row); a corrupt
+  stored `raw_json` row is reported as a 500, not mislabelled a 400.
+- **Frontend hardening from the same review:** the report query is keyed
+  by the active environment and never auto-refetches on focus/reconnect
+  (every fetch re-walks every project on the OPA side -- Refresh and the
+  post-sync invalidation are the only triggers); the per-account history
+  drill-down matches by id only (`ResourceHistoryPanel`'s new
+  `matchByName={false}`), never by display name, so a same-named DB/AD
+  account or user can't leak into a service account's history; summary
+  tiles and export now follow the fuzzy search as well as the structured
+  filters; the "unknown" label says what it means for this report ("not
+  in live roster, no delete event"); export/options/scope counts are
+  memoised; selection clears on search. The resource-type label map moved
+  to `utils/resourceTypeLabels.ts` so the generic report CSV export shows
+  the same labels as the table (it used to write the raw value).
+- **Fix:** a completed global sync now also invalidates the Secrets
+  Access Dashboard's query (`Footer.tsx` only refreshed the generic
+  reports and resource history before), alongside the new report.
+- **Public-repo hygiene:** a pre-existing code comment in
+  `ResourcesTab.tsx` quoted a real-looking organisation name and tenant
+  login as field examples; replaced with neutral examples.
+  `OPA_APP_REVIEW.md` (local-only review notes) is now gitignored so a
+  `git add -A` can never publish it.
+- **Tests:** `tests/test_service_accounts_report.py` (39): status
+  matrix, SaaS/Okta split, DB/AD exclusion with counts, the checkout
+  attach-vs-create rule, conflicting markers, SUCCESS-over-DEFERRED
+  create (including a newer DEFERRED attempt), rotation
+  totals/limit/oldest-captured, rotation-only discovery from stored
+  markers and from pre-fallback raw rows, truncation flag, empty cases,
+  cross-environment scoping, roster rows without ids, ordering,
+  `rotation_limit` validation, the Secrets archive builder's new
+  delete/create rules, `_entry_succeeded`, migration 005's indexes,
+  `query_events(match_alternate_id=False)`, `count_events_by_resource`
+  (outcomes + stored markers), the ingest-time and read-time
+  `serviceAccountType` fallback, and the route through a real HTTP
+  server: 409 without an environment (with or without a client), 409
+  never-synced / sync-not-completed, 200 for two synced owners each
+  getting their own roster and archive through the real builder, 400 on
+  a bad `rotation_limit`, 401 in hosted mode without the nginx proxy
+  secret, 502 on an upstream OPA failure, 500 on a corrupt archive row.
+  Timestamps come from one frozen base time so no assertion recomputes
+  "now". Frontend: `utils/serviceAccounts.test.ts` (12),
+  `utils/exportSections.serviceAccounts.test.ts` (3) and
+  `components/AuditCells.test.tsx` (5).
+- Docs: README, `docs/features.md` (new "Service Accounts Dashboard"
+  section), `docs/api-notes.md` (new confirmed-behavior item 17).
+
 5.39.10 — **Add missing report/query layer tests (TEST-05).**
 No production code change -- tests only. `query_events`, `count_events`,
 `run_report`, `resource_history` and `_normalize_until` had zero tests

@@ -1211,6 +1211,63 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 return self._send_json(200, report)
 
+            if path == "/api/service_accounts_report":
+                # The SaaS / Okta service-account counterpart of the
+                # secrets_access_report route above (same auth posture:
+                # inside the nginx/owner-session gate, scoped to THIS
+                # owner's active environment and client, not admin-only).
+                # Tenant-wide rather than per-project -- see
+                # engine.walk_service_account_rosters for why a project
+                # scope could never report a deleted account honestly.
+                # Archive-only by design: unlike the Secrets report there
+                # is no live System Log fallback for an environment that
+                # has never synced -- the archive is this tool's system of
+                # record and the roster/event volumes here (AD rotations
+                # alone were 83k rows on a real tenant) don't fit a
+                # bounded live query anyway; the 409 tells the user what
+                # to do instead of silently returning a thinner report.
+                if not _require_client(self._send_json, local_client):
+                    return
+                if not local_env_id:
+                    return self._send_json(409, {"error": "No active environment configured. Use the gear menu to set one up."})
+                import audit_store
+                # "Completed" means it, not just "a sync_state row exists"
+                # (which is_first_sync checks): a first sync that is still
+                # running or errored before its first day-chunk landed
+                # has nothing honest to report from yet.
+                sync_state = audit_store.get_sync_state(local_env_id)
+                if not sync_state or not sync_state.get("last_sync_completed_at"):
+                    return self._send_json(409, {
+                        "error": "This environment has not completed a compliance sync yet. Run Sync now (footer) first -- the Service Accounts report is sourced from the compliance archive.",
+                        "reason": "not_synced",
+                    })
+                try:
+                    rotation_limit = int((qs.get("rotation_limit") or [engine.SERVICE_ACCOUNT_ROTATION_LIMIT_DEFAULT])[0])
+                except ValueError:
+                    return self._send_json(400, {"error": "rotation_limit must be an integer"})
+                # An out-of-range rotation_limit raises ValueError inside
+                # the builder -> 400 via the shared handler below. A
+                # corrupt stored raw_json row would ALSO surface as a
+                # ValueError (json.JSONDecodeError subclasses it) and be
+                # mislabelled a client error by that shared handler, so
+                # it is caught first and reported as what it is.
+                try:
+                    report = engine.build_service_accounts_report_from_archive(
+                        local_client, local_env_id, rotation_limit=rotation_limit
+                    )
+                except json.JSONDecodeError as exc:
+                    engine.log("ERROR", f"service_accounts_report: corrupt raw_json row in the archive: {exc}")
+                    return self._send_json(500, {"error": "A stored event in the compliance archive could not be parsed."})
+                summary = report["summary"]
+                engine.log("INFO", (
+                    f"service_accounts_report: {summary['total']} account(s) "
+                    f"({summary['saas']} saas, {summary['okta']} okta; "
+                    f"{summary['active']} active, {summary['deleted']} deleted, {summary['unknown']} unknown) "
+                    f"across {report['walked']['projects']} project(s); excluded {report['excluded']}; "
+                    f"warnings {report['warnings']}; truncated={report['truncated']}"
+                ))
+                return self._send_json(200, report)
+
             if path.startswith("/api/resource_groups/") and path.endswith("/security_policies"):
                 if not _require_client(self._send_json, local_client):
                     return

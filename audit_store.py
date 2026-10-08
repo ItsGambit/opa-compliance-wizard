@@ -209,7 +209,7 @@ COMPLIANCE_REPORTS = {
     "pam_credential_reveals": {
         "label": "PAM Credential Reveals",
         "control": "CC6",
-        "description": "Service-account/shared-credential password reveals.",
+        "description": "Service-account/shared-credential password reveals. The resource column names the account family (SaaS app, Okta, Database, Active Directory, Server). For a per-account roster with status and full history of SaaS/Okta service accounts, see the Service Accounts dashboard.",
     },
     "pam_policy_modifications": {
         "label": "PAM Policy Modifications",
@@ -234,7 +234,7 @@ COMPLIANCE_REPORTS = {
     "credential_rotation": {
         "label": "Credential Rotation",
         "control": "CC8",
-        "description": "Service-account password rotation lifecycle (scheduled and manual).",
+        "description": "Service-account password rotation lifecycle (scheduled and manual). The resource column names the account family (SaaS app, Okta, Database, Active Directory); the outcome column is the real result (SUCCESS / FAILURE / DEFERRED). For per-account rotation totals on SaaS/Okta service accounts, see the Service Accounts dashboard.",
     },
 }
 
@@ -546,11 +546,41 @@ def _migration_004_drop_preserve_logs_locally(conn):
     conn.execute("ALTER TABLE app_environments DROP COLUMN preserve_logs_locally")
 
 
+def _migration_005_service_account_report_indexes(conn):
+    """v5.40.0 (Service Accounts report). Two query plans were measured
+    against the real schema with EXPLAIN QUERY PLAN during that
+    feature's review and both ignored idx_events_env_resource_id:
+      * per-resource newest-N reads (query_events with resource_id and
+        an event_type filter, ORDER BY published DESC LIMIT n) walked the
+        whole environment newest-first via idx_events_env_published --
+        ~100ms per account on a 175k-row environment, paid once per
+        service account;
+      * the per-resource GROUP BY behind count_events_by_resource
+        scanned every row of the environment that has a resource_id, not
+        just the event types asked for -- 0.5s on a 515k-row environment,
+        growing with the whole archive rather than with the family being
+        counted.
+    The first index makes a (environment, resource, type) read
+    index-ordered by published; the second is a covering index for the
+    GROUP BY (0.014s on the same data). Both are plain CREATE INDEX on
+    existing columns -- no data migration, idempotent, and a one-off cost
+    of a few seconds on a large archive at first start after upgrade."""
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_events_env_resource_type_published
+           ON events (environment_id, resource_id, event_type, published)"""
+    )
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_events_env_type_resource_outcome
+           ON events (environment_id, event_type, resource_id, outcome_result, resource_type_detail, published)"""
+    )
+
+
 MIGRATIONS = {
     1: _migration_001_unified_schema,
     2: _migration_002_ingestion_manifests,
     3: _migration_003_pending_admin_actions,
     4: _migration_004_drop_preserve_logs_locally,
+    5: _migration_005_service_account_report_indexes,
 }
 
 
@@ -1353,7 +1383,8 @@ def _require_positive_limit(limit):
         raise ValueError(f"limit must be a positive integer, got {limit!r}")
 
 
-def query_events(environment_id, event_types=None, since=None, until=None, actor_id=None, resource_id=None, limit=1000):
+def query_events(environment_id, event_types=None, since=None, until=None, actor_id=None, resource_id=None, limit=1000,
+                 match_alternate_id=True):
     """Generic report query -- used by every COMPLIANCE_REPORTS preset in
     Phase 4, and by resource_history below. Returns raw rows (dicts with
     the full parsed raw_json under "raw"), shaping to the four-field
@@ -1364,8 +1395,17 @@ def query_events(environment_id, event_types=None, since=None, until=None, actor
     resource_id OR resource_alternate_id column (both are populated from
     the same real target id -- see _resource_fields -- and for most
     resource kinds confirmed live to just be the same value twice, but
-    matching both covers any kind where they'd genuinely differ) and uses
-    idx_events_env_resource_id, so this stays fast even on a large archive."""
+    matching both covers any kind where they'd genuinely differ).
+
+    match_alternate_id=False restricts that to resource_id alone. Measured
+    with EXPLAIN QUERY PLAN during the v5.40.0 review: the OR form can't
+    use any index on resource_id (resource_alternate_id is unindexed), so
+    SQLite walks the environment newest-first via idx_events_env_published
+    until `limit` rows match -- ~100ms per call on a 175k-row environment
+    for a rarely-matching resource. With the OR dropped (and
+    _migration_005's index) the same read is index-ordered. Callers that
+    know alternateId == id for their event family (confirmed for every
+    service-account event, see create_secret_folders.py) pass False."""
     _require_positive_limit(limit)
     conn = _get_connection()
     until = _normalize_until(until)
@@ -1384,9 +1424,12 @@ def query_events(environment_id, event_types=None, since=None, until=None, actor
     if actor_id:
         clauses.append("actor_id = ?")
         params.append(actor_id)
-    if resource_id:
+    if resource_id and match_alternate_id:
         clauses.append("(resource_id = ? OR resource_alternate_id = ?)")
         params.extend([resource_id, resource_id])
+    elif resource_id:
+        clauses.append("resource_id = ?")
+        params.append(resource_id)
     sql = (
         "SELECT uuid, event_type, published, actor_id, actor_display_name, "
         "actor_alternate_id, outcome_result, resource_id, resource_alternate_id, "
@@ -1423,6 +1466,53 @@ def count_events(environment_id, event_types=None, since=None, until=None):
         params.append(until)
     sql = "SELECT COUNT(*) FROM events WHERE " + " AND ".join(clauses)
     return conn.execute(sql, params).fetchone()[0]
+
+
+def count_events_by_resource(environment_id, event_types):
+    """Per-resource totals for the given event types, without parsing a
+    single raw_json: {resource_id: {"total", "by_outcome": {outcome:
+    count}, "type_details": {resource_type_detail: count}, "first_at",
+    "last_at"}} for every resource that has any matching row. One GROUP
+    BY over stored columns, served by _migration_005's covering index --
+    added for the service-accounts report, where password_rotation.end
+    alone was 115k rows in a real archive and loading those as raw
+    events just to count them per account is not an option.
+
+    type_details is what lets that report classify an account family
+    (SaaS / Okta / database / AD) for ids it only ever sees in rotation
+    rows WITHOUT reading any raw JSON: _resource_type_detail_fallback
+    stores debugData.serviceAccountType in resource_type_detail at
+    ingest, so every value a resource's rows ever carried is one bucket
+    here. Rows ingested before that fallback existed have NULL there
+    (not counted in type_details) -- the caller samples raw rows only for
+    a resource whose type_details is empty. Rows whose resource_id is
+    NULL have nothing to group by and are skipped."""
+    if not event_types:
+        return {}
+    conn = _get_connection()
+    placeholders = ",".join("?" for _ in event_types)
+    sql = (
+        "SELECT resource_id, outcome_result, resource_type_detail, COUNT(*) AS n, "
+        "MIN(published) AS first_at, MAX(published) AS last_at FROM events "
+        f"WHERE environment_id = ? AND event_type IN ({placeholders}) AND resource_id IS NOT NULL "
+        "GROUP BY resource_id, outcome_result, resource_type_detail"
+    )
+    out = {}
+    for row in conn.execute(sql, [environment_id, *event_types]):
+        entry = out.setdefault(
+            row["resource_id"], {"total": 0, "by_outcome": {}, "type_details": {}, "first_at": None, "last_at": None}
+        )
+        outcome = row["outcome_result"] or "UNKNOWN"
+        entry["total"] += row["n"]
+        entry["by_outcome"][outcome] = entry["by_outcome"].get(outcome, 0) + row["n"]
+        detail = row["resource_type_detail"]
+        if detail:
+            entry["type_details"][detail] = entry["type_details"].get(detail, 0) + row["n"]
+        if entry["first_at"] is None or (row["first_at"] and row["first_at"] < entry["first_at"]):
+            entry["first_at"] = row["first_at"]
+        if entry["last_at"] is None or (row["last_at"] and row["last_at"] > entry["last_at"]):
+            entry["last_at"] = row["last_at"]
+    return out
 
 
 # Full per-event-type audit, 2026-09-30, against two real 90-day System
@@ -1514,20 +1604,42 @@ def _resource_fields(event_type, raw):
     resource_id = primary.get("id") if primary else None
     resource_alternate_id = primary.get("alternateId") if primary else None
     debug_data = (raw.get("debugContext") or {}).get("debugData") or {}
-    resource_type_detail = debug_data.get("resourceType")
-    if not resource_type_detail and event_type == "user.authentication.auth_via_mfa":
-        # confirmed live 2026-09-30 against a real tenant: this eventType's
-        # debugData has no `resourceType` field at all, but DOES carry the
-        # real authenticator/factor used (e.g. OKTA_VERIFY_PUSH,
-        # SIGNED_NONCE/FastPass, GOOGLE_AUTHENTICATOR) in `factor` --
-        # without this, the MFA Enforcement report's resource_type_detail
-        # column was always blank and fell back to the target's generic
-        # "AuthenticatorEnrollment" type for every row, which can't
-        # distinguish a push challenge from a TOTP code or a FastPass
-        # phishing-resistant verification -- real information an auditor
-        # asking "which factor types are actually in use" needs.
-        resource_type_detail = debug_data.get("factor")
+    resource_type_detail = debug_data.get("resourceType") or _resource_type_detail_fallback(event_type, debug_data)
     return resource_id or None, resource_alternate_id or None, resource_type_detail or None
+
+
+def _resource_type_detail_fallback(event_type, debug_data):
+    """What to show as resource_type_detail when an event has no
+    debugData.resourceType at all -- shared by _resource_fields (ingest
+    time, stored) and _four_field_row (read time, for rows ingested
+    before a given fallback existed, so no backfill migration is needed
+    when one is added). Every branch is live-confirmed:
+
+    - user.authentication.auth_via_mfa (confirmed 2026-09-30): no
+      `resourceType`, but the real authenticator/factor used (e.g.
+      OKTA_VERIFY_PUSH, SIGNED_NONCE/FastPass, GOOGLE_AUTHENTICATOR) is in
+      `factor` -- without it the MFA Enforcement report's detail column
+      was always blank and fell back to the generic
+      "AuthenticatorEnrollment" target type, which can't distinguish a
+      push challenge from a TOTP code or a phishing-resistant FastPass
+      verification -- real information an auditor asking "which factor
+      types are actually in use" needs.
+    - pam.service_account.* (confirmed 2026-10-07 across ~130k real rows):
+      no `resourceType`, but `serviceAccountType` names the account
+      family (APP_ACCOUNT = SaaS app, OKTA_USER_ACCOUNT = Okta Universal
+      Directory, DATABASE_ACCOUNT, PAM_AD_ACCOUNT). Without it the
+      Credential Reveals / Credential Rotation cards showed every row as
+      a bare "Service Account", lumping four genuinely different account
+      families together -- see create_secret_folders.py's
+      SERVICE_ACCOUNT_TYPE_TO_KIND for the same strings on the report
+      side. An empty string (seen once live, on an update event) is
+      returned as None so the generic target type still shows."""
+    event_type = event_type or ""
+    if event_type == "user.authentication.auth_via_mfa":
+        return debug_data.get("factor") or None
+    if event_type.startswith("pam.service_account."):
+        return debug_data.get("serviceAccountType") or None
+    return None
 
 
 def backfill_resource_columns():
@@ -1695,6 +1807,12 @@ def _four_field_row(event_row):
     client = raw.get("client") or {}
     geo = client.get("geographicalContext") or {}
     client_geo = ", ".join(part for part in (geo.get("city"), geo.get("state"), geo.get("country")) if part)
+    # Read-time fallback for rows ingested before a given
+    # _resource_type_detail_fallback branch existed -- those rows already
+    # have resource_id set, so backfill_resource_columns (which only
+    # touches rows with all three columns NULL) will never revisit them.
+    debug_data = (raw.get("debugContext") or {}).get("debugData") or {}
+    resource_type_detail = event_row.get("resource_type_detail") or _resource_type_detail_fallback(event_type, debug_data)
     return {
         "uuid": event_row["uuid"],
         "user": event_row["actor_display_name"] or event_row["actor_alternate_id"] or event_row["actor_id"] or "unknown",
@@ -1704,7 +1822,7 @@ def _four_field_row(event_row):
         "timestamp": event_row["published"],
         "resource": resource or "",
         "resource_type": resource_type or "",
-        "resource_type_detail": event_row.get("resource_type_detail") or "",
+        "resource_type_detail": resource_type_detail or "",
         "resource_id": event_row.get("resource_id") or "",
         "resource_alternate_id": event_row.get("resource_alternate_id") or "",
         "outcome": event_row["outcome_result"] or "",
@@ -1773,9 +1891,17 @@ def resource_history(environment_id, resource_id=None, resource_name=None, since
     those two kinds back to their real history; confirmed no real name
     collisions exist within either kind on this tenant (5 distinct
     database account names, 11 distinct AD account names). SaaS/Okta
-    accounts do NOT need this fallback -- their own id (privileged_
-    resource_id/okta_user_id) IS the real log target id, confirmed live
-    against a real Salesforce account and two Okta service accounts.
+    accounts do NOT need this fallback -- but note WHICH id is the log
+    target: it is the account's own OPA-internal `id` (the
+    access_tracking_id the Access Explorer indexes), NOT the Okta-side
+    privileged_resource_id / okta_user_id, which are never logged as
+    targets at all (confirmed 2026-08-15 and again across ~130k real
+    rows on 2026-10-07 -- see create_secret_folders.py's
+    RESOURCE_ACCESS_EVENT_TYPES and SERVICE_ACCOUNT_REPORT_EVENT_TYPES).
+    The Service Accounts Dashboard (v5.40.0) calls this with that id and
+    NO resource_name on purpose: a service-account display name can
+    repeat across apps or collide with a DB/AD account, and a
+    compliance drill-down must not mix another account's events in.
 
     At least one of resource_id/resource_name must be given (both empty
     means "nothing to look up" -- returns the empty-result shape rather

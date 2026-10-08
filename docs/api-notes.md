@@ -179,6 +179,55 @@ these APIs day-to-day.
     (`COMPLIANCE_EVENT_TYPES` in `audit_store.py`) was built this way,
     one exact name at a time, not copied from any external guide.
 
+17. **Service-account events (SaaS app / Okta UD / database / AD) all
+    share one target type and the same reveal/rotation eventTypes —
+    the account family is only in `debugContext.debugData`.** Confirmed
+    2026-10-07 by a read-only probe of a real compliance archive
+    (~130k rows across these families, two environments), which is what
+    the Service Accounts Dashboard (v5.40.0) is built on:
+    - `pam.service_account.create`, `.update`, `.delete`, `.assign`,
+      `.password.reveal`, `.password_rotation.start` and
+      `.password_rotation.end` all exist with real payloads. The account
+      is `target[0]` with `type: "Service Account"`, a 36-character uuid
+      `id` that equals its `alternateId` — and equals the account's own
+      `id` from the project `saas_app_accounts` /
+      `okta_universal_directory_accounts` lists (the
+      `access_tracking_id` the Access Explorer already indexes). The
+      Okta-side ids (`privileged_resource_id` / `okta_user_id`) are
+      never logged as targets. There is **no project co-target** on any
+      of them (secrets events do carry one), so a deleted account's
+      project cannot be recovered from the log.
+    - `debugData.serviceAccountType` names the family on every
+      `pam.service_account.*` event: `APP_ACCOUNT` (SaaS app),
+      `OKTA_USER_ACCOUNT` (Okta UD), `DATABASE_ACCOUNT`,
+      `PAM_AD_ACCOUNT` — the same two strings the staged-accounts API
+      uses for `account_type`. Seen empty (`""`) once, on an update
+      event, so code must not require it.
+    - `pam.resource.checkout` carries the same account id as
+      `target[1]` (after the Team) but has **no** `serviceAccountType`;
+      `debugData.resourceType` is the discriminator there —
+      `MANAGED_SAAS_APP_SERVICE_ACCOUNT` (SaaS), `PAM_DATABASE_ACCOUNT`,
+      `SERVER_ACCOUNT`. No Okta UD checkout has been observed, so its
+      `resourceType` value is unconfirmed and deliberately not coded.
+    - `password_rotation.end` is by far the highest-volume PAM event —
+      ~115k rows in the probed archive, ~83k of them Active Directory
+      accounts, up to ~17k for a single account — with outcomes
+      `SUCCESS` / `FAILURE` / `DEFERRED` (FAILURE rows carry
+      `outcome.reason`), `debugData["system Initiated"]` as the literal
+      strings `"Yes"` / `"No"` (note the space in the key), and
+      `versionId` on most rows. `.start` fires far less often than
+      `.end` and carries no outcome. `create` can also end `DEFERRED`
+      or `FAILURE` and be retried under the same account id, so "when
+      was it created" must prefer the successful attempt.
+    - After assigning a staged account to a project, an Okta UD account
+      rotates immediately (`status_detail: ROTATED`, `sync_status:
+      SYNCED`) but a SaaS account registered through a bare
+      `POST /privileged-access/api/v1/service-accounts` stayed
+      `UNMANAGED` / `NOT_SYNCED` on two separate runs, while other SaaS
+      accounts in the same org showed `ROTATED` / `SYNCED`. Not
+      root-caused — which is why the dashboard shows `sync_status` as
+      informational context and never as a compliance finding.
+
 ## Idempotency
 
 Existing folders are detected by recursively walking the full folder

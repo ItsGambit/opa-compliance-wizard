@@ -51,6 +51,11 @@ export function Footer() {
       queryClient.invalidateQueries({ queryKey: ['report'] })
       queryClient.invalidateQueries({ queryKey: ['report_defs'] })
       queryClient.invalidateQueries({ queryKey: ['resource_history'] })
+      // Both per-resource dashboards read the same archive once an
+      // environment has synced -- a fresh sync must refresh them too
+      // (secrets_access_report was missing here before 5.40.0).
+      queryClient.invalidateQueries({ queryKey: ['secrets_access_report'] })
+      queryClient.invalidateQueries({ queryKey: ['service_accounts_report'] })
       queryClient.invalidateQueries({ queryKey: ['sync_status'] })
     }
     if (syncJob.phase === 'error' && prevSyncPhase.current !== 'error') {

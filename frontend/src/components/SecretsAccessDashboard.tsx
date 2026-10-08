@@ -1,68 +1,16 @@
 import { useState } from 'react'
-import { ChevronDown, ChevronUp, RefreshCw } from 'lucide-react'
+import { RefreshCw } from 'lucide-react'
 import { useResourceGroups, useProjects, useSecretsAccessReport } from '../api/hooks'
-import type { AuditEntry, FolderAccessRow, RevealEntry, SecretAccessRow, SecretsAccessStatus } from '../types'
+import type { FolderAccessRow, SecretAccessRow } from '../types'
 import { formatDateTime } from '../utils/format'
 import { secretsAccessReportExportSections } from '../utils/exportSections'
+// AuditCell / AuditHistoryCell / status helpers moved to AuditCells.tsx in
+// 5.40.0 so the Service Accounts Dashboard renders history identically.
+import { statusLabel, statusVariant } from '../utils/accessStatus'
+import { AuditCell, AuditHistoryCell } from './AuditCells'
 import { ExportButtons } from './ExportButtons'
 import { Select } from './Select'
 import { StatusBadge } from './StatusBadge'
-
-function AuditCell({ entry }: { entry: AuditEntry | null }) {
-  if (!entry) return <span className="text-text-faint">—</span>
-  return (
-    <span className="text-text-dim">
-      {entry.by ?? 'unknown'}
-      <span className="text-text-faint"> · {formatDateTime(entry.at)}</span>
-      {entry.request_id && (
-        <span className="text-text-faint"> · request <code className="text-[0.625rem]">{entry.request_id}</code></span>
-      )}
-    </span>
-  )
-}
-
-/** A single most-recent entry, with the rest tucked behind an expand toggle
- * — same interaction PolicyRuleCard's ResourceAccessSummary uses for reveal
- * history, reused here for both "updated" (AuditEntry[]) and "retrieved"
- * (RevealEntry[]). */
-function AuditHistoryCell({ entries }: { entries: (AuditEntry | RevealEntry)[] }) {
-  const [expanded, setExpanded] = useState(false)
-  if (entries.length === 0) return <span className="text-text-faint">—</span>
-
-  const [latest, ...rest] = entries
-  return (
-    <span className="inline-flex flex-col gap-0.5">
-      <span className="inline-flex items-center gap-1">
-        <AuditCell entry={latest} />
-        {rest.length > 0 && (
-          <button
-            type="button"
-            onClick={() => setExpanded(e => !e)}
-            className="text-text-faint hover:text-text-dim"
-            title={expanded ? 'Hide earlier entries' : `Show ${rest.length} earlier entr${rest.length === 1 ? 'y' : 'ies'}`}
-          >
-            {expanded ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
-          </button>
-        )}
-      </span>
-      {expanded &&
-        rest.map((entry, i) => (
-          <span key={i} className="pl-3">
-            <AuditCell entry={entry} />
-          </span>
-        ))}
-    </span>
-  )
-}
-
-function statusVariant(status: SecretsAccessStatus): 'active' | 'deleted' | 'unknown' {
-  return status
-}
-
-function statusLabel(status: SecretsAccessStatus): string {
-  if (status === 'unknown') return 'unknown (outside log window)'
-  return status
-}
 
 function SecretsTable({ rows }: { rows: SecretAccessRow[] }) {
   if (rows.length === 0) return <span className="text-xs text-text-faint">No secrets found in this project.</span>

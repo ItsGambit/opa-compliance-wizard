@@ -13,6 +13,7 @@ import {
   fetchResourceHistory,
   fetchSecretsAccessReport,
   fetchServiceAccount,
+  fetchServiceAccountsReport,
   fetchSyncStatus,
   fetchUserResourceAccess,
   fetchVersion,
@@ -164,6 +165,31 @@ export function useSecretsAccessReport(resourceGroupId: string | undefined, proj
     queryFn: () => fetchSecretsAccessReport(resourceGroupId!, projectId!),
     enabled: !!resourceGroupId && !!projectId,
     retry: false, // a 409 (no Okta token configured) won't resolve by retrying
+  })
+}
+
+/** Tenant-wide SaaS / Okta service-account report (5.40.0) -- fires as
+ * soon as the dashboard mounts (no picker to wait for, unlike
+ * useSecretsAccessReport). Keyed by the active environment so switching
+ * environments can never keep showing the previous one's accounts.
+ *
+ * No automatic refetch (staleTime: Infinity, no focus/reconnect refetch,
+ * same as useWhoami/useVersion): every fetch re-walks EVERY resource
+ * group and project on the OPA side (1 + R + 2P calls) plus the archive
+ * queries, so React Query's default "stale immediately, refetch on
+ * window focus" would re-run that whole walk every time the tab regains
+ * focus -- a real rate-limit risk on a large tenant. Refresh is an
+ * explicit button, and the Footer invalidates this key when a global
+ * sync completes, same as every other archive-backed view. */
+export function useServiceAccountsReport(environment: string | undefined, rotationLimit?: number) {
+  return useQuery({
+    queryKey: ['service_accounts_report', environment, rotationLimit],
+    queryFn: () => fetchServiceAccountsReport(rotationLimit),
+    enabled: !!environment,
+    retry: false, // a 409 (never synced / no environment) won't resolve by retrying
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
   })
 }
 

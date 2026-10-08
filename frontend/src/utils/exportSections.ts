@@ -8,11 +8,14 @@ import type {
   PolicyRule,
   RevealEntry,
   SecretAccessRow,
+  ServiceAccountReportRow,
 } from '../types'
 import type { ExportSection } from './export'
 import { cellValue, formatDateTime, labelize } from './format'
 import type { GrantedRule } from './policy'
 import { describeCondition } from './policy'
+import { resourceTypeLabel } from './resourceTypeLabels'
+import { SERVICE_ACCOUNT_KIND_LABEL } from './serviceAccounts'
 
 function grantRow(policy: AccessPolicy, rule: PolicyRule): Record<string, string> {
   return {
@@ -199,6 +202,51 @@ export function secretsAccessReportExportSections(secrets: SecretAccessRow[], fo
   ]
 }
 
+// ── Service Accounts Dashboard (5.40.0) ──────────────────────────────────
+
+function auditCellWithOutcome(entry: AuditEntry | null | undefined): string {
+  if (!entry) return ''
+  const base = auditCell(entry)
+  // Secrets entries carry no outcome; service-account ones do, and a
+  // DEFERRED/FAILURE create or rotation must not export as if it succeeded.
+  return entry.outcome && entry.outcome !== 'SUCCESS' ? `${base} [${entry.outcome}]` : base
+}
+
+function serviceAccountRow(row: ServiceAccountReportRow): Record<string, string> {
+  const rot = row.rotations
+  return {
+    Account: row.name || row.id,
+    Type: SERVICE_ACCOUNT_KIND_LABEL[row.kind],
+    Username: row.username ?? '',
+    'App / Okta User ID': row.kind === 'saas' ? (row.app_name ?? '') : (row.okta_user_id ?? ''),
+    'Resource Group': row.resource_group_name ?? '',
+    Project: row.project_name ?? '',
+    Status: labelize(row.status),
+    'Sync Status (informational)': row.sync_status ?? '',
+    'Last Password Change': row.last_password_change_at ? formatDateTime(row.last_password_change_at) : '',
+    Created: auditCellWithOutcome(row.created),
+    'Assigned (most recent first)': row.assigned.map(auditCellWithOutcome).join('; '),
+    'Updated (most recent first)': row.updated.map(auditCellWithOutcome).join('; '),
+    'Retrieved (most recent first)': row.reveals.map(auditCellWithOutcome).join('; '),
+    'Checked Out (most recent first)': row.checkouts
+      .map(c => (c.expires_at ? `${auditCellWithOutcome(c)} until ${formatDateTime(c.expires_at)}` : auditCellWithOutcome(c)))
+      .join('; '),
+    'Rotations (total)': String(rot.total),
+    'Rotation Outcomes': Object.entries(rot.by_outcome).map(([k, v]) => `${k}: ${v}`).join(', '),
+    'Last Rotation': rot.last_at ? formatDateTime(rot.last_at) : '',
+    'Recent Rotations (most recent first)': rot.recent
+      .map(r => `${auditCellWithOutcome(r)}${r.system_initiated == null ? '' : r.system_initiated ? ' (scheduled)' : ' (manual)'}`)
+      .join('; '),
+    Deleted: auditCellWithOutcome(row.deleted),
+    'Account ID': row.id,
+    'Privileged Resource ID': row.privileged_resource_id ?? '',
+  }
+}
+
+export function serviceAccountsReportExportSections(rows: ServiceAccountReportRow[]): ExportSection[] {
+  return [{ title: 'Service Accounts', rows: rows.map(serviceAccountRow) }]
+}
+
 // ── Compliance Reports ─────────────────────────────────────────────────────
 
 /** The "four-field standard" the audit-requirements guide calls for on
@@ -214,7 +262,7 @@ export function complianceReportRow(row: ComplianceReportRow): Record<string, st
     'Request ID': row.request_id || '',
     'Affected Resource': row.resource || '—',
     'Resource Email/ID': [row.resource_alternate_id, row.resource_id].filter(v => v && v !== 'unknown').join(' / '),
-    'Resource Type': row.resource_type_detail || row.resource_type || '',
+    'Resource Type': resourceTypeLabel(row),
     Outcome: row.outcome || '',
     'Outcome Reason': row.outcome_reason || '',
     'Event Type': row.event_type,

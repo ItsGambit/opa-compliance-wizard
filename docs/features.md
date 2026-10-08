@@ -306,6 +306,73 @@ Fernet-encrypted) existed before compliance sync did, but was retired in
 v5.34.0 once the archive became a strict superset of what it ever
 captured.
 
+### Service Accounts Dashboard
+
+The SaaS / Okta counterpart of the Secrets Access Dashboard (v5.40.0):
+every **SaaS app service account** and **Okta Universal Directory
+service account** across the whole tenant — including ones since
+deleted — with who created, updated, assigned and deleted each one, who
+revealed its password or checked it out, and its password-rotation
+history (totals by outcome, first/last, and the most recent rotations),
+all from the compliance archive.
+
+Two sources merged, same as Secrets: the live roster (the same
+per-project SaaS / Okta account lists the Access Explorer's Resources
+tab shows, walked across every resource group and project) for what
+exists right now, plus the archive's `pam.service_account.create /
+.update / .delete / .assign / .password.reveal /
+.password_rotation.end` and `pam.resource.checkout` history — see
+[confirmed tenant behavior #17](api-notes.md#confirmed-tenant-behavior-found-via-live-testing-not-docs)
+for what was actually verified. The same honesty rule applies: an
+account absent from the live roster is only ever **deleted** when the
+archive holds a successful delete event for it; otherwise it's
+**unknown**, never guessed. Every history entry carries the event's real
+outcome, because a service-account create or rotation genuinely ends
+`DEFERRED` or `FAILURE` on real tenants.
+
+**Why it's tenant-wide rather than per-project.** Secrets events carry
+the project as a co-target; service-account events don't. A deleted
+account's project is therefore not knowable from the archive, so a
+per-project page could never say "deleted" honestly. Instead the
+dashboard loads everything and filters client-side by **type** (SaaS
+app / Okta), **status**, **resource group** and **project**, with a
+fuzzy search over name, username, app, project and resource group —
+and tells you how many no-longer-live accounts a resource group /
+project filter is hiding. Summary tiles (accounts, SaaS, Okta, active,
+deleted, unknown) always agree with the filtered table.
+
+**What's deliberately left out.** Database and Active Directory
+accounts share the exact same event types and the same "Service
+Account" target type; they are classified out (and counted in a note
+under the tiles) rather than mixed in or silently dropped. An account
+id with no recognisable family marker is likewise excluded and counted,
+never guessed into a type. `sync_status` and the last password change
+are shown as **informational** text under the account, not as a
+finding — a freshly registered SaaS account can legitimately sit
+`NOT_SYNCED` (see [api-notes.md](api-notes.md)).
+
+Clicking an account opens the same per-resource **history panel** the
+Resources tab uses — every archived event where that account is a
+target, with the date range, fuzzy filters, truncation notice and
+export the generic reports have. **Export CSV / MD** covers the
+currently filtered rows (with a Type column, so a SaaS-only or Okta-only
+file is one filter away), and **Refresh** re-walks the live roster.
+
+Requires a completed compliance sync for the active environment — this
+report is sourced from the archive only (no live, 90-day Okta fallback
+like the Secrets report's pre-sync path); until then the tab says so
+and points at **Sync now**. It needs the OPA credentials for the roster
+walk, not an Okta API token.
+
+**Cost and freshness.** Loading the tab walks every resource group and
+project (one call per project per account type) and then reads the
+archive, so a tenant with hundreds of projects will take a while — the
+tab says so while loading. The result is kept until you press
+**Refresh** or a global sync completes; switching environments loads
+that environment's own report. First start after upgrading to v5.40.0
+builds two new archive indexes (a one-off few seconds on a large
+archive) that keep the per-account rotation reads fast.
+
 ### Policy assignment (Folder Builder)
 
 Every folder row in the tree editor carries a small access badge

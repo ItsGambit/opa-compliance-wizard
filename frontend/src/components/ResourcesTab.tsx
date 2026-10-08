@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Search } from 'lucide-react'
-import { useEnvironments, useResourceHistory } from '../api/hooks'
 import { AdConnectionRulesPanel } from './AdConnectionRulesPanel'
 import type {
   AccessActiveDirectoryAccount,
@@ -19,10 +18,9 @@ import type {
   AccessWorkloadRole,
 } from '../types'
 import type { ExportSection } from '../utils/export'
-import { complianceReportExportSections } from '../utils/exportSections'
 import { HighlightedText, useFuzzyFilter } from '../utils/fuzzySearch'
 import { ExportButtons } from './ExportButtons'
-import { ReportRowsTable } from './ReportRowsTable'
+import { ResourceHistoryPanel } from './ResourceHistoryPanel'
 import { Select } from './Select'
 
 // Every kind here is live-verified (2026-09-30) against a real tenant --
@@ -149,8 +147,8 @@ function buildRows(kind: string, model: AccessModel, windowsServers: AccessServe
     case 'okta_accounts': {
       // Real bug fixed 2026-09-30: this used to read a.account_name,
       // which doesn't exist on the real API object -- confirmed live the
-      // real fields are `name` (human label, e.g. "McKinsey Okta SA") and
-      // `username` (the login identity, e.g. "mcksa@atko.email"), so
+      // real fields are `name` (human label, e.g. "Example Okta SA") and
+      // `username` (the login identity, e.g. "svc@example.com"), so
       // every row was silently falling through to the raw id.
       const list: AccessOktaAccount[] = model.okta_accounts
       return {
@@ -365,74 +363,9 @@ function ResourceTable({
   )
 }
 
-/** The per-resource compliance-report history drill-down -- clicking a row
- * above shows every report row (across EVERY report, not one) where this
- * resource appears as ANY target on the event, matched by id AND/OR its
- * exact display name (resourceLabel, passed through as resourceName --
- * needed for database/AD accounts, which have no log-side id at all --
- * see audit_store.resource_history's docstring for the full live-verified
- * explanation). */
-function ResourceHistoryPanel({ resourceId, resourceLabel, onClose }: { resourceId: string; resourceLabel: string; onClose: () => void }) {
-  const { data: environments } = useEnvironments()
-  const activeEnv = environments?.active
-  const today = new Date().toISOString().slice(0, 10)
-  const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
-  const [from, setFrom] = useState(ninetyDaysAgo)
-  const [to, setTo] = useState(today)
-
-  // No per-view Refresh here -- every resource's history reads the SAME
-  // shared audit_store.db archive as every ordinary report, so pulling
-  // fresh Okta data is one global action (the Footer's "Sync now"), not
-  // something duplicated per screen. This query auto-refetches when that
-  // global sync completes, via queryClient.invalidateQueries on the
-  // ['resource_history'] key prefix (see Footer.tsx).
-  const { data, isLoading } = useResourceHistory(resourceId, activeEnv, from, to, resourceLabel)
-  // FIX (external review, 2026-09-30): `data?.rows ?? []` creates a brand
-  // new [] literal on every render while data is still loading --
-  // useFuzzyFilter callers downstream (see e.g. ResourceRowList) rebuild
-  // their whole Fuse search index every render instead of only when the
-  // underlying data actually changes, since useMemo there keys off this
-  // array's REFERENCE, not its contents.
-  const rows = useMemo(() => data?.rows ?? [], [data])
-  const [filteredRows, setFilteredRows] = useState(rows)
-
-  return (
-    <div className="flex flex-col gap-4">
-      <div className="flex items-center justify-between">
-        <h3 className="text-sm font-semibold text-text">Access history — {resourceLabel}</h3>
-        <div className="flex items-center gap-2">
-          <ExportButtons
-            sections={complianceReportExportSections(`History: ${resourceLabel}`, filteredRows)}
-            filenameBase={`opa-resource-history-${resourceLabel}`}
-          />
-          <button type="button" className="btn-secondary text-xs" onClick={onClose}>
-            Close
-          </button>
-        </div>
-      </div>
-
-      <div className="card p-3 flex items-end gap-3">
-        <div className="field">
-          <label className="section-label block mb-1">From</label>
-          <input type="date" className="text-input" value={from} onChange={e => setFrom(e.target.value)} />
-        </div>
-        <div className="field">
-          <label className="section-label block mb-1">To</label>
-          <input type="date" className="text-input" value={to} onChange={e => setTo(e.target.value)} />
-        </div>
-      </div>
-
-      <ReportRowsTable
-        rows={rows}
-        isLoading={isLoading}
-        emptyMessage="No compliance-report activity found for this resource in this date range."
-        onFilteredRowsChange={setFilteredRows}
-        total={data?.total}
-        truncated={data?.truncated}
-      />
-    </div>
-  )
-}
+// ResourceHistoryPanel (the per-resource drill-down clicking a row opens)
+// moved to its own file in 5.40.0 -- the Service Accounts Dashboard reuses
+// it unchanged.
 
 export function ResourcesTab({ model }: Props) {
   const [kind, setKind] = useState(RESOURCE_KINDS[0].value)

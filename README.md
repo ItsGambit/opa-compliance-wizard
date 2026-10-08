@@ -58,7 +58,14 @@ worth reporting privately.
    ISO 27001). This is the data PAM admins need to hand their auditors;
    it isn't a finished SOC 2/SOX/ISO 27001 report in itself. **This is
    the primary use case.** See
-   [Compliance Reports Dashboard](docs/features.md#compliance-reports-dashboard).
+   [Compliance Reports Dashboard](docs/features.md#compliance-reports-dashboard),
+   plus two per-resource views built on the same archive: the
+   [Secrets Access Dashboard](docs/features.md#secrets-access-dashboard)
+   (every secret and folder in a project, with who created, changed,
+   retrieved or deleted it) and the
+   [Service Accounts Dashboard](docs/features.md#service-accounts-dashboard)
+   (every SaaS app and Okta service account across the tenant, including
+   ones since deleted, with reveals, checkouts and rotation history).
 2. **Creates a tree of OPA vault secret folders** (any depth) — and, if
    needed, the resource group / project / access group they live under —
    from a CSV file or the dashboard's visual tree editor. See

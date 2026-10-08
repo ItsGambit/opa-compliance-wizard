@@ -15,6 +15,7 @@ import { EnvironmentSetup } from './components/EnvironmentSetup'
 import { Footer } from './components/Footer'
 import { FolderBuilder } from './components/FolderBuilder'
 import { SecretsAccessDashboard } from './components/SecretsAccessDashboard'
+import { ServiceAccountsDashboard } from './components/ServiceAccountsDashboard'
 import { REPORTS_SUB_TABS, SideNav } from './components/SideNav'
 import { UserMenu } from './components/UserMenu'
 
@@ -117,6 +118,7 @@ export default function App() {
               <h1 className="text-lg font-semibold text-text">
                 {activeTab === 'reports' && reportsSubTab === 'browse' && 'Compliance Reports'}
                 {activeTab === 'reports' && reportsSubTab === 'secrets_access' && 'Secrets Access Dashboard'}
+                {activeTab === 'reports' && reportsSubTab === 'service_accounts' && 'Service Accounts Dashboard'}
                 {activeTab === 'access' && 'Access Explorer'}
                 {activeTab === 'builder' && 'Folder Builder'}
                 {activeTab === 'audit_log' && 'Audit Log'}
@@ -126,6 +128,8 @@ export default function App() {
                   'Audit evidence for SOC 2 / SOX / ISO 27001 and similar frameworks, generated from OPA + core Okta audit history.'}
                 {activeTab === 'reports' && reportsSubTab === 'secrets_access' &&
                   'See who created, updated, retrieved, or deleted each secret and folder in a resource group/project.'}
+                {activeTab === 'reports' && reportsSubTab === 'service_accounts' &&
+                  'Every SaaS app and Okta service account across the tenant — including ones since deleted — with who created, assigned, revealed, checked out or rotated it, and when.'}
                 {activeTab === 'access' &&
                   'Explore who has access to what, across resource groups, projects, policies, users, and groups.'}
                 {activeTab === 'builder' &&
@@ -144,6 +148,7 @@ export default function App() {
 
           {activeTab === 'reports' && reportsSubTab === 'browse' && <ComplianceReports />}
           {activeTab === 'reports' && reportsSubTab === 'secrets_access' && <SecretsAccessDashboard />}
+          {activeTab === 'reports' && reportsSubTab === 'service_accounts' && <ServiceAccountsDashboard />}
           {activeTab === 'access' && <AccessExplorer subTab={accessSubTab} />}
           {activeTab === 'builder' && <FolderBuilder />}
           {activeTab === 'audit_log' && whoami?.is_admin && <AuditLogPage />}

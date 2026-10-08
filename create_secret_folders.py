@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.39.10
+# Version     : 5.40.0
 # =============================================================================
 
 import argparse
@@ -80,7 +80,7 @@ import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.39.10"
+SCRIPT_VERSION = "5.40.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -281,6 +281,76 @@ SECRETS_ACCESS_REPORT_EVENT_TYPES = {
     "secret": ["pam.secret.create", "pam.secret.update", "pam.secret.delete", "pam.secret.reveal"],
     "secret_folder": ["pam.secret_folder.create", "pam.secret_folder.update", "pam.secret_folder.delete"],
 }
+
+# Confirmed 2026-10-07 by a read-only probe of a real compliance archive
+# (two environments, ~130k rows across these families -- not inferred from
+# docs): every pam.service_account.* event carries the account as a
+# "Service Account" target whose `id` is the account's OPA-internal id --
+# the same value build_access_model stores as access_tracking_id from
+# list_project_saas_app_accounts / list_project_okta_ud_accounts -- with
+# alternateId identical to id, and debugContext.debugData.serviceAccountType
+# naming the account family (see SERVICE_ACCOUNT_TYPE_TO_KIND).
+# pam.resource.checkout carries the same id as its "Service Account" target
+# but has NO serviceAccountType; its debugData.resourceType is what tells
+# the family apart there (see CHECKOUT_RESOURCE_TYPE_TO_KIND). Database and
+# Active Directory accounts share the exact same "Service Account" target
+# type AND the same reveal/rotation eventTypes, so NOTHING about the target
+# alone says which family an event belongs to -- the report below has to
+# classify every event explicitly before bucketing it.
+#
+# Real lifecycle events exist for service accounts (create/update/delete/
+# assign -- all seen with real payloads), so a deleted account can be
+# reported as "deleted" from direct evidence, the same honesty rule the
+# Secrets report uses. pam.resource.checkin.start/.end are deliberately
+# excluded, same reasoning as RESOURCE_ACCESS_EVENT_TYPES above.
+SERVICE_ACCOUNT_REPORT_EVENT_TYPES = {
+    "lifecycle": [
+        "pam.service_account.create",
+        "pam.service_account.update",
+        "pam.service_account.delete",
+        "pam.service_account.assign",
+    ],
+    "reveal": ["pam.service_account.password.reveal"],
+    "checkout": ["pam.resource.checkout"],
+    # password_rotation.start exists too (and stays in audit_store's
+    # generic Credential Rotation card) but carries no outcome; .end is
+    # the outcome-bearing event (SUCCESS / FAILURE / DEFERRED, all three
+    # seen on real rows, FAILURE rows carry outcome.reason), so the
+    # per-account rotation history is built from .end alone.
+    "rotation": ["pam.service_account.password_rotation.end"],
+}
+
+# debugData.serviceAccountType -> report kind. Every key was seen on real
+# events. DATABASE_ACCOUNT and PAM_AD_ACCOUNT are listed as "other" ON
+# PURPOSE so they are excluded (and counted in the response's `excluded`
+# block) rather than silently dropped as unrecognised -- they are real,
+# high-volume families (AD rotations alone were 83k rows in the probe) that
+# this report is explicitly not about. The staged-accounts API uses the
+# same two strings (OKTA_USER_ACCOUNT / APP_ACCOUNT) for its account_type.
+SERVICE_ACCOUNT_TYPE_TO_KIND = {
+    "APP_ACCOUNT": "saas",
+    "OKTA_USER_ACCOUNT": "okta",
+    "DATABASE_ACCOUNT": "other",
+    "PAM_AD_ACCOUNT": "other",
+}
+
+# debugData.resourceType on pam.resource.checkout -> report kind. Only
+# MANAGED_SAAS_APP_SERVICE_ACCOUNT is live-confirmed for SaaS; no Okta UD
+# checkout has been observed yet, so there is deliberately NO Okta entry
+# here -- see build_service_accounts_report_from_archive for how an
+# unlisted value is handled (it attaches to an account the report already
+# knows about, but never conjures a new one from an unconfirmed string).
+CHECKOUT_RESOURCE_TYPE_TO_KIND = {
+    "MANAGED_SAAS_APP_SERVICE_ACCOUNT": "saas",
+    "PAM_DATABASE_ACCOUNT": "other",
+    "SERVER_ACCOUNT": "other",
+}
+
+SERVICE_ACCOUNT_ROTATION_LIMIT_DEFAULT = 25
+SERVICE_ACCOUNT_ROTATION_LIMIT_MAX = 200
+# Cap on the bulk-loaded lifecycle/reveal/checkout rows (same figure the
+# Secrets archive builder uses). The report says `truncated` when hit.
+SERVICE_ACCOUNT_EVENT_LOAD_LIMIT = 100000
 
 FIELD_NAME = "name"
 FIELD_DESCRIPTION = "description"
@@ -3133,10 +3203,14 @@ def build_secrets_access_report(client, okta_client, resource_group_id, project_
     Returns {"secrets": [...], "folders": [...], "since_days": since_days,
     "local_retention_enabled": False, "oldest_captured_at": ...}.
     Each row: {id, name, path, status, created, updated, deleted}
-    (created/deleted are {"by", "at"} or None; updated is a list of
-    {"by", "at"}, most-recent-first). Secret rows additionally carry
-    reveals: a list of {"by", "at", "request_id"}, most-recent-first,
-    capped at reveal_limit.
+    (created/deleted are _audit_entry dicts -- {"by", "at", "request_id",
+    "outcome", "outcome_reason"} -- or None; updated is a list of them,
+    most-recent-first). Secret rows additionally carry reveals: the same
+    entries, most-recent-first, capped at reveal_limit. Since v5.40.0 a
+    delete only counts with a SUCCESS outcome and `created` prefers the
+    successful attempt (see _record_create / _record_delete) -- the same
+    rules the Service Accounts report uses, so a FAILED delete can no
+    longer mark a live secret "deleted".
 
     `local_retention_enabled` is always False here -- Phase 5 (2026-10-01)
     retired this function's own local caching (secrets_log_cache.json);
@@ -3197,27 +3271,18 @@ def build_secrets_access_report(client, okta_client, resource_group_id, project_
         if path_target and not bucket["path"]:
             bucket["path"] = (path_target.get("displayName") or "").lstrip("/")
 
-        # displayName over alternateId: for a human actor these usually
-        # agree (full name vs. email), but a service-account actor (e.g.
-        # this dashboard's own "claudesvr") has an opaque "users/<uuid>"
-        # alternateId/id with the only human-readable value in
-        # displayName -- confirmed live against real delete events from
-        # this project's own past service-account-driven testing.
-        actor = event.get("actor") or {}
-        entry = {
-            "by": actor.get("displayName") or actor.get("alternateId"),
-            "at": event.get("published"),
-            "request_id": _extract_request_id(event),
-        }
+        # Entry shape, create/delete rules shared with the archive builder
+        # below and the Service Accounts report (v5.40.0): a delete only
+        # counts with a SUCCESS outcome and a create prefers the
+        # successful attempt -- see _audit_entry / _record_delete.
+        entry = _audit_entry(event)
         event_type = event.get("eventType")
         if event_type.endswith(".create"):
-            if bucket["created"] is None:  # events are most-recent-first; a resource has exactly one create
-                bucket["created"] = entry
+            _record_create(bucket, entry)
         elif event_type.endswith(".update"):
             bucket["updated"].append(entry)
         elif event_type.endswith(".delete"):
-            if bucket["deleted"] is None:
-                bucket["deleted"] = entry
+            _record_delete(bucket, entry)
         elif event_type.endswith(".reveal"):
             if len(bucket["reveals"]) < reveal_limit:
                 bucket["reveals"].append(entry)
@@ -3279,11 +3344,12 @@ def build_project_secrets_report_from_archive(client, environment_id, resource_g
     no Okta API token configured, unlike the original.
 
     Deliberately reuses the EXACT SAME bucketing/status logic as
-    build_secrets_access_report (verbatim-copied, not refactored to share
-    code) -- that function's active/deleted/unknown honesty rules took
-    several iterations to get right (see this project's own history), and
-    the risk of a shared-code refactor introducing a subtle regression in
-    the already-working live-query path outweighs the small duplication.
+    build_secrets_access_report (the loop is copied rather than
+    abstracted -- that function's active/deleted/unknown honesty rules
+    took several iterations to get right, see this project's own
+    history; only the per-event entry/create/delete rules are shared
+    helpers, _audit_entry / _record_create / _record_delete, since
+    v5.40.0 so all three per-resource reports apply them identically).
     Only the EVENT SOURCE differs: audit_store.query_events (all history
     ever ingested, no 90-day/1000-row cap) instead of one bounded
     okta_client.get_system_log call.
@@ -3340,21 +3406,14 @@ def build_project_secrets_report_from_archive(client, environment_id, resource_g
         if path_target and not bucket["path"]:
             bucket["path"] = (path_target.get("displayName") or "").lstrip("/")
 
-        actor = event.get("actor") or {}
-        entry = {
-            "by": actor.get("displayName") or actor.get("alternateId"),
-            "at": event.get("published"),
-            "request_id": _extract_request_id(event),
-        }
+        entry = _audit_entry(event)
         event_type = event.get("eventType")
         if event_type.endswith(".create"):
-            if bucket["created"] is None:
-                bucket["created"] = entry
+            _record_create(bucket, entry)
         elif event_type.endswith(".update"):
             bucket["updated"].append(entry)
         elif event_type.endswith(".delete"):
-            if bucket["deleted"] is None:
-                bucket["deleted"] = entry
+            _record_delete(bucket, entry)
         elif event_type.endswith(".reveal"):
             bucket["reveals"].append(entry)
 
@@ -3396,6 +3455,411 @@ def build_project_secrets_report_from_archive(client, environment_id, resource_g
         "since_days": None,  # archive has no fixed window -- whole history ever ingested
         "local_retention_enabled": True,
         "oldest_captured_at": oldest_captured_at,
+    }
+
+
+def walk_service_account_rosters(client):
+    """Every SaaS app account ("saas") and Okta Universal Directory account
+    ("okta") across every resource group and project the client can see,
+    as a list of (kind, account, project_ref) tuples, plus a count of what
+    was walked. These are the same two per-project list calls
+    build_access_model's index_resources step makes (and the same
+    project_ref shape ResourcesTab renders), pulled out so the
+    service-accounts report can refresh rosters without the rest of that
+    much heavier bootstrap. build_access_model keeps its own loop because
+    it walks folders/servers/AD/DB accounts in the same pass.
+
+    Tenant-wide on purpose: service-account events carry no project
+    co-target (confirmed, see SERVICE_ACCOUNT_REPORT_EVENT_TYPES), so a
+    per-project walk could never say which project a since-deleted
+    account belonged to -- "deleted" is only honest against the whole
+    tenant's live roster. Cost is 1 + R + 2P calls; the caller surfaces
+    the walked counts so a large tenant can see what it paid for."""
+    accounts = []
+    walked = {"resource_groups": 0, "projects": 0}
+    for rg in client.list_resource_groups():
+        walked["resource_groups"] += 1
+        for project in client.list_projects(rg["id"]):
+            walked["projects"] += 1
+            ref = {
+                "project_id": project.get("id"),
+                "project_name": project.get("name"),
+                "resource_group_id": rg.get("id"),
+                "resource_group_name": rg.get("name"),
+            }
+            for acct in client.list_project_saas_app_accounts(rg["id"], project["id"]):
+                accounts.append(("saas", acct, ref))
+            for acct in client.list_project_okta_ud_accounts(rg["id"], project["id"]):
+                accounts.append(("okta", acct, ref))
+    return accounts, walked
+
+
+def _audit_entry(event):
+    """One history entry for the per-resource reports (Secrets Access and
+    Service Accounts): who, when, Okta request id, and the event's own
+    outcome. Outcome is not decoration: a real service-account create can
+    end DEFERRED or FAILURE and be retried (seen live), a rotation ends
+    SUCCESS / FAILURE / DEFERRED, and a secret delete can fail too -- an
+    entry without its outcome reads as "it happened" when it may not
+    have. displayName over alternateId for the actor: for a human the two
+    usually agree (full name vs. email), but a service-account actor has
+    an opaque "users/<uuid>" alternateId with the only human-readable
+    value in displayName -- confirmed live against real delete events."""
+    actor = event.get("actor") or {}
+    outcome = event.get("outcome") or {}
+    return {
+        "by": actor.get("displayName") or actor.get("alternateId"),
+        "at": event.get("published"),
+        "request_id": _extract_request_id(event),
+        "outcome": outcome.get("result"),
+        "outcome_reason": outcome.get("reason"),
+    }
+
+
+def _entry_succeeded(entry):
+    """True unless the entry's event explicitly reported a non-SUCCESS
+    outcome. A missing outcome counts as success on purpose: every real
+    Okta System Log event carries outcome.result, so "absent" only
+    happens for a hand-built or reconstructed payload, and treating that
+    as a failure would hide real history. An explicit DEFERRED / FAILURE
+    is never treated as "it happened" -- a failed delete must not mark a
+    resource deleted, and a deferred create is not when it was created."""
+    return entry.get("outcome") in (None, "SUCCESS")
+
+
+def _record_create(bucket, entry):
+    """Events are newest-first. Keeps the newest SUCCESSFUL create; until
+    one is seen, keeps the newest attempt (with its outcome) so the row
+    still says what happened rather than nothing."""
+    if bucket["created"] is None or (_entry_succeeded(entry) and not _entry_succeeded(bucket["created"])):
+        bucket["created"] = entry
+
+
+def _record_delete(bucket, entry):
+    """Only a successful delete is evidence of deletion -- this is what
+    the active/deleted/unknown status is computed from, so a FAILURE
+    here would mark a live resource deleted."""
+    if bucket["deleted"] is None and _entry_succeeded(entry):
+        bucket["deleted"] = entry
+
+
+def _service_account_event_kind(event):
+    """'saas' / 'okta' / 'other' / None for one raw event, from the
+    live-confirmed debugData field for its eventType (serviceAccountType
+    for pam.service_account.*, resourceType for pam.resource.checkout --
+    see the two *_TO_KIND tables). None means the event carries no
+    recognised family marker at all (seen live: an update event with an
+    empty serviceAccountType), NOT "not a service account" -- the caller
+    resolves those from the account's other evidence."""
+    debug_data = (event.get("debugContext") or {}).get("debugData") or {}
+    if event.get("eventType") == "pam.resource.checkout":
+        return CHECKOUT_RESOURCE_TYPE_TO_KIND.get(debug_data.get("resourceType"))
+    return SERVICE_ACCOUNT_TYPE_TO_KIND.get(debug_data.get("serviceAccountType"))
+
+
+def _empty_rotation_summary():
+    return {"total": 0, "by_outcome": {}, "first_at": None, "last_at": None, "recent": []}
+
+
+def build_service_accounts_report_from_archive(client, environment_id, rotation_limit=SERVICE_ACCOUNT_ROTATION_LIMIT_DEFAULT):
+    """The SaaS / Okta service-account counterpart of
+    build_project_secrets_report_from_archive: every SaaS app account and
+    Okta Universal Directory account in the tenant -- including ones since
+    deleted -- with who created / updated / assigned / deleted it, who
+    revealed its password or checked it out, and its rotation history,
+    sourced from the audit_store archive (never a live System Log call).
+
+    Two sources merged, same as the Secrets report:
+      1. The live roster walk (walk_service_account_rosters) -- "what
+         exists right now", keyed by the account's own OPA-internal id.
+      2. The archive -- "what happened", keyed by the SAME id (confirmed,
+         see SERVICE_ACCOUNT_REPORT_EVENT_TYPES), including accounts that
+         no longer exist and so aren't in source 1 at all.
+
+    Status honesty rules are the Secrets report's, verbatim in spirit:
+    present in the live walk => "active" (even with zero history);
+    absent live => "deleted" ONLY when a SUCCESS delete event exists,
+    otherwise "unknown". Never inferred.
+
+    Two things the Secrets builder never had to do:
+      * Classify before bucketing. Database and AD accounts share the
+        same target type AND the same reveal/rotation eventTypes, so
+        every event votes for a family via its live-confirmed debugData
+        marker; the roster is authoritative when it knows the id, a
+        saas/okta vote wins over an "other" vote, and an id with no vote
+        at all is excluded and COUNTED (response["excluded"]) rather than
+        guessed. A pam.resource.checkout with an unrecognised
+        resourceType can attach to an account the report already knows
+        but never creates one -- the Okta UD checkout marker is not yet
+        live-confirmed (see CHECKOUT_RESOURCE_TYPE_TO_KIND).
+      * Scale rotations differently. password_rotation.end is by far the
+        highest-volume PAM event in a real archive (115k rows, 83k of them
+        AD), so it is never bulk-loaded as raw JSON: totals come from one
+        GROUP BY over the indexed resource_id column
+        (audit_store.count_events_by_resource), only the newest
+        `rotation_limit` rows per account are fetched as entries, and an
+        account that only ever appears in rotation events (its lifecycle
+        predates the archive) is still discovered -- one raw row is read
+        to classify it.
+
+    Returns {"accounts": [row...], "summary": {...}, "walked": {...},
+    "excluded": {...}, "since_days": None, "local_retention_enabled":
+    True, "oldest_captured_at": ...}. Each row: id, kind ("saas"|"okta"),
+    name, username, app_name, okta_user_id, privileged_resource_id,
+    resource_group_id/_name, project_id/_name (all None for an account no
+    longer in the live walk -- its project is not knowable, see
+    walk_service_account_rosters), status, sync_status and
+    last_password_change_at (live-only, INFORMATIONAL: a freshly
+    registered SaaS account can legitimately sit NOT_SYNCED, see
+    docs/api-notes.md), created, updated[], assigned[], deleted,
+    reveals[], checkouts[] (most-recent-first; checkouts carry expires_at)
+    and rotations {total, by_outcome, first_at, last_at, recent[]}.
+    `created` prefers the most recent SUCCESS create over a DEFERRED/
+    FAILURE attempt (the attempt is kept, with its outcome, when no
+    success exists); `deleted` is only ever a SUCCESS delete."""
+    import audit_store
+
+    if not isinstance(rotation_limit, int) or not (1 <= rotation_limit <= SERVICE_ACCOUNT_ROTATION_LIMIT_MAX):
+        raise ValueError(
+            f"rotation_limit must be an integer between 1 and {SERVICE_ACCOUNT_ROTATION_LIMIT_MAX}, got {rotation_limit!r}"
+        )
+
+    roster, walked = walk_service_account_rosters(client)
+    live = {}  # account id -> (kind, account, project_ref), walk order preserved
+    for kind, acct, ref in roster:
+        aid = acct.get("id")
+        if aid and aid not in live:
+            live[aid] = (kind, acct, ref)
+
+    # --- Source 2a: the low-volume families, bulk-loaded like the Secrets
+    # builder does (a real archive had ~110 rows across these). ---
+    low_volume_types = [
+        t for key in ("lifecycle", "reveal", "checkout") for t in SERVICE_ACCOUNT_REPORT_EVENT_TYPES[key]
+    ]
+    rotation_types = SERVICE_ACCOUNT_REPORT_EVENT_TYPES["rotation"]
+    archived = audit_store.query_events(
+        environment_id, event_types=low_volume_types, limit=SERVICE_ACCOUNT_EVENT_LOAD_LIMIT
+    )
+    # Honest about a cut-off, the same way run_report/resource_history are
+    # (UI-03/DATA-07): these families are small on every real archive seen
+    # so far (~110 rows), but the cap exists and a report that silently
+    # dropped the OLDEST rows would be missing exactly the creates and
+    # deletes the status column depends on.
+    event_total = audit_store.count_events(environment_id, event_types=low_volume_types)
+    truncated = event_total > len(archived)
+    events = sorted((r["raw"] for r in archived), key=lambda e: e.get("published") or "", reverse=True)
+
+    # Pass 1: one family vote per event, keyed by the account id. Nothing
+    # is bucketed yet -- an id's family is decided from ALL its evidence
+    # first (an update with an empty marker must not hide behind an older
+    # create that does carry one).
+    votes = {}  # id -> set of kinds voted ('saas'/'okta'/'other'); None votes are not recorded
+    names_from_events = {}  # id -> newest NON-EMPTY displayName seen (events are newest-first)
+
+    def _note_name(aid, name):
+        if name and aid not in names_from_events:
+            names_from_events[aid] = name
+
+    def _note_vote(aid, kind):
+        if kind is not None:
+            votes.setdefault(aid, set()).add(kind)
+
+    seen_event_ids = set()
+    for event in events:
+        target = _access_report_target(event, "Service Account")
+        if target is None or not target.get("id"):
+            continue
+        aid = target["id"]
+        seen_event_ids.add(aid)
+        _note_name(aid, target.get("displayName"))
+        _note_vote(aid, _service_account_event_kind(event))
+
+    # --- Source 2b: rotation totals for EVERY id that has any, via the
+    # indexed columns (never raw JSON) -- also how an account that only
+    # ever rotated gets discovered at all. Its family comes from the
+    # stored resource_type_detail values (serviceAccountType, written at
+    # ingest by audit_store._resource_type_detail_fallback), so even an
+    # id whose newest row carries an empty marker is classified from the
+    # rows that do. Only an id with NO stored marker on any row (every
+    # row predates that fallback) falls back to reading a few raw rows. ---
+    rotation_totals = audit_store.count_events_by_resource(environment_id, event_types=rotation_types)
+    for aid, totals in rotation_totals.items():
+        if aid in live or aid in seen_event_ids:
+            continue
+        for detail in totals.get("type_details") or {}:
+            _note_vote(aid, SERVICE_ACCOUNT_TYPE_TO_KIND.get(detail))
+        if aid in votes:
+            continue
+        for row in audit_store.query_events(
+            environment_id, event_types=rotation_types, resource_id=aid, limit=5, match_alternate_id=False
+        ):
+            raw = row["raw"]
+            _note_name(aid, (_access_report_target(raw, "Service Account") or {}).get("displayName"))
+            _note_vote(aid, _service_account_event_kind(raw))
+
+    warnings = {"conflicting_family_markers": 0}
+
+    def _decide_kind(aid):
+        voted = votes.get(aid, set())
+        roster_kind = live[aid][0] if aid in live else None
+        conflicting = (voted - {roster_kind}) if roster_kind else (voted if len(voted) > 1 else set())
+        if conflicting:
+            # Real evidence disagreeing with itself (a roster SaaS id whose
+            # events say DATABASE_ACCOUNT, or an event-only id voting both
+            # saas and okta) -- surfaced as a count and logged, never
+            # silently resolved. The roster stays authoritative.
+            warnings["conflicting_family_markers"] += 1
+            log("WARN", f"service_accounts_report: conflicting family markers {sorted(voted)} "
+                        f"(roster says {roster_kind!r}) for one account id")
+        if roster_kind:
+            return roster_kind
+        for kind in ("saas", "okta"):
+            if kind in voted:
+                return kind
+        if "other" in voted:
+            return "other"
+        return None
+
+    candidate_ids = set(live) | seen_event_ids | set(rotation_totals)
+    excluded = {"other_account_types": 0, "unclassified": 0}
+    kind_by_id = {}
+    for aid in candidate_ids:
+        kind = _decide_kind(aid)
+        if kind in ("saas", "okta"):
+            kind_by_id[aid] = kind
+        elif kind == "other":
+            excluded["other_account_types"] += 1
+        else:
+            excluded["unclassified"] += 1
+
+    # Pass 2: bucket the low-volume events for the ids that made the cut.
+    def _new_bucket():
+        return {
+            "created": None,  # newest SUCCESS create, else newest attempt -- see _record_create
+            "updated": [],
+            "assigned": [],
+            "deleted": None,  # SUCCESS delete only -- see _record_delete
+            "reveals": [],
+            "checkouts": [],
+        }
+
+    buckets = {aid: _new_bucket() for aid in kind_by_id}
+    for event in events:  # newest-first
+        target = _access_report_target(event, "Service Account")
+        if target is None or target.get("id") not in buckets:
+            continue
+        bucket = buckets[target["id"]]
+        entry = _audit_entry(event)
+        event_type = event.get("eventType") or ""
+        if event_type.endswith(".create"):
+            _record_create(bucket, entry)
+        elif event_type.endswith(".update"):
+            bucket["updated"].append(entry)
+        elif event_type.endswith(".assign"):
+            bucket["assigned"].append(entry)
+        elif event_type.endswith(".delete"):
+            _record_delete(bucket, entry)
+        elif event_type.endswith(".reveal"):
+            bucket["reveals"].append(entry)
+        elif event_type == "pam.resource.checkout":
+            debug_data = (event.get("debugContext") or {}).get("debugData") or {}
+            bucket["checkouts"].append({**entry, "expires_at": debug_data.get("checkoutExpiry")})
+
+    # --- Rotation history: newest `rotation_limit` rows per account that
+    # has any, each an index-ordered read on resource_id alone
+    # (alternateId == id for every service-account event, confirmed). ---
+    rotations_by_id = {}
+    for aid in kind_by_id:
+        totals = rotation_totals.get(aid)
+        if not totals:
+            rotations_by_id[aid] = _empty_rotation_summary()
+            continue
+        recent = []
+        for row in audit_store.query_events(
+            environment_id, event_types=rotation_types, resource_id=aid, limit=rotation_limit, match_alternate_id=False
+        ):
+            raw = row["raw"]
+            # A rotation-only account classified from stored markers never
+            # had a raw row read until now -- its display name comes from
+            # the same rows this history needs anyway (newest non-empty).
+            _note_name(aid, (_access_report_target(raw, "Service Account") or {}).get("displayName"))
+            debug_data = (raw.get("debugContext") or {}).get("debugData") or {}
+            initiated = debug_data.get("system Initiated")  # literal key with a space, confirmed live
+            recent.append({
+                **_audit_entry(raw),
+                "system_initiated": None if initiated is None else str(initiated).strip().lower() == "yes",
+            })
+        rotations_by_id[aid] = {
+            "total": totals["total"],
+            "by_outcome": totals["by_outcome"],
+            "first_at": totals["first_at"],
+            "last_at": totals["last_at"],
+            "recent": recent,
+        }
+
+    def _row(aid):
+        kind = kind_by_id[aid]
+        b = buckets[aid]
+        acct, ref = (live[aid][1], live[aid][2]) if aid in live else ({}, {})
+        if aid in live:
+            status = "active"
+        else:
+            status = "deleted" if b["deleted"] else "unknown"
+        return {
+            "id": aid,
+            "kind": kind,
+            "name": acct.get("name") or names_from_events.get(aid) or "",
+            "username": acct.get("username"),
+            "app_name": acct.get("application_instance_name") if kind == "saas" else None,
+            "okta_user_id": acct.get("okta_user_id") if kind == "okta" else None,
+            "privileged_resource_id": acct.get("privileged_resource_id") if kind == "saas" else None,
+            "resource_group_id": ref.get("resource_group_id"),
+            "resource_group_name": ref.get("resource_group_name"),
+            "project_id": ref.get("project_id"),
+            "project_name": ref.get("project_name"),
+            "status": status,
+            "sync_status": acct.get("sync_status"),
+            "last_password_change_at": acct.get("last_password_change_system_timestamp"),
+            "created": b["created"],
+            "updated": b["updated"],
+            "assigned": b["assigned"],
+            "deleted": b["deleted"],
+            "reveals": b["reveals"],
+            "checkouts": b["checkouts"],
+            "rotations": rotations_by_id[aid],
+        }
+
+    # Live roster first (walk order: resource group, project), then every
+    # event-only account sorted by name so the report reads the same way
+    # on every refresh.
+    live_rows = [_row(aid) for aid in live if aid in kind_by_id]
+    event_only_rows = sorted(
+        (_row(aid) for aid in kind_by_id if aid not in live),
+        key=lambda r: ((r["name"] or "").lower(), r["id"]),
+    )
+    rows = live_rows + event_only_rows
+
+    oldest_candidates = [e.get("published") for e in events if e.get("published")]
+    oldest_candidates += [t["first_at"] for t in rotation_totals.values() if t.get("first_at")]
+    summary = {
+        "total": len(rows),
+        "saas": sum(1 for r in rows if r["kind"] == "saas"),
+        "okta": sum(1 for r in rows if r["kind"] == "okta"),
+        "active": sum(1 for r in rows if r["status"] == "active"),
+        "deleted": sum(1 for r in rows if r["status"] == "deleted"),
+        "unknown": sum(1 for r in rows if r["status"] == "unknown"),
+    }
+    return {
+        "accounts": rows,
+        "summary": summary,
+        "walked": walked,
+        "excluded": excluded,
+        "warnings": warnings,
+        "event_total": event_total,
+        "truncated": truncated,
+        "since_days": None,  # archive has no fixed window -- whole history ever ingested
+        "local_retention_enabled": True,
+        "oldest_captured_at": min(oldest_candidates, default=None),
     }
 
 

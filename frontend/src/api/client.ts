@@ -24,6 +24,7 @@ import type {
   ResourceHistoryResponse,
   SecretsAccessReport,
   ServiceAccountInfo,
+  ServiceAccountsReport,
   SyncSchedule,
   SyncStatusResponse,
   WorkloadRole,
@@ -381,6 +382,17 @@ export function fetchResourceHistory(
  * this isn't part of the bootstrap. */
 export function fetchAdConnectionDiscoveryConfig(connectionId: string): Promise<AdConnectionDiscoveryConfig> {
   return apiFetch(`/api/active_directory_connections/${encodeURIComponent(connectionId)}/discovery_config`)
+}
+
+// ── Service Accounts Dashboard (5.40.0) ──────────────────────────────────
+
+/** Tenant-wide by design (see the route's own comment in server/serve.py)
+ * -- no resource group/project in the URL; the dashboard filters
+ * client-side. 409 with reason "not_synced" until the active environment
+ * has completed a compliance sync. */
+export function fetchServiceAccountsReport(rotationLimit?: number): Promise<ServiceAccountsReport> {
+  const qs = rotationLimit != null ? `?rotation_limit=${encodeURIComponent(String(rotationLimit))}` : ''
+  return apiFetch(`/api/service_accounts_report${qs}`)
 }
 
 // ── Audit log (admin-only, see server/serve.py's /api/audit_log) ─────────

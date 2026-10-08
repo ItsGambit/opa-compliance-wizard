@@ -4,38 +4,9 @@ import type { ComplianceReportRow } from '../types'
 import { formatDateTime } from '../utils/format'
 import { HighlightedText, useFuzzyFilter } from '../utils/fuzzySearch'
 
-// resource_type_detail comes from Okta's own debugContext.debugData.resourceType
-// (confirmed live 2026-09-30 -- real values seen: PAM_DATABASE_ACCOUNT,
-// SERVER_ACCOUNT) -- more specific than the generic target-derived
-// resource_type (e.g. "Service Account"), which alone can't distinguish a
-// database account checkout from a server account checkout. Shown in
-// preference to resource_type when present, falling back otherwise.
-const RESOURCE_TYPE_DETAIL_LABEL: Record<string, string> = {
-  PAM_DATABASE_ACCOUNT: 'Database Account',
-  SERVER_ACCOUNT: 'Server Account',
-  // confirmed live 2026-09-30 via a real tenant's pam.resource.checkout
-  // event for a Salesforce account -- not seen during initial probing,
-  // found via this session's own Playwright verification pass instead.
-  MANAGED_SAAS_APP_SERVICE_ACCOUNT: 'SaaS Service Account',
-  // confirmed live 2026-10-01 against a 50-event real sample of
-  // user.authentication.auth_via_mfa (see audit_store._resource_fields):
-  // the real `factor` values seen were SIGNED_NONCE (36), OKTA_VERIFY_PUSH
-  // (13), PASSWORD_AS_FACTOR (1), and one lowercase `signed_nonce` (1) --
-  // Okta's own data is case-inconsistent for the same factor, so both
-  // cases are mapped to the same label rather than showing two distinct
-  // rows for what's really one factor type.
-  SIGNED_NONCE: 'Okta Verify (FastPass)',
-  signed_nonce: 'Okta Verify (FastPass)',
-  OKTA_VERIFY_PUSH: 'Okta Verify (Push)',
-  PASSWORD_AS_FACTOR: 'Password',
-}
-
-function resourceTypeLabel(row: { resource_type: string; resource_type_detail: string }): string {
-  if (row.resource_type_detail) {
-    return RESOURCE_TYPE_DETAIL_LABEL[row.resource_type_detail] ?? row.resource_type_detail
-  }
-  return row.resource_type
-}
+// The resource_type_detail -> label map lives in utils/resourceTypeLabels.ts
+// (5.40.0) so the CSV export shows the same labels as this table.
+import { resourceTypeLabel } from '../utils/resourceTypeLabels'
 
 // Email + Okta resource ID, shown together under the resource's display
 // name -- a display name alone isn't a unique identifier (two real users/

@@ -787,6 +787,12 @@ export interface AuditEntry {
    * Log for follow-up investigation. Present on created/updated/deleted
    * entries too, not just reveals, as of Phase 8's report-enhancement pass. */
   request_id: string | null
+  /** The event's own outcome.result / outcome.reason (5.40.0). Only the
+   * Service Accounts report sets these -- a service-account create or
+   * rotation genuinely ends DEFERRED / FAILURE on real tenants, so an
+   * entry needs to say so. Absent on Secrets entries (undefined). */
+  outcome?: string | null
+  outcome_reason?: string | null
 }
 
 export interface RevealEntry extends AuditEntry {}
@@ -814,6 +820,97 @@ export interface SecretAccessRow extends SecretsAccessRowBase {
 }
 
 export type FolderAccessRow = SecretsAccessRowBase
+
+// ── Service Accounts Dashboard (5.40.0) ──────────────────────────────────
+// Every SaaS app account and Okta Universal Directory account across the
+// tenant, merged with the compliance archive -- see
+// create_secret_folders.py's build_service_accounts_report_from_archive
+// for the status rules and the live-confirmed event facts behind it.
+
+export type ServiceAccountKind = 'saas' | 'okta'
+
+export interface ServiceAccountCheckoutEntry extends AuditEntry {
+  /** debugData.checkoutExpiry on the checkout event, when present. */
+  expires_at: string | null
+}
+
+export interface ServiceAccountRotationEntry extends AuditEntry {
+  /** true = OPA's scheduled rotation, false = a person triggered it, null
+   * = the event didn't say. From debugData's "system Initiated" marker. */
+  system_initiated: boolean | null
+}
+
+export interface ServiceAccountRotations {
+  /** Every password_rotation.end row for this account in the archive
+   * (counted server-side; never bulk-loaded). */
+  total: number
+  by_outcome: Record<string, number>
+  first_at: string | null
+  last_at: string | null
+  /** Newest first, capped at the route's rotation_limit (default 25). */
+  recent: ServiceAccountRotationEntry[]
+}
+
+export interface ServiceAccountReportRow {
+  /** The account's own OPA-internal id -- the same id every archived
+   * event references it by (access_tracking_id in the Access Explorer). */
+  id: string
+  kind: ServiceAccountKind
+  name: string
+  username: string | null
+  /** SaaS only: the Okta app instance the account belongs to. */
+  app_name: string | null
+  /** Okta only: the Okta user ("00u...") the account wraps. */
+  okta_user_id: string | null
+  /** SaaS only: the "opr..." id security-policy selectors use. */
+  privileged_resource_id: string | null
+  // All four are null for an account no longer in the live roster -- its
+  // project is not knowable from the archive and is never guessed.
+  resource_group_id: string | null
+  resource_group_name: string | null
+  project_id: string | null
+  project_name: string | null
+  /** Same rules as SecretsAccessStatus: active = in the live roster;
+   * deleted = absent live with a SUCCESS delete event; unknown otherwise. */
+  status: SecretsAccessStatus
+  /** INFORMATIONAL, live-only: OPA's own sync state for the account. A
+   * freshly registered SaaS account can legitimately sit NOT_SYNCED (see
+   * docs/api-notes.md) -- shown as context, never as a finding. */
+  sync_status: string | null
+  last_password_change_at: string | null
+  /** Most recent SUCCESS create, else the most recent attempt (with its
+   * outcome). */
+  created: AuditEntry | null
+  updated: AuditEntry[]
+  assigned: AuditEntry[]
+  /** Only ever a SUCCESS delete. */
+  deleted: AuditEntry | null
+  reveals: RevealEntry[]
+  checkouts: ServiceAccountCheckoutEntry[]
+  rotations: ServiceAccountRotations
+}
+
+export interface ServiceAccountsReport {
+  accounts: ServiceAccountReportRow[]
+  summary: { total: number; saas: number; okta: number; active: number; deleted: number; unknown: number }
+  /** What the live roster walk cost -- surfaced so a large tenant can see
+   * what a Refresh does. */
+  walked: { resource_groups: number; projects: number }
+  /** Account ids seen in the archive but deliberately left out: Database /
+   * Active Directory accounts (same event types, different report) and ids
+   * with no recognisable family marker (never guessed into a type). */
+  excluded: { other_account_types: number; unclassified: number }
+  /** Real evidence disagreeing with itself (e.g. a roster SaaS id whose
+   * events say DATABASE_ACCOUNT) -- counted, never silently resolved. */
+  warnings: { conflicting_family_markers: number }
+  /** Lifecycle/reveal/checkout rows in the archive vs. the server-side
+   * bulk-load cap -- see ComplianceReportResponse's total/truncated. */
+  event_total: number
+  truncated: boolean
+  since_days: null
+  local_retention_enabled: boolean
+  oldest_captured_at: string | null
+}
 
 export interface SecretsAccessReport {
   secrets: SecretAccessRow[]

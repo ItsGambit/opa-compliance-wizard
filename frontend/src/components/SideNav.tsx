@@ -14,6 +14,7 @@ import {
   Settings,
   ShieldCheck,
   Sun,
+  UserCog,
 } from 'lucide-react'
 
 const THEME_STORAGE_KEY = 'opa-compliance-wizard-theme'
@@ -66,9 +67,12 @@ export interface AccessSubTab {
 // (see build_project_secrets_report_from_archive in create_secret_folders.py)
 // and belongs conceptually under the same umbrella rather than sitting
 // alongside it as an unrelated dashboard.
+// Service Accounts (5.40.0) sits here for the same reason -- a per-account
+// SaaS / Okta roster + history view read from the same archive.
 export const REPORTS_SUB_TABS = [
   { value: 'browse', label: 'Browse Reports' },
   { value: 'secrets_access', label: 'Secrets Access' },
+  { value: 'service_accounts', label: 'Service Accounts' },
 ]
 
 interface Props {
@@ -297,7 +301,7 @@ export function SideNav({
                   key={sub.value}
                   active={reportsSubTab === sub.value}
                   label={sub.label}
-                  icon={sub.value === 'secrets_access' ? KeyRound : undefined}
+                  icon={sub.value === 'secrets_access' ? KeyRound : sub.value === 'service_accounts' ? UserCog : undefined}
                   onClick={() => { onReportsSubTabChange(sub.value); closeDrawer() }}
                 />
               ))}
