@@ -39,6 +39,7 @@ SERVER_SCRIPT = PROJECT_ROOT / "server" / "serve.py"
 REQUIREMENTS_FILE = PROJECT_ROOT / "requirements.txt"
 
 MIN_PYTHON = (3, 9)  # driven by the `keyring` dependency's own requires-python
+MIN_SQLITE = (3, 35, 0)  # ALTER TABLE ... DROP COLUMN (audit_store.py migration 4); see audit_store.MIN_SQLITE_VERSION
 
 
 # =============================================================================
@@ -155,6 +156,18 @@ def check_python():
     no safe, portable way to re-exec into a not-yet-verified interpreter
     path across Windows/Mac/Linux package managers."""
     if sys.version_info[:2] >= MIN_PYTHON:
+        # DATA-08 (external review, 2026-10-05): the interpreter's bundled
+        # SQLite matters as much as the interpreter -- the schema
+        # migrations need DROP COLUMN (SQLite 3.35+), and an older build
+        # (e.g. a distro Python 3.9 shipped with SQLite 3.34) used to fail
+        # at first start with a raw syntax error instead of this message.
+        import sqlite3
+        if sqlite3.sqlite_version_info < MIN_SQLITE:
+            print(f"Python {'.'.join(map(str, sys.version_info[:3]))} is fine, but its bundled SQLite "
+                  f"{sqlite3.sqlite_version} is below the {'.'.join(map(str, MIN_SQLITE))} this dashboard's "
+                  f"database schema needs. Install a newer Python build (python.org, Homebrew, or your distro's "
+                  f"newer package) whose sqlite3 module links a current SQLite, then run the launcher again.")
+            return False
         return True
     current = ".".join(map(str, sys.version_info[:3]))
     needed = ".".join(map(str, MIN_PYTHON))

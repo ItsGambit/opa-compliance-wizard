@@ -267,6 +267,36 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    — most commonly the username, or a binary path that doesn't match
    step 7a's `which` output exactly.
 
+**Backing up and restoring the archive.** `audit_store.db` is the only
+copy of evidence older than Okta's 90-day System Log retention, and it
+is a WAL-mode SQLite database: a plain `cp` while the server is writing
+can miss the newest events (they live in `audit_store.db-wal` until a
+checkpoint) or produce an inconsistent file. Use SQLite's own online
+backup instead, which is safe while the app runs:
+
+```bash
+sqlite3 /home/<app-user>/opa-compliance-wizard/audit_store.db ".backup '/backups/audit_store-$(date +%F).db'"
+```
+
+(or `VACUUM INTO '/backups/audit_store-YYYY-MM-DD.db'` for a compacted
+copy). To restore: stop the service, move the current `audit_store.db`,
+`-wal` and `-shm` files aside, copy the backup into place, make sure it
+is owned by the app user with mode `0600`, start the service, then run
+`sqlite3 audit_store.db "PRAGMA integrity_check"` and open each
+environment's **Integrity** check in the dashboard (`GET
+/api/environments/<name>/integrity`; the admin-only `?deep=1` additionally
+re-hashes every content-sealed event, which only exists for manifests
+written with evidence chain v2 enabled -- the response's
+`deep_applicable` says whether there was anything to re-read). Set
+`OPA_AUDIT_DB_PATH=/var/lib/opa-compliance-wizard/audit_store.db` (or any
+path outside the code checkout) in the service's environment file to keep
+the archive out of the directory `deploy.sh` rsyncs over: create that
+directory first, owned by the app user (`install -d -o <app-user> -g
+<app-user> -m 0700 /var/lib/opa-compliance-wizard`), and add it to the
+unit's `ReadWritePaths=` (the shipped unit uses `ProtectHome` /
+`ProtectSystem`, so an unlisted path is read-only to the service). The app
+creates the file owner-only (`0600`) wherever it lives.
+
 **Health check.** `GET /healthz` (unauthenticated by design, same
 `auth_request off` treatment as `/login`) returns `{"status": "ok"|
 "degraded", "version": ..., "checks": {...}}` — point an external uptime

@@ -55,34 +55,71 @@ def _event(uuid, published):
     }
 
 
-def test_incomplete_chunk_stops_sync_and_does_not_advance_watermark(tmp_audit_store, tmp_environments_file):
+def _iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def test_incomplete_chunk_resumes_from_its_newest_event_not_the_chunk_end(tmp_audit_store, tmp_environments_file):
+    """DATA-09 (external review, 2026-10-05) + TEST-06. The fetch is
+    ASCENDING, so when a day-chunk hits the page cap everything up to the
+    newest `published` actually returned is complete. The sync must set
+    the watermark to EXACTLY that instant and ask Okta for the same day
+    again starting there -- not stop (the old behaviour, which could never
+    get past a day busier than the cap), and not jump to the chunk's end
+    (which would skip the un-fetched remainder of the day). TEST-06 named
+    the gap in the old assertions: a watermark advanced to the newest
+    event of the TRUNCATED page passed them; here that instant is the one
+    required value, and the second call's `since` must equal it."""
     audit_store.run_migrations()
     environment = "11111111-1111-1111-1111-111111111111"
-
-    since = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=2)
+    since = _iso(start)
+    mid_day = _iso(start + timedelta(hours=6))   # newest event the capped first page returned
+    later = _iso(start + timedelta(hours=18))    # still inside day 1, only reachable by resuming
     okta_client = FakeOktaClient([
-        ([_event("evt-1", since)], True),   # day 1: complete
-        ([_event("evt-2", since)], False),  # day 2: INCOMPLETE -- hit max_pages
+        ([_event("evt-1", since), _event("evt-2", mid_day)], False),  # day 1, page cap hit at mid_day
+        ([_event("evt-2", mid_day), _event("evt-3", later)], True),   # resumed from mid_day (inclusive -> evt-2 again, deduped)
+    ])
+
+    result = audit_store.sync_okta_events(okta_client, environment, "all", since=since)
+
+    assert result["complete"] is True
+    assert result["incomplete_chunks"] == 1
+    assert result["scanned"] == 4  # the re-read instant counts as fetched (documented), inserted stays 3
+    assert "error" not in result
+    assert okta_client.calls[1][0] == mid_day  # resumed from exactly the newest fetched event
+    assert okta_client.calls[1][1] >= okta_client.calls[0][1]  # the resumed window still covers the rest of day 1
+    state = audit_store.get_sync_state(environment)
+    assert state["last_sync_status"] == "success"
+    assert state["last_sync_error"] is None
+    assert state["total_events_ingested"] == 3  # evt-2 was re-read and deduplicated, not doubled
+    assert state["last_synced_at"] >= later
+
+
+def test_incomplete_chunk_with_no_progress_stops_with_an_error_instead_of_looping(tmp_audit_store, tmp_environments_file):
+    """The one case resuming cannot help: every page of the capped fetch
+    carried the same instant as the chunk start, so resuming from
+    max_published would ask the identical question forever."""
+    audit_store.run_migrations()
+    environment = "11111111-1111-1111-1111-111111111111"
+    start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=2)
+    since = _iso(start)
+    okta_client = FakeOktaClient([
+        ([_event("evt-1", since)], False),  # cap hit, newest event == chunk start: no progress possible
     ])
 
     result = audit_store.sync_okta_events(okta_client, environment, "all", since=since)
 
     assert result["complete"] is False
-    assert "error" in result
-    assert result["chunks"] == 2
-
+    assert result["incomplete_chunks"] == 1
+    assert "without making progress" in result["error"]
+    assert len(okta_client.calls) == 1  # did not loop
     state = audit_store.get_sync_state(environment)
     assert state["last_sync_status"] == "error"
     assert state["last_sync_error"] is not None
-    # Watermark must sit at day 1's completion, NOT be advanced into day 2
-    # (the incomplete chunk) -- confirmed via the published timestamp of
-    # the only event that was inserted during the completed day.
-    assert state["last_synced_at"] is not None
-    assert state["last_synced_at"] <= okta_client.calls[0][1]  # <= day 1's "until"
-
-    # Both chunks' events were still inserted (the error path doesn't
-    # discard already-fetched rows, only stops advancing the watermark).
-    assert state["total_events_ingested"] == 2
+    assert state["last_sync_completed_at"] is None  # DATA-05: completion is only ever a success
+    assert state["last_sync_attempt_at"] is not None
+    assert state["total_events_ingested"] == 1  # the fetched row is kept, not discarded
 
 
 def test_resuming_after_incomplete_chunk_retries_same_window(tmp_audit_store, tmp_environments_file):
@@ -106,9 +143,16 @@ def test_resuming_after_incomplete_chunk_retries_same_window(tmp_audit_store, tm
     environment = "11111111-1111-1111-1111-111111111111"
     day1_since = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
+    day2_since = (
+        datetime.fromisoformat(day1_since.replace("Z", "+00:00")) + timedelta(days=1)
+    ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     first_client = FakeOktaClient([
-        ([_event("evt-1", day1_since)], True),   # day 1: completes, watermark advances
-        ([_event("evt-2", day1_since)], False),  # day 2: INCOMPLETE -- stops here
+        ([_event("evt-1", day1_since)], True),   # day 1: completes, watermark advances to evt-1's instant
+        # day 2: INCOMPLETE with no progress -- every event the capped page
+        # returned carries the chunk's own first instant (a burst of events
+        # sharing one millisecond), so resuming from it would re-ask the same
+        # question; the one shape that still stops the run.
+        ([_event("evt-2", day2_since)], False),
     ])
     first_result = audit_store.sync_okta_events(first_client, environment, "all", since=day1_since)
     assert first_result["complete"] is False

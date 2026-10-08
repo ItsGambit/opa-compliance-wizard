@@ -76,7 +76,10 @@ export function Footer() {
               -> Sync settings dialog. "never" (not hidden) is a real,
               meaningful state -- sync_state is genuinely null until the
               first sync for this environment ever completes. */}
-          <span>Last Okta import: {syncStatus?.sync_state?.last_synced_at ? formatDateTime(syncStatus.sync_state.last_synced_at) : 'never'}</span>
+          {/* last_sync_completed_at, not the watermark: as of 5.40.2 it is written
+              only by a sync that finished successfully (DATA-05), which is what
+              "last sync" should mean here. */}
+          <span>Last sync: {syncStatus?.sync_state?.last_sync_completed_at ? formatDateTime(syncStatus.sync_state.last_sync_completed_at) : 'never'}</span>
           <button
             type="button"
             onClick={() => syncJob.start()}

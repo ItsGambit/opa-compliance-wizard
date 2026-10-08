@@ -31,7 +31,7 @@ import urllib.error
 import urllib.request
 import uuid
 import webbrowser
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote, urlencode
@@ -287,6 +287,28 @@ def _lookup_mfa_log_event(actor_sub, near_iso_timestamp):
         return None
 
 
+def _drop_sessions_for_environment(environment_id, except_owner=None):
+    """ENG1-06 (external review, 2026-10-05): "unshare", admin edit and
+    delete used to leave every OTHER owner's already-activated session on
+    that environment alive -- its cached OpaClient (key id/secret and a
+    bearer token in memory, able to re-mint on 401) kept working until the
+    process restarted, so withdrawing access took effect only at the next
+    deploy. Drops every session whose env_id matches; those owners get the
+    ordinary "No active environment" 409 on their next call and must
+    activate something they are still allowed to see."""
+    with _sessions_lock:
+        for key in [k for k, s in _sessions.items() if s.get("env_id") == environment_id and k != except_owner]:
+            _sessions.pop(key, None)
+
+
+def _ingest_running(environment_id):
+    """True while a sync OR a CSV import holds this environment's ingest
+    slot (DATA-11: the two must never interleave writes, and a purge must
+    not race either)."""
+    with _sync_jobs_lock:
+        return _sync_jobs.get(environment_id, {}).get("status") == "running"
+
+
 def _session_snapshot(owner_key):
     """Returns (client, okta_client, env_name, env_id) for this owner, all
     None if they have no active session yet. Snapshotting a dict lookup
@@ -376,6 +398,13 @@ _sync_jobs = {}  # environment_id -> {"status": "idle"|"running"|"done"|"error",
 # every `deploy.sh` run) never causes a missed or duplicate daily run --
 # "was today's run already done" is answered from persisted state, not
 # from an object that stopped existing when the process died.
+# DATA-05 (external review, 2026-10-05): last_sync_completed_at is now
+# written only by a SUCCESSFUL sync, so a failing environment is no longer
+# mistaken for "already ran today" -- but without this back-off the loop
+# would retry it on every poll (every 5 minutes, all day) against Okta's
+# rate limits. A failed or still-"running" (e.g. process died mid-sync)
+# attempt is retried once this much time has passed since it started.
+SCHEDULER_RETRY_BACKOFF_SECS = 60 * 60
 SCHEDULER_POLL_INTERVAL_SECS = 300  # 5 min -- frequent enough that "run at HH:MM" feels accurate,
                                      # cheap enough to not matter running forever in the background
 # A catch-up run within one poll interval of its scheduled time is normal
@@ -517,19 +546,30 @@ def _start_sync_job(env_id, env_name, ingestion_scope, owner=engine.LOCAL_OWNER_
                 engine.log_audit_event(actor_email, actor_sub, "sync.scheduled_skipped", {"name": env_name, "reason": "already running"}, client_ip=client_ip, user_agent=user_agent)
             return False
     action_prefix = "sync.scheduled" if trigger == "scheduled" else "sync.manual"
+    def _refuse(error_msg):
+        # DATA-05: a credential failure is an attempt too -- recorded in
+        # sync_state so the scheduler backs off instead of retrying every
+        # poll all day (it used to leave sync_state untouched).
+        with _sync_jobs_lock:
+            _sync_jobs[storage_name] = {"status": "error", "steps": [], "error": error_msg}
+        try:
+            import audit_store
+            audit_store._upsert_sync_state(
+                audit_store._get_connection(), env_id,
+                last_sync_attempt_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                last_sync_status="error", last_sync_error=error_msg,
+            )
+        except Exception as exc:
+            engine.log("WARN", f"could not record the failed sync attempt for '{env_name}': {exc}")
+        engine.log_audit_event(actor_email, actor_sub, f"{action_prefix}_failed", {"name": env_name, "error": error_msg}, client_ip=client_ip, user_agent=user_agent)
+        return False
+
     try:
         creds = engine.get_environment_credentials(env_name, owner=owner)
     except KeyError as exc:
-        with _sync_jobs_lock:
-            _sync_jobs[storage_name] = {"status": "error", "steps": [], "error": str(exc)}
-        engine.log_audit_event(actor_email, actor_sub, f"{action_prefix}_failed", {"name": env_name, "error": str(exc)}, client_ip=client_ip, user_agent=user_agent)
-        return False
+        return _refuse(str(exc))
     if not creds.get("okta_url") or not creds.get("okta_api_token"):
-        error_msg = "No Okta URL/API token configured for this environment."
-        with _sync_jobs_lock:
-            _sync_jobs[storage_name] = {"status": "error", "steps": [], "error": error_msg}
-        engine.log_audit_event(actor_email, actor_sub, f"{action_prefix}_failed", {"name": env_name, "error": error_msg}, client_ip=client_ip, user_agent=user_agent)
-        return False
+        return _refuse("No Okta URL/API token configured for this environment.")
     okta_client = engine.OktaClient(creds["okta_url"], creds["okta_api_token"])
     start_details = {"name": env_name, "ingestion_scope": ingestion_scope}
     if minutes_late is not None:
@@ -630,6 +670,16 @@ def _scheduler_loop():
                     last_completed_date = last_completed[:10]  # "YYYY-MM-DD" prefix of the ISO (UTC) timestamp
                     if last_completed_date == now_utc.strftime("%Y-%m-%d"):
                         continue  # already ran today (UTC)
+                # DATA-05: back off after a failed/unfinished attempt instead of
+                # retrying on every poll (see SCHEDULER_RETRY_BACKOFF_SECS).
+                last_attempt = state.get("last_sync_attempt_at") if state else None
+                if last_attempt and (state.get("last_sync_status") in ("error", "running")):
+                    try:
+                        attempt_dt = datetime.fromisoformat(last_attempt.replace("Z", "+00:00"))
+                        if now_utc - attempt_dt < timedelta(seconds=SCHEDULER_RETRY_BACKOFF_SECS):
+                            continue
+                    except ValueError:
+                        pass  # unparseable attempt timestamp -- don't let it block the retry
 
                 minutes_late = (now_utc.hour * 60 + now_utc.minute) - (run_hour * 60 + run_minute)
                 _start_sync_job(
@@ -1033,11 +1083,25 @@ class Handler(SimpleHTTPRequestHandler):
                 # touches `events` itself (see
                 # audit_store.verify_ingestion_chain's docstring).
                 name = unquote(path[len("/api/environments/"):-len("/integrity")])
+                deep = (qs.get("deep") or ["0"])[0] in ("1", "true")  # DATA-04: also re-hash sealed curated events
+                if deep and owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers(self.headers):
+                    # Deep mode re-reads every sealed event (one SELECT per
+                    # row) inside the request -- an admin-only cost.
+                    return self._send_json(403, {"error": "Admin access required for a deep integrity check."})
                 try:
-                    result = engine.verify_environment_evidence_chain(name, owner=engine_owner)
+                    result = engine.verify_environment_evidence_chain(name, owner=engine_owner, deep=deep)
                 except KeyError as exc:
                     return self._send_json(404, {"error": str(exc)})
                 return self._send_json(200, result)
+
+            if path == "/api/archives/orphaned":
+                # DATA-12: archives whose environment no longer exists.
+                # Admin-only read (local mode exempt), same rule as
+                # /api/audit_log -- these rows belong to no owner any more.
+                if owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers(self.headers):
+                    return self._send_json(403, {"error": "Admin access required to list orphaned archives."})
+                import audit_store
+                return self._send_json(200, {"archives": audit_store.list_orphaned_archives()})
 
             if path == "/api/reports":
                 import audit_store
@@ -1198,7 +1262,11 @@ class Handler(SimpleHTTPRequestHandler):
                 # requirement) -- zero regression for anyone not using the
                 # new feature yet.
                 import audit_store
-                if local_env_id and not audit_store.is_first_sync(local_env_id):
+                # environment_has_archive, not is_first_sync (5.40.2): a
+                # sync_state row now exists from the moment a sync STARTS
+                # (DATA-05), so "a row exists" would switch this report to an
+                # empty archive after a first sync that failed at once.
+                if local_env_id and audit_store.environment_has_archive(local_env_id):
                     report = engine.build_project_secrets_report_from_archive(
                         local_client, local_env_id, rg_id, proj_id
                     )
@@ -1231,12 +1299,12 @@ class Handler(SimpleHTTPRequestHandler):
                 if not local_env_id:
                     return self._send_json(409, {"error": "No active environment configured. Use the gear menu to set one up."})
                 import audit_store
-                # "Completed" means it, not just "a sync_state row exists"
-                # (which is_first_sync checks): a first sync that is still
-                # running or errored before its first day-chunk landed
-                # has nothing honest to report from yet.
-                sync_state = audit_store.get_sync_state(local_env_id)
-                if not sync_state or not sync_state.get("last_sync_completed_at"):
+                # "Has an archive" means a COMPLETED live sync or a CSV
+                # import, not just "a sync_state row exists" (which
+                # is_first_sync checks): a first sync that is still running
+                # or errored before its first day-chunk landed has nothing
+                # honest to report from yet (DATA-03/DATA-05).
+                if not audit_store.environment_has_archive(local_env_id):
                     return self._send_json(409, {
                         "error": "This environment has not completed a compliance sync yet. Run Sync now (footer) first -- the Service Accounts report is sourced from the compliance archive.",
                         "reason": "not_synced",
@@ -1559,7 +1627,7 @@ class Handler(SimpleHTTPRequestHandler):
                 shared = bool(payload.get("shared", False))
                 is_admin = _is_admin_from_headers(self.headers)
                 try:
-                    engine.set_environment_shared(
+                    target_id = engine.set_environment_shared(
                         name, engine_owner, shared, is_admin=is_admin,
                         environment_id=payload.get("id"),
                     )
@@ -1567,8 +1635,29 @@ class Handler(SimpleHTTPRequestHandler):
                     return self._send_json(404, {"error": str(exc)})
                 except PermissionError as exc:
                     return self._send_json(403, {"error": str(exc)})
+                if not shared:
+                    # ENG1-06: an unshare withdraws access NOW, not at the
+                    # next restart -- every other owner's live session on it
+                    # is dropped (the owner's own stays).
+                    _drop_sessions_for_environment(target_id, except_owner=owner_key)
                 self._log_audit_event(actor_email, actor_sub, "environment.share", {"name": name, "shared": shared, "admin_override": is_admin})
                 return self._send_json(200, {"name": name, "shared": shared})
+
+            if path.startswith("/api/environments/") and path.endswith("/sync/reset_watermark"):
+                # DATA-03 remedy: the only supported way out of an unusable
+                # watermark. Same visibility rule as /sync/start; the next
+                # sync backfills the full 90-day window (dedup makes that
+                # free of duplicates).
+                name = unquote(path[len("/api/environments/"):-len("/sync/reset_watermark")])
+                import audit_store
+                meta = engine.list_environments_for(engine_owner).get(name)
+                if meta is None:
+                    return self._send_json(404, {"error": f"No environment named '{name}' visible to this user."})
+                if _ingest_running(meta["environment_id"]):
+                    return self._send_json(409, {"error": "A sync or import is running for this environment; reset the watermark after it finishes."})
+                previous = audit_store.reset_sync_watermark(meta["environment_id"])
+                self._log_audit_event(actor_email, actor_sub, "sync.reset_watermark", {"name": name, "previous_watermark": previous})
+                return self._send_json(200, {"name": name, "previous_watermark": previous})
 
             if path.startswith("/api/environments/") and path.endswith("/sync_schedule"):
                 name = unquote(path[len("/api/environments/"):-len("/sync_schedule")])
@@ -1650,10 +1739,29 @@ class Handler(SimpleHTTPRequestHandler):
                 ingestion_scope = payload.get("ingestion_scope", "curated")
                 if not csv_path.is_file():
                     return self._send_json(400, {"error": f"{csv_path.name} not found on server filesystem"})
+                # DATA-11 (external review, 2026-10-05): an import racing a
+                # live sync for the same environment writes the same tables
+                # from two threads; refuse rather than interleave. The
+                # import takes the SAME ingest slot a sync does (atomically,
+                # under the lock), so _start_sync_job's own "already running"
+                # check refuses a sync for the duration of the import too.
+                env_id = meta["environment_id"]
+                with _sync_jobs_lock:
+                    if _sync_jobs.get(env_id, {}).get("status") == "running":
+                        return self._send_json(409, {"error": "A sync is running for this environment; import the CSV after it finishes."})
+                    previous_job = _sync_jobs.get(env_id)
+                    _sync_jobs[env_id] = {"status": "running", "steps": [], "error": None, "kind": "csv_import"}
                 try:
-                    result = audit_store.import_from_csv(str(csv_path), meta["environment_id"], ingestion_scope)
-                except ValueError as exc:
-                    return self._send_json(400, {"error": str(exc)})
+                    try:
+                        result = audit_store.import_from_csv(str(csv_path), env_id, ingestion_scope)
+                    except ValueError as exc:
+                        return self._send_json(400, {"error": str(exc)})
+                finally:
+                    with _sync_jobs_lock:
+                        if previous_job is None:
+                            _sync_jobs.pop(env_id, None)
+                        else:
+                            _sync_jobs[env_id] = previous_job
                 self._log_audit_event(actor_email, actor_sub, "sync.import_csv", {"name": name, "csv_path": csv_path.name, **result})
                 return self._send_json(200, result)
 
@@ -1958,23 +2066,70 @@ class Handler(SimpleHTTPRequestHandler):
         # of that branch).
         local_client, _local_okta_client, local_env_name, _local_env_id = _session_snapshot(owner_key)
         try:
+            if path.startswith("/api/archives/"):
+                # DATA-12 (external review, 2026-10-05): purge the archive a
+                # deleted environment left behind. Admin-only (local mode
+                # exempt, same rule as /api/audit_log) -- this destroys
+                # evidence, so it is never a per-owner action, and it is
+                # audit-logged with the per-table counts.
+                if owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers(self.headers):
+                    return self._send_json(403, {"error": "Admin access required to purge an orphaned archive."})
+                import audit_store
+                archive_id = unquote(path[len("/api/archives/"):]).rstrip("/")
+                if not archive_id:
+                    return self._send_json(400, {"error": "missing environment_id"})
+                if _ingest_running(archive_id):
+                    return self._send_json(409, {"error": "A sync or import is still running for that environment; purge it after it finishes."})
+                try:
+                    counts = audit_store.purge_environment_archive(archive_id)
+                except ValueError as exc:
+                    return self._send_json(409, {"error": str(exc)})
+                if not any(counts.values()):
+                    return self._send_json(404, {"error": "No archive rows exist for that environment_id."})
+                self._log_audit_event(actor_email, actor_sub, "archive.purge", {"environment_id": archive_id, **counts})
+                return self._send_json(200, {"purged": archive_id, **counts})
+
             if path.startswith("/api/environments/"):
                 name = unquote(path[len("/api/environments/"):])
                 is_admin = _is_admin_from_headers(self.headers)
                 environment_id = (qs.get("id") or [None])[0]
+                # DATA-12: deleting the archive too is an explicit choice
+                # (`?purge_archive=1`); the default keeps it as an orphan an
+                # admin can review/purge later via /api/archives. Destroying
+                # evidence is admin-only (local mode exempt), same rule as
+                # /api/archives -- an environment's owner can delete the
+                # environment, but not the compliance history other users
+                # may report from (a shared environment's archive is
+                # everyone's evidence).
+                purge_archive = (qs.get("purge_archive") or ["0"])[0] in ("1", "true")
+                if purge_archive and owner_key != LOCAL_OWNER_KEY_HEADER and not is_admin:
+                    return self._send_json(403, {"error": "Admin access required to delete an environment's compliance archive; delete without purge_archive to keep it."})
                 try:
-                    was_active = engine.delete_environment(
+                    result = engine.delete_environment(
                         name, owner=engine_owner, is_admin=is_admin, environment_id=environment_id,
+                        purge_archive=purge_archive,
                     )
                 except PermissionError as exc:
                     return self._send_json(403, {"error": str(exc)})
                 except KeyError as exc:
                     return self._send_json(404, {"error": str(exc)})
-                if was_active:
-                    with _sessions_lock:
-                        _sessions.pop(owner_key, None)
-                self._log_audit_event(actor_email, actor_sub, "environment.delete", {"name": name, "admin_override": is_admin})
-                return self._send_json(200, {"deleted": name})
+                except Exception as exc:
+                    # The environment is gone even if the archive purge failed
+                    # (see delete_environment) -- log the delete before
+                    # surfacing the error, never lose the audit entry.
+                    self._log_audit_event(actor_email, actor_sub, "environment.delete",
+                                          {"name": name, "admin_override": is_admin, "purge_archive": purge_archive,
+                                           "archive_purge_error": str(exc)})
+                    raise
+                # ENG1-06: every owner's live session on this environment is
+                # now stale (its cached client still holds the old credentials
+                # in memory) -- drop them all, not just the caller's.
+                _drop_sessions_for_environment(result["environment_id"])
+                details = {"name": name, "admin_override": is_admin, "purge_archive": purge_archive}
+                if result["archive"]:
+                    details["archive_purged"] = result["archive"]
+                self._log_audit_event(actor_email, actor_sub, "environment.delete", details)
+                return self._send_json(200, {"deleted": name, "archive_purged": purge_archive})
 
             if (path.startswith("/api/resource_groups/") and "/projects/" in path
                     and "/folders/" in path):

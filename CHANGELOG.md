@@ -2,6 +2,164 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.40.2 — **Archive integrity: nine data-integrity findings from the 2026-10-05 external review (DATA-03/04/05/08/09/11/12/13/14, ENG2-04/UI-09, TEST-06).**
+Batch 1 of the review's remaining findings, all in the compliance
+archive's ingest, sync and retention paths. No API shape an existing
+client depends on changed; three response objects gained fields.
+- **DATA-03 — CSV import no longer sets the live-sync watermark.** A
+  file's newest timestamp used to become `last_synced_at`, so a future or
+  garbage timestamp silently disabled every later sync (confirmed: a
+  `2099-01-01` row made every sync a 0-call "success"), a partial export
+  skipped everything it didn't contain, and an import on a new
+  environment skipped the first sync's 90-day backfill. Imports now
+  record `sync_state.last_import_at` only; `is_first_sync`/report routes
+  use the new `environment_has_archive()` (completed sync OR import).
+  Every stored `published` -- live or CSV -- is canonicalised to
+  `YYYY-MM-DDTHH:MM:SS.mmmZ` (`_canonical_published`: space or T
+  separator, 0-9 fractional digits, Z/offset/none-as-UTC); an
+  unparseable CSV timestamp is skipped and counted
+  (`skipped_unparseable`), never stored. An unusable stored watermark
+  (unparseable or in the future) is now an explicit error, not a no-op.
+- **DATA-05 — a sync that raises mid-way is recorded.** The exception
+  path writes `last_sync_status="error"` + `last_sync_error`, seals a
+  manifest for every row already inserted, and re-raises;
+  `last_sync_completed_at` is now written ONLY by a successful
+  completion (new `last_sync_attempt_at` records every start). The
+  scheduler keys "already ran today" off completion and backs off a
+  failed/unfinished attempt for `SCHEDULER_RETRY_BACKOFF_SECS` (1 h)
+  instead of either never retrying or retrying every 5 minutes.
+- **DATA-09 — a day busier than the page cap no longer stalls the sync
+  forever.** The fetch is ascending, so when a chunk hits `max_pages` the
+  watermark is set to the newest `published` actually returned and the
+  sync resumes from exactly there (the one inclusive instant is re-read
+  and deduplicated). Only a chunk that returns no progress at all stops
+  the run. Result gains `incomplete_chunks`. TEST-06's under-asserting
+  watermark test is replaced by one that pins the exact resume instant.
+- **DATA-11 — write paths roll back.** `_insert_rows`,
+  `_record_ingestion_manifest`, prune and migrations each roll back on
+  error (a bad row used to leave the thread's write transaction open
+  and block every other writer); `_upsert_sync_state` is one
+  `INSERT ... ON CONFLICT DO UPDATE` of only the supplied fields, under
+  the lock (no stale read-merge-write); `VACUUM` runs under the lock;
+  `POST .../sync/import_csv` is refused (409) while a sync is running
+  for that environment.
+- **DATA-12 — orphaned archives are visible and purgeable; the size cap
+  is per environment.** Deleting an environment left its events,
+  targets, sync state and manifests under an id nothing could address,
+  and `retention_max_size_mb` measured the whole file, so a neighbour's
+  (or an orphan's) bytes pruned a live environment's history. The cap now
+  measures the environment's own `raw_json` payload (computed once,
+  decremented per step). New `audit_store.list_orphaned_archives()` /
+  `purge_environment_archive()` (refuses an id that still has an
+  environment), admin-only `GET /api/archives/orphaned` and
+  `DELETE /api/archives/{id}` (audit-logged with per-table counts), and
+  `DELETE /api/environments/{name}?purge_archive=1` for an explicit
+  delete-with-evidence (default unchanged: keep the archive).
+- **DATA-13 — report windows are validated.** `from`/`to` go through
+  `normalize_window()` inside `query_events`/`count_events`: a bare date
+  means that whole UTC day (start/end respectively), any other ISO-8601
+  value is converted to UTC, anything else (e.g. `2026-09-29T10:00`,
+  `from` after `to`) is a 400 instead of a silently wrong window.
+  `reflag_curated_rows()` at start promotes stored rows whose event type
+  has since been added to `COMPLIANCE_EVENT_TYPES` (never demotes).
+- **DATA-14 — the database is created owner-only.** First connect runs
+  under umask 077 and re-tightens `audit_store.db`/`-wal`/`-shm` to
+  `0600` (local/desktop mode used to create them world-readable; hosted
+  mode was already covered by the unit's UMask). `OPA_AUDIT_DB_PATH`
+  moves the archive outside the code checkout. `docs/hosting.md` gains a
+  backup (`sqlite3 .backup` / `VACUUM INTO`) and restore procedure.
+- **DATA-08 — migrations are atomic and the SQLite floor is explicit.**
+  `run_migrations` refuses SQLite < 3.35 with a readable message (the
+  launcher too), runs each migration under `BEGIN IMMEDIATE` re-reading
+  the version after taking the write lock (two processes starting
+  together serialise; DDL and the version row commit or roll back as one),
+  and migration 4 is idempotent (a crash between its DROP COLUMN and the
+  version INSERT used to make every later start fail).
+- **ENG2-04 / UI-09 — sync-schedule validation on both sides.**
+  `validate_sync_schedule_config`: only known keys, `enabled` a real
+  bool, `run_time` `HH:MM`, retention values `null` or an int >= 1 (bool
+  rejected) -- `0` used to mean "prune every non-curated event on the
+  next sync". The dialog validates the same way before sending, its
+  inputs are `min=1`, `doSave` reports failure so the first-run flow can
+  no longer start a 90-day backfill or CSV import after a save that
+  failed, and Save waits for the sync status to load.
+- **DATA-04 — evidence chain v2, implemented and tested, shipped
+  dormant.** The v1 chain (`prev_manifest_hash` -> previous `batch_hash`,
+  a hash of uuids only) verified as valid after deleting or editing any
+  event, editing any manifest field, truncating the tail, or deleting
+  any manifest from a run of empty batches. Migration 006 adds
+  `content_hash` (sha256 over `uuid:sha256(raw_json)` of every curated
+  row), `entry_hash` (sha256 over the previous link and every manifest
+  field) and `entries_json` to `ingestion_manifests`;
+  `verify_ingestion_chain(deep=True)` (route `?deep=1`) recomputes entry
+  hashes and re-reads every sealed curated event, tolerating pruned
+  non-curated rows; the result gains `reason`, `head_hash`,
+  `legacy_manifests`, `verified_rows`, `unverifiable_rows`; sync/import
+  results carry `chain_head` so the head lands in `audit_log.jsonl` as an
+  anchor outside the database. **New manifests are still written in the
+  v1 format** (`audit_store.EVIDENCE_CHAIN_V2 = False`): changing what
+  the Phase 6 chain seals is the maintainer's decision, not a reviewer's;
+  flipping the flag starts sealing content from the next ingestion with
+  no re-seal of history (the first v2 row chains to the last v1 row).
+  Tests exercise both modes, including every tamper the review
+  reproduced against v1.
+- Migration 006 also adds `idx_events_env_type_published` (DATA-10: the
+  report picker's per-card counts become index-only).
+- **Hardening from this release's own adversarial review (all tiers):**
+  the Secrets Access report route now switches to the archive on
+  `environment_has_archive()` too, not on "a sync_state row exists" (a
+  first sync that failed at once would otherwise have served an empty
+  archive as authoritative); the DATA-09 resume point is the newest row
+  FETCHED, not the newest row stored, so curated scope cannot stall on a
+  capped chunk of non-curated rows; cursors are millisecond-exact so the
+  no-progress guard compares like with like; existing rows with a
+  non-canonical `published` (pre-5.40.2 CSV imports) are rewritten at
+  start (`canonicalize_stored_timestamps`); an unusable watermark has a
+  remedy -- `POST /api/environments/{name}/sync/reset_watermark` and a
+  **Reset watermark** button in the sync dialog -- and still records the
+  attempt so the scheduler backs off; a credential failure in
+  `_start_sync_job` records an attempt too; a stored `retention_days` /
+  `retention_max_size_mb` below 1 is read as "no limit" (and logged)
+  instead of pruning everything; `?purge_archive=1` is admin-only (local
+  mode exempt) -- an owner may delete the environment but not evidence
+  other users report from -- and its audit entry carries the per-table
+  counts (logged even if the purge itself fails); purge, delete-with-purge
+  and watermark reset are refused (409) while a sync or import holds the
+  environment's ingest slot, which a CSV import now takes atomically (so a
+  sync cannot start during an import either); purging an id with no
+  archive rows is a 404 with no audit entry; the orphan existence check
+  runs inside the delete transaction; the retention-days prune rolls
+  back on error; the final manifest/state writes of a successful sync are
+  inside the error handling; the size cap counts UTF-8 bytes
+  (`LENGTH(CAST(raw_json AS BLOB))`); `_canonical_published` returns None
+  (never raises) for offsets like `+24:00` and out-of-range years and
+  only accepts ASCII digits; the DB file is pre-created `0600` with
+  `os.open` instead of a process-wide `umask`, and a missing
+  `OPA_AUDIT_DB_PATH` directory is a clear error; `reflag_curated_rows`
+  runs per environment (index-served); migration 006 drops the now
+  redundant `idx_events_env_type`; the version row is `INSERT OR IGNORE`
+  so two processes racing a fresh database both finish. Chain v2 (still
+  dormant): `entries_json` lists curated rows only (a 1M-row backfill no
+  longer produces a tens-of-MB manifest), a legacy row after a sealed
+  row breaks the chain ("downgrade"), `deep=1` is admin-only, the result
+  carries `deep_applicable`, and every manifest -- success, failure or
+  import -- is anchored outside the database as an
+  `evidence_chain.sealed` audit-log entry.
+- **ENG1-06 (partial, from the same review): unshare and delete now end
+  every other owner's live session on that environment immediately**
+  (`_drop_sessions_for_environment`) instead of at the next restart;
+  admin edit of another owner's credentials is covered in the next batch.
+- **UI:** the Footer and the Compliance Reports gap banner now show
+  `last_sync_completed_at` ("Last sync" -- a successful completion, which
+  is what it now means) instead of the event-time watermark; the sync
+  dialog shows the watermark as "Events covered up to", the last CSV
+  import, a status-load error, and a CSV import's skipped-row count.
+- **Tests:** `tests/test_archive_integrity_fixes.py` (79 new, incl. HTTP
+  routes and owner/admin isolation), `tests/test_sync_watermark.py` (two
+  new resume tests replace the under-asserting one; the no-progress case
+  is a realistic same-instant burst), `tests/test_ingestion_manifest.py`
+  adjusted for the richer verify result. 319 pass.
+
 5.40.1 — **Fix: the browser's back button left the app instead of returning to the Compliance Reports home.**
 Navigation (top-level tab, Access Explorer / Compliance Reports sub-tab,
 and an opened compliance report) lived only in React state, so the

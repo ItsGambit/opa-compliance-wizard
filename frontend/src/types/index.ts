@@ -55,18 +55,31 @@ export interface SyncStepEvent {
 export interface SyncState {
   environment: string
   last_synced_at: string | null
+  /** Set only by a SUCCESSFUL sync as of 5.40.2 (DATA-05). */
   last_sync_completed_at: string | null
   last_sync_status: string | null
   last_sync_error: string | null
   total_events_ingested: number
   ingestion_scope: IngestionScope
+  /** When a sync last STARTED (5.40.2). Older servers omit it. */
+  last_sync_attempt_at?: string | null
+  /** When a CSV import last ran (5.40.2, DATA-03 -- imports no longer move
+   * the live-sync watermark). Older servers omit it. */
+  last_import_at?: string | null
 }
 
 export interface SyncStatusResponse {
   status: 'idle' | 'running' | 'done' | 'error'
   steps: SyncStepEvent[]
   error: string | null
-  result?: { inserted: number; scanned: number; since: string; chunks: number; pruned: number; cutoff: string | null }
+  result?: {
+    inserted: number; scanned: number; since: string; chunks: number; pruned: number; cutoff: string | null
+    /** 5.40.2: day-chunks that hit the page cap and were resumed from
+     * their newest returned event (DATA-09), and the evidence chain head
+     * sealed by this sync (DATA-04). Older servers omit both. */
+    incomplete_chunks?: number
+    chain_head?: string
+  }
   sync_state: SyncState | null
   is_first_sync: boolean
 }

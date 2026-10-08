@@ -135,8 +135,8 @@ export function ComplianceReports({ selectedReport, onSelectReport }: Props) {
           <div>
             This report's source data has a known gap — the last sync for{' '}
             <span className="font-medium">{activeEnv}</span> failed: {syncState.last_sync_error}.{' '}
-            {syncState.last_synced_at
-              ? `Last successful sync: ${new Date(syncState.last_synced_at).toLocaleString()}.`
+            {syncState.last_sync_completed_at
+              ? `Last successful sync: ${new Date(syncState.last_sync_completed_at).toLocaleString()}.`
               : 'No successful sync has completed yet.'}
           </div>
         </div>

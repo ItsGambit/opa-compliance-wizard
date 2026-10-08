@@ -28,6 +28,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -254,7 +255,33 @@ def list_reports():
 
 
 def _audit_db_path():
+    """DATA-14 (external review, 2026-10-05): OPA_AUDIT_DB_PATH lets an
+    operator keep the archive outside the code checkout (so a deploy's
+    rsync and the evidence store never share a directory). Default is
+    unchanged: next to this file."""
+    override = os.environ.get("OPA_AUDIT_DB_PATH")
+    if override:
+        return override
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit_store.db")
+
+
+# DATA-14: the archive holds names, e-mails, client IPs and pending admin
+# action payloads. Hosted mode already runs under systemd's UMask=0077; a
+# local/desktop run used the process umask (typically 022), creating a
+# world-readable audit_store.db. The first connect now creates the file
+# (and SQLite's -wal/-shm sidecars) owner-only, and re-tightens an
+# existing file so an archive created by an older version is fixed on the
+# next start. POSIX only -- os.chmod is a no-op on Windows for these bits.
+_DB_FILE_MODE = 0o600
+
+
+def _restrict_db_file_modes(path):
+    for candidate in (path, path + "-wal", path + "-shm"):
+        try:
+            if os.path.exists(candidate):
+                os.chmod(candidate, _DB_FILE_MODE)
+        except OSError:
+            pass  # read-only media / unsupported filesystem -- never block startup over a chmod
 
 
 _db_lock = threading.Lock()
@@ -283,8 +310,22 @@ def _get_connection():
     bookkeeping and no way to leak."""
     conn = getattr(_thread_local, "conn", None)
     if conn is None:
-        conn = sqlite3.connect(_audit_db_path(), timeout=30)
+        path = _audit_db_path()
+        # DATA-14: pre-create the file owner-only. Done with O_CREAT|0600
+        # rather than os.umask(): umask is process-wide, and two request
+        # threads opening their first connection together could leave the
+        # whole process's umask changed. SQLite gives -wal/-shm the main
+        # file's mode; _restrict_db_file_modes re-tightens an archive
+        # created by an older version. A missing parent directory (e.g. an
+        # OPA_AUDIT_DB_PATH nobody created) fails here with a clear path.
+        if path != ":memory:" and not os.path.exists(path):
+            try:
+                os.close(os.open(path, os.O_CREAT | os.O_WRONLY, _DB_FILE_MODE))
+            except FileNotFoundError:
+                raise RuntimeError(f"The archive directory for {path!r} does not exist; create it (owned by the app user) first.")
+        conn = sqlite3.connect(path, timeout=30)
         conn.execute("PRAGMA journal_mode=WAL")
+        _restrict_db_file_modes(path)
         conn.execute("PRAGMA foreign_keys=ON")
         conn.row_factory = sqlite3.Row
         _thread_local.conn = conn
@@ -542,8 +583,16 @@ def _migration_004_drop_preserve_logs_locally(conn):
     database's own archive instead. Confirmed safe to drop: not part of
     app_environments' UNIQUE(owner_id, display_name) constraint or any
     index, and DROP COLUMN support (SQLite 3.35.0+) is well below both
-    real installs' confirmed SQLite versions (3.46.1/3.49.1)."""
-    conn.execute("ALTER TABLE app_environments DROP COLUMN preserve_logs_locally")
+    real installs' confirmed SQLite versions (3.46.1/3.49.1).
+
+    DATA-08 (external review, 2026-10-05): idempotent -- a process that
+    died between this DROP and the schema_migrations INSERT used to leave
+    a database that raised "no such column" on every later start, with
+    no way to repair it short of hand-editing. Now a missing column means
+    "already done". The SQLite floor itself is enforced once, in
+    run_migrations, with a readable message instead of a raw syntax error."""
+    if "preserve_logs_locally" in _table_columns(conn, "app_environments"):
+        conn.execute("ALTER TABLE app_environments DROP COLUMN preserve_logs_locally")
 
 
 def _migration_005_service_account_report_indexes(conn):
@@ -575,13 +624,55 @@ def _migration_005_service_account_report_indexes(conn):
     )
 
 
+def _migration_006_evidence_chain_v2_and_sync_attempts(conn):
+    """2026-10-05 external review, DATA-04 / DATA-05 / DATA-03 / DATA-10.
+    Three ALTER TABLE ADD COLUMNs plus one index, every one guarded by a
+    column/index-exists check so a half-applied run is simply resumed:
+
+    - ingestion_manifests.content_hash / entry_hash / entries_json: the
+      "chain v2" fields -- see _record_ingestion_manifest. Rows written
+      before this migration keep only batch_hash and are verified by the
+      v1 rule (prev == previous batch_hash); the first v2 row chains to
+      the last v1 row's batch_hash, so the boundary is explicit, not a
+      re-seal of history nobody can vouch for.
+    - sync_state.last_sync_attempt_at: when a sync last STARTED, separate
+      from last_sync_completed_at, which now only ever means "finished
+      successfully" (DATA-05). The scheduler keys its retry back-off off
+      the attempt and its "already ran today" off the completion.
+    - sync_state.last_import_at: when a CSV import last ran. A CSV import
+      no longer touches the live-sync watermark at all (DATA-03).
+    - idx_events_env_type_published: makes the report picker's 18
+      per-card COUNT(*) queries index-only (DATA-10)."""
+    manifest_cols = _table_columns(conn, "ingestion_manifests")
+    for column in ("content_hash TEXT", "entry_hash TEXT", "entries_json TEXT"):
+        if column.split()[0] not in manifest_cols:
+            conn.execute(f"ALTER TABLE ingestion_manifests ADD COLUMN {column}")
+    state_cols = _table_columns(conn, "sync_state")
+    for column in ("last_sync_attempt_at TEXT", "last_import_at TEXT"):
+        if column.split()[0] not in state_cols:
+            conn.execute(f"ALTER TABLE sync_state ADD COLUMN {column}")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_env_type_published ON events (environment_id, event_type, published)"
+    )
+    # Its prefix now covers everything idx_events_env_type served; keeping
+    # both would only add write cost per insert.
+    conn.execute("DROP INDEX IF EXISTS idx_events_env_type")
+
+
 MIGRATIONS = {
     1: _migration_001_unified_schema,
     2: _migration_002_ingestion_manifests,
     3: _migration_003_pending_admin_actions,
     4: _migration_004_drop_preserve_logs_locally,
     5: _migration_005_service_account_report_indexes,
+    6: _migration_006_evidence_chain_v2_and_sync_attempts,
 }
+
+# DATA-08: migration 4 needs ALTER TABLE ... DROP COLUMN (SQLite 3.35.0,
+# 2021-03). launch.py's Python floor alone admits interpreters bundled with
+# an older SQLite (e.g. Debian 11's 3.34), which used to fail at boot with a
+# raw `near "DROP": syntax error`.
+MIN_SQLITE_VERSION = (3, 35, 0)
 
 
 def run_migrations():
@@ -593,16 +684,39 @@ def run_migrations():
     Phase 2 -- every future schema change should add a new numbered
     function to MIGRATIONS, not another one-off patch.
 
+    DATA-08 (external review, 2026-10-05): each migration now runs under
+    an explicit BEGIN IMMEDIATE, which (a) takes SQLite's write lock up
+    front so two processes starting together (server + CLI) serialise
+    instead of both passing the version check and racing the same DDL,
+    and (b) makes the DDL + the schema_migrations INSERT one atomic unit
+    -- under Python's default (legacy) transaction control no transaction
+    was open yet when the DDL ran (only DML auto-begins), so the rollback
+    below undid nothing. The version is re-read AFTER the lock is held
+    for the same reason. Migrations 1-3 use executescript, whose implicit
+    COMMIT ends the BEGIN IMMEDIATE early; every statement they run is IF
+    NOT EXISTS and the version row is INSERT OR IGNORE, so two processes
+    racing a fresh database both finish without a duplicate-key crash.
+
     Idempotent: calling this on an already-fully-migrated database is a
     cheap no-op (one SELECT MAX(version), no transactions opened)."""
+    if sqlite3.sqlite_version_info < MIN_SQLITE_VERSION:
+        raise RuntimeError(
+            f"SQLite {sqlite3.sqlite_version} is too old: this application needs SQLite "
+            f"{'.'.join(map(str, MIN_SQLITE_VERSION))} or newer (ALTER TABLE ... DROP COLUMN). "
+            "Use a Python build linked against a newer SQLite."
+        )
     conn = _get_connection()
     current_version = _schema_version(conn)
     for version in sorted(v for v in MIGRATIONS if v > current_version):
         with _db_lock:
             try:
+                conn.execute("BEGIN IMMEDIATE")
+                if _schema_version(conn) >= version:
+                    conn.rollback()  # another process applied it while we waited for the write lock
+                    continue
                 MIGRATIONS[version](conn)
                 conn.execute(
-                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                    "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
                     (version, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")),
                 )
                 conn.commit()
@@ -617,8 +731,91 @@ def init_db():
     create_secret_folders.migrate_legacy_environments_json()
     backfill_resource_columns()
     backfill_event_targets()
+    canonicalize_stored_timestamps()
+    reflag_curated_rows()
     _cleanup_expired_pending_admin_actions()
     _cleanup_retired_secrets_log_cache()
+
+
+def reflag_curated_rows():
+    """DATA-13 (external review, 2026-10-05): is_curated is computed once
+    at ingest, so an event type added to COMPLIANCE_EVENT_TYPES later
+    left every already-stored row of that type prunable (is_curated=0)
+    even though it now backs a report card. Re-flags them from the
+    CURRENT mapping at every start -- index-served (environment_id,
+    event_type) and a no-op once done. Never clears a flag: a type
+    removed from the mapping keeps the rows that were curated when they
+    were ingested (nothing the archive already promised to keep is
+    silently demoted to prunable). Runs per environment so the
+    (environment_id, event_type) index serves every statement instead of
+    a whole-table scan. Returns the number of rows re-flagged."""
+    conn = _get_connection()
+    types = sorted(COMPLIANCE_EVENT_TYPES)
+    if not types:
+        return 0
+    placeholders = ",".join("?" for _ in types)
+    environment_ids = [r[0] for r in conn.execute("SELECT DISTINCT environment_id FROM events")]
+    total = 0
+    with _db_lock:
+        try:
+            for environment_id in environment_ids:
+                cur = conn.execute(
+                    f"UPDATE events SET is_curated = 1 WHERE environment_id = ? AND is_curated = 0 "
+                    f"AND event_type IN ({placeholders})",
+                    (environment_id, *types),
+                )
+                total += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return total
+
+
+def canonicalize_stored_timestamps():
+    """DATA-03 / DATA-13 boot backfill: rows ingested before 5.40.2 from a
+    CSV export kept the file's own timestamp shape (e.g. a space instead
+    of `T`, no milliseconds, an offset), which sorts and filters wrongly
+    against the canonical `YYYY-MM-DDTHH:MM:SS.mmmZ` form every other row
+    has -- and INSERT OR IGNORE's dedup means a later live fetch of the
+    same event never corrects it. Rewrites `published` (and the copy
+    inside raw_json) through _canonical_published for every row whose
+    stored value is not already canonical; a row that cannot be parsed
+    is left alone and counted. Index-served (the LIKE excludes canonical
+    rows by shape, so a healthy archive scans nothing it keeps).
+    Returns (rewritten, unparseable)."""
+    conn = _get_connection()
+    rows = conn.execute(
+        """SELECT environment_id, uuid, published, raw_json FROM events
+           WHERE published IS NULL OR LENGTH(published) != 24 OR published NOT LIKE '____-__-__T__:__:__.___Z'"""
+    ).fetchall()
+    if not rows:
+        return 0, 0
+    rewritten = unparseable = 0
+    with _db_lock:
+        try:
+            for row in rows:
+                canonical = _canonical_published(row["published"])
+                if canonical is None:
+                    unparseable += 1
+                    continue
+                raw_json = row["raw_json"]
+                try:
+                    raw = json.loads(raw_json)
+                    raw["published"] = canonical
+                    raw_json = json.dumps(raw, separators=(",", ":"))
+                except (ValueError, TypeError):
+                    pass  # unreadable raw_json: fix the column, leave the blob
+                conn.execute(
+                    "UPDATE events SET published = ?, raw_json = ? WHERE environment_id = ? AND uuid = ?",
+                    (canonical, raw_json, row["environment_id"], row["uuid"]),
+                )
+                rewritten += 1
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return rewritten, unparseable
 
 
 def _cleanup_retired_secrets_log_cache():
@@ -668,7 +865,7 @@ def _normalize_live_event(event):
     return (
         event.get("uuid"),
         event.get("eventType"),
-        event.get("published"),
+        _canonical_published(event.get("published")),
         actor.get("id"),
         actor.get("displayName"),
         actor.get("alternateId"),
@@ -681,12 +878,68 @@ def _normalize_live_event(event):
     )
 
 
+_ISO_TIMESTAMP_RE = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})[T ](?P<time>\d{2}:\d{2}:\d{2})(?:\.(?P<frac>\d{1,9}))?"
+    r"(?P<tz>Z|z|[+-]\d{2}:?\d{2})?$",
+    re.ASCII,  # \d must mean 0-9, not every Unicode digit
+)
+
+
+def _iso_ms(dt):
+    """The archive's canonical form for an aware datetime: millisecond
+    precision, UTC, trailing Z -- what every stored `published` and
+    every sync cursor/watermark uses, so string comparisons between them
+    are exact (a second-precision cursor against a millisecond watermark
+    is what made a no-progress check unreliable, review item DATA-09)."""
+    dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def _canonical_published(value):
+    """DATA-03 / DATA-13 (external review, 2026-10-05): every comparison
+    on `published` in this module is a plain string comparison, which is
+    only correct when every stored value has the exact same shape --
+    `YYYY-MM-DDTHH:MM:SS.mmmZ` (what the live API emits). CSV exports
+    used to be stored verbatim, so a differently-shaped timestamp sorted
+    and filtered wrongly, and a bad or future one could poison the sync
+    watermark. Returns that canonical UTC form for any ISO-8601-ish
+    input (space or T separator, 0-9 fractional digits, Z or an offset,
+    or no zone -- treated as UTC, which is what Okta's own export uses),
+    or None for anything that doesn't parse, which _insert_rows treats
+    as a malformed row and skips."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, datetime):
+            return _iso_ms(value if value.tzinfo else value.replace(tzinfo=timezone.utc))
+        text = str(value).strip()
+        m = _ISO_TIMESTAMP_RE.match(text)
+        if not m:
+            return None
+        frac = (m.group("frac") or "0")[:6].ljust(6, "0")
+        tz = m.group("tz")
+        if not tz or tz in ("Z", "z"):
+            tzinfo = timezone.utc
+        else:
+            sign = 1 if tz[0] == "+" else -1
+            digits = tz[1:].replace(":", "")
+            tzinfo = timezone(sign * timedelta(hours=int(digits[:2]), minutes=int(digits[2:])))  # +24:00 raises -> None
+        dt = datetime.strptime(f"{m.group('date')}T{m.group('time')}.{frac}", "%Y-%m-%dT%H:%M:%S.%f").replace(tzinfo=tzinfo)
+        return _iso_ms(dt)  # a year-0001/9999 value near the UTC boundary overflows -> None
+    except (ValueError, OverflowError):
+        return None  # shape matched, value didn't (month 13, offset +24:00, out-of-range year)
+
+
 def _normalize_csv_row(row):
     """Shapes one row from a System Log CSV export (flattened
     target0-3.* columns, dotted header names) into the same normalized
     row tuple as _normalize_live_event, PLUS reconstructs a `target`
     list so raw_json's shape matches a live event closely enough for
-    report/drill-down code to treat both sources identically."""
+    report/drill-down code to treat both sources identically. The
+    timestamp is canonicalised (DATA-03/DATA-13, see _canonical_published)
+    both in the stored column and inside raw_json, so a CSV row and a
+    live row of the same event compare identically everywhere."""
+    published = _canonical_published(row.get("timestamp"))
     targets = []
     for i in range(4):
         t_id = row.get(f"target{i}.id", "")
@@ -702,7 +955,7 @@ def _normalize_csv_row(row):
     raw = {
         "uuid": row.get("uuid"),
         "eventType": row.get("event_type"),
-        "published": row.get("timestamp"),
+        "published": published,
         "displayMessage": row.get("display_message"),
         "severity": row.get("severity"),
         "actor": {
@@ -720,7 +973,7 @@ def _normalize_csv_row(row):
     return (
         row.get("uuid"),
         row.get("event_type"),
-        row.get("timestamp"),
+        published,
         row.get("actor.id"),
         row.get("actor.display_name"),
         row.get("actor.alternate_id"),
@@ -749,121 +1002,281 @@ def _insert_rows(conn, environment_id, rows, ingestion_scope):
     and doubled total_events_ingested -- fixed by switching to OR IGNORE
     + checking rowcount instead of a blind per-row counter).
     Returns (new_row_count, max_published_seen_across_ALL_rows_scanned,
-    new_uuids) -- max_published still reflects every row this call
-    looked at (including ones that turned out to be duplicates), since
-    the watermark must advance based on what was FETCHED, not just what
-    was newly inserted, or a delta sync could re-scan the same
-    already-seen day forever. new_uuids (Phase 6) is only the uuids of
-    rows that were genuinely new this call (cur.rowcount == 1) -- fed to
+    new_entries) -- max_published reflects every well-formed row this
+    call looked at: duplicates AND rows the ingestion scope filtered out
+    (it is computed before the curated-scope check), since the watermark
+    must advance based on what was FETCHED, not just what was stored, or
+    a delta sync could re-scan the same already-seen day forever -- and,
+    in curated scope, a capped chunk with no curated rows after the
+    cursor would otherwise look like "no progress" (review DATA-09).
+    new_entries (Phase 6, extended for the v2
+    chain -- DATA-04) is one (uuid, is_curated, sha256(raw_json)) per
+    row that was genuinely new this call (cur.rowcount == 1) -- fed to
     _record_ingestion_manifest by the caller to hash exactly what this
-    batch actually added, not every row merely scanned."""
+    batch actually added, content included, not every row merely
+    scanned.
+
+    DATA-11 (external review, 2026-10-05): the whole batch is one
+    transaction that is rolled back if any row raises mid-way -- before,
+    a bad row left this thread's write transaction open after the lock
+    was released, blocking every other writer until the thread died."""
     max_published = None
     inserted = 0
-    new_uuids = []
+    new_entries = []
     with _db_lock:
-        for (uuid, event_type, published, actor_id, actor_name, actor_alt, outcome, raw_json,
-             resource_id, resource_alt_id, resource_type_detail, targets) in rows:
-            if not uuid or not event_type or not published:
-                continue  # malformed row (e.g. a CSV export's trailing blank line) -- skip, don't crash
-            is_curated = 1 if event_type in COMPLIANCE_EVENT_TYPES else 0
-            if ingestion_scope == "curated" and not is_curated:
-                continue
-            cur = conn.execute(
-                """INSERT OR IGNORE INTO events
-                   (uuid, environment_id, event_type, published, actor_id,
-                    actor_display_name, actor_alternate_id, outcome_result,
-                    is_curated, raw_json, resource_id, resource_alternate_id,
-                    resource_type_detail)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (uuid, environment_id, event_type, published, actor_id,
-                 actor_name, actor_alt, outcome, is_curated, raw_json,
-                 resource_id, resource_alt_id, resource_type_detail),
-            )
-            inserted += cur.rowcount
-            if max_published is None or published > max_published:
-                max_published = published
-            # Only fan out into event_targets on a genuine new insert
-            # (cur.rowcount == 1) -- INSERT OR IGNORE is a no-op on a
-            # duplicate uuid, and re-inserting the same event's targets
-            # every re-run would duplicate rows with nothing to dedupe on.
-            if cur.rowcount:
-                new_uuids.append(uuid)
-                if targets:
-                    conn.executemany(
-                        """INSERT INTO event_targets
-                           (environment_id, uuid, target_id, target_alternate_id, target_display_name)
-                           VALUES (?, ?, ?, ?, ?)""",
-                        [
-                            (environment_id, uuid, t.get("id"), t.get("alternateId"), t.get("displayName"))
-                            for t in targets
-                        ],
-                    )
-        conn.commit()
-    return inserted, max_published, new_uuids
+        try:
+            for (uuid, event_type, published, actor_id, actor_name, actor_alt, outcome, raw_json,
+                 resource_id, resource_alt_id, resource_type_detail, targets) in rows:
+                if not uuid or not event_type or not published:
+                    continue  # malformed row (e.g. a CSV export's trailing blank line) -- skip, don't crash
+                if max_published is None or published > max_published:
+                    max_published = published  # before the scope filter -- see the docstring
+                is_curated = 1 if event_type in COMPLIANCE_EVENT_TYPES else 0
+                if ingestion_scope == "curated" and not is_curated:
+                    continue
+                cur = conn.execute(
+                    """INSERT OR IGNORE INTO events
+                       (uuid, environment_id, event_type, published, actor_id,
+                        actor_display_name, actor_alternate_id, outcome_result,
+                        is_curated, raw_json, resource_id, resource_alternate_id,
+                        resource_type_detail)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (uuid, environment_id, event_type, published, actor_id,
+                     actor_name, actor_alt, outcome, is_curated, raw_json,
+                     resource_id, resource_alt_id, resource_type_detail),
+                )
+                inserted += cur.rowcount
+                # Only fan out into event_targets on a genuine new insert
+                # (cur.rowcount == 1) -- INSERT OR IGNORE is a no-op on a
+                # duplicate uuid, and re-inserting the same event's targets
+                # every re-run would duplicate rows with nothing to dedupe on.
+                if cur.rowcount:
+                    new_entries.append((uuid, is_curated, _content_sha256(raw_json)))
+                    if targets:
+                        conn.executemany(
+                            """INSERT INTO event_targets
+                               (environment_id, uuid, target_id, target_alternate_id, target_display_name)
+                               VALUES (?, ?, ?, ?, ?)""",
+                            [
+                                (environment_id, uuid, t.get("id"), t.get("alternateId"), t.get("displayName"))
+                                for t in targets
+                            ],
+                        )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return inserted, max_published, new_entries
 
 
-def _record_ingestion_manifest(conn, environment_id, source, since, until, new_uuids):
+def _content_sha256(raw_json):
+    return hashlib.sha256(raw_json.encode("utf-8")).hexdigest()
+
+
+def _manifest_entry_hash(prev_hash, environment_id, source, since, until, row_count, created_at, batch_hash, content_hash):
+    """DATA-04: the v2 link. Every field an auditor would rely on is
+    inside the hash, and so is the previous link, so editing any manifest
+    field, deleting a manifest, or re-ordering them changes every hash
+    after it. Field separator is a newline, which none of these values
+    can contain (ids/hashes/ISO timestamps/ints)."""
+    parts = [prev_hash or "", environment_id, source, since or "", until or "", str(row_count), created_at, batch_hash, content_hash]
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def _manifest_content_hash(entries):
+    """sha256 over `uuid:sha256(raw_json)` for every CURATED row in the
+    batch, sorted by uuid. Curated rows are the ones the archive promises
+    never to prune (see prune_events), so they are the only ones a later
+    deep verification can be expected to re-read; a non-curated row that
+    retention has legitimately removed must not make the chain look
+    tampered with."""
+    lines = sorted(f"{uuid}:{sha}" for uuid, is_curated, sha in entries if is_curated)
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def _record_ingestion_manifest(conn, environment_id, source, since, until, new_entries):
     """Phase 6: writes one hash-chained manifest row for a completed
     ingestion call (one per sync_okta_events()/import_from_csv()
     invocation, NOT per internal day-chunk -- see this phase's design
-    notes). batch_hash is a sha256 of the sorted new_uuids list -- an
-    identifier hash, not a content hash, computed once at ingestion time
-    so verify_ingestion_chain never needs to re-read `events` later (and
-    is therefore unaffected by prune_events deleting old non-curated
-    rows afterward). A batch with zero new rows still gets a row here
-    (hash of an empty list) -- "nothing new happened" is itself a
-    chained, verifiable fact, not a silent skip that would leave a gap.
+    notes). A batch with zero new rows still gets a row here -- "nothing
+    new happened" is itself a chained, verifiable fact, not a silent skip
+    that would leave a gap.
 
-    Chains to the immediately preceding manifest row for this SAME
-    environment_id (by insertion order) -- not a separate mutable
-    "chain head" column, since this one-row lookup is cheap and avoids
-    a second piece of state that could drift out of sync with the table
-    it's describing. Caller must hold conn (same connection as the
-    row-insert transaction it's covering); this function commits on its
-    own since both of this phase's callers write their manifest row in
-    a separate locked section after their chunking loop, not inside
-    _insert_rows' own per-chunk lock (see sync_okta_events)."""
-    batch_hash = hashlib.sha256("\n".join(sorted(new_uuids)).encode()).hexdigest()
+    Chain v2 (DATA-04, external review, 2026-10-05). The v1 chain only
+    linked each row's prev_manifest_hash to the previous row's
+    batch_hash, where batch_hash was a hash of the new uuids alone -- so
+    editing any event, editing any manifest field, truncating the tail,
+    or deleting any manifest from a run of empty batches (all with the
+    identical empty-list hash, i.e. every quiet day) all still verified
+    as valid. A v2 row stores three more things:
+      - content_hash: sha256 over `uuid:sha256(raw_json)` of every CURATED
+        row in the batch (the rows the archive never prunes), so the
+        content of the evidence is sealed, not just its identifiers;
+      - entry_hash: sha256 over the previous link AND every field of this
+        row (source, since, until, row_count, created_at, batch_hash,
+        content_hash) -- the real link. prev_manifest_hash now carries
+        the previous row's entry_hash (or its batch_hash for a pre-v2
+        row), so the v1->v2 boundary is explicit rather than a re-seal;
+      - entries_json: [[uuid, sha], ...] for the CURATED rows only (the
+        ones content_hash covers and a deep verify re-reads) -- the
+        non-curated rows are counted in row_count but not listed, since a
+        90-day backfill in scope "all" can be ~1M rows and listing every
+        one would make a single manifest row tens of MB.
+    batch_hash (sorted-uuids hash, every row) is kept so pre-v2 rows and
+    tools that read it keep working.
+
+    Returns the new head hash (entry_hash, or batch_hash while the v2
+    flag is off). Every manifest -- success, failure or import -- is also
+    anchored OUTSIDE the database as an `evidence_chain.sealed` entry in
+    audit_log.jsonl (environment_id, source, row_count, head), so a
+    truncated chain tail is visible by comparing the stored head against
+    the last logged one; the anchor must never be able to break an
+    ingestion, so a logging failure is swallowed. Caller must hold conn;
+    commits on its own, after the row-insert transaction it covers."""
+    entries = [tuple(e) for e in new_entries]
+    uuids = sorted(uuid for uuid, _c, _s in entries)
+    batch_hash = hashlib.sha256("\n".join(uuids).encode()).hexdigest()
+    content_hash = _manifest_content_hash(entries)
+    created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     with _db_lock:
-        prev = conn.execute(
-            "SELECT batch_hash FROM ingestion_manifests WHERE environment_id = ? ORDER BY id DESC LIMIT 1",
-            (environment_id,),
-        ).fetchone()
-        conn.execute(
-            """INSERT INTO ingestion_manifests
-               (environment_id, source, since, until, row_count, batch_hash, prev_manifest_hash, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (environment_id, source, since, until, len(new_uuids), batch_hash,
-             prev["batch_hash"] if prev else None,
-             datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")),
+        try:
+            prev = conn.execute(
+                "SELECT batch_hash, entry_hash FROM ingestion_manifests WHERE environment_id = ? ORDER BY id DESC LIMIT 1",
+                (environment_id,),
+            ).fetchone()
+            prev_hash = (prev["entry_hash"] or prev["batch_hash"]) if prev else None
+            if EVIDENCE_CHAIN_V2:
+                entry_hash = _manifest_entry_hash(
+                    prev_hash, environment_id, source, since, until, len(entries), created_at, batch_hash, content_hash
+                )
+                curated_entries = sorted([u, s] for u, c, s in entries if c)
+                v2_fields = (content_hash, entry_hash, json.dumps(curated_entries, separators=(",", ":")))
+            else:
+                entry_hash = batch_hash  # v1 head: the next row chains to batch_hash, exactly as before
+                v2_fields = (None, None, None)
+            conn.execute(
+                """INSERT INTO ingestion_manifests
+                   (environment_id, source, since, until, row_count, batch_hash, prev_manifest_hash, created_at,
+                    content_hash, entry_hash, entries_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (environment_id, source, since, until, len(entries), batch_hash, prev_hash, created_at, *v2_fields),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    try:
+        import create_secret_folders
+        create_secret_folders.log_audit_event(
+            None, None, "evidence_chain.sealed",
+            {"environment_id": environment_id, "source": source, "row_count": len(entries), "chain_head": entry_hash},
         )
-        conn.commit()
-    return batch_hash
+    except Exception:
+        pass
+    return entry_hash
 
 
-def verify_ingestion_chain(environment_id):
+# DATA-04: the v2 chain is implemented and tested but NOT yet the format
+# new manifests are written in. Changing what the Phase 6 evidence chain
+# seals is a change to the tool's evidence-integrity guarantee -- a
+# maintainer decision, not a reviewer's -- so it ships dormant: with this
+# False, _record_ingestion_manifest writes exactly the v1 rows it always
+# did (verify_ingestion_chain already understands both). Flip to True to
+# start sealing content from the next ingestion onward; no migration or
+# re-seal of history is needed (the first v2 row chains to the last v1
+# row's batch_hash).
+EVIDENCE_CHAIN_V2 = False
+
+
+def verify_ingestion_chain(environment_id, deep=False):
     """Walks this environment's ingestion_manifests in insertion order
-    and confirms each row's prev_manifest_hash matches the preceding
-    row's batch_hash (and the first row's prev_manifest_hash is NULL) --
-    a cheap, mechanical "has this chain been tampered with" check that
-    never touches `events` (the stored hashes are the source of truth,
-    not something recomputed from live data -- see
-    _record_ingestion_manifest), so it stays fast regardless of archive
-    size. Returns {"valid": bool, "manifest_count": int, "broken_at":
-    id|None} -- broken_at is the id of the first row whose
-    prev_manifest_hash doesn't match, or None if the chain is intact (or
-    empty -- zero manifests is a valid, intact chain of nothing)."""
+    and verifies the chain (DATA-04, see _record_ingestion_manifest):
+    every row's prev_manifest_hash must equal the previous row's head
+    (entry_hash, or batch_hash for a pre-v2 row); every v2 row's
+    entry_hash must recompute from its stored fields; and with
+    deep=True every v2 row's curated events are re-read from `events`,
+    re-hashed and compared against entries_json and content_hash -- so a
+    deleted or edited curated event, an edited manifest field, a deleted
+    manifest, or a re-ordered chain all surface here. A non-curated row
+    missing from `events` is NOT a failure (retention pruning is
+    legitimate) -- it is counted in `unverifiable_rows`.
+
+    Once a v2 row has been seen, a later row WITHOUT v2 fields breaks the
+    chain ("downgrade"): otherwise anyone with write access could null
+    the v2 columns of the tail and relink it by batch_hash, turning the
+    content seal back off silently.
+
+    Returns {"valid", "manifest_count", "broken_at", "reason",
+    "head_hash", "legacy_manifests", "deep", "deep_applicable",
+    "verified_rows", "unverifiable_rows"}. deep_applicable is False when
+    no manifest carries v2 fields (nothing content-sealed to re-read --
+    the case while EVIDENCE_CHAIN_V2 is off), so a caller never mistakes
+    "verified 0 rows" for "all rows verified". broken_at is the id of
+    the first bad row, or None. Zero manifests is a valid, intact chain
+    of nothing. What this cannot see: a tail truncated AFTER the last row
+    (nothing follows it to disagree) -- compare head_hash against the
+    last `evidence_chain.sealed` entry in audit_log.jsonl for that."""
     conn = _get_connection()
     rows = conn.execute(
-        "SELECT id, batch_hash, prev_manifest_hash FROM ingestion_manifests WHERE environment_id = ? ORDER BY id ASC",
+        """SELECT id, environment_id, source, since, until, row_count, batch_hash, prev_manifest_hash,
+                  created_at, content_hash, entry_hash, entries_json
+           FROM ingestion_manifests WHERE environment_id = ? ORDER BY id ASC""",
         (environment_id,),
     ).fetchall()
+    result = {
+        "valid": True, "manifest_count": len(rows), "broken_at": None, "reason": None, "head_hash": None,
+        "legacy_manifests": 0, "deep": bool(deep), "deep_applicable": False, "verified_rows": 0, "unverifiable_rows": 0,
+    }
+
+    def _broken(row, reason):
+        result.update({"valid": False, "broken_at": row["id"], "reason": reason})
+        return result
+
     expected_prev = None
+    seen_v2 = False
     for row in rows:
         if row["prev_manifest_hash"] != expected_prev:
-            return {"valid": False, "manifest_count": len(rows), "broken_at": row["id"]}
-        expected_prev = row["batch_hash"]
-    return {"valid": True, "manifest_count": len(rows), "broken_at": None}
+            return _broken(row, "prev_manifest_hash does not match the previous manifest")
+        if not row["entry_hash"]:
+            if seen_v2:
+                return _broken(row, "a manifest without v2 fields follows a sealed (v2) manifest -- chain downgraded")
+            result["legacy_manifests"] += 1
+            expected_prev = row["batch_hash"]
+            continue
+        seen_v2 = True
+        result["deep_applicable"] = True
+        recomputed = _manifest_entry_hash(
+            row["prev_manifest_hash"], row["environment_id"], row["source"], row["since"], row["until"],
+            row["row_count"], row["created_at"], row["batch_hash"], row["content_hash"],
+        )
+        if recomputed != row["entry_hash"]:
+            return _broken(row, "entry_hash does not match the manifest's stored fields")
+        if deep:
+            try:
+                entries = [tuple(e) for e in json.loads(row["entries_json"] or "[]")]
+            except (ValueError, TypeError):
+                return _broken(row, "entries_json is unreadable")
+            if len(entries) > row["row_count"]:
+                return _broken(row, "entries_json lists more rows than row_count")
+            # entries_json holds the curated rows only, so the content hash
+            # recomputes from it directly; non-curated rows are the
+            # difference between row_count and len(entries) and were
+            # never content-sealed (retention may legitimately prune them).
+            if _manifest_content_hash([(u, 1, s) for u, s in entries]) != row["content_hash"]:
+                return _broken(row, "content_hash does not match entries_json")
+            result["unverifiable_rows"] += row["row_count"] - len(entries)
+            for uuid, sha in entries:
+                stored = conn.execute(
+                    "SELECT raw_json FROM events WHERE environment_id = ? AND uuid = ?", (environment_id, uuid)
+                ).fetchone()
+                if stored is None:
+                    return _broken(row, f"curated event {uuid} is missing from the archive")
+                if _content_sha256(stored["raw_json"]) != sha:
+                    return _broken(row, f"event {uuid} content does not match its sealed hash")
+                result["verified_rows"] += 1
+        expected_prev = row["entry_hash"]
+    result["head_hash"] = expected_prev
+    return result
 
 
 class PendingActionError(Exception):
@@ -1000,27 +1413,57 @@ def get_sync_state(environment_id):
     return result
 
 
+_SYNC_STATE_FIELDS = (
+    "last_synced_at", "last_sync_completed_at", "last_sync_status", "last_sync_error",
+    "total_events_ingested", "ingestion_scope", "last_sync_attempt_at", "last_import_at",
+)
+
+
 def _upsert_sync_state(conn, environment_id, **fields):
-    existing = conn.execute(
-        "SELECT * FROM sync_state WHERE environment_id = ?", (environment_id,)
-    ).fetchone()
-    merged = dict(existing) if existing else {
-        "environment_id": environment_id, "last_synced_at": None,
-        "last_sync_completed_at": None, "last_sync_status": None,
-        "last_sync_error": None, "total_events_ingested": 0,
-        "ingestion_scope": "curated",
-    }
-    merged.update(fields)
-    conn.execute(
-        """INSERT OR REPLACE INTO sync_state
-           (environment_id, last_synced_at, last_sync_completed_at, last_sync_status,
-            last_sync_error, total_events_ingested, ingestion_scope)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (merged["environment_id"], merged["last_synced_at"], merged["last_sync_completed_at"],
-         merged["last_sync_status"], merged["last_sync_error"], merged["total_events_ingested"],
-         merged["ingestion_scope"]),
-    )
-    conn.commit()
+    """Writes ONLY the supplied fields (DATA-11, external review,
+    2026-10-05): the old read-merge-write outside the lock let a CSV
+    import racing a background sync write back a stale copy of the whole
+    row -- moving the watermark backwards or overwriting the status.
+    One statement under _db_lock, so there is nothing stale to merge."""
+    unknown = set(fields) - set(_SYNC_STATE_FIELDS)
+    if unknown:
+        raise ValueError(f"unknown sync_state field(s): {sorted(unknown)}")
+    columns = ["environment_id", *fields]
+    placeholders = ",".join("?" for _ in columns)
+    updates = ", ".join(f"{col}=excluded.{col}" for col in fields) or "environment_id=environment_id"
+    with _db_lock:
+        try:
+            conn.execute(
+                f"INSERT INTO sync_state ({', '.join(columns)}) VALUES ({placeholders}) "
+                f"ON CONFLICT(environment_id) DO UPDATE SET {updates}",
+                (environment_id, *fields.values()),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def reset_sync_watermark(environment_id):
+    """DATA-03 remedy: clears last_synced_at so the next sync backfills
+    the full 90-day window from scratch (INSERT OR IGNORE dedupes every
+    row it has already). The only supported way out of an unusable
+    watermark (a poisoned pre-5.40.2 CSV import, a clock that jumped) --
+    nothing else is touched. Returns the watermark that was cleared."""
+    conn = _get_connection()
+    state = get_sync_state(environment_id)
+    previous = (state or {}).get("last_synced_at")
+    _upsert_sync_state(conn, environment_id, last_synced_at=None, last_sync_status=None, last_sync_error=None)
+    return previous
+
+
+def environment_has_archive(environment_id):
+    """True once this environment has anything to report from -- a
+    completed live sync OR a CSV import (DATA-03 moved imports off the
+    sync watermark, so "has it synced" alone would wrongly say no for an
+    import-only environment). Used by the archive-only report routes."""
+    state = get_sync_state(environment_id)
+    return bool(state and (state.get("last_sync_completed_at") or state.get("last_import_at")))
 
 
 CHUNK_DAYS = 1  # window size for the day-by-day walk below
@@ -1074,19 +1517,60 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
     The walk never reaches literal "now" -- see SAFETY_LAG_SECONDS above.
 
     Returns {"inserted": int, "scanned": int, "since": str, "chunks": int,
-    "complete": bool} -- "complete" is False if a day-chunk hit
-    get_system_log's max_pages cap (see that method's docstring); in that
-    case the sync stops early with last_sync_status="error" and the
-    watermark deliberately NOT advanced past the incomplete chunk, so the
-    next sync run retries it rather than silently skipping lost events."""
+    "complete": bool, "incomplete_chunks": int, "chain_head": str}.
+
+    Incomplete chunks (DATA-09, external review, 2026-10-05): when a
+    day-chunk hits get_system_log's max_pages cap, the fetch is ASCENDING,
+    so everything up to the newest `published` actually returned is known
+    complete. The sync now persists the watermark at exactly that
+    timestamp and carries on from there (re-reading that one inclusive
+    instant, which INSERT OR IGNORE dedupes) instead of stopping -- the
+    old "stop and retry the same day tomorrow" could never get past a day
+    busier than the cap and let everything after it age out of Okta's
+    90-day window. Only a chunk that returns NO progress at all (every
+    page carried the same instant) stops the run with last_sync_status
+    "error", since re-reading it would loop forever.
+
+    Failure (DATA-05): a chunk's rows commit as they land, so an exception
+    on a later chunk used to leave rows that no manifest covered and a
+    sync_state stuck at "running" with no error. Any exception now
+    records the manifest for every row already inserted, writes
+    last_sync_status="error" + last_sync_error, and re-raises.
+    last_sync_completed_at is written ONLY by a successful completion;
+    last_sync_attempt_at records every start (the scheduler keys its
+    retry back-off off the attempt, not the completion)."""
     if ingestion_scope not in INGESTION_SCOPES:
         raise ValueError(f"ingestion_scope must be one of {INGESTION_SCOPES}")
     conn = _get_connection()
 
+    # Every start is an attempt (DATA-05), recorded BEFORE anything can
+    # fail -- including the watermark check just below -- so the
+    # scheduler's back-off sees it.
+    _upsert_sync_state(
+        conn, environment_id,
+        last_sync_attempt_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        last_sync_status="running", last_sync_error=None, ingestion_scope=ingestion_scope,
+    )
+
     if since is None:
         state = get_sync_state(environment_id)
-        if state and state.get("last_synced_at"):
-            watermark_dt = datetime.fromisoformat(state["last_synced_at"].replace("Z", "+00:00"))
+        stored = (state or {}).get("last_synced_at")
+        if stored:
+            canonical = _canonical_published(stored)
+            if canonical is None or canonical > datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"):
+                # DATA-03: a watermark that doesn't parse, or sits in the
+                # future, would make every later sync a silent no-op (or
+                # a crash) -- say so instead of pretending to sync. The
+                # remedy is reset_sync_watermark (route: POST
+                # /api/environments/<name>/sync/reset_watermark).
+                message = (
+                    f"Stored sync watermark {stored!r} is unusable (unparseable or in the future). "
+                    "Reset the watermark (Compliance sync settings -> Reset watermark) and sync again; "
+                    "the next sync will backfill the full 90-day window."
+                )
+                _upsert_sync_state(conn, environment_id, last_sync_status="error", last_sync_error=message)
+                raise ValueError(message)
+            watermark_dt = datetime.fromisoformat(canonical.replace("Z", "+00:00"))
             since = (watermark_dt - timedelta(seconds=WATERMARK_OVERLAP_SECONDS)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
         else:
             since = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -1095,87 +1579,91 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
     safe_now_dt = datetime.now(timezone.utc) - timedelta(seconds=SAFETY_LAG_SECONDS)
     cursor = datetime.fromisoformat(since.replace("Z", "+00:00"))
     total_inserted = 0
-    total_scanned = 0
+    total_scanned = 0  # rows fetched, INCLUDING any re-read after a page-cap resume (see DATA-09 above)
     chunks = 0
-    all_new_uuids = []  # Phase 6: accumulated across every day-chunk, hashed into ONE manifest row for this whole call
+    incomplete_chunks = 0
+    all_new_entries = []  # Phase 6: accumulated across every day-chunk, sealed into ONE manifest row for this whole call
 
-    while cursor < safe_now_dt:
-        chunk_until_dt = min(cursor + timedelta(days=CHUNK_DAYS), safe_now_dt)
-        chunk_since = cursor.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        chunk_until = chunk_until_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
+    def _fail(error_message, until):
+        _upsert_sync_state(conn, environment_id, last_sync_status="error", last_sync_error=error_message)
         if on_progress:
-            on_progress("fetch", "progress", f"{chunk_since} .. {chunk_until}")
-        events, complete = okta_client.get_system_log(
-            since=chunk_since, until=chunk_until, limit=1000, sort_order="ASCENDING", max_pages=200
-        )
-        total_scanned += len(events)
+            on_progress("ingest", "error", error_message)
+        # An interrupted sync still produced real inserted rows (across
+        # however many chunks completed) -- those must be in the chain
+        # too, same "nothing new is silently invisible" reasoning as a
+        # zero-new-rows batch.
+        return _record_ingestion_manifest(conn, environment_id, "sync", original_since, until, all_new_entries)
 
-        rows = [_normalize_live_event(e) for e in events]
-        inserted, max_published, new_uuids = _insert_rows(conn, environment_id, rows, ingestion_scope)
-        total_inserted += inserted
-        all_new_uuids.extend(new_uuids)
-        chunks += 1
+    try:
+        while cursor < safe_now_dt:
+            chunk_until_dt = min(cursor + timedelta(days=CHUNK_DAYS), safe_now_dt)
+            chunk_since = _iso_ms(cursor)  # millisecond-exact, so "no progress" below compares like with like
+            chunk_until = _iso_ms(chunk_until_dt)
 
-        # FIX (external review, 2026-09-30, "1.5"): get_system_log logs a
-        # WARN when it hits max_pages with more pages still remaining, but
-        # previously returned the truncated results exactly like a
-        # complete fetch -- this loop would advance the watermark past
-        # chunk_until as if the whole day was fully ingested, silently
-        # and PERMANENTLY losing whatever events existed on the remaining
-        # page(s) (Okta's System Log has no way to re-fetch an aged-out
-        # window later). If this chunk came back incomplete, stop the
-        # whole sync here with the watermark left at the END of the
-        # PREVIOUS chunk (not this one) -- the next sync run will retry
-        # this exact chunk from scratch rather than skip past the gap.
-        if not complete:
-            error_message = (
-                f"Hit max_pages for {chunk_since}..{chunk_until} -- more events exist on this "
-                f"day than could be fetched in one sync run. Watermark NOT advanced past this "
-                f"day; the next sync will retry it. If this persists, the day's event volume may "
-                f"exceed what a single day-chunk can safely page through."
-            )
-            _upsert_sync_state(
-                conn, environment_id,
-                last_sync_completed_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                last_sync_status="error",
-                last_sync_error=error_message,
-                total_events_ingested=(get_sync_state(environment_id) or {}).get("total_events_ingested", 0) + inserted,
-                ingestion_scope=ingestion_scope,
-            )
             if on_progress:
-                on_progress("ingest", "error", f"Incomplete fetch for {chunk_since}..{chunk_until}; stopping sync.")
-            # Phase 6: an interrupted sync still produced real inserted
-            # rows (across however many chunks completed before the
-            # failing one) -- those need to be in the chain too, same
-            # "nothing new is silently invisible" reasoning as a
-            # zero-new-rows batch below.
-            _record_ingestion_manifest(conn, environment_id, "sync", original_since, chunk_until, all_new_uuids)
-            return {
-                "inserted": total_inserted, "scanned": total_scanned, "since": original_since,
-                "chunks": chunks, "complete": False, "error": error_message,
-            }
+                on_progress("fetch", "progress", f"{chunk_since} .. {chunk_until}")
+            events, complete = okta_client.get_system_log(
+                since=chunk_since, until=chunk_until, limit=1000, sort_order="ASCENDING", max_pages=200
+            )
+            total_scanned += len(events)
 
-        # Persist progress after EVERY chunk, not just at the end -- a
-        # restart mid-backfill resumes from here instead of from scratch.
-        watermark = max_published or chunk_until
-        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            rows = [_normalize_live_event(e) for e in events]
+            inserted, max_published, new_entries = _insert_rows(conn, environment_id, rows, ingestion_scope)
+            total_inserted += inserted
+            all_new_entries.extend(new_entries)
+            chunks += 1
+
+            if not complete:
+                incomplete_chunks += 1
+                if not max_published or max_published <= chunk_since:
+                    error_message = (
+                        f"Hit max_pages for {chunk_since}..{chunk_until} without making progress -- more "
+                        f"events share the instant {chunk_since} than one sync run can page through. "
+                        f"Watermark left at {chunk_since}; the next sync will retry it."
+                    )
+                    chain_head = _fail(error_message, chunk_until)
+                    return {
+                        "inserted": total_inserted, "scanned": total_scanned, "since": original_since,
+                        "chunks": chunks, "complete": False, "incomplete_chunks": incomplete_chunks,
+                        "error": error_message, "chain_head": chain_head,
+                    }
+                # Everything up to max_published is complete (ascending
+                # fetch); resume from exactly there, same day.
+                if on_progress:
+                    on_progress("fetch", "progress", f"{chunk_since} .. {chunk_until} hit the page cap at {max_published}; resuming from there")
+                _upsert_sync_state(conn, environment_id, last_synced_at=max_published, last_sync_status="running")
+                cursor = datetime.fromisoformat(max_published.replace("Z", "+00:00"))
+                continue
+
+            # Persist progress after EVERY chunk, not just at the end -- a
+            # restart mid-backfill resumes from here instead of from scratch.
+            watermark = max_published or chunk_until
+            _upsert_sync_state(conn, environment_id, last_synced_at=watermark, last_sync_status="running")
+            cursor = chunk_until_dt
+
+        # Still inside the try: a failure sealing the manifest or writing
+        # the final state must also end as "error", never a silent "running".
+        chain_head = _record_ingestion_manifest(
+            conn, environment_id, "sync", original_since, _iso_ms(safe_now_dt), all_new_entries
+        )
         _upsert_sync_state(
             conn, environment_id,
-            last_synced_at=watermark,
-            last_sync_completed_at=now_iso,
-            last_sync_status="running",
-            last_sync_error=None,
-            total_events_ingested=(get_sync_state(environment_id) or {}).get("total_events_ingested", 0) + inserted,
-            ingestion_scope=ingestion_scope,
+            last_sync_completed_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            last_sync_status="success", last_sync_error=None,
         )
-        cursor = chunk_until_dt
+    except Exception as exc:
+        try:
+            _fail(f"{type(exc).__name__}: {exc}", _iso_ms(cursor))
+        except Exception:
+            pass  # the original exception is the one worth surfacing
+        raise
 
-    _upsert_sync_state(conn, environment_id, last_sync_status="success")
-    _record_ingestion_manifest(conn, environment_id, "sync", original_since, safe_now_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"), all_new_uuids)
     if on_progress:
         on_progress("ingest", "done", f"{total_inserted} new row(s) inserted across {chunks} day-chunk(s)")
-    return {"inserted": total_inserted, "scanned": total_scanned, "since": original_since, "chunks": chunks, "complete": True}
+    return {
+        "inserted": total_inserted, "scanned": total_scanned, "since": original_since, "chunks": chunks,
+        "complete": True, "incomplete_chunks": incomplete_chunks, "chain_head": chain_head,
+    }
 
 
 def import_from_csv(csv_path, environment_id, ingestion_scope, on_progress=None):
@@ -1193,35 +1681,37 @@ def import_from_csv(csv_path, environment_id, ingestion_scope, on_progress=None)
     if on_progress:
         on_progress("read_csv", "start", csv_path)
     rows = []
+    skipped_unparseable = 0
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for csv_row in reader:
-            rows.append(_normalize_csv_row(csv_row))
+            normalized = _normalize_csv_row(csv_row)
+            if normalized[2] is None and (normalized[0] or normalized[1]):
+                skipped_unparseable += 1  # a real row whose timestamp didn't parse (DATA-03) -- never stored
+            rows.append(normalized)
     if on_progress:
         on_progress("read_csv", "done", f"{len(rows)} row(s) read")
 
-    inserted, max_published, new_uuids = _insert_rows(conn, environment_id, rows, ingestion_scope)
-    _record_ingestion_manifest(conn, environment_id, "csv_import", None, None, new_uuids)
+    inserted, _max_published, new_entries = _insert_rows(conn, environment_id, rows, ingestion_scope)
+    chain_head = _record_ingestion_manifest(conn, environment_id, "csv_import", None, None, new_entries)
 
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    existing_state = get_sync_state(environment_id)
-    # A CSV import advances the watermark too, IF it's newer than what's
-    # already recorded -- e.g. importing a 90-day export shouldn't roll
-    # last_synced_at BACKWARD if a live sync already ran more recently.
-    prior_watermark = (existing_state or {}).get("last_synced_at")
-    new_watermark = max_published if (not prior_watermark or (max_published and max_published > prior_watermark)) else prior_watermark
+    # DATA-03 (external review, 2026-10-05): a CSV import no longer
+    # touches last_synced_at at all. The live-sync watermark describes
+    # what the LIVE sync has covered; letting a file's newest timestamp
+    # set it meant (a) a future/garbage timestamp silently disabled every
+    # later sync, (b) a filtered or partial export skipped everything the
+    # file didn't contain, and (c) an import on a new environment skipped
+    # the first live sync's 90-day backfill. The import is recorded in
+    # its own column; the next live sync still backfills from scratch and
+    # the dedup-by-uuid insert keeps the overlap free of duplicates.
     _upsert_sync_state(
         conn, environment_id,
-        last_synced_at=new_watermark,
-        last_sync_completed_at=now,
-        last_sync_status="success",
-        last_sync_error=None,
-        total_events_ingested=(existing_state or {}).get("total_events_ingested", 0) + inserted,
+        last_import_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
         ingestion_scope=ingestion_scope,
     )
     if on_progress:
         on_progress("ingest", "done", f"{inserted} new row(s) inserted")
-    return {"inserted": inserted, "scanned": len(rows)}
+    return {"inserted": inserted, "scanned": len(rows), "skipped_unparseable": skipped_unparseable, "chain_head": chain_head}
 
 
 def _delete_pruned_targets(conn, environment_id, events_where_sql, events_where_params):
@@ -1243,11 +1733,12 @@ def prune_events(environment_id, retention_days=None, max_size_mb=None):
     """Deletes non-curated rows older than retention_days. Curated rows
     (is_curated=1) are NEVER auto-pruned regardless of ingestion_scope --
     even a "curated only" archive can have its own separate, longer
-    retention. If max_size_mb is also set and the DB file is still over
-    that size after the time-based prune, walks the cutoff back one day
-    at a time (oldest non-curated first) until under the cap, or until
-    every non-curated row is gone (curated rows are never sacrificed to
-    satisfy a size cap).
+    retention. If max_size_mb is also set and this environment's own
+    archived payload (the bytes of its stored events -- NOT the database
+    file, see DATA-12 below) is still over that size after the
+    time-based prune, walks the cutoff back one day at a time (oldest
+    non-curated first) until under the cap, or until every non-curated
+    row is gone (curated rows are never sacrificed to satisfy a size cap).
 
     Returns {"pruned": int, "cutoff": str|None}."""
     conn = _get_connection()
@@ -1258,99 +1749,156 @@ def prune_events(environment_id, retention_days=None, max_size_mb=None):
         cutoff_dt = datetime.now(timezone.utc) - timedelta(days=retention_days)
         cutoff = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
         with _db_lock:
-            # BUG FIX (external review, 2026-10-05, DATA-01): event_targets
-            # has a FOREIGN KEY on (environment_id, uuid) -> events, and
-            # _insert_rows writes a target row for nearly every real Okta
-            # event -- so the very first prune that matched a row with a
-            # target used to raise sqlite3.IntegrityError, which meant
-            # retention pruning NEVER actually deleted anything on a fresh
-            # install, the DB grew without bound, and _run_sync_job logged
-            # a perfectly successful sync as a failure every single day.
-            # Children deleted first, in the SAME transaction as the
-            # parent delete, same as any other cascade-by-hand.
-            _delete_pruned_targets(conn, environment_id, "AND is_curated = 0 AND published < ?", (cutoff,))
-            cur = conn.execute(
-                "DELETE FROM events WHERE environment_id = ? AND is_curated = 0 AND published < ?",
-                (environment_id, cutoff),
-            )
-            pruned_total += cur.rowcount
-            conn.commit()
+            try:
+                # BUG FIX (external review, 2026-10-05, DATA-01): event_targets
+                # has a FOREIGN KEY on (environment_id, uuid) -> events, and
+                # _insert_rows writes a target row for nearly every real Okta
+                # event -- so the very first prune that matched a row with a
+                # target used to raise sqlite3.IntegrityError, which meant
+                # retention pruning NEVER actually deleted anything on a fresh
+                # install, the DB grew without bound, and _run_sync_job logged
+                # a perfectly successful sync as a failure every single day.
+                # Children deleted first, in the SAME transaction as the
+                # parent delete, same as any other cascade-by-hand.
+                _delete_pruned_targets(conn, environment_id, "AND is_curated = 0 AND published < ?", (cutoff,))
+                cur = conn.execute(
+                    "DELETE FROM events WHERE environment_id = ? AND is_curated = 0 AND published < ?",
+                    (environment_id, cutoff),
+                )
+                pruned_total += cur.rowcount
+                conn.commit()
+            except Exception:
+                conn.rollback()  # DATA-11
+                raise
 
     if max_size_mb is not None:
         max_bytes = max_size_mb * 1024 * 1024
         step_days = 1
         pruned_any_by_size = False
 
-        def _live_data_bytes():
-            # PERFORMANCE FIX (external review, 2026-09-30): the loop
-            # below used to call VACUUM after every single day's delete to
-            # make os.path.getsize(...) reflect the shrink -- confirmed
-            # real: up to 3650 full-database rebuilds in the worst case
-            # (VACUUM rewrites the ENTIRE file, not just the freed pages),
-            # causing severe disk I/O thrashing and blocking every
-            # concurrent HTTP read for the whole rebuild each time.
-            #
-            # The fix is NOT simply "stop calling VACUUM" -- SQLite's
-            # DELETE never shrinks the on-disk file by itself (freed pages
-            # go to an internal freelist, the file stays the same size
-            # until something vacuums it), so removing VACUUM without
-            # also changing what this loop measures would make
-            # os.path.getsize(...) never decrease, and the loop would
-            # never detect "under the cap now" -- it would delete
-            # everything instead of stopping early once enough is freed,
-            # a functional regression, not a fix.
-            #
-            # Real fix: estimate LIVE (used, non-freed) data size directly
-            # from SQLite's own page accounting -- (page_count -
-            # freelist_count) * page_size -- which drops immediately after
-            # a DELETE + COMMIT, with NO vacuum needed to observe it. This
-            # is exactly as accurate for "should we keep pruning" as the
-            # physical file size was (the file size only ever matters
-            # because it's a proxy for how much space this data actually
-            # occupies -- this measures that directly), and costs three
-            # cheap PRAGMA reads instead of a full file rewrite.
-            page_count = conn.execute("PRAGMA page_count").fetchone()[0]
-            freelist_count = conn.execute("PRAGMA freelist_count").fetchone()[0]
-            page_size = conn.execute("PRAGMA page_size").fetchone()[0]
-            return (page_count - freelist_count) * page_size
+        # DATA-12 (external review, 2026-10-05): the cap is measured
+        # against THIS environment's own stored payload (the UTF-8 BYTES of
+        # its raw_json -- CAST AS BLOB, since LENGTH() on TEXT counts
+        # characters), not the whole database file. Measuring the file
+        # meant every other environment's rows -- and the orphaned archive
+        # of any deleted environment (see list_orphaned_archives) --
+        # counted against this environment's cap, so a live environment
+        # lost its own non-curated history to make room for data nobody
+        # could even see. This IS a change of meaning for an install with a
+        # cap already configured: indexes, event_targets and row overhead
+        # are no longer counted, so the file can exceed the configured
+        # number -- the cap is a per-environment payload budget now, which
+        # is what "max N MB for this environment" means (noted in the
+        # 5.40.2 changelog and in the sync-settings dialog). Computed once,
+        # then decremented by the bytes each step removes, so a long walk
+        # back is not O(rows) per iteration.
+        live_bytes = conn.execute(
+            "SELECT COALESCE(SUM(LENGTH(CAST(raw_json AS BLOB))), 0) FROM events WHERE environment_id = ?", (environment_id,)
+        ).fetchone()[0]
 
         # Walk the cutoff back further, oldest non-curated first, until under the cap
         # or nothing non-curated is left to prune.
         for _ in range(3650):  # hard safety cap -- never loop forever
-            if _live_data_bytes() <= max_bytes:
-                break
-            remaining = conn.execute(
-                "SELECT COUNT(*) FROM events WHERE environment_id = ? AND is_curated = 0",
-                (environment_id,),
-            ).fetchone()[0]
-            if remaining == 0:
+            if live_bytes <= max_bytes:
                 break
             oldest = conn.execute(
                 "SELECT MIN(published) FROM events WHERE environment_id = ? AND is_curated = 0",
                 (environment_id,),
             ).fetchone()[0]
             if not oldest:
-                break
+                break  # nothing non-curated left -- curated rows are never sacrificed to a size cap
             step_cutoff = (
                 datetime.fromisoformat(oldest.replace("Z", "+00:00")) + timedelta(days=step_days)
             ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
             with _db_lock:
-                # DATA-01, same reasoning as the retention_days branch above.
-                _delete_pruned_targets(conn, environment_id, "AND is_curated = 0 AND published < ?", (step_cutoff,))
-                cur = conn.execute(
-                    "DELETE FROM events WHERE environment_id = ? AND is_curated = 0 AND published < ?",
-                    (environment_id, step_cutoff),
-                )
-                pruned_total += cur.rowcount
-                conn.commit()
+                try:
+                    step_bytes = conn.execute(
+                        "SELECT COALESCE(SUM(LENGTH(CAST(raw_json AS BLOB))), 0) FROM events "
+                        "WHERE environment_id = ? AND is_curated = 0 AND published < ?",
+                        (environment_id, step_cutoff),
+                    ).fetchone()[0]
+                    # DATA-01, same reasoning as the retention_days branch above.
+                    _delete_pruned_targets(conn, environment_id, "AND is_curated = 0 AND published < ?", (step_cutoff,))
+                    cur = conn.execute(
+                        "DELETE FROM events WHERE environment_id = ? AND is_curated = 0 AND published < ?",
+                        (environment_id, step_cutoff),
+                    )
+                    pruned_total += cur.rowcount
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+            live_bytes -= step_bytes
             pruned_any_by_size = True
 
         # Reclaim the actual disk space exactly ONCE, after every delete
-        # this call is going to do -- not per-iteration.
+        # this call is going to do -- not per-iteration. Under the lock
+        # (DATA-11): VACUUM rewrites the file and blocks every writer for
+        # its duration, so no writer should be mid-transaction when it runs.
         if pruned_any_by_size:
-            conn.execute("VACUUM")
+            with _db_lock:
+                conn.execute("VACUUM")
 
     return {"pruned": pruned_total, "cutoff": cutoff}
+
+
+def list_orphaned_archives():
+    """DATA-12: environment_ids that still have archive rows (events,
+    sync_state or ingestion_manifests) but no app_environments row any
+    more -- the data a deleted environment leaves behind, which no route
+    could address, prune, export or purge before. Returns one dict per
+    orphan with what an admin needs to decide: event_count, bytes (raw
+    payload), oldest/newest published, manifest_count. Cost: the
+    DISTINCT over events is an index scan of the whole table plus one
+    aggregate per orphan -- fine for an admin-only, on-demand call, not
+    something to poll."""
+    conn = _get_connection()
+    ids = {
+        r[0] for r in conn.execute(
+            """SELECT DISTINCT environment_id FROM events
+               UNION SELECT environment_id FROM sync_state
+               UNION SELECT environment_id FROM ingestion_manifests"""
+        )
+    } - {r[0] for r in conn.execute("SELECT environment_id FROM app_environments")}
+    out = []
+    for environment_id in sorted(ids):
+        stats = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(raw_json AS BLOB))), 0), MIN(published), MAX(published) "
+            "FROM events WHERE environment_id = ?",
+            (environment_id,),
+        ).fetchone()
+        manifests = conn.execute(
+            "SELECT COUNT(*) FROM ingestion_manifests WHERE environment_id = ?", (environment_id,)
+        ).fetchone()[0]
+        out.append({
+            "environment_id": environment_id, "event_count": stats[0], "bytes": stats[1],
+            "oldest_published": stats[2], "newest_published": stats[3], "manifest_count": manifests,
+        })
+    return out
+
+
+def purge_environment_archive(environment_id):
+    """DATA-12: removes every archive row for an environment that no
+    longer exists -- events, event_targets, sync_state and
+    ingestion_manifests -- in one transaction. Refuses (ValueError) while
+    an app_environments row still references the id: a live environment's
+    evidence is deleted through delete_environment(purge_archive=True),
+    never by addressing the archive directly. Returns the per-table
+    counts so the caller can audit-log exactly what was destroyed."""
+    conn = _get_connection()
+    with _db_lock:
+        try:
+            conn.execute("BEGIN IMMEDIATE")  # the existence check and the deletes are one unit
+            if conn.execute("SELECT 1 FROM app_environments WHERE environment_id = ?", (environment_id,)).fetchone():
+                raise ValueError("That environment still exists; delete the environment itself to purge its archive.")
+            counts = {}
+            for table in ("event_targets", "events", "sync_state", "ingestion_manifests"):
+                counts[table] = conn.execute(f"DELETE FROM {table} WHERE environment_id = ?", (environment_id,)).rowcount
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return counts
 
 
 def _normalize_until(until):
@@ -1368,6 +1916,42 @@ def _normalize_until(until):
     if until and len(until) == 10:  # "YYYY-MM-DD" exactly, no time component
         return until + "T23:59:59.999Z"
     return until
+
+
+_BARE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def normalize_window(since, until):
+    """DATA-13 (external review, 2026-10-05): the `from`/`to` query
+    parameters used to be compared against `published` as raw strings,
+    so "2026-09-29T10:00" (no seconds), a value with a +02:00 offset, or
+    plain garbage gave a subtly wrong window with no error. Each bound is
+    now parsed and re-emitted in the archive's canonical UTC form: a bare
+    date (what the date pickers send) means that whole UTC day -- start
+    of day for `since`, end of day for `until` (the _normalize_until
+    rule); any other ISO-8601 value is converted to UTC; anything else
+    raises ValueError (-> HTTP 400 via the shared handler). None passes
+    through. Applied inside query_events/count_events so every caller --
+    reports, resource history, the picker counts -- gets the same rule."""
+    def _one(value, end_of_day):
+        if value is None or value == "":
+            return None
+        text = str(value).strip()
+        if _BARE_DATE_RE.match(text):
+            try:
+                datetime.strptime(text, "%Y-%m-%d")
+            except ValueError:
+                raise ValueError(f"invalid date {value!r}: expected YYYY-MM-DD")
+            return text + ("T23:59:59.999Z" if end_of_day else "T00:00:00.000Z")
+        canonical = _canonical_published(text)
+        if canonical is None:
+            raise ValueError(f"invalid timestamp {value!r}: expected YYYY-MM-DD or an ISO-8601 date-time")
+        return canonical
+
+    since_norm, until_norm = _one(since, False), _one(until, True)
+    if since_norm and until_norm and since_norm > until_norm:
+        raise ValueError("the 'from' bound is after the 'to' bound")
+    return since_norm, until_norm
 
 
 def _require_positive_limit(limit):
@@ -1408,7 +1992,7 @@ def query_events(environment_id, event_types=None, since=None, until=None, actor
     service-account event, see create_secret_folders.py) pass False."""
     _require_positive_limit(limit)
     conn = _get_connection()
-    until = _normalize_until(until)
+    since, until = normalize_window(since, until)
     clauses = ["environment_id = ?"]
     params = [environment_id]
     if event_types:
@@ -1451,7 +2035,7 @@ def count_events(environment_id, event_types=None, since=None, until=None):
     picker's per-card event counts, where fetching every row's full
     payload just to discard it would be wasteful."""
     conn = _get_connection()
-    until = _normalize_until(until)
+    since, until = normalize_window(since, until)
     clauses = ["environment_id = ?"]
     params = [environment_id]
     if event_types:

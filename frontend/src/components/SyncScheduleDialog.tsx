@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { useQueryClient } from '@tanstack/react-query'
 import { CalendarClock, Cloud, FileText, Play, X } from 'lucide-react'
-import { importSyncCsv, saveSyncSchedule } from '../api/client'
+import { importSyncCsv, resetSyncWatermark, saveSyncSchedule } from '../api/client'
 import { useCsvFiles } from '../api/hooks'
 import { useSyncJob } from '../hooks/useSyncJob'
 import { toast } from '../hooks/useToast'
@@ -76,6 +76,23 @@ export function SyncScheduleDialog({ env }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, env.sync_schedule])
 
+  // UI-09 / ENG2-04 (external review, 2026-10-05): validate here with the
+  // same rules the server enforces (create_secret_folders.py's
+  // validate_sync_schedule_config), so a typo is caught before the request
+  // and the message names the field. The inputs' min="1" below and this
+  // check both exist because the placeholders say "Forever"/"No limit":
+  // a user typing 0 means "no limit", and 0 used to be sent as-is, which
+  // made the next sync's prune delete every non-curated event.
+  const validationError = (): string | null => {
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(runTime)) return 'Run time must be a 24-hour HH:MM time (UTC).'
+    for (const [label, raw] of [['Retention (days)', retentionDays], ['Max size (MB)', retentionMaxSizeMb]] as const) {
+      if (!raw.trim()) continue
+      const n = Number(raw)
+      if (!Number.isInteger(n) || n < 1) return `${label} must be a whole number of at least 1, or empty for no limit.`
+    }
+    return null
+  }
+
   const buildConfig = (): SyncSchedule => ({
     enabled,
     run_time: runTime,
@@ -84,20 +101,31 @@ export function SyncScheduleDialog({ env }: Props) {
     retention_max_size_mb: retentionMaxSizeMb.trim() ? Number(retentionMaxSizeMb) : null,
   })
 
-  const doSave = async (config: SyncSchedule) => {
+  /** Returns true only if the schedule was actually saved -- the first-run
+   * flow must never start a 90-day backfill or a CSV import on the back of
+   * a save that failed (it used to: the error was swallowed here and the
+   * caller carried on). */
+  const doSave = async (config: SyncSchedule): Promise<boolean> => {
     setSaving(true)
     try {
       await saveSyncSchedule(env.name, config)
       queryClient.invalidateQueries({ queryKey: ['environments'] })
       toast({ title: config.enabled ? 'Daily sync enabled' : 'Daily sync disabled', variant: 'success' })
+      return true
     } catch (err) {
       toast({ title: 'Could not save sync settings', description: err instanceof Error ? err.message : String(err), variant: 'error' })
+      return false
     } finally {
       setSaving(false)
     }
   }
 
   const handleSaveClick = () => {
+    const problem = validationError()
+    if (problem) {
+      toast({ title: 'Check the sync settings', description: problem, variant: 'error' })
+      return
+    }
     const config = buildConfig()
     // Only prompt for a first-run choice when actually turning sync ON
     // for the first time ever (no prior sync_state at all) -- toggling
@@ -106,12 +134,12 @@ export function SyncScheduleDialog({ env }: Props) {
       setFirstRunPrompt(true)
       return
     }
-    doSave(config)
+    void doSave(config)
   }
 
   const handleFirstRunContinue = async () => {
     const config = buildConfig()
-    await doSave(config)
+    if (!(await doSave(config))) return // keep the prompt open; nothing else may start on a failed save
     setFirstRunPrompt(false)
     if (firstRunChoice === 'backfill') {
       job.start(config.ingestion_scope)
@@ -119,7 +147,13 @@ export function SyncScheduleDialog({ env }: Props) {
       setSaving(true)
       try {
         const result = await importSyncCsv(env.name, csvFile, config.ingestion_scope)
-        toast({ title: `Imported ${result.inserted} event(s) from CSV`, variant: 'success' })
+        toast({
+          title: `Imported ${result.inserted} event(s) from CSV`,
+          description: result.skipped_unparseable
+            ? `${result.skipped_unparseable} row(s) had a timestamp that could not be read and were not imported.`
+            : undefined,
+          variant: result.skipped_unparseable ? 'error' : 'success',
+        })
         job.refreshStatus()
       } catch (err) {
         toast({ title: 'CSV import failed', description: err instanceof Error ? err.message : String(err), variant: 'error' })
@@ -204,27 +238,57 @@ export function SyncScheduleDialog({ env }: Props) {
                   <div className="field">
                     <label className="section-label block mb-1">Retention (days)</label>
                     <input
-                      type="number" min="0" placeholder="Forever" className="text-input w-full"
+                      type="number" min="1" step="1" placeholder="Forever" className="text-input w-full"
                       value={retentionDays} onChange={e => setRetentionDays(e.target.value)}
                     />
                   </div>
                   <div className="field">
                     <label className="section-label block mb-1">Max size (MB)</label>
                     <input
-                      type="number" min="0" placeholder="No limit" className="text-input w-full"
+                      type="number" min="1" step="1" placeholder="No limit" className="text-input w-full"
                       value={retentionMaxSizeMb} onChange={e => setRetentionMaxSizeMb(e.target.value)}
                     />
                   </div>
                 </div>
                 <p className="text-[0.6875rem] text-text-faint">
-                  Curated events are never pruned regardless of retention or ingestion scope.
+                  Curated events are never pruned regardless of retention or ingestion scope. Leave a limit empty for
+                  no limit — 0 is not accepted. The size cap counts this environment's own archived event payload.
                 </p>
+
+                {job.statusError && (
+                  <div className="card p-2.5 text-xs text-loss">Could not load the sync status: {job.statusError}</div>
+                )}
 
                 {state && (
                   <div className="card p-2.5 text-xs text-text-dim flex flex-col gap-1">
-                    <div>Last synced: {state.last_synced_at ? new Date(state.last_synced_at).toLocaleString() : 'never'}</div>
+                    <div>Last successful sync: {state.last_sync_completed_at ? new Date(state.last_sync_completed_at).toLocaleString() : 'never'}</div>
+                    <div>Events covered up to: {state.last_synced_at ? new Date(state.last_synced_at).toLocaleString() : '—'}</div>
+                    {state.last_import_at && <div>Last CSV import: {new Date(state.last_import_at).toLocaleString()}</div>}
                     <div>Total events archived: {state.total_events_ingested}</div>
                     {state.last_sync_status === 'error' && <div className="text-loss">Last error: {state.last_sync_error}</div>}
+                    {/* DATA-03 remedy: an unusable watermark (a poisoned pre-5.40.2
+                        CSV import, a clock jump) has exactly one supported way out. */}
+                    {state.last_sync_status === 'error' && state.last_sync_error?.includes('watermark') && (
+                      <button
+                        type="button"
+                        className="btn-secondary self-start"
+                        disabled={saving || isRunning}
+                        onClick={async () => {
+                          setSaving(true)
+                          try {
+                            await resetSyncWatermark(env.name)
+                            toast({ title: 'Sync watermark reset', description: 'The next sync will backfill the full 90-day window.', variant: 'success' })
+                            job.refreshStatus()
+                          } catch (err) {
+                            toast({ title: 'Could not reset the watermark', description: err instanceof Error ? err.message : String(err), variant: 'error' })
+                          } finally {
+                            setSaving(false)
+                          }
+                        }}
+                      >
+                        Reset watermark
+                      </button>
+                    )}
                   </div>
                 )}
 
@@ -277,7 +341,16 @@ export function SyncScheduleDialog({ env }: Props) {
                 <Dialog.Close asChild>
                   <button type="button" className="btn-secondary">Cancel</button>
                 </Dialog.Close>
-                <button type="button" className="btn-primary" disabled={saving} onClick={handleSaveClick}>
+                {/* Save waits for the sync status to have loaded: the first-run
+                    prompt keys off is_first_sync, and saving before that answer
+                    exists would skip the prompt for a brand-new environment. */}
+                <button
+                  type="button"
+                  className="btn-primary"
+                  disabled={saving || !job.statusLoaded}
+                  title={!job.statusLoaded ? 'Loading sync status…' : undefined}
+                  onClick={handleSaveClick}
+                >
                   Save
                 </button>
               </div>

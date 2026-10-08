@@ -10,9 +10,16 @@ interface SyncJobState {
   phase: SyncJobPhase
   status: SyncStatusResponse | null
   error: string | null
+  /** True once a status fetch has settled (succeeded OR failed) -- lets a
+   * caller tell "still loading" from "loaded nothing" (UI-09: the sync
+   * settings dialog waits for this before enabling Save). */
+  statusLoaded: boolean
+  /** The last status fetch's error, if it failed -- shown instead of
+   * silently keeping a stale/empty status. */
+  statusError: string | null
 }
 
-const INITIAL_STATE: SyncJobState = { phase: 'idle', status: null, error: null }
+const INITIAL_STATE: SyncJobState = { phase: 'idle', status: null, error: null, statusLoaded: false, statusError: null }
 
 /** Drives one environment's compliance-sync background job: POST
  * /sync/start, poll /sync/status every second until done/error. Mirrors
@@ -54,13 +61,15 @@ export function useSyncJob(environmentName: string | undefined) {
 
   const refreshStatus = useCallback(() => {
     if (!environmentName) return
-    fetchSyncStatus(environmentName).then(status => setState(s => ({ ...s, status })))
+    fetchSyncStatus(environmentName)
+      .then(status => setState(s => ({ ...s, status, statusLoaded: true, statusError: null })))
+      .catch(err => setState(s => ({ ...s, statusLoaded: true, statusError: err instanceof Error ? err.message : String(err) })))
   }, [environmentName])
 
   const start = useCallback((ingestionScope?: IngestionScope) => {
     if (!environmentName) return
     stopPolling()
-    setState({ phase: 'starting', status: null, error: null })
+    setState(s => ({ ...s, phase: 'starting', status: null, error: null }))
     startSync(environmentName, ingestionScope)
       .then(() => {
         setState(s => ({ ...s, phase: 'running' }))

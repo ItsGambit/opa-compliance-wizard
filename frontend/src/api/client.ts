@@ -143,11 +143,18 @@ export function importSyncCsv(
   name: string,
   csvPath: string,
   ingestionScope: IngestionScope
-): Promise<{ inserted: number; scanned: number }> {
+): Promise<{ inserted: number; scanned: number; skipped_unparseable?: number; chain_head?: string }> {
   return apiFetch(`/api/environments/${encodeURIComponent(name)}/sync/import_csv`, {
     method: 'POST',
     body: JSON.stringify({ csv_path: csvPath, ingestion_scope: ingestionScope }),
   })
+}
+
+/** DATA-03 remedy (5.40.2): clears the live-sync watermark so the next sync
+ * backfills the full 90-day window. Only offered when the server reports an
+ * unusable watermark. */
+export function resetSyncWatermark(name: string): Promise<{ name: string; previous_watermark: string | null }> {
+  return apiFetch(`/api/environments/${encodeURIComponent(name)}/sync/reset_watermark`, { method: 'POST' })
 }
 
 export function fetchResourceGroups(): Promise<{ resource_groups: ResourceGroup[] }> {

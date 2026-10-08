@@ -184,13 +184,17 @@ def test_verify_ingestion_chain_valid_on_an_untampered_chain(tmp_audit_store):
     audit_store.sync_okta_events(FakeOktaClient([([_event("evt-2", since)], True)]), ENV_A, "all", since=since)
 
     result = audit_store.verify_ingestion_chain(ENV_A)
-    assert result == {"valid": True, "manifest_count": 2, "broken_at": None}
+    # 5.40.2 (DATA-04) added reason/head_hash/legacy_manifests/deep/... to
+    # the result; the three original keys keep their exact meaning.
+    assert {k: result[k] for k in ("valid", "manifest_count", "broken_at")} == {"valid": True, "manifest_count": 2, "broken_at": None}
+    assert result["head_hash"] is not None
 
 
 def test_verify_ingestion_chain_valid_and_empty_with_no_manifests(tmp_audit_store):
     audit_store.run_migrations()
     result = audit_store.verify_ingestion_chain(ENV_A)
-    assert result == {"valid": True, "manifest_count": 0, "broken_at": None}
+    assert {k: result[k] for k in ("valid", "manifest_count", "broken_at")} == {"valid": True, "manifest_count": 0, "broken_at": None}
+    assert result["head_hash"] is None
 
 
 def test_verify_ingestion_chain_detects_a_tampered_hash(tmp_audit_store):
@@ -270,7 +274,8 @@ def test_http_integrity_route_returns_valid_chain(live_server, tmp_environments_
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body == {"valid": True, "manifest_count": 1, "broken_at": None}
+    assert {k: body[k] for k in ("valid", "manifest_count", "broken_at")} == {"valid": True, "manifest_count": 1, "broken_at": None}
+    assert body["deep"] is False
 
 
 def test_http_integrity_route_404s_for_unknown_environment(live_server):

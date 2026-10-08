@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.40.1
+# Version     : 5.40.2
 # =============================================================================
 
 import argparse
@@ -80,7 +80,7 @@ import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.40.1"
+SCRIPT_VERSION = "5.40.2"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -1112,12 +1112,27 @@ def set_environment_shared(name, owner, shared, is_admin=False, environment_id=N
     with audit_store._db_lock:
         conn.execute("UPDATE app_environments SET shared = ? WHERE environment_id = ?", (int(bool(shared)), target_id))
         conn.commit()
+    return target_id  # ENG1-06: lets the caller drop other owners' live sessions on an unshare
 
 
-def delete_environment(name, owner=LOCAL_OWNER_KEY, is_admin=False, environment_id=None):
+def delete_environment(name, owner=LOCAL_OWNER_KEY, is_admin=False, environment_id=None, purge_archive=False):
     """Removes an environment's metadata and both keychain secrets. Returns
-    True if it was the active environment for THIS caller (caller should
-    clear any live client for this owner). Raises KeyError if the name
+    {"was_active": bool, "environment_id": str, "archive": counts|None}:
+    was_active is True if it was the active environment for THIS caller
+    (caller should clear any live client for this owner); environment_id
+    is the real id that was deleted, so the caller can also drop every
+    OTHER owner's live session on it (ENG1-06 -- a shared environment's
+    cached OpaClient kept working for everyone who had activated it);
+    archive is the per-table purge count when purge_archive=True, else
+    None. purge_archive deletes the environment's compliance archive
+    (events, targets, sync state, manifests -- DATA-12, external review
+    2026-10-05); the default keeps the archive as an orphan an admin can
+    later export or purge via audit_store.list_orphaned_archives /
+    purge_environment_archive, since keeping evidence is the safer default
+    and deleting it must be an explicit, audit-logged choice. The purge
+    runs after the environment row and secrets are gone; if it fails the
+    environment stays deleted and the archive stays as an orphan (nothing
+    is half-deleted), and the error propagates. Raises KeyError if the name
     doesn't exist (for this owner, unless `is_admin` with a real
     cross-owner id), PermissionError if it exists but is owned by someone
     else and `is_admin` is False. See _resolve_admin_target's docstring
@@ -1151,7 +1166,8 @@ def delete_environment(name, owner=LOCAL_OWNER_KEY, is_admin=False, environment_
         conn.commit()
     for field in ENVIRONMENT_SECRET_FIELDS:
         keyring_delete(target_id, field)
-    return was_active
+    archive_counts = audit_store.purge_environment_archive(target_id) if purge_archive else None
+    return {"was_active": was_active, "environment_id": target_id, "archive": archive_counts}
 
 
 def get_environment_credentials(name, owner=LOCAL_OWNER_KEY):
@@ -1174,18 +1190,20 @@ def get_environment_credentials(name, owner=LOCAL_OWNER_KEY):
     return creds
 
 
-def verify_environment_evidence_chain(name, owner=LOCAL_OWNER_KEY):
+def verify_environment_evidence_chain(name, owner=LOCAL_OWNER_KEY, deep=False):
     """Phase 6: resolves `name` to its real environment_id (same
     visibility rule as get_environment_credentials -- a shared
     environment resolves correctly for a non-owner caller) and walks its
     ingestion-manifest hash chain via audit_store.verify_ingestion_chain.
-    Raises KeyError if `name` doesn't exist or isn't visible to `owner`."""
+    deep=True also re-reads and re-hashes every sealed curated event
+    (DATA-04) -- slower, proportional to the archive. Raises KeyError if
+    `name` doesn't exist or isn't visible to `owner`."""
     import audit_store
     visible = list_environments_for(owner)
     meta = visible.get(name)
     if meta is None:
         raise KeyError(f"No saved environment named '{name}'")
-    return audit_store.verify_ingestion_chain(meta["environment_id"])
+    return audit_store.verify_ingestion_chain(meta["environment_id"], deep=deep)
 
 
 def get_active_environment_credentials(owner=LOCAL_OWNER_KEY):
@@ -3141,7 +3159,62 @@ def get_sync_schedule(name, owner=LOCAL_OWNER_KEY):
     if meta is None:
         raise KeyError(f"No saved environment named '{name}'")
     stored = meta.get("sync_schedule", {})
-    return {**SYNC_SCHEDULE_DEFAULTS, **stored}
+    merged = {**SYNC_SCHEDULE_DEFAULTS, **stored}
+    # ENG2-04: a retention value saved before validation existed (0, a
+    # negative number, a string) used to reach prune_events, where 0
+    # means "cutoff = now" -- every non-curated event deleted on each
+    # sync. Read tolerantly as "no limit" and say so; the write path
+    # rejects such values outright now.
+    for field in ("retention_days", "retention_max_size_mb"):
+        value = merged.get(field)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or value < 1):
+            log("WARN", f"sync schedule for '{name}' has an invalid stored {field}={value!r}; treating it as no limit")
+            merged[field] = None
+    return merged
+
+
+_RUN_TIME_PATTERN = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def validate_sync_schedule_config(config):
+    """ENG2-04 / UI-09 (external review, 2026-10-05): only
+    `ingestion_scope` used to be checked. A `run_time` like "25:00" made
+    an enabled schedule never fire with nothing reporting it; a
+    `retention_days` of 0 or a negative number made the next sync's prune
+    delete EVERY non-curated event (a cutoff at or after "now"), which
+    Okta's 90-day retention makes unrecoverable; `enabled: "false"`
+    truthed to True; and arbitrary request keys rode through `**config`
+    into the audit event. Returns a dict holding ONLY the known keys that
+    were supplied, each validated; raises ValueError (-> HTTP 400) with a
+    message naming the field. Validation is on write only -- stored rows
+    with odd values are still read tolerantly by the scheduler."""
+    if not isinstance(config, dict):
+        raise ValueError("sync schedule must be a JSON object")
+    unknown = set(config) - set(SYNC_SCHEDULE_DEFAULTS)
+    if unknown:
+        raise ValueError(f"unknown sync schedule field(s): {', '.join(sorted(unknown))}")
+    clean = {}
+    if "enabled" in config:
+        if not isinstance(config["enabled"], bool):
+            raise ValueError("enabled must be true or false")
+        clean["enabled"] = config["enabled"]
+    if "run_time" in config:
+        run_time = config["run_time"]
+        if not isinstance(run_time, str) or not _RUN_TIME_PATTERN.match(run_time):
+            raise ValueError('run_time must be "HH:MM" (24-hour, UTC)')
+        clean["run_time"] = run_time
+    if "ingestion_scope" in config:
+        if config["ingestion_scope"] not in ("curated", "all"):
+            raise ValueError('ingestion_scope must be "curated" or "all"')
+        clean["ingestion_scope"] = config["ingestion_scope"]
+    for field in ("retention_days", "retention_max_size_mb"):
+        if field in config:
+            value = config[field]
+            # bool is an int subclass -- True would silently mean "1 day".
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+                raise ValueError(f"{field} must be a whole number of at least 1, or null for no limit")
+            clean[field] = value
+    return clean
 
 
 def set_sync_schedule(name, config, owner=LOCAL_OWNER_KEY):
@@ -3151,8 +3224,7 @@ def set_sync_schedule(name, config, owner=LOCAL_OWNER_KEY):
     settings object, not part of the credential form. Raises KeyError if `name`
     isn't a saved environment owned by `owner`, ValueError if
     ingestion_scope isn't a real choice."""
-    if config.get("ingestion_scope", "curated") not in ("curated", "all"):
-        raise ValueError('ingestion_scope must be "curated" or "all"')
+    config = validate_sync_schedule_config(config)
     import audit_store
     conn = audit_store._get_connection()
     target_id, meta = _find_own_environment_sql(conn, owner, name)
