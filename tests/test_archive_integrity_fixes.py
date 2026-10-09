@@ -542,7 +542,9 @@ def test_a_sync_committing_mid_check_is_not_reported_as_tampering(schema, monkey
     result = audit_store.verify_ingestion_chain(ENV)
     assert Interleaving.fired
     assert result["valid"] is True and result["manifest_count"] == 1  # the snapshot predates the concurrent sync
-    monkeypatch.undo()
+    # Restore only the connection getter: monkeypatch.undo() would also undo
+    # tmp_audit_store's own redirect and open the real audit_store.db (LNCH-07).
+    monkeypatch.setattr(audit_store, "_get_connection", real_get)
     assert audit_store.verify_ingestion_chain(ENV)["manifest_count"] == 2
 
 
@@ -775,6 +777,7 @@ def test_database_files_are_created_owner_only(tmp_audit_store, tmp_environments
             assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
 
 
+@pytest.mark.real_audit_db_path
 def test_audit_db_path_honours_the_environment_override(monkeypatch, tmp_path):
     monkeypatch.setenv("OPA_AUDIT_DB_PATH", str(tmp_path / "elsewhere.db"))
     assert audit_store._audit_db_path() == str(tmp_path / "elsewhere.db")

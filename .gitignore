@@ -44,6 +44,15 @@ folders_result_*.csv
 # listed here too so a root-level `git status` never shows them as untracked)
 frontend/node_modules/
 frontend/dist/
+frontend/dist.new/
+frontend/dist.old/
+
+# server/deploy.sh's own local state on a server: optional settings, the
+# one-deploy-at-a-time lock, and the nginx rollback copy (holds the proxy
+# secret while a deploy runs)
+.deploy.conf
+.deploy.lock
+.nginx-deploy-backup
 
 # Internal design/planning docs -- stay local-only, never pushed to the
 # public GitHub remote even though code/deploy docs in docs/ do get

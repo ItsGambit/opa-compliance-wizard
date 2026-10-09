@@ -81,8 +81,8 @@ OPA via **Group Push** — never via OPA's own local-group endpoint.
 
 | Requirement | Minimum version | Why |
 |---|---|---|
-| Python | 3.9+ | `keyring` (encrypted credential storage) requires it |
-| Node.js | 20.19+ or 22.12+ | Vite 8 (the frontend build tool) requires it |
+| Python | 3.9+ | `keyring` (encrypted credential storage) requires it; CI tests 3.9, 3.12 and 3.14 |
+| Node.js | 20.19+ or 22.12+ | Vite 8 (the frontend build tool) requires it. Running the frontend *tests* (contributors only) needs 22.22.2+ or 24.15+ (jsdom) |
 | npm | bundled with Node | frontend dependency install/build |
 | pip | bundled with Python | installs `keyring` |
 
@@ -92,14 +92,29 @@ offers to install/upgrade it for you via whatever package manager your
 OS already has (`winget` on Windows, `brew` on macOS, `apt`/`dnf`/`pacman`
 on Linux), asking for confirmation first. If none of those are available,
 it prints the exact manual install command and exits cleanly instead of
-failing partway through a build.
+failing partway through a build. If your package manager's Node.js is
+still too old after installing, it says so and points you to nodejs.org.
+Python packages go into a project virtual environment (`.venv`). The
+frontend is rebuilt only when its sources changed; if a build fails and
+there is no earlier build, the launcher stops instead of opening a page
+that can't load. If a dashboard server from this folder is still running
+on the port, it asks before stopping it (and never touches any other
+process).
 
 ## Quickstart (desktop dashboard)
 
+You can skip this: the launcher below offers to do it. By hand:
+
 ```bash
-pip install -r requirements.txt
-cd frontend && npm install
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # Windows: .venv\Scripts\pip
+cd frontend && npm ci
 ```
+
+(`npm ci`, not `npm install`: it installs exactly the versions in
+`package-lock.json` and never rewrites it. The virtual environment keeps
+the packages out of your system Python, which on current Debian/Ubuntu
+and Homebrew refuses a plain `pip install`; `launch.py` uses `.venv`
+automatically when it exists.)
 
 Then run it — cross-platform, no credentials needed to launch:
 

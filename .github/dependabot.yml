@@ -19,3 +19,10 @@ updates:
     directory: "/frontend"
     schedule:
       interval: "weekly"
+
+  # OPS-16: the workflow's actions are pinned to commit SHAs; this keeps
+  # those pins (and their version comments) current.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

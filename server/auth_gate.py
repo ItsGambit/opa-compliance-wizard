@@ -163,6 +163,11 @@ engine.backfill_mfa_log_events -> this process's /internal/mfa_log_lookup
 transient API error) is NOT an error; see _mfa_log_lookup's docstring.
 """
 
+# OPS-07: keeps the PEP 604 annotations (`list[str] | None`) from being
+# evaluated at import time, so the gate imports on Python 3.9 -- the
+# minimum the README and launch.py document. CI runs the suite on 3.9.
+from __future__ import annotations
+
 import argparse
 import base64
 import contextvars

@@ -64,6 +64,55 @@ workload that doesn't need it — the honest tradeoff isn't "SQLite vs.
 a faster database," it's "one file vs. a whole extra service," and for
 this tool's single-server-process design, the file wins.
 
+**First install: what the server needs** (Debian/Ubuntu commands; adapt
+for your distro). The hosted services can't start without these, and an
+improvised fix on the login path tends to be an insecure one, so do them
+before the numbered steps below:
+- Packages: `sudo apt-get install nginx python3-venv gnome-keyring
+  dbus-user-session rsync git curl` and a Node.js the build accepts
+  (`^20.19.0 || >=22.12.0`; a distro's own `nodejs` is often older -- use
+  nodejs.org or NodeSource).
+- The code, as the app user (no sudo): `git clone
+  https://github.com/ItsGambit/opa-compliance-wizard.git ~/opa-compliance-wizard`,
+  then in it `python3 -m venv .venv && .venv/bin/pip install -r
+  requirements.txt` and `cd frontend && npm ci --ignore-scripts && npx
+  vite build`.
+- The app user's systemd "user manager" must keep running without a login
+  session, because the keyring daemon lives in `/run/user/<uid>`: `sudo
+  loginctl enable-linger <app-user>`. The units name that directory as
+  `/run/user/1000`; if `id -u <app-user>` isn't `1000`, change it in both
+  units.
+- The environment file holds secrets (`KEYRING_UNLOCK_PASSWORD`,
+  `NGINX_PROXY_SECRET`, `INTERNAL_API_SHARED_SECRET`): create it owner-only
+  before writing anything into it, `sudo install -m 600 -o <app-user> -g
+  <app-user's group> /dev/null /etc/opa-compliance-wizard.env`, then edit it
+  as the app user. `KEYRING_UNLOCK_PASSWORD` is the password
+  `server/start-headless.sh` unlocks (or, the first time, creates) the
+  app user's login keyring with; the backend refuses to start without it.
+- A TLS certificate for the nginx site (the template expects
+  `/etc/nginx/ssl/opa-secrets-wizard.crt` and `.key`; any path works, as
+  long as the site names it). For a test install on an IP address, a
+  self-signed one: `sudo install -d -m 700 /etc/nginx/ssl && sudo openssl
+  req -x509 -newkey rsa:2048 -nodes -days 825 -subj "/CN=<ip or host>"
+  -addext "subjectAltName=IP:<ip>" -keyout /etc/nginx/ssl/opa-secrets-wizard.key
+  -out /etc/nginx/ssl/opa-secrets-wizard.crt` (use `DNS:<host>` for a
+  name).
+- The nginx site, readable only by root and the app user's group (it will
+  hold `NGINX_PROXY_SECRET`; nginx's master process reads its config as
+  root, so `www-data` needs no access, and `deploy.sh` reads it through the
+  group to carry the secret forward): `sudo install -m 0640 -o root -g
+  <app-user's group> server/nginx-opa-secrets-wizard.conf
+  /etc/nginx/sites-available/opa-secrets-wizard`, then `sudoedit` it to
+  set your `server_name` (both blocks), certificate paths and the proxy
+  secret, and `sudo ln -s /etc/nginx/sites-available/opa-secrets-wizard
+  /etc/nginx/sites-enabled/ && sudo nginx -t && sudo systemctl reload
+  nginx`. `deploy.sh` keeps those values (it carries them from the live
+  site into every new version of the template) and keeps the file's owner
+  and mode.
+- The shell scripts are executable in git (5.41.0); on a checkout where
+  they aren't (e.g. one edited from Windows), `chmod +x server/*.sh
+  start-wizard.sh`.
+
 **Setup, at a high level** (see `server/*.service`, `server/start-headless.sh`,
 and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
 1. Register a **Web Application** OIDC integration in your Okta org
@@ -86,8 +135,9 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    stored under the old `opa-secrets-wizard:{env_name}` prefix as-is —
    they're still read via a fallback and need no migration.
 4. Set these environment variables for `server/auth_gate.py` (e.g. in the
-   systemd unit's `EnvironmentFile`) -- the process refuses to start
-   without all three, rather than silently pointing at the wrong org:
+   systemd unit's `EnvironmentFile`, created owner-only as above) -- the
+   process refuses to start without the first four, rather than silently
+   pointing at the wrong org:
    - `OKTA_ORG_URL` — e.g. `https://your-org.oktapreview.com`
    - `OKTA_OIDC_CLIENT_ID` — the Client ID from step 1 (not secret, but
      still specific to your deployment)
@@ -95,6 +145,10 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
      at, e.g. `https://192.168.1.10` or `https://opa.example.com`
    - `OKTA_ADMIN_GROUP_ID` — see "Admin access" below.
    - `OKTA_ENV_NAME` (optional, defaults to `"default"`)
+   - `KEYRING_UNLOCK_PASSWORD` — required by `server/start-headless.sh`
+     (the backend's start script): it unlocks the app user's login keyring,
+     where the Okta client secret and the tenants' API credentials live.
+     Pick a long random value; it is only ever read from this file.
    - `INTERNAL_API_SHARED_SECRET` (optional) — a random string, set
      identically in the SAME `EnvironmentFile` used by both
      `server/serve.py` and `server/auth_gate.py` (they already share one,
@@ -156,7 +210,10 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    sudo systemctl daemon-reload
    ```
    Run these from the repo root so `$(pwd)` resolves to the real
-   `$APP_DIR`. `server/setup-second-gate.sh` copies the LIVE unit at
+   `$APP_DIR`. `sudo tee` creates the unit files owned by root, which is
+   what they must stay: systemd runs them as root, so a unit file the app
+   user can edit is a way to root at the next reload or boot (`deploy.sh`
+   warns, with the fix, when it finds one). `server/setup-second-gate.sh` copies the LIVE unit at
    `/etc/systemd/system/opa-auth-gate.service` to build an additional
    gate's unit (see `server/unit_second_gate.py`), not this repo
    template, so it's unaffected by these placeholders either way.
@@ -172,8 +229,9 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    `restart` sequence yourself — `deploy.sh` only ever restarts the
    units that are ALREADY installed; it has no way to know their
    on-disk definition changed. Check `diff server/*.service
-   /etc/systemd/system/` after any deploy that touches these files, same
-   spirit as `deploy.sh`'s own nginx-drift warning. Also confirm your
+   /etc/systemd/system/` after any deploy whose CHANGELOG entry says a
+   unit file changed.
+   Also confirm your
    server's live `EnvironmentFile=` path actually matches what's in
    `/etc/systemd/system/*.service` right now (`systemctl cat
    opa-secrets-wizard | grep EnvironmentFile`) before copying a new unit
@@ -206,10 +264,17 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    unit (`opa-auth-gate-<name>`).
 7. **One-time sudoers setup, only if you'll use `server/deploy.sh` to
    redeploy later** (recommended — it's the repeatable path; see that
-   file's own header comment). This grants the deploying user just the
-   few commands that script needs, nothing broader — it's deliberately a
-   one-time, human-reviewed step done directly on the server, not
-   something `deploy.sh` ever does to itself. (Why not have the script do
+   file's own header comment). This grants the deploying user exactly the
+   commands that script runs — a one-time, human-reviewed step done
+   directly on the server, not something `deploy.sh` ever does to itself.
+   **Be aware what that amounts to (OPS-05):** the `cp` grant installs a
+   file the deploy user can write as nginx's config, and nginx's master
+   process (root) parses it, so an account holding this rule can get root
+   with some nginx knowledge. Treat the deploy account as an
+   administrator: keep its SSH key protected, and don't use it for
+   anything else. Separating the deploy identity from the service identity
+   is the real fix; it is a planned change, not something this step
+   provides. (Why not have the script do
    this automatically? Because it pulls and runs code from GitHub on
    every invocation — letting it also edit sudoers would mean any future
    commit could silently grant itself more privilege than this exact
@@ -222,9 +287,10 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    is the wrong thing to call "completed." That restart is now
    unconditional and fatal — skip this sudoers setup and a deploy with
    any code change at all will fail outright at that step, not just
-   warn. (nginx config drift, the other thing this grants, still only
-   warns-and-prints-the-manual-command if its own narrower sudoers gap
-   is hit — only the auth-gate restart was escalated.)
+   warn. The nginx apply is just as strict (a denied, invalid or
+   unreloadable config stops the deploy and rolls back), and since 5.41.0
+   `deploy.sh` checks every grant with `sudo -n -l` **before** it changes
+   anything, listing what's missing.
 
    Step 7a. Find the exact paths to `systemctl`, `nginx`, and `cp` on
    *your* server — sudoers rules match an exact binary path, not just a
@@ -260,6 +326,10 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    deleting it never needs sudo at all — back over the live path;
    sudoers matches each exact argument list separately, so a rule for
    only one of these two leaves the other silently denied.
+
+   If you set `OPA_NGINX_SITE` (see "Redeploying" below) because your
+   distro keeps sites elsewhere, the two `cp` lines name that path
+   instead.
 
    **Two `systemctl restart` lines for the backend, not one** (OPS-01,
    external review, 2026-10-05): `deploy.sh`/`setup-second-gate.sh`
@@ -298,6 +368,59 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    include all six, re-open the file from step 7c and check for a typo
    — most commonly the username, or a binary path that doesn't match
    step 7a's `which` output exactly.
+
+**Redeploying: `server/deploy.sh`.** Run it on the server as the app user:
+`<install dir>/server/deploy.sh`. It works out the install directory from
+its own location (5.41.0; nothing to edit), takes a lock so two deploys
+can't overlap, checks the sudo grants and that it can read the live nginx
+site, and only then clones, syncs, rebuilds, restarts and applies the
+nginx site (with `nginx -t` and rollback). The grant check requires each
+command to be allowed; where sudo can show it (classic sudo 1.9.15+), also
+without a password -- sudo-rs, Ubuntu's default since 25.10, can't, and a
+rule that prompts then stops the deploy at the step that uses it. The live
+site is checked against the new template's layout
+before anything changes. Each restarted service must
+stay up: the backend must answer `/api/version` with the new version from
+a new process, each gate must answer its `/verify` with `401`, and none
+may be restarted by systemd on its own afterwards (checked again a few
+seconds after the last restart). Every run that gets
+past the clone writes one `deploy.started` and one `deploy.completed` or
+`deploy.failed` (with the stage that failed) to the Audit Log.
+Optional settings, from the environment or from `<install dir>/.deploy.conf`
+(`KEY=VALUE` lines; read, never executed; kept across deploys):
+- `OPA_REPO_URL` — deploy from your fork instead of upstream.
+- `OPA_DEPLOY_REF` (or `--ref <x>`) — a branch, tag or full commit to
+  deploy instead of the default branch's tip. `--ref <previous commit>`
+  is also the quickest way back after a bad deploy, to 5.41.0 or later: an
+  older release's `deploy.sh` only works in its own hardcoded directory, so
+  it is refused anywhere else.
+- `OPA_BACKEND_PORT` — if `serve.py` doesn't listen on 8766.
+- `OPA_NGINX_SITE` — the live site file, if not
+  `/etc/nginx/sites-available/opa-secrets-wizard`.
+- Create `.deploy.conf` only after your first deploy of 5.41.0 or later:
+  that first run still syncs with the previous release's exclude list,
+  which doesn't keep the file. For that one run, pass settings as
+  environment variables instead.
+- `OPA_DEPLOY_BACKUP_DIR` — take an online copy of the archive and the
+  audit log (owner-only) into this directory, outside the install, before
+  the services restart. Nothing there is ever deleted by `deploy.sh`;
+  prune old copies yourself.
+
+What it may print, and why:
+- *"The unit file ... changed on disk. Run 'systemctl daemon-reload'"* after
+  a restart, with a NOTE that this is pending for every unit: some other
+  tool (snapd refreshing a snap, a package install) enabled or disabled a
+  unit without reloading systemd, which marks every unit until the next
+  `daemon-reload`. Harmless for the deploy; `sudo systemctl daemon-reload`
+  clears it. If instead the WARNING names an OPA unit, that unit's file
+  changed since systemd loaded it and the restart used the old definition:
+  run `sudo systemctl daemon-reload` and deploy again.
+- A WARNING that the nginx site is readable by every local account, or
+  that it or a unit file can be changed by a non-root account, with the
+  one-time `chown`/`chmod` that fixes it; and one about
+  `sites-available/opa-secrets-wizard.deploy-backup`, a rollback copy left
+  by `deploy.sh` before 5.36.0 (it holds an old copy of the proxy secret;
+  remove it).
 
 **Backing up and restoring the archive.** `audit_store.db` is the only
 copy of evidence older than Okta's 90-day System Log retention, and it

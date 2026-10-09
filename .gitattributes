@@ -5,3 +5,6 @@
 
 *.sh text eol=lf
 *.py text eol=lf
+
+# cmd.exe mis-parses goto labels in LF-only batch files; keep Windows scripts CRLF.
+*.bat text eol=crlf

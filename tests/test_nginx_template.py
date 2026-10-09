@@ -308,4 +308,5 @@ def test_port_80_redirect_ignores_the_client_host_header(served):
 
     server_name = re.search(r"server_name\s+([^;\s]+);", TEMPLATE.read_text()).group(1)
     assert resp.status == 301
-    assert resp.getheader("Location") == f"https://{server_name}/x?y=1"
+    # nginx keeps $server_name lowercased (the template holds a placeholder name)
+    assert resp.getheader("Location") == f"https://{server_name.lower()}/x?y=1"

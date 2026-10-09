@@ -9,6 +9,7 @@ disposable per-test substitutes.
 """
 import os
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -98,15 +99,43 @@ def tmp_audit_store(tmp_path, monkeypatch):
     # Each test gets a fresh thread-local connection cache, since the real
     # one is keyed by threading.local() and would otherwise carry a stale
     # connection (to a PRIOR test's temp db) into this test if the same
-    # worker thread ran both.
-    audit_store._thread_local = __import__("threading").local()
+    # worker thread ran both. LNCH-07: set through monkeypatch so the
+    # original cache comes back at teardown, and this test's connection is
+    # closed -- a later test that forgets the fixture then reaches the real
+    # path function (and its own guard) instead of silently reusing this
+    # test's temp database.
+    local = threading.local()
+    monkeypatch.setattr(audit_store, "_thread_local", local)
 
     env_path = tmp_path / "environments.json"
     monkeypatch.setattr(engine, "_environments_file_path", lambda: str(env_path))
     banner_path = tmp_path / "banner_config.json"
     monkeypatch.setattr(engine, "_banner_config_path", lambda: str(banner_path))
 
-    return path
+    yield path
+    conn = getattr(local, "conn", None)
+    if conn is not None:
+        conn.close()
+        local.conn = None
+
+
+@pytest.fixture(autouse=True)
+def never_open_the_real_audit_store(request, monkeypatch):
+    """LNCH-07: a test that reaches audit_store without tmp_audit_store
+    fails loudly instead of opening the developer's real audit_store.db (or
+    a previous test's cached temp one). tmp_audit_store overrides this; a
+    test of the path function itself opts out with
+    @pytest.mark.real_audit_db_path (it never opens the database)."""
+    import audit_store
+
+    if request.node.get_closest_marker("real_audit_db_path"):
+        return
+
+    def _refuse():
+        raise RuntimeError("this test opened audit_store.db without the tmp_audit_store fixture")
+
+    monkeypatch.setattr(audit_store, "_audit_db_path", _refuse)
+    monkeypatch.setattr(audit_store, "_thread_local", threading.local())
 
 
 @pytest.fixture(autouse=True)

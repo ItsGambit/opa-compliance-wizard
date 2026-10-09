@@ -1,21 +1,39 @@
-# Phase 7 of docs/fast-follow-redesign.md (local-only, not pushed --
-# see CONTRIBUTING.md for the manual command sequence this workflow
-# mirrors). Two independent jobs so a frontend failure never masks the
-# backend's own pass/fail signal (and vice versa) -- both run in
-# parallel on GitHub's runners regardless, so this costs nothing in
-# wall-clock time.
+# CI for every push and pull request -- the same checks CONTRIBUTING.md
+# lists for running locally. Independent jobs, so a failure in one never
+# masks another's result.
 name: CI
 
 on: [push, pull_request]
 
+# OPS-16: this workflow only reads the repository; the token it gets can't
+# write anything.
+permissions:
+  contents: read
+
+# A newer push to the same branch cancels the older run -- except on main,
+# where every commit keeps its own result.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Actions are pinned to a full commit SHA (a tag can be moved); Dependabot's
+# github-actions updates keep them current.
 jobs:
   backend:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9: the minimum README and launch.py document (OPS-07);
+        # 3.14: what current Ubuntu ships.
+        python-version: ["3.9", "3.12", "3.14"]
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          python-version: "3.12"
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
       - run: pip install -r requirements-dev.txt
       # tests/test_nginx_template.py runs the real nginx against the shipped
       # site template (nginx -t, then served on loopback ports) -- install it
@@ -46,13 +64,17 @@ jobs:
   shell:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      # Deploy and server setup scripts run as root-adjacent on the server: a syntax error or a
-      # ShellCheck error-level finding (e.g. an unquoted expansion that splits) must fail CI.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      # Deploy and server setup scripts run with sudo on the server: a syntax
+      # error or any ShellCheck warning (e.g. SC2086, an unquoted expansion
+      # that splits) fails CI. Behaviour is tested in tests/test_deploy_sh.py
+      # and tests/test_setup_second_gate_sh.py (backend job).
       - name: bash -n every shell script
-        run: for f in $(git ls-files '*.sh'); do bash -n "$f" || exit 1; done
-      - name: ShellCheck (errors)
-        run: shellcheck --severity=error $(git ls-files '*.sh')
+        run: git ls-files -z '*.sh' | xargs -0 -n1 bash -n
+      - name: ShellCheck (warnings and errors)
+        run: git ls-files -z '*.sh' | xargs -0 shellcheck --severity=warning
 
   frontend:
     runs-on: ubuntu-latest
@@ -60,18 +82,59 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: "24"
-      - run: npm ci
+      # --ignore-scripts, as server/deploy.sh does: no dependency gets to
+      # run an install script (OPS-06).
+      - run: npm ci --ignore-scripts
       # `tsc -b`, not `tsc --noEmit`: the root tsconfig.json is a solution
       # file with "files": [] and only references, so a plain `tsc --noEmit`
-      # type-checked ZERO files and always passed (OPS-04). Build mode
-      # checks both referenced projects (app + node), which carry noEmit
-      # themselves; its pre-existing errors were fixed in 5.40.3.
+      # type-checked ZERO files and always passed (OPS-04).
       - run: npx tsc -b
+      - run: npm run lint
       - run: npm test
-      # Matches server/deploy.sh's own exact build invocation (npx vite
-      # build directly) -- the type check above runs separately.
+      # Matches server/deploy.sh's own build invocation (npx vite build).
+      - run: npx vite build
+
+  # Known-vulnerable runtime dependencies (what ships to the browser). Its
+  # own job: a new upstream advisory turns this red without masking the
+  # frontend's own result.
+  npm-audit:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: "24"
+      - run: npm audit --omit=dev --audit-level=high
+
+  # The oldest Node versions package.json's engines field accepts can still
+  # build what deploy.sh builds (the test toolchain needs a newer Node; see
+  # README).
+  frontend-build-min-node:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["20.19.0", "22.12.0"]
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: npm ci --ignore-scripts
       - run: npx vite build

@@ -11,10 +11,10 @@ A local React app + Python backend (same stack as the
 Tailwind v4 + Radix UI + TanStack Query). **No credentials are needed
 to launch it** — see "Environments" below.
 
-**First-time setup:**
+**First-time setup** (optional -- the launcher offers to do it):
 ```bash
-pip install -r requirements.txt
-cd frontend && npm install
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+cd frontend && npm ci
 ```
 
 **Run it — cross-platform.** All build/launch logic lives in one place,

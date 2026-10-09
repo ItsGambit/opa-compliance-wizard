@@ -68,7 +68,7 @@ DEV_FRONTEND_ORIGIN = "http://localhost:5173"
 
 # When this app is reverse-proxied behind nginx on a real hostname/IP (see
 # server/nginx-opa-secrets-wizard.conf), the browser's Origin header is that
-# public origin (e.g. "https://192.168.15.139"), not 127.0.0.1/localhost --
+# public origin (e.g. "https://192.168.1.10"), not 127.0.0.1/localhost --
 # neither of which this app can know in advance, since it's set by whoever
 # deploys it. EXTRA_ALLOWED_ORIGINS (comma-separated, e.g. in the systemd
 # unit's EnvironmentFile) adds those without hardcoding a specific
@@ -821,7 +821,6 @@ def _scheduler_loop():
     `minutes_late` in its start event; an unexpected exception in this
     loop itself, previously only a print() that's easy to miss in
     systemd's journal, now also gets a real audit_log.jsonl entry)."""
-    import audit_store
     while not _scheduler_stop_event.is_set():
         # No HTTP request exists to correlate this tick with (see
         # engine.CORRELATION_ID's own docstring) -- a "sched-" prefixed
@@ -830,66 +829,73 @@ def _scheduler_loop():
         # for them, without implying a request that was never made.
         engine.CORRELATION_ID.set(f"sched-{uuid.uuid4().hex[:8]}")
         try:
-            now_utc = datetime.now(timezone.utc)
-            # list_all_environments(), NOT list_environments_for(LOCAL_OWNER_KEY):
-            # a per-user, non-shared environment (e.g. a logged-in Okta
-            # identity's own private copy of "prod") owns its own
-            # sync_schedule and Okta token just like a shared one does, and
-            # the scheduler must still find and run it -- list_environments_for
-            # deliberately hides another owner's non-shared environments from
-            # a single requesting identity, which is correct for a live HTTP
-            # request but was silently starving this background loop of any
-            # environment that wasn't LOCAL_OWNER_KEY's own or shared=True.
-            environments = engine.list_all_environments()
-            for environment_id, meta in environments.items():
-                env_name = meta.get("name")
-                owner = meta.get("owner")
-                try:
-                    schedule = engine.get_sync_schedule(env_name, owner=owner)
-                except KeyError:
-                    continue
-                if not schedule.get("enabled"):
-                    continue
-
-                run_time_str = schedule.get("run_time") or "02:00"
-                try:
-                    run_hour, run_minute = (int(x) for x in run_time_str.split(":"))
-                except (ValueError, AttributeError):
-                    run_hour, run_minute = 2, 0
-                if (now_utc.hour, now_utc.minute) < (run_hour, run_minute):
-                    continue  # not time yet today (UTC)
-
-                # audit_store's archive is keyed by environment_id (Phase 2
-                # SQLite migration) -- each environment_id has its own
-                # distinct sync_state row even when two different owners'
-                # environments share a display name.
-                state = audit_store.get_sync_state(environment_id)
-                last_completed = state.get("last_sync_completed_at") if state else None
-                if last_completed:
-                    last_completed_date = last_completed[:10]  # "YYYY-MM-DD" prefix of the ISO (UTC) timestamp
-                    if last_completed_date == now_utc.strftime("%Y-%m-%d"):
-                        continue  # already ran today (UTC)
-                # DATA-05: back off after a failed/unfinished attempt instead of
-                # retrying on every poll (see SCHEDULER_RETRY_BACKOFF_SECS).
-                last_attempt = state.get("last_sync_attempt_at") if state else None
-                if last_attempt and (state.get("last_sync_status") in ("error", "running")):
-                    try:
-                        attempt_dt = datetime.fromisoformat(last_attempt.replace("Z", "+00:00"))
-                        if now_utc - attempt_dt < timedelta(seconds=SCHEDULER_RETRY_BACKOFF_SECS):
-                            continue
-                    except ValueError:
-                        pass  # unparseable attempt timestamp -- don't let it block the retry
-
-                minutes_late = (now_utc.hour * 60 + now_utc.minute) - (run_hour * 60 + run_minute)
-                _start_sync_job(
-                    environment_id, env_name, schedule.get("ingestion_scope", "curated"), owner=owner, trigger="scheduled",
-                    minutes_late=minutes_late if minutes_late > SCHEDULER_LATE_THRESHOLD_MINUTES else None,
-                    correlation_id=engine.CORRELATION_ID.get(),
-                )
+            _scheduler_tick(datetime.now(timezone.utc))
         except Exception as exc:
             engine.log("ERROR", f"[scheduler] Unexpected error in scheduler loop: {exc}")
             engine.log_audit_event(None, None, "sync.scheduler_error", {"error": str(exc)})
         _scheduler_stop_event.wait(SCHEDULER_POLL_INTERVAL_SECS)
+
+
+def _scheduler_tick(now_utc):
+    """One poll of _scheduler_loop: starts every environment's due sync.
+    Split out (TEST-10) so the date math, catch-up and back-off rules are
+    tested with an injected clock."""
+    import audit_store
+    # list_all_environments(), NOT list_environments_for(LOCAL_OWNER_KEY):
+    # a per-user, non-shared environment (e.g. a logged-in Okta
+    # identity's own private copy of "prod") owns its own
+    # sync_schedule and Okta token just like a shared one does, and
+    # the scheduler must still find and run it -- list_environments_for
+    # deliberately hides another owner's non-shared environments from
+    # a single requesting identity, which is correct for a live HTTP
+    # request but was silently starving this background loop of any
+    # environment that wasn't LOCAL_OWNER_KEY's own or shared=True.
+    environments = engine.list_all_environments()
+    for environment_id, meta in environments.items():
+        env_name = meta.get("name")
+        owner = meta.get("owner")
+        try:
+            schedule = engine.get_sync_schedule(env_name, owner=owner)
+        except KeyError:
+            continue
+        if not schedule.get("enabled"):
+            continue
+
+        run_time_str = schedule.get("run_time") or "02:00"
+        try:
+            run_hour, run_minute = (int(x) for x in run_time_str.split(":"))
+        except (ValueError, AttributeError):
+            run_hour, run_minute = 2, 0
+        if (now_utc.hour, now_utc.minute) < (run_hour, run_minute):
+            continue  # not time yet today (UTC)
+
+        # audit_store's archive is keyed by environment_id (Phase 2
+        # SQLite migration) -- each environment_id has its own
+        # distinct sync_state row even when two different owners'
+        # environments share a display name.
+        state = audit_store.get_sync_state(environment_id)
+        last_completed = state.get("last_sync_completed_at") if state else None
+        if last_completed:
+            last_completed_date = last_completed[:10]  # "YYYY-MM-DD" prefix of the ISO (UTC) timestamp
+            if last_completed_date == now_utc.strftime("%Y-%m-%d"):
+                continue  # already ran today (UTC)
+        # DATA-05: back off after a failed/unfinished attempt instead of
+        # retrying on every poll (see SCHEDULER_RETRY_BACKOFF_SECS).
+        last_attempt = state.get("last_sync_attempt_at") if state else None
+        if last_attempt and (state.get("last_sync_status") in ("error", "running")):
+            try:
+                attempt_dt = datetime.fromisoformat(last_attempt.replace("Z", "+00:00"))
+                if now_utc - attempt_dt < timedelta(seconds=SCHEDULER_RETRY_BACKOFF_SECS):
+                    continue
+            except ValueError:
+                pass  # unparseable attempt timestamp -- don't let it block the retry
+
+        minutes_late = (now_utc.hour * 60 + now_utc.minute) - (run_hour * 60 + run_minute)
+        _start_sync_job(
+            environment_id, env_name, schedule.get("ingestion_scope", "curated"), owner=owner, trigger="scheduled",
+            minutes_late=minutes_late if minutes_late > SCHEDULER_LATE_THRESHOLD_MINUTES else None,
+            correlation_id=engine.CORRELATION_ID.get(),
+        )
 
 
 class StrictBindHTTPServer(ThreadingHTTPServer):

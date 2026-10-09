@@ -16,9 +16,15 @@ before you invest time.
 ## Setting up locally
 
 ```bash
-pip install -r requirements.txt
-cd frontend && npm install
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+cd frontend && npm ci
 ```
+
+Python 3.9 is the oldest supported version and CI runs the suite on 3.9,
+3.12 and 3.14, so keep backend code 3.9-compatible (no `match`, no
+`X | Y` annotations evaluated at runtime without
+`from __future__ import annotations`). The frontend tests need Node
+22.22.2+ or 24.15+; the build alone works from 20.19.
 
 Run it with `python launch.py` from the repo root — see the main
 [README](README.md) for the full quickstart.
@@ -65,9 +71,21 @@ cd frontend && npx tsc -b
 # Frontend: run the test suite
 npm test
 
+# Frontend: lint
+npm run lint
+
 # Frontend: confirm it still builds
 npx vite build
+
+# Shell scripts (server/*.sh run with sudo on servers): syntax + ShellCheck
+git ls-files -z '*.sh' | xargs -0 -n1 bash -n
+git ls-files -z '*.sh' | xargs -0 shellcheck --severity=warning
 ```
+
+`server/deploy.sh` and `server/setup-second-gate.sh` have behaviour tests
+that run them for real against temp directories with stubbed system
+commands (`tests/test_deploy_sh.py`, `tests/test_setup_second_gate_sh.py`);
+extend them when you change either script.
 
 Beyond that: **manually exercise the feature you changed.** If you fixed
 a bug, reproduce it first, then confirm your fix actually resolves it —
@@ -89,9 +107,9 @@ they protect.
   of places where Okta/OPA's published docs turned out to be wrong or
   incomplete — see [docs/api-notes.md](docs/api-notes.md). If you find
   another one, add it there.
-- Match the existing file's formatting conventions (the frontend has no
-  enforced linter config beyond TypeScript's own strictness; the backend
-  has no enforced formatter) — consistency with surrounding code matters
+- Match the existing file's formatting conventions (the frontend's linter
+  is oxlint, `npm run lint`, run in CI; the backend has no enforced
+  formatter) — consistency with surrounding code matters
   more than any particular personal style preference.
 
 ## Versioning

@@ -2,6 +2,205 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.41.0 — **Deploy script, launcher and CI: the remaining twenty-three findings from the 2026-10-05 external review (OPS-02, OPS-05..11, OPS-13, OPS-14, OPS-16, OPS-17, LNCH-01..07, TEST-10..13), plus the nginx site template no longer carries one server's values.**
+Batch 6 of the review's remaining findings. A minor release, not a
+patch: `server/deploy.sh` gains settings (`--ref`, `.deploy.conf`, an
+opt-in archive backup) and the launcher gains a project virtual
+environment. Nothing in the app, its API, its reports or its data
+changed.
+- **Operator action and deploy impact.**
+  - **Before deploying, check the deploy sudoers rule.** `deploy.sh` now
+    checks every `sudo` command it will run (`sudo -n -l`) before it
+    changes anything, and stops with the list of missing grants. A rule
+    written for `deploy.sh` before 5.36.0 is missing the current rollback
+    grant, `cp <install dir>/.nginx-deploy-backup
+    /etc/nginx/sites-available/opa-secrets-wizard` (docs/hosting.md step
+    7c has the full rule). The first deploy of 5.41.0 still runs the
+    previous release's fetch-and-sync step, so on that one deploy the
+    check happens after the files are synced and before anything is
+    rebuilt or restarted.
+  - **The nginx site template is now a template.** Its `server_name`
+    lines say `REPLACE_WITH_SERVER_NAME` (they held the maintainer's
+    address, which `deploy.sh` then wrote over everyone else's). On every
+    deploy, `deploy.sh` carries the live site's own proxy secret,
+    `server_name` values and certificate paths into the new template
+    (`server/nginx_bake.py`), so a site that already follows the template
+    sees no change. It refuses before changing anything when the live
+    site has a different number of those directives than the template
+    (e.g. an extra server block added by certbot), or still has the
+    placeholder proxy secret.
+  - **File modes `deploy.sh` now reports (OPS-09).** It can't change them
+    without new sudo grants, so it prints the one-time fix on every run
+    until it's done: a live nginx site readable by every local account,
+    or owned or writable by anyone but root (`sudo chown root:<app user's
+    group> <site> && sudo chmod 0640 <site>`; `sudo cp` keeps that owner
+    and mode on every later deploy); a leftover
+    `sites-available/opa-secrets-wizard.deploy-backup` from a pre-5.36.0
+    deploy (it holds an old copy of the proxy secret: `sudo rm` it); a
+    systemd unit file the app user can write (`sudo chown root:root`,
+    `chmod 0644`).
+  - No systemd unit, environment variable or nginx directive changed:
+    no `daemon-reload` is needed, and the nginx site changes only if it
+    still predates 5.40.5's template.
+  - **Create `.deploy.conf` only after the first 5.41.0 deploy**: that run
+    still syncs with the previous release's exclude list, which deletes
+    it. Use environment variables for that one run.
+  - Rollback: `deploy.sh --ref <commit>` deploys any commit from 5.41.0
+    on. A release before 5.41.0 brings a `deploy.sh` that only works in
+    its own hardcoded install directory, so `--ref` to one is refused
+    anywhere else (on the maintainer's server it is allowed and logs
+    `deploy.started` twice for that run). Nothing new is stored.
+- **`server/deploy.sh`.**
+  - **Runs from wherever it's installed (OPS-02).** The install directory
+    is the script's own location; there is nothing to edit (an edited
+    path used to be overwritten by the script's own sync, and the rest of
+    the run used the maintainer's). Optional settings come from the
+    environment or `<install dir>/.deploy.conf` (read, never executed;
+    kept across deploys): `OPA_REPO_URL` (a fork), `OPA_DEPLOY_REF`,
+    `OPA_BACKEND_PORT`, `OPA_NGINX_SITE` (a site file outside
+    `sites-available`), `OPA_DEPLOY_BACKUP_DIR`.
+  - **Deploys a chosen version (OPS-06).** `--ref <branch | tag | full
+    commit>`; the deployed version and commit are printed and logged.
+    `npm ci --ignore-scripts`: no dependency runs an install script on
+    the server (the lockfile's only one is a macOS-only optional
+    package).
+  - **Checks before changing anything (OPS-11).** One deploy at a time
+    (`flock` on `.deploy.lock`); every sudo grant, and -- where sudo can
+    show it (classic sudo 1.9.15+ prints the matching rule for `sudo -l -l
+    <cmd>`) -- that it needs no password, since an account that is also in
+    `%sudo` would otherwise pass for a rule it doesn't have. sudo-rs
+    (Ubuntu's default since 25.10) and older sudo print only the command,
+    so there the check confirms the grant exists and says so;
+    that the live nginx site's layout carries over onto the new template;
+    that the live nginx
+    site is readable; that no nginx rollback copy is left from a run
+    whose rollback failed (that copy may be the last good config, so the
+    deploy stops instead of overwriting it). The temp copy it runs from
+    is started with `bash <file>`, so a `noexec` `/tmp` works.
+  - **Services must actually stay up (OPS-11).** The backend must answer
+    `/api/version` with the new version from a new process (so a
+    same-version hotfix whose restart didn't happen is caught) within
+    30 s; each login gate must answer `401` on `/verify`; and none of
+    them, nor the host status service, may have been restarted by
+    systemd on its own since (a crash one second after the restart used
+    to pass) -- checked again 5 s after the last restart.
+  - **The frontend is built beside the live one and swapped in.** A
+    failed build leaves the running UI untouched; the server never
+    serves a half-emptied `dist/`.
+  - **Exactly one result in the Audit Log (OPS-10).** Every run that gets
+    past the clone logs one `deploy.started` and one `deploy.completed`
+    or `deploy.failed` with the stage (`preflight`, `rsync`,
+    `pip_install`, `frontend_build`, `db_backup`, `restart_gate`,
+    `post_restart_check`, `nginx_validate_failed`, ...). Several failure paths
+    used to leave only `deploy.started`. "Done" is printed at the very
+    end, after the nginx step.
+  - **Secret-bearing files owner-only from the first byte (OPS-09).** The
+    baked copy of the site in the install directory is `0600` (it was
+    left `0664`), and the rollback copy is created `0600` rather than
+    copied and then narrowed.
+  - **Opt-in archive backup.** With `OPA_DEPLOY_BACKUP_DIR` set, an
+    online copy of `audit_store.db` (SQLite's backup API, checked with
+    `integrity_check`, at the path the service actually uses) and of
+    `audit_log.jsonl` is taken before the services restart, after a free
+    space check. Nothing there is ever deleted by `deploy.sh`.
+  - **The "unit file changed on disk, run daemon-reload" warning
+    explained.** It is not caused by `deploy.sh` (the unit files are
+    outside the directory it syncs). systemd marks EVERY unit that way
+    after any enable/disable that wasn't followed by a reload -- e.g.
+    snapd mounting a refreshed snap -- until the next `daemon-reload`.
+    `deploy.sh` now tells that case (harmless) apart from an OPA unit
+    whose own file changed (the restart then uses the old definition --
+    a warning with what to do).
+  - GNU `grep -P` is no longer required.
+- **`server/setup-second-gate.sh`.**
+  - **The Cloudflare tunnel token stays off sudo's log (OPS-13).** It is
+    handed to `cloudflared service install` by file path inside a root
+    shell (sudo records the command line it runs); the staged file is
+    shredded whether or not the install works, and a failure shows
+    cloudflared's output with the token masked. The script's header now
+    says what cloudflared itself does with the token (it writes it into
+    its own unit file and process arguments).
+  - **A generated site that breaks `nginx -t` is never left enabled
+    (OPS-14).** The script finds out whether the new site is the cause
+    (by testing without it); if so it is removed (a copy kept in the run's
+    backup folder) and nothing is reloaded; if nginx is broken for another
+    reason, it says so. A re-run checks an existing site the same way.
+    Temp files holding secrets are removed on every exit, failing steps
+    show their output, the informational checks can't stop the script,
+    an origin already in `EXTRA_ALLOWED_ORIGINS` is matched as a whole
+    entry (`opa.example.com` used to match `xopa.example.com`), and the
+    generated sudoers line uses this host's `systemctl` path and the app
+    user's real primary group.
+- **Launcher (`launch.py`, `start-wizard.sh`, the `.bat`).**
+  - **Never stops a process that isn't this folder's server (LNCH-01).**
+    It used to SIGKILL every process whose command line contained
+    "serve.py" (another project's server, an editor). Now only the process
+    LISTENING on the port, only if it runs this checkout's
+    `server/serve.py`, only after asking, and with SIGTERM first.
+  - **Installs that work (LNCH-02).** Python packages go into a project
+    virtual environment (`.venv`), which the launcher then uses
+    (`pip install` into a system Python is refused on current
+    Debian/Ubuntu/Homebrew, and the failure used to be silent); a
+    package-manager Node that's still too old is named as such instead of
+    "close and re-run" forever; Arch uses `pacman -S --needed` (no
+    partial upgrade); a missing Node no longer blocks a launch that has a
+    build to serve.
+  - **Build failures are not hidden (LNCH-03).** The frontend is rebuilt
+    only when its sources changed; a failed build offers `npm ci` and
+    retries; with no earlier build the launcher stops; with a stale one it
+    asks. `npm ci` replaces `npm install` (never rewrites the lockfile).
+    The launcher exits with the server's status.
+  - **Clean shutdown (LNCH-04).** On Mac/Linux the launcher becomes the
+    server process, so Ctrl+C, SIGTERM and SIGHUP reach it directly and it
+    can't be orphaned; on Windows the server gets 10 s after Ctrl+C before
+    it is terminated.
+  - Runs from the checkout's folder whatever the current directory
+    (LNCH-06). The wrappers check for Python 3.9+ before handing over and
+    say what to install (LNCH-05); `start-wizard.sh` said 3.8.
+- **Python 3.9 really works (OPS-07).** `server/auth_gate.py` crashed at
+  import on 3.9 (`list[str] | None` annotations); fixed, and CI now runs
+  the whole suite on 3.9, 3.12 and 3.14.
+- **CI and dependencies (OPS-16, OPS-17).** Read-only token, actions
+  pinned to commit SHAs (Dependabot now updates them), ShellCheck at
+  warning level, `npm run lint`, `npm audit` of runtime dependencies,
+  newer pushes cancel older runs off `main`, and the frontend build is
+  checked on the oldest Node versions `package.json`'s new `engines`
+  field accepts (20.19.0, 22.12.0). The README now says the frontend
+  tests need Node 22.22.2+/24.15+, and the quickstart uses a virtual
+  environment and `npm ci`. `source-map-js` (a build-time dependency)
+  goes to 1.2.2 for GHSA-68fv-2mgg-jv7q. `server/start-headless.sh` and
+  `start-wizard.sh` are executable in git (OPS-08). `.bat` files are
+  checked out with CRLF line endings.
+- **Hosting guide (OPS-05, OPS-08, OPS-10).** A first-install checklist
+  (packages, `loginctl enable-linger`, the environment file created
+  `0600` before any secret goes in, `KEYRING_UNLOCK_PASSWORD`, a
+  certificate, the site installed `root:<group> 0640`); the sudoers step
+  now says plainly that the deploy grant is root-equivalent for that
+  account; a "Redeploying" section covering the settings and every new
+  message; the stale "nginx drift only warns" text is gone.
+- **Tests (TEST-10..13, LNCH-07).** `tests/test_deploy_sh.py` runs the
+  real `deploy.sh` end to end against a temp install with stubbed system
+  commands (66 cases: relocation, settings, refs, preflight, lock, the
+  handoff from the previous release's script, every failure stage, nginx
+  carry-over, rollback and file modes, the daemon-reload note, the
+  backup); `tests/test_setup_second_gate_sh.py`,
+  `tests/test_nginx_bake.py`, `tests/test_launch.py`; the scheduler's
+  date math and back-off with an injected clock (`_scheduler_tick`,
+  split out of the loop); table and seeded property tests for the
+  dotenv, Link-header, folder-name and CSV round-trip parsers and the
+  CSV formula guard; a second admin can't save the first admin's
+  prepared change over HTTP (TEST-12); the Windows half of the
+  `allow_reuse_address` rule is pinned (TEST-13). `tmp_audit_store` now
+  closes and restores its connection, and a test that reaches
+  `audit_store` without it fails instead of opening the real database
+  (LNCH-07) -- which found one test whose `monkeypatch.undo()` would
+  have. An adversarial review of this release found ten more issues
+  (rollback to a pre-5.41 ref outside the maintainer's path, `.deploy.conf`
+  lost on the first upgrade, password-requiring sudo rules passing the
+  pre-check, the launcher not recognising its own venv, late crashes,
+  the nginx layout check running after the restarts, Windows Ctrl+C after
+  the venv relaunch, and smaller ones); all are fixed and tested.
+
 5.40.7 — **Frontend: twenty-four findings from the 2026-10-05 external review (UI-04/05/07/10..22, FE-04/05/07/09/11..13/15), plus an admin screen for archives left behind by deleted environments.**
 Batch 5 of the review's remaining findings. No report content or export
 format changed: every compliance report and export shows and writes the

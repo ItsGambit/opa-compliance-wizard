@@ -276,3 +276,25 @@ def test_replaying_the_same_action_id_a_second_time_is_rejected(live_server):
     )
     assert second.status_code == 409
     assert second.json()["reason"] == "already_consumed"
+
+
+def test_a_second_admin_cannot_save_an_action_the_first_admin_prepared(live_server):
+    """TEST-12: the HTTP layer binds a save to the admin who prepared it --
+    serve.py passes the REQUEST's X-Auth-Sub to the consume, not the row's.
+    Admin B replaying admin A's action_id (e.g. a leaked step-up cookie)
+    gets 403 actor_mismatch and nothing is written; A can still use it."""
+    reviewed = {"admin_group_id": "00gReviewed", "user_group_id": None, "restrict_login": True}
+    before = requests.get(f"{live_server}/api/access_control", headers=_admin_headers(), timeout=5).json()
+    action_id = requests.post(
+        f"{live_server}/api/access_control/prepare", json=reviewed, headers=_admin_headers(), timeout=5,
+    ).json()["action_id"]
+
+    other_admin = dict(_admin_headers(action_id), **{"X-Auth-Sub": "00uOTHERADMIN"})
+    resp = requests.post(f"{live_server}/api/access_control/save", json={}, headers=other_admin, timeout=5)
+    assert resp.status_code == 403
+    assert resp.json()["reason"] == "actor_mismatch"
+    assert requests.get(f"{live_server}/api/access_control", headers=_admin_headers(), timeout=5).json() == before
+
+    own = requests.post(f"{live_server}/api/access_control/save", json={}, headers=_admin_headers(action_id), timeout=5)
+    assert own.status_code == 200
+    assert requests.get(f"{live_server}/api/access_control", headers=_admin_headers(), timeout=5).json() == reviewed
