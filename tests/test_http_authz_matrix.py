@@ -890,3 +890,56 @@ def test_job_errors_drop_decode_errors_that_quote_input(matrix_server):
     except json.JSONDecodeError as exc:
         assert serve._job_error_message(exc).startswith("Internal error (reference ")
     assert serve._job_error_message(ValueError("watermark is in the future")) == "watermark is in the future"
+
+
+# ---------------------------------------------------------------------------
+# GATE-06 / GATE-08 (review batch 3, v5.40.5)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("headers", [{}, {"X-Nginx-Proxy-Secret": "wrong"}, {"X-Auth-Sub": ADMIN}])
+def test_hosted_anonymous_healthz_answers_status_only(matrix_server, monkeypatch, headers):
+    """nginx serves /healthz without auth and without the proxy secret, so in
+    hosted mode anyone who can reach the HTTPS port gets this answer: no
+    version, no per-check detail."""
+    base_url, serve = matrix_server
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    resp = requests.get(base_url + "/healthz", headers=headers, timeout=10)
+    assert resp.status_code == 200
+    assert set(resp.json()) == {"status"} and resp.json()["status"] in ("ok", "degraded")
+    assert engine.SCRIPT_VERSION not in resp.text
+
+
+def test_hosted_healthz_with_the_proxy_secret_keeps_the_detail(matrix_server, monkeypatch):
+    base_url, serve = matrix_server
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    resp = requests.get(base_url + "/healthz", headers={"X-Nginx-Proxy-Secret": SECRET, "X-Auth-Sub": ADMIN},
+                        timeout=10)
+    assert resp.status_code == 200 and set(resp.json()) == {"status", "version", "checks"}
+
+
+def test_local_healthz_keeps_the_detail(matrix_server):
+    base_url, _serve = matrix_server
+    assert set(requests.get(base_url + "/healthz", timeout=10).json()) == {"status", "version", "checks"}
+
+
+@pytest.mark.parametrize("presented,expected", [
+    (SECRET, True), (SECRET + "x", False), (SECRET[:-1], False), ("", False), (None, False),
+    ("é" + SECRET, False),
+])
+def test_proxy_secret_compare(matrix_server, monkeypatch, presented, expected):
+    _base_url, serve = matrix_server
+    headers = {} if presented is None else {"X-Nginx-Proxy-Secret": presented}
+    assert serve._request_is_from_nginx(headers) is expected
+
+
+def test_proxy_secret_compare_is_constant_time(monkeypatch):
+    """GATE-08: the comparison goes through hmac.compare_digest."""
+    import hmac as _hmac
+
+    import server.serve as serve
+
+    calls = []
+    real = _hmac.compare_digest
+    monkeypatch.setattr(serve.hmac, "compare_digest", lambda a, b: calls.append((a, b)) or real(a, b))
+    monkeypatch.setattr(serve, "NGINX_PROXY_SECRET", "abc")
+    assert serve._request_is_from_nginx({"X-Nginx-Proxy-Secret": "abc"}) is True
+    assert calls == [(b"abc", b"abc")]

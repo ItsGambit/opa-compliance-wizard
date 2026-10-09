@@ -25,6 +25,18 @@ entirely (the server sends a correct 401 challenge; the browser just never
 shows it). OIDC's own hosted login page sidesteps that failure mode
 completely.
 
+**What the nginx template enforces (5.40.5+):** `nosniff`, `X-Frame-Options:
+DENY` / `frame-ancestors 'none'` and `Referrer-Policy: same-origin` on every
+response (declared once at server level -- a `location` that adds its own
+`add_header` stops inheriting them, so don't); `server_tokens off`; TLS 1.2+;
+an exact-match `/healthz` that drops client identity headers; and a
+per-address rate limit (30/min, burst 60, `429`) on `/step-up` and
+`/authorization-code/callback`, the routes that make the gate call Okta.
+HSTS is left commented out: browsers ignore it for an IP address, and on a
+hostname with a self-signed certificate it removes the option to click
+through the warning -- enable it once the site has a trusted certificate.
+`tests/test_nginx_template.py` runs the real nginx against the template.
+
 **Why hosting matters for Compliance Reports specifically:** the daily
 sync job that keeps the audit archive current (see
 [Compliance Reports Dashboard](features.md#compliance-reports-dashboard)) runs as a
@@ -172,6 +184,26 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    file without first merging that env file's real contents into
    whichever path the new template expects will start the service with
    none of its actual secrets set.
+
+   **Session-signing key (5.40.5+).** `auth_gate.py` signs its cookies with
+   the key at `OPA_SESSION_KEY_PATH` (default
+   `/etc/opa-secrets-wizard-session.key`). The gate refuses to start if
+   that file holds fewer than 32 bytes (an empty file -- e.g. from `touch`
+   -- used to be accepted, which made every cookie forgeable). Either let
+   the gate create it (its directory must be writable by the app user; it
+   is created `0600`), or create it yourself:
+   ```bash
+   sudo sh -c 'umask 027; head -c 32 /dev/urandom > /etc/opa-secrets-wizard-session.key'
+   sudo chown root:<app-user> /etc/opa-secrets-wizard-session.key
+   sudo chmod 0640 /etc/opa-secrets-wizard-session.key
+   ```
+   **Emergency sign-out of everyone:** sessions are signed cookies with no
+   server-side store, so replacing this key (same commands, then
+   `sudo systemctl restart opa-auth-gate`) is the way to end every session
+   at once -- e.g. after offboarding an admin, since a session keeps the
+   admin flag it was issued with until it expires (12 h). Each additional
+   gate has its own key (`/etc/opa-auth-gate-<name>/session.key`) and
+   unit (`opa-auth-gate-<name>`).
 7. **One-time sudoers setup, only if you'll use `server/deploy.sh` to
    redeploy later** (recommended — it's the repeatable path; see that
    file's own header comment). This grants the deploying user just the
@@ -321,7 +353,11 @@ creates the file owner-only (`0600`) wherever it lives.
 
 **Health check.** `GET /healthz` (unauthenticated by design, same
 `auth_request off` treatment as `/login`) returns `{"status": "ok"|
-"degraded", "version": ..., "checks": {...}}` — point an external uptime
+"degraded", "version": ..., "checks": {...}}` in local mode. In `hosted`
+mode (5.40.5+) anyone who can reach the HTTPS port can call it, so it
+answers only `{"status": ...}`: the version is on `GET /api/version`
+(loopback, `curl -s http://127.0.0.1:8766/api/version`) and a failed
+check's detail is a `WARN` line in the service's journal. Point an external uptime
 monitor or load balancer at `https://<your-host>/healthz` instead of `/`
 (which always 200s, even with zero environments configured or a broken
 archive, so it can't actually tell you anything is wrong). Checks are
@@ -530,8 +566,12 @@ mkdir -p ~/.opa-setup && chmod 700 ~/.opa-setup
 bash ~/opa-secrets-folders/server/setup-second-gate.sh \
   --name <name> --org-url https://<org or custom domain> --auth-server org \
   --client-id <Okta client id> --admin-group <Okta group id> --origin https://<hostname> \
-  [--port 8768] [--listen 127.0.0.1:8080] [--tunnel]
+  [--port 8768] [--listen 127.0.0.1:8080] [--allow-public-listen] [--tunnel]
 ```
+
+`--listen` must be a loopback address (`127.x.x.x`) unless
+`--allow-public-listen` is also given (5.40.5+): the generated site speaks
+plain HTTP and expects TLS to end in front of it.
 
 It asks for sudo and for the read-only Okta admin-check token (hidden),
 backs up first, and is safe to re-run. What it creates:
@@ -565,6 +605,15 @@ the dashboard's Access control page only ever edits the one, default file.
 
 `server/deploy.sh` restarts every enabled `opa-auth-gate-*` unit after the
 main gate, so deploys keep both gates on the same code.
+
+**The generated site is a snapshot.** It is built once from the live main
+site and `deploy.sh` never updates it, so changes to the main template
+(e.g. 5.40.5's security headers and sign-in rate limit) reach an additional
+gate's site only when you rebuild it: remove
+`/etc/nginx/sites-available/opa-<name>` and `/etc/nginx/sites-enabled/opa-<name>`
+and re-run the same `setup-second-gate.sh` command (every other step is
+skipped). Behind a tunnel every request reaches nginx from `127.0.0.1`, so
+the per-address sign-in rate limit is shared by everyone using that site.
 
 ## Host status for monitoring (optional, 5.39.0+)
 

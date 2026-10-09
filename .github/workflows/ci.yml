@@ -17,7 +17,13 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements-dev.txt
+      # tests/test_nginx_template.py runs the real nginx against the shipped
+      # site template (nginx -t, then served on loopback ports) -- install it
+      # if the runner image doesn't already have it, and fail rather than skip.
+      - run: command -v nginx || { sudo apt-get update -qq && sudo apt-get install -y -qq nginx; }
       - run: pytest
+        env:
+          OPA_REQUIRE_NGINX_TESTS: "1"
       # Scans every .py file in the repo, not just whatever a PR touched --
       # cheap in CI, catches a syntax error introduced by an unrelated
       # search-and-replace that a human reviewer wouldn't think to re-check.

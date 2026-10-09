@@ -7,13 +7,15 @@
 #   bash server/setup-second-gate.sh \
 #     --name second --org-url https://login.example.com --auth-server org \
 #     --client-id 0oa... --admin-group 00g... --origin https://opa.example.com \
-#     [--port 8768] [--listen 127.0.0.1:8080] [--env-name <keyring namespace>] [--tunnel]
+#     [--port 8768] [--listen 127.0.0.1:8080] [--allow-public-listen] [--env-name <keyring namespace>] [--tunnel]
 #
 #   --name         short id: unit opa-auth-gate-<name>, env file /etc/opa-compliance-wizard-<name>.env,
 #                  session-key folder /etc/opa-auth-gate-<name>, nginx site opa-<name>
 #   --auth-server  default | org | <custom authorization server id>   (OKTA_AUTH_SERVER)
 #   --listen       where the new nginx site listens (default 127.0.0.1:8080, loopback for a tunnel;
-#                  TLS is expected to end in front of it, so X-Forwarded-Proto is set to https)
+#                  TLS is expected to end in front of it, so X-Forwarded-Proto is set to https).
+#                  Must be 127.x.x.x unless --allow-public-listen is also given (5.40.5, GATE-15): the
+#                  site is plain HTTP and carries the proxy secret path.
 #   --tunnel       also install cloudflared and connect a Cloudflare Tunnel with the token staged in
 #                  ~/.opa-setup/tunnel-token (shredded after use)
 # Secrets never go on the command line: the Okta client secret is read from ~/.opa-setup/<name>-client-secret
@@ -22,7 +24,7 @@
 set -euo pipefail
 
 NAME="" ORG_URL="" AUTH_SERVER="default" CLIENT_ID="" ADMIN_GROUP="" ORIGIN="" PORT=8768
-LISTEN=127.0.0.1:8080 ENV_NAME="" TUNNEL=0
+LISTEN=127.0.0.1:8080 ENV_NAME="" TUNNEL=0 PUBLIC_LISTEN=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --name) NAME=$2; shift 2;;            --org-url) ORG_URL=$2; shift 2;;
@@ -30,6 +32,7 @@ while [ $# -gt 0 ]; do
     --admin-group) ADMIN_GROUP=$2; shift 2;; --origin) ORIGIN=$2; shift 2;;
     --port) PORT=$2; shift 2;;            --listen) LISTEN=$2; shift 2;;
     --env-name) ENV_NAME=$2; shift 2;;    --tunnel) TUNNEL=1; shift;;
+    --allow-public-listen) PUBLIC_LISTEN=1; shift;;
     *) echo "unknown option: $1" >&2; exit 2;;
   esac
 done
@@ -49,6 +52,10 @@ say "1. Checks"
 [[ "$AUTH_SERVER" =~ ^[A-Za-z0-9]{1,64}$ ]] || die "--auth-server: default, org or a server id"
 [[ "$PORT" =~ ^[0-9]{4,5}$ ]] && [ "$PORT" != 8766 ] && [ "$PORT" != 8767 ] || die "--port: free port, not 8766/8767"
 [[ "$LISTEN" =~ ^[0-9.]+:[0-9]{2,5}$ ]] || die "--listen: address:port"
+[ "$PUBLIC_LISTEN" = 1 ] || [[ "$LISTEN" =~ ^127(\.[0-9]{1,3}){3}: ]] \
+  || die "--listen: not a loopback address; add --allow-public-listen to publish this plain-HTTP site"
+PUBLIC_LISTEN_ARG=()
+[ "$PUBLIC_LISTEN" = 1 ] && PUBLIC_LISTEN_ARG=(--allow-public-listen)
 [[ "$ENV_NAME" =~ ^[A-Za-z0-9_-]{1,40}$ ]] || die "--env-name looks wrong"
 [ "$(id -u)" != 0 ] || die "run as the app user, not root (the script uses sudo itself)"
 APP_USER=$(id -un); APP_UID=$(id -u)
@@ -205,7 +212,8 @@ say "5. nginx site for $ORIGIN on $LISTEN"
 if [ ! -f "$NEW_SITE" ]; then
   # Built from the LIVE main site, so the proxy secret is copied, never typed: keep its HTTPS server block,
   # listen on $LISTEN, and send the sign-in routes to this gate.
-  sudo python3 "$APP/server/nginx_second_site.py" "$MAIN_SITE" "$NEW_SITE" "$PORT" "$LISTEN" "$HOST" "$NAME"
+  sudo python3 "$APP/server/nginx_second_site.py" "$MAIN_SITE" "$NEW_SITE" "$PORT" "$LISTEN" "$HOST" "$NAME" \
+    ${PUBLIC_LISTEN_ARG[@]+"${PUBLIC_LISTEN_ARG[@]}"}
   sudo chmod 640 "$NEW_SITE"; sudo chown root:www-data "$NEW_SITE" 2>/dev/null || true
   sudo ln -sf "$NEW_SITE" "/etc/nginx/sites-enabled/opa-$NAME"
   ok "created $NEW_SITE"

@@ -111,3 +111,41 @@ def test_collect_runs_here_and_has_no_secret_fields(monkeypatch):
     assert s["state"] in ("ok", "warn", "down")
     assert set(s) == {"checked_at", "host", "os", "kernel", "uptime_seconds", "load", "cpus", "memory",
                       "disk", "services", "updates", "app_version", "state"}
+
+
+# GATE-15 (5.40.5): a slow apt simulation no longer blocks concurrent callers.
+def test_concurrent_callers_do_not_queue_behind_the_apt_refresh(monkeypatch):
+    import time
+
+    started, release = threading.Event(), threading.Event()
+
+    def slow():
+        started.set()
+        release.wait(10)
+        return {"pending": 1, "security": 0, "checked_at": "t"}
+
+    monkeypatch.setattr(hs, "_run_apt_simulation", slow)
+    monkeypatch.setattr(hs, "_updates_cache", {"at": 0.0, "value": {"pending": 9, "security": 9, "checked_at": "old"}})
+    worker = threading.Thread(target=hs._updates)
+    worker.start()
+    assert started.wait(5)
+    t0 = time.time()
+    value = hs._updates()  # refresh in flight: answers at once with the previous result
+    assert time.time() - t0 < 1 and value["pending"] == 9
+    release.set()
+    worker.join(5)
+    assert hs._updates()["pending"] == 1
+
+
+def test_first_ever_call_while_refreshing_returns_nulls(monkeypatch):
+    monkeypatch.setattr(hs, "_updates_cache", {"at": 0.0, "value": None})
+    assert hs._updates_lock.acquire(blocking=False)
+    try:
+        value = hs._updates()
+    finally:
+        hs._updates_lock.release()
+    assert value["pending"] is None and value["security"] is None and "reboot_required" in value
+
+
+def test_handler_has_a_socket_timeout():
+    assert hs.Handler.timeout == 30

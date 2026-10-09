@@ -46,12 +46,16 @@ Runs standalone on 127.0.0.1:8767, fronted by nginx's auth_request module
                                              sub -- used to gate the one
                                              endpoint that saves Access
                                              Control changes.
-  - GET  /logout                         -> clears the local session cookie
+  - GET  /logout                         -> clears the gate's cookies
                                              AND redirects through Okta's own
                                              logout endpoint (otherwise the
                                              gate forgets you but Okta's own
                                              SSO session silently logs you
-                                             back in on the next /login)
+                                             back in on the next /login).
+                                             A cross-site GET gets a "Log
+                                             out?" page instead (GATE-12).
+  - POST /logout                         -> that page's form; same-origin
+                                             (Origin == DASHBOARD_ORIGIN) only
   - GET  /internal/mfa_log_lookup        -> LOOPBACK-ONLY (not proxied by
                                              nginx at all), gated by
                                              INTERNAL_API_SHARED_SECRET (see
@@ -66,7 +70,9 @@ Runs standalone on 127.0.0.1:8767, fronted by nginx's auth_request module
 Session cookie is a signed ("<expiry>.<hmac>") token, same scheme as this
 project's other short-lived signed tokens conceptually -- HMAC-SHA256 over a
 server-only secret in /etc/opa-secrets-wizard-session.key (root:<app-user>,
-0640, generated once on first run). The PKCE code_verifier + OAuth `state`
+0640 if pre-created; 0600 if this process creates it; at least 32 bytes or
+the gate refuses to start -- see _load_or_create_session_key and "Session-
+signing key" in docs/hosting.md). The PKCE code_verifier + OAuth `state`
 for an in-flight login are held in a short-lived signed cookie too (nothing
 server-side to garbage-collect), since this gate is a single Python process
 and doesn't need a shared session store. The step-up cookie (opa_wizard_
@@ -162,11 +168,13 @@ import base64
 import contextvars
 import hashlib
 import hmac
+import http.client
 import http.cookies
 import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -303,9 +311,20 @@ STEPUP_LOG_LOOKBACK_SECONDS = 120
 # Per gate instance (OPA_ACCESS_CONTROL_PATH, 5.38.3): an additional gate for another Okta org must not check
 # the main org's group IDs. Unset = access_control.json next to the app, as always.
 ACCESS_CONTROL_FILE_PATH = access_control_path(os.environ, Path(__file__).resolve().parent.parent / "access_control.json")
+# GATE-14 (external review, 2026-10-05): an operator who points a gate at its own access-control file (every
+# additional gate does -- setup-second-gate.sh writes it with restrict_login on) has said "this gate's rules live
+# HERE". A missing or never-parseable file then means "config lost", not "not configured yet", so the callback
+# refuses logins (AccessControlUnavailable) instead of silently opening them to every user assigned to the Okta
+# app. Unset (the main gate) keeps the documented first-boot bootstrap default below.
+ACCESS_CONTROL_PATH_EXPLICIT = bool(os.environ.get("OPA_ACCESS_CONTROL_PATH"))
+
+
+class AccessControlUnavailable(Exception):
+    """The explicitly configured access-control file is missing or has never parsed (GATE-14)."""
 
 
 _LAST_GOOD_ACCESS_CONTROL_CONFIG = None  # see _read_access_control_config
+_ACCESS_CONTROL_LOCK = threading.Lock()
 
 
 def _read_access_control_config() -> dict:
@@ -336,30 +355,67 @@ def _read_access_control_config() -> dict:
     login outright would be worse than a temporary bootstrap-default
     window that a restart or a fixed file resolves."""
     global _LAST_GOOD_ACCESS_CONTROL_CONFIG
-    try:
-        with open(ACCESS_CONTROL_FILE_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return {"admin_group_id": OKTA_ADMIN_GROUP_ID, "user_group_id": None, "restrict_login": False}
-    except ValueError:
-        if _LAST_GOOD_ACCESS_CONTROL_CONFIG is not None:
-            return dict(_LAST_GOOD_ACCESS_CONTROL_CONFIG)
-        return {"admin_group_id": OKTA_ADMIN_GROUP_ID, "user_group_id": None, "restrict_login": False}
-    config = {
-        "admin_group_id": data.get("admin_group_id") or None,
-        "user_group_id": data.get("user_group_id") or None,
-        "restrict_login": bool(data.get("restrict_login", False)),
-    }
-    _LAST_GOOD_ACCESS_CONTROL_CONFIG = config
-    return config
+    bootstrap = {"admin_group_id": OKTA_ADMIN_GROUP_ID, "user_group_id": None, "restrict_login": False}
+    with _ACCESS_CONTROL_LOCK:
+        try:
+            with open(ACCESS_CONTROL_FILE_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("access-control file is not a JSON object")
+        except FileNotFoundError:
+            if ACCESS_CONTROL_PATH_EXPLICIT:
+                raise AccessControlUnavailable(f"{ACCESS_CONTROL_FILE_PATH} is missing") from None
+            return bootstrap
+        except ValueError:
+            if _LAST_GOOD_ACCESS_CONTROL_CONFIG is not None:
+                return dict(_LAST_GOOD_ACCESS_CONTROL_CONFIG)
+            if ACCESS_CONTROL_PATH_EXPLICIT:
+                raise AccessControlUnavailable(f"{ACCESS_CONTROL_FILE_PATH} does not parse") from None
+            return bootstrap
+        config = {
+            "admin_group_id": data.get("admin_group_id") or None,
+            "user_group_id": data.get("user_group_id") or None,
+            "restrict_login": bool(data.get("restrict_login", False)),
+        }
+        _LAST_GOOD_ACCESS_CONTROL_CONFIG = config
+        return dict(config)
+
+
+SESSION_KEY_MIN_BYTES = 32
 
 
 def _load_or_create_session_key() -> bytes:
-    if SESSION_KEY_PATH.exists():
-        return SESSION_KEY_PATH.read_bytes()
-    key = os.urandom(32)
-    SESSION_KEY_PATH.write_bytes(key)
-    SESSION_KEY_PATH.chmod(0o640)
+    """GATE-07 (external review, 2026-10-05): an empty or short key file
+    (`touch` + `chown` is the obvious way to pre-create it under /etc, and
+    a crash mid-write used to leave one too) was used as-is, so every
+    cookie was signed with an empty HMAC key and anyone could forge one.
+    Now: a key shorter than SESSION_KEY_MIN_BYTES refuses to start, and a
+    new key is written to a private temp file in the same directory and
+    then hard-linked into place -- os.link fails if the name already
+    exists, so the key appears complete or not at all, and two processes
+    starting at once both end up with whichever key won."""
+    if not SESSION_KEY_PATH.exists():
+        key = os.urandom(SESSION_KEY_MIN_BYTES)
+        tmp = SESSION_KEY_PATH.with_name(f".{SESSION_KEY_PATH.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(key)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.link(tmp, SESSION_KEY_PATH)
+            except FileExistsError:
+                pass  # another process won the race -- use its key, read below
+        finally:
+            tmp.unlink(missing_ok=True)
+    key = SESSION_KEY_PATH.read_bytes()
+    if len(key) < SESSION_KEY_MIN_BYTES:
+        raise RuntimeError(
+            f"Session key {SESSION_KEY_PATH} is {len(key)} bytes; at least {SESSION_KEY_MIN_BYTES} random bytes "
+            "are required. Remove it so the gate creates one, or write one with e.g. "
+            f"`head -c {SESSION_KEY_MIN_BYTES} /dev/urandom > <path>` (see docs/hosting.md)."
+        )
     return key
 
 
@@ -406,7 +462,32 @@ def _load_admin_check_token() -> str:
 
 OKTA_CLIENT_SECRET = _load_client_secret()
 OKTA_ADMIN_CHECK_TOKEN = _load_admin_check_token()
-_JWKS_CLIENT = PyJWKClient(OKTA_JWKS_URL)
+# timeout=10 (PyJWT's default is 30): with the 10 s token exchange and the
+# 25 s group-lookup budget, a callback against a slow Okta still answers
+# inside nginx's default 60 s proxy_read_timeout.
+_JWKS_CLIENT = PyJWKClient(OKTA_JWKS_URL, timeout=10)
+
+# GATE-09 (external review, 2026-10-05): what an outbound urllib call can
+# raise besides the HTTPError/URLError the helpers used to catch -- a read
+# timeout after the headers arrived (TimeoutError, an OSError, not wrapped
+# in URLError), a truncated body (http.client.HTTPException), or a
+# non-JSON body (ValueError). URLError and HTTPError are OSError
+# subclasses, so OSError covers them too.
+OUTBOUND_ERRORS = (OSError, ValueError, http.client.HTTPException)
+GROUP_LOOKUP_MAX_PAGES = 20
+GROUP_LOOKUP_BUDGET_SECONDS = 25
+# Okta user ids (the `sub` of every ID token this gate accepts, and what
+# /internal/mfa_log_lookup interpolates into a System Log filter) are
+# short alphanumeric ids. Checked before a sub becomes a response header
+# or a filter-expression string literal.
+_OKTA_SUB_PATTERN = re.compile(r"[A-Za-z0-9]{1,64}")
+# Header values nginx forwards to serve.py: printable ASCII only (no
+# CR/LF, no characters BaseHTTPRequestHandler.send_header can't encode).
+_HEADER_SAFE = re.compile(r"[\x21-\x7e]{1,320}")
+
+
+class MfaLookupFailed(Exception):
+    """The System Log query could not be made or its answer was unusable."""
 
 
 def _fetch_user_group_ids(user_sub: str) -> list[str] | None:
@@ -420,13 +501,76 @@ def _fetch_user_group_ids(user_sub: str) -> list[str] | None:
     never an empty list to mean "unknown"; a real "in zero groups" user
     still gets a real (empty) list back from Okta."""
     url = f"{OKTA_ORG_URL}/api/v1/users/{urllib.parse.quote(user_sub, safe='')}/groups"
-    req = urllib.request.Request(url, headers={"Authorization": f"SSWS {OKTA_ADMIN_CHECK_TOKEN}", "Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            groups = json.loads(r.read())
-    except (urllib.error.HTTPError, urllib.error.URLError, ValueError):
-        return None
-    return [g.get("id") for g in groups if g.get("id")]
+    ids = []
+    # GATE-10 (external review, 2026-10-05): only the first page used to be
+    # read. Okta's spec documents no paging parameters for this endpoint,
+    # but its general convention is a `Link: <...>; rel="next"` header, so
+    # follow one if present -- bounded, and only to this org's own
+    # /api/v1/ (the SSWS token must never be sent anywhere else). Any page
+    # failing fails the whole lookup closed (None).
+    # The whole lookup stays inside GROUP_LOOKUP_BUDGET_SECONDS so the
+    # callback (10 s token exchange + 10 s JWKS fetch + this) answers within
+    # nginx's default 60 s proxy_read_timeout. urlopen's timeout is per
+    # socket operation, so a response trickling in byte by byte could still
+    # overrun a single call; only Okta is on the other end.
+    deadline = time.monotonic() + GROUP_LOOKUP_BUDGET_SECONDS
+    for _page in range(GROUP_LOOKUP_MAX_PAGES):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log("WARN", f"group lookup for {user_sub} ran out of time")
+            return None
+        req = urllib.request.Request(url, headers={"Authorization": f"SSWS {OKTA_ADMIN_CHECK_TOKEN}", "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=min(10, remaining)) as r:
+                groups = json.loads(r.read())
+                # Okta sends rel="self" and rel="next" as SEPARATE Link
+                # header lines; .get() would return only the first.
+                get_all = getattr(r.headers, "get_all", None)
+                links = get_all("Link") if get_all else [r.headers.get("Link")]
+                link_header = ", ".join(v for v in (links or []) if v)
+        except OUTBOUND_ERRORS as exc:
+            log("WARN", f"group lookup for {user_sub} failed: {type(exc).__name__}")
+            return None
+        if not isinstance(groups, list):
+            log("WARN", f"group lookup for {user_sub} returned a {type(groups).__name__}, not a list")
+            return None
+        ids.extend(g["id"] for g in groups if isinstance(g, dict) and isinstance(g.get("id"), str) and g.get("id"))
+        url = _next_link(link_header)
+        if url is _FOREIGN_LINK:
+            return None  # fail closed: a page we won't fetch might hold the admin group
+        if url is None:
+            return ids
+    log("WARN", f"group lookup for {user_sub} exceeded {GROUP_LOOKUP_MAX_PAGES} pages")
+    return None
+
+
+_FOREIGN_LINK = object()  # _next_link: a rel="next" we refuse to follow
+
+
+def _next_link(link_header: str):
+    """The rel="next" URL from RFC 8288 Link header value(s), None when
+    there is no next page, or _FOREIGN_LINK when the next page is outside
+    this org's /api/v1/ (never followed with the SSWS token; the caller
+    fails closed). The URL sits between <...>, so a comma inside it does
+    not split the entry."""
+    for m in re.finditer(r'<([^>]*)>((?:\s*;\s*(?:"[^"]*"|[^;,<"])*)*)', link_header or ""):
+        # Parameters one by one, so a quoted value (title="a;rel=next") is
+        # consumed whole and never read as a rel. Relation types compare
+        # case-insensitively (RFC 8288 2.1.1).
+        rels = []
+        for param in re.finditer(r';\s*([A-Za-z*-]+)\s*=\s*("([^"]*)"|[^;,\s"]*)', m.group(2)):
+            if param.group(1).lower() == "rel":
+                value = param.group(3) if param.group(3) is not None else param.group(2)
+                rels.extend(value.lower().split())
+        if "next" not in rels:
+            continue
+        target = m.group(1)
+        if target.startswith(f"{OKTA_ORG_URL}/api/v1/") and not any(c in target for c in "\r\n\\"):
+            return target
+        host = urllib.parse.urlsplit(target).hostname if target.isprintable() else "?"
+        log("WARN", f"refused a Link rel=next to host {host!r}, outside {OKTA_ORG_URL}/api/v1/")
+        return _FOREIGN_LINK
+    return None
 
 
 def _resolve_membership(group_ids: list[str] | None, admin_group_id: str | None, user_group_id: str | None) -> tuple[bool, bool]:
@@ -453,7 +597,11 @@ def _query_mfa_log_event(user_sub: str, since_dt) -> dict | None:
     synchronous step-up-callback caller that used to retry this; an
     already-past event has had plenty of time to index, so there's no
     retry benefit here). Returns a small dict (published/eventType/
-    outcome/displayMessage), or None on any miss/error."""
+    outcome/displayMessage), or None when Okta answered and there is no
+    matching event. Raises MfaLookupFailed when Okta could not be asked
+    or gave an unusable answer -- that used to be None as well, which
+    serve.py's backfill counted as a definite miss and so used up an
+    entry's lookup attempts during an Okta or token outage."""
     since = since_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
     filter_expr = f'actor.id eq "{user_sub}" and eventType eq "user.authentication.auth_via_mfa"'
     params = {"filter": filter_expr, "since": since, "sortOrder": "DESCENDING", "limit": "5"}
@@ -462,12 +610,16 @@ def _query_mfa_log_event(user_sub: str, since_dt) -> dict | None:
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             events = json.loads(r.read())
-    except (urllib.error.HTTPError, urllib.error.URLError, ValueError):
-        return None
+    except OUTBOUND_ERRORS as exc:
+        raise MfaLookupFailed(type(exc).__name__) from exc
+    if not isinstance(events, list):
+        raise MfaLookupFailed(f"System Log returned a {type(events).__name__}, not a list")
     if not events:
         return None
     event = events[0]
-    outcome = event.get("outcome") or {}
+    if not isinstance(event, dict):
+        raise MfaLookupFailed("System Log event is not an object")
+    outcome = event.get("outcome") if isinstance(event.get("outcome"), dict) else {}
     return {
         "published": event.get("published"),
         "eventType": event.get("eventType"),
@@ -522,7 +674,10 @@ def _pkce_pair():
 def _get_cookie(headers, name):
     raw = headers.get("Cookie", "")
     cookie = http.cookies.SimpleCookie()
-    cookie.load(raw)
+    try:
+        cookie.load(raw)
+    except http.cookies.CookieError:
+        return None
     morsel = cookie.get(name)
     return morsel.value if morsel else None
 
@@ -563,23 +718,89 @@ def _exchange_code_for_tokens(code: str, code_verifier: str) -> dict:
         return json.loads(r.read())
 
 
-def _verify_id_token(id_token: str) -> dict:
+def _verify_id_token(id_token: str, expected_nonce: str | None) -> dict:
+    """GATE-13 (external review, 2026-10-05): exp/iat/sub/aud/iss are now
+    REQUIRED (PyJWT otherwise validates exp/aud/iss only when present), and
+    the ID token's `nonce` must equal the one this gate put in the signed
+    flow cookie and the /authorize request -- Okta returns it in the ID
+    token (oauth spec, `nonce`: "A value that's returned in the ID
+    token"), binding the token to this browser's login attempt."""
     signing_key = _JWKS_CLIENT.get_signing_key_from_jwt(id_token)
-    return jwt.decode(
+    claims = jwt.decode(
         id_token,
         signing_key.key,
         algorithms=["RS256"],
         audience=OKTA_CLIENT_ID,
         issuer=OKTA_ISSUER,
+        options={"require": ["exp", "iat", "sub", "aud", "iss"]},
     )
+    nonce = claims.get("nonce")
+    if not expected_nonce or not isinstance(nonce, str) or not hmac.compare_digest(
+        nonce.encode(), expected_nonce.encode()
+    ):
+        raise jwt.InvalidTokenError("ID token nonce does not match this login attempt")
+    if not isinstance(claims.get("sub"), str) or not _OKTA_SUB_PATTERN.fullmatch(claims["sub"]):
+        raise jwt.InvalidTokenError("ID token sub is not an Okta user id")
+    return claims
+
+
+def _header_safe(value):
+    """value if it can go into a response header unchanged, else None."""
+    return value if isinstance(value, str) and _HEADER_SAFE.fullmatch(value) else None
+
+
+# GATE-12: shown instead of logging out when a GET /logout came from another
+# site (Sec-Fetch-Site: cross-site/same-site). Static -- nothing from the
+# request is echoed into it. The form posts back to /logout, same origin.
+_LOGOUT_CONFIRM_PAGE = (
+    "<!doctype html><html lang=en><head><meta charset=utf-8>"
+    "<meta name=viewport content=\"width=device-width,initial-scale=1\">"
+    "<title>Log out?</title></head><body style=\"font-family:system-ui,sans-serif;max-width:28rem;margin:4rem auto;"
+    "padding:0 1rem\"><h1 style=\"font-size:1.25rem\">Log out of the OPA Compliance Wizard?</h1>"
+    "<p>Another site sent you to the log-out page. Log out only if you meant to.</p>"
+    "<form method=post action=/logout><button type=submit>Log out</button> <a href=\"/\">Stay signed in</a>"
+    "</form></body></html>"
+)
 
 
 class Handler(BaseHTTPRequestHandler):
+    # GATE-15: an idle or slow connection no longer holds a thread forever.
+    timeout = 30
+
     def log_message(self, fmt, *args):
         pass
 
     def do_GET(self):
-        CORRELATION_ID.set(uuid.uuid4().hex[:12])
+        self._dispatch(self._route_get)
+
+    def do_POST(self):
+        self._dispatch(self._route_post)
+
+    def _dispatch(self, route):
+        """GATE-09: an unexpected exception used to drop the connection
+        (nginx: bare 502) with only a traceback on stderr. Now it is logged
+        with the correlation id and answered with a generic 500 that
+        quotes the id, never the exception text."""
+        correlation_id = uuid.uuid4().hex[:12]
+        CORRELATION_ID.set(correlation_id)
+        try:
+            route()
+        except Exception as exc:  # noqa: BLE001 -- last-resort handler
+            log("ERROR", f"{self.command} {urllib.parse.urlparse(self.path).path} failed: {type(exc).__name__}: {exc}")
+            try:
+                self._respond_text(500, f"Something went wrong signing you in. Reference: {correlation_id}")
+            except OSError:
+                pass
+
+    def _route_post(self):
+        if urllib.parse.urlparse(self.path).path == "/logout":
+            self._logout_post()
+        else:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    def _route_get(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
@@ -618,7 +839,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/verify":
             self._verify_session(require_stepup=query.get("require_stepup", ["0"])[0] == "1")
         elif path == "/logout":
-            self._logout()
+            self._logout_get()
         elif path == "/internal/mfa_log_lookup":
             self._mfa_log_lookup(query)
         else:
@@ -644,8 +865,10 @@ class Handler(BaseHTTPRequestHandler):
         the IdP round-trips, rather than trusting anything client-held."""
         verifier, challenge = _pkce_pair()
         state = base64.urlsafe_b64encode(os.urandom(16)).rstrip(b"=").decode()
+        nonce = base64.urlsafe_b64encode(os.urandom(16)).rstrip(b"=").decode()  # GATE-13
         flow_token = _sign_payload(
-            {"typ": "flow", "state": state, "verifier": verifier, "purpose": purpose, "action_id": action_id},
+            {"typ": "flow", "state": state, "nonce": nonce, "verifier": verifier, "purpose": purpose,
+             "action_id": action_id},
             FLOW_TTL_SECONDS,
         )
 
@@ -655,6 +878,7 @@ class Handler(BaseHTTPRequestHandler):
             "scope": "openid profile email",
             "redirect_uri": REDIRECT_URI,
             "state": state,
+            "nonce": nonce,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
         }
@@ -671,6 +895,10 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_callback(self, query):
         error = query.get("error", [None])[0]
         if error:
+            # Okta's own error code/description (e.g. access_denied when the
+            # user isn't assigned to the app) -- useful to the user, and
+            # sent as text/plain, so nothing in it is interpreted.
+            log("WARN", f"login callback: Okta returned error={error!r}")
             self._respond_text(400, f"Okta returned an error: {error} - {query.get('error_description', [''])[0]}")
             return
 
@@ -679,15 +907,24 @@ class Handler(BaseHTTPRequestHandler):
         flow_token = _get_cookie(self.headers, FLOW_COOKIE)
         flow = _verify_signed_payload(flow_token, "flow") if flow_token else None
 
-        if not code or not returned_state or not flow or flow.get("state") != returned_state:
+        if (not code or not returned_state or not flow or not isinstance(flow.get("state"), str)
+                or not hmac.compare_digest(flow["state"].encode(), returned_state.encode())):
             self._respond_text(400, "Invalid or expired login attempt -- please try logging in again.")
             return
 
         try:
             tokens = _exchange_code_for_tokens(code, flow["verifier"])
-            claims = _verify_id_token(tokens["id_token"])
-        except (urllib.error.HTTPError, urllib.error.URLError, KeyError, jwt.PyJWTError) as exc:
-            self._respond_text(401, f"Login failed during token verification: {exc}")
+            if not isinstance(tokens, dict) or not isinstance(tokens.get("id_token"), str):
+                raise ValueError("token response has no id_token")
+            claims = _verify_id_token(tokens["id_token"], flow.get("nonce"))
+        except (*OUTBOUND_ERRORS, KeyError, TypeError, jwt.PyJWTError) as exc:
+            # GATE-09: the detail goes to the gate's log, not the browser.
+            log("WARN", f"login callback: token exchange/verification failed: {type(exc).__name__}: {exc}")
+            self._respond_text(
+                401,
+                "Login failed while verifying your sign-in with Okta -- please try logging in again. "
+                f"Reference: {CORRELATION_ID.get()}",
+            )
             return
 
         if flow.get("purpose") == "step_up":
@@ -730,6 +967,7 @@ class Handler(BaseHTTPRequestHandler):
             # check, since the Okta round trip itself takes a few seconds.
             auth_time = claims.get("auth_time")
             if not isinstance(auth_time, (int, float)) or time.time() - auth_time > STEPUP_MAX_AUTH_AGE_SECONDS:
+                log("WARN", f"step-up refused for {claims['sub']}: auth_time not fresh")
                 self._respond_text(
                     401,
                     "Step-up verification failed: Okta did not report a fresh authentication. "
@@ -739,6 +977,7 @@ class Handler(BaseHTTPRequestHandler):
             stepup_token = _sign_payload(
                 {"typ": "stepup", "sub": claims["sub"], "action_id": flow.get("action_id")}, STEPUP_TTL_SECONDS
             )
+            log("INFO", f"step-up completed for {claims['sub']}")
             self.send_response(302)
             self.send_header("Set-Cookie", _cookie_header(STEPUP_COOKIE, stepup_token, max_age=STEPUP_TTL_SECONDS))
             self.send_header("Set-Cookie", _cookie_header(FLOW_COOKIE, "", max_age=0))
@@ -752,13 +991,24 @@ class Handler(BaseHTTPRequestHandler):
         # takes effect on next login/session refresh (SESSION_TTL_SECONDS),
         # not instantly -- an accepted tradeoff of this session model, not
         # an oversight.
-        access_control = _read_access_control_config()
+        try:
+            access_control = _read_access_control_config()
+        except AccessControlUnavailable as exc:
+            log("ERROR", f"login refused for {claims['sub']}: access control unavailable ({exc})")
+            self._respond_text(
+                503,
+                "Sign-in is temporarily unavailable: this dashboard's access settings could not be read. "
+                f"Contact an administrator. Reference: {CORRELATION_ID.get()}",
+            )
+            return
         group_ids = _fetch_user_group_ids(claims["sub"])
         is_admin, is_allowed = _resolve_membership(
             group_ids, access_control["admin_group_id"], access_control["user_group_id"]
         )
 
         if access_control["restrict_login"] and not is_allowed:
+            log("INFO", f"login denied for {claims['sub']}: not in the user or admin group"
+                        + (" (group lookup failed)" if group_ids is None else ""))
             self._respond_text(
                 403,
                 "You don't have access to this dashboard. Contact an administrator to be "
@@ -772,6 +1022,7 @@ class Handler(BaseHTTPRequestHandler):
             SESSION_TTL_SECONDS,
         )
 
+        log("INFO", f"login for {claims['sub']} (admin={is_admin})")
         self.send_response(302)
         self.send_header("Set-Cookie", _cookie_header(SESSION_COOKIE, session_token, max_age=SESSION_TTL_SECONDS))
         self.send_header("Set-Cookie", _cookie_header(FLOW_COOKIE, "", max_age=0))
@@ -788,7 +1039,8 @@ class Handler(BaseHTTPRequestHandler):
         # LOCAL_OWNER_KEY_HEADER` maps straight to the privileged
         # `__local__` owner) -- belt-and-suspenders with the SRV-01 fix
         # on the serve.py side.
-        if not session or not session.get("sub"):
+        sub = _header_safe(session.get("sub")) if session else None
+        if not sub:
             self.send_response(401)
             self.end_headers()
             return
@@ -802,11 +1054,15 @@ class Handler(BaseHTTPRequestHandler):
             # machine/browser profile could authorize a save on behalf of
             # whoever is logged in now. A mismatch or missing/expired
             # step-up cookie is treated identically to no step-up at all.
-            if not stepup or not stepup.get("sub") or stepup.get("sub") != session.get("sub"):
+            if not stepup or not stepup.get("sub") or stepup.get("sub") != sub:
                 self.send_response(401)
                 self.end_headers()
                 return
             action_id = stepup.get("action_id")
+            if action_id is not None and not (isinstance(action_id, str) and _ACTION_ID_PATTERN.fullmatch(action_id)):
+                self.send_response(401)
+                self.end_headers()
+                return
 
         self.send_response(200)
         # Two distinct headers, deliberately: `sub` is Okta's stable,
@@ -816,8 +1072,11 @@ class Handler(BaseHTTPRequestHandler):
         # or reused across a re-provisioned account) and exists here
         # purely for human-readable display/audit-log purposes -- never
         # used as a storage/permission key downstream.
-        self.send_header("X-Auth-Sub", session.get("sub", ""))
-        self.send_header("X-Auth-User", session.get("email") or session.get("sub", ""))
+        self.send_header("X-Auth-Sub", sub)
+        # GATE-09: an e-mail send_header can't encode (non-latin-1) used to
+        # raise on every request, locking that user out; anything that isn't
+        # printable ASCII now falls back to the sub, as a missing e-mail does.
+        self.send_header("X-Auth-User", _header_safe(session.get("email")) or sub)
         self.send_header("X-Auth-Is-Admin", "true" if session.get("is_admin") else "false")
         if action_id is not None:
             # Phase 3: carries the pending-action id this step-up is
@@ -854,19 +1113,27 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        if self.headers.get("X-Internal-Secret") != INTERNAL_API_SHARED_SECRET:
+        # GATE-08: constant-time compare.
+        if not hmac.compare_digest(
+            (self.headers.get("X-Internal-Secret") or "").encode(), INTERNAL_API_SHARED_SECRET.encode()
+        ):
             self.send_response(403)
             self.end_headers()
             return
 
         user_sub = query.get("sub", [None])[0]
         near_iso = query.get("near", [None])[0]
-        if not user_sub or not near_iso:
+        # The sub is interpolated into a System Log filter string literal --
+        # only an Okta user id shape gets that far (400 = "this entry's
+        # parameters are bad", which serve.py counts against that entry only).
+        if not user_sub or not near_iso or not _OKTA_SUB_PATTERN.fullmatch(user_sub):
             self.send_response(400)
             self.end_headers()
             return
         try:
             near_dt = datetime.fromisoformat(near_iso.replace("Z", "+00:00"))
+            if near_dt.tzinfo is None:
+                near_dt = near_dt.replace(tzinfo=timezone.utc)
         except ValueError:
             self.send_response(400)
             self.end_headers()
@@ -876,8 +1143,19 @@ class Handler(BaseHTTPRequestHandler):
         # audit entry's own timestamp, so querying from just before it
         # (clock-skew slop) covers the real event with a single shot, no
         # retry loop needed (see _query_mfa_log_event's docstring).
-        since_dt = near_dt - timedelta(seconds=STEPUP_LOG_LOOKBACK_SECONDS)
-        result = _query_mfa_log_event(user_sub, since_dt)
+        since_dt = (near_dt - timedelta(seconds=STEPUP_LOG_LOOKBACK_SECONDS)).astimezone(timezone.utc)
+        try:
+            result = _query_mfa_log_event(user_sub, since_dt)
+        except MfaLookupFailed as exc:
+            # Batch 3 carry-over: "couldn't ask Okta" is a 502, not `200 null`
+            # (which serve.py reads as a definite "no such event" and counts
+            # as a used-up attempt). serve.py maps any 5xx to
+            # MfaLookupUnavailable: the backfill stops and charges nobody.
+            log("WARN", f"mfa_log_lookup: System Log query failed: {exc}")
+            self.send_response(502)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         body = json.dumps(result).encode()
@@ -885,25 +1163,61 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _logout(self):
+    def _logout_get(self):
+        """GATE-12 (external review, 2026-10-05): GET /logout is a
+        state-changing GET, so any other site could log a user out of the
+        dashboard and of Okta with a plain link. Browsers that send Fetch
+        Metadata say where a navigation came from: `same-origin` (the app's
+        own Log out link) and `none` (typed, bookmarked) log out as before;
+        anything else (`cross-site`, `same-site`) gets a static "Log out?"
+        page whose button POSTs back here. A browser that sends no
+        Sec-Fetch-Site at all keeps the old behaviour."""
+        site = self.headers.get("Sec-Fetch-Site")
+        if site is not None and site not in ("same-origin", "none"):
+            body = _LOGOUT_CONFIRM_PAGE.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self._do_logout()
+
+    def _logout_post(self):
+        """The confirm page's form. Only a same-origin POST logs out (Origin
+        must be DASHBOARD_ORIGIN -- nginx's site sets Referrer-Policy:
+        same-origin, under which a same-origin form POST still sends its
+        real Origin)."""
+        if self.headers.get("Origin") != DASHBOARD_ORIGIN:
+            self._respond_text(403, "Log out must be confirmed from this dashboard.")
+            return
+        self._do_logout()
+
+    def _do_logout(self):
         token = _get_cookie(self.headers, SESSION_COOKIE)
         session = _verify_signed_payload(token, "session") if token else None
         id_token = session.get("id_token") if session else None
 
-        clear_header = _cookie_header(SESSION_COOKIE, "", max_age=0)
         if id_token:
             params = {"id_token_hint": id_token, "post_logout_redirect_uri": POST_LOGOUT_REDIRECT_URI}
             location = f"{OKTA_LOGOUT_URL}?{urllib.parse.urlencode(params)}"
         else:
             location = "/login"
 
-        self.send_response(302)
-        self.send_header("Set-Cookie", clear_header)
+        if session:
+            log("INFO", f"logout for {session.get('sub')}")
+        self.send_response(303 if self.command == "POST" else 302)
+        # GATE-12: clear every gate cookie, not only the session -- a
+        # step-up proof or half-finished login must not outlive the logout.
+        for name in (SESSION_COOKIE, STEPUP_COOKIE, FLOW_COOKIE):
+            self.send_header("Set-Cookie", _cookie_header(name, "", max_age=0))
         self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     def _respond_text(self, status, text):
-        body = text.encode()
+        body = text.encode("utf-8", "replace")
         self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

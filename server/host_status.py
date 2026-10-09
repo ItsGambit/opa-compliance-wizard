@@ -146,21 +146,35 @@ _updates_cache = {"at": 0.0, "value": None}
 _updates_lock = threading.Lock()
 
 
+def _run_apt_simulation():
+    pending = security = None
+    try:
+        out = subprocess.run(["apt-get", "-s", "-o", "Debug::NoLocking=1", "upgrade"],
+                             capture_output=True, text=True, timeout=60,
+                             env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"})
+        pending, security = parse_apt_simulation(out.stdout)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return {"pending": pending, "security": security,
+            "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+
+
 def _updates():
-    with _updates_lock:
-        if _updates_cache["value"] is None or time.time() - _updates_cache["at"] > UPDATES_TTL:
-            pending = security = None
-            try:
-                out = subprocess.run(["apt-get", "-s", "-o", "Debug::NoLocking=1", "upgrade"],
-                                     capture_output=True, text=True, timeout=60,
-                                     env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"})
-                pending, security = parse_apt_simulation(out.stdout)
-            except (OSError, subprocess.SubprocessError):
-                pass
-            _updates_cache["value"] = {"pending": pending, "security": security,
-                                       "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-            _updates_cache["at"] = time.time()
-        value = dict(_updates_cache["value"])
+    """GATE-15 (external review, 2026-10-05): the apt simulation (up to 60 s)
+    used to run with the lock held, so every concurrent request queued
+    behind it. Now one request refreshes while the others answer at once
+    with the previous result (or nulls on the very first run, the same
+    shape as a failed check)."""
+    stale = _updates_cache["value"] is None or time.time() - _updates_cache["at"] > UPDATES_TTL
+    if stale and _updates_lock.acquire(blocking=False):
+        try:
+            if _updates_cache["value"] is None or time.time() - _updates_cache["at"] > UPDATES_TTL:
+                _updates_cache["value"] = _run_apt_simulation()
+                _updates_cache["at"] = time.time()
+        finally:
+            _updates_lock.release()
+    cached = _updates_cache["value"]
+    value = dict(cached) if cached is not None else {"pending": None, "security": None, "checked_at": None}
     value["reboot_required"] = Path("/var/run/reboot-required").exists()
     return value
 
@@ -193,6 +207,7 @@ def collect():
 class Handler(BaseHTTPRequestHandler):
     server_version = "host-status"
     sys_version = ""
+    timeout = 30  # GATE-15: an idle connection no longer holds a thread forever
 
     def do_GET(self):
         if self.path.split("?", 1)[0] != "/__status":

@@ -22,6 +22,7 @@ saves it via POST /api/environments.
 
 import argparse
 import csv as _csv
+import hmac
 import io
 import json
 import re
@@ -171,7 +172,12 @@ def _request_is_from_nginx(headers):
     _is_admin_from_headers below, which now calls this first)."""
     if not NGINX_PROXY_SECRET:
         return True
-    return headers.get("X-Nginx-Proxy-Secret") == NGINX_PROXY_SECRET
+    # GATE-08 (external review, 2026-10-05): constant-time compare -- this
+    # secret is the whole trust boundary for every X-Auth-* header.
+    presented = headers.get("X-Nginx-Proxy-Secret")
+    if not isinstance(presented, str):
+        return False
+    return hmac.compare_digest(presented.encode("utf-8"), NGINX_PROXY_SECRET.encode("utf-8"))
 
 # Per-owner session state, replacing what used to be three bare globals
 # (client/okta_client/active_env_name) shared by every request regardless
@@ -1198,6 +1204,14 @@ class Handler(SimpleHTTPRequestHandler):
                     engine.log("WARN", f"healthz: archive check failed: {exc}")
                     checks["archive_writable"] = "error"
                 status = "ok" if all(v == "ok" for v in checks.values()) else "degraded"
+                if DEPLOYMENT_MODE == "hosted" and not _request_is_from_nginx(self.headers):
+                    # GATE-06 (external review, 2026-10-05): in hosted mode this
+                    # is reachable by anyone who can reach the HTTPS port (nginx
+                    # never attaches the proxy secret to it), so it answers only
+                    # what a monitor needs. The exact version and which check
+                    # failed stay off the network: /api/version on loopback and
+                    # the WARN lines above in the journal have them.
+                    return self._send_json(200, {"status": status})
                 return self._send_json(200, {"status": status, "version": engine.SCRIPT_VERSION, "checks": checks})
 
             if path == "/api/whoami":

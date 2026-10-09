@@ -2,6 +2,167 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.40.5 — **Login gate, nginx template and second-site generator: nine findings from the 2026-10-05 external review (GATE-06/07/08/09/10/12/13/14/15), plus the MFA log lookup now reports Okta failures as failures.**
+Batch 3 of the review's remaining findings. Nothing changes for a normal
+sign-in. GATE-05 (session revocation) and GATE-11 (systemd sandboxing)
+need a maintainer decision and are not in this release.
+- **Operator action and deploy impact.**
+  - `server/deploy.sh` applies the changed nginx template to the main
+    site (`sites-available/opa-secrets-wizard`) as usual: `nginx -t` and
+    then a reload, with rollback if either fails. No systemd unit
+    changed, so no `daemon-reload` is needed. The gates and the app
+    restart as on every deploy.
+  - An additional gate's nginx site (`opa-<name>`, made by
+    `setup-second-gate.sh`) is a one-time snapshot that `deploy.sh`
+    does not manage. It gets the new headers and rate limit only when
+    you rebuild it: remove `sites-available/opa-<name>` and
+    `sites-enabled/opa-<name>`, then re-run the same setup command. This
+    is optional; until you do, that site behaves exactly as before.
+  - The nginx site defines a rate-limit zone (`opa_auth`) at the top of
+    the file. If the main site is included twice (a stray copy in
+    `sites-enabled` or `conf.d`), `nginx -t` now fails on the duplicate
+    zone and `deploy.sh` rolls back. Check that `sudo nginx -T | grep -c
+    'zone=opa_auth:'` prints 1. A rebuilt additional-gate site uses the
+    main site's zone, so the main site has to stay enabled.
+  - The session key now has to be at least 32 bytes or the gate refuses
+    to start. A key the gate created itself is always 32 bytes, so check
+    only a key you made by hand: `stat -c %s <OPA_SESSION_KEY_PATH>`.
+  - `docs/hosting.md` now gives the command to create the key, and
+    documents replacing it plus restarting the gate as the emergency way
+    to sign everyone out.
+- **Noticeable changes.**
+  - **In hosted mode, anonymous `/healthz` returns only `{"status": ...}`
+    (GATE-06).** It no longer includes the version or the per-check
+    detail. Get the version from `curl -s
+    http://127.0.0.1:8766/api/version` on the server. A failed check is
+    logged as a WARN line in the journal. Local mode, and a request that
+    carries the proxy secret, still get the full answer.
+  - **Too many sign-in callbacks get `429` (GATE-06).** The limit is per
+    client address on `/authorization-code/callback` and `/step-up`:
+    30 a minute, with a burst of 60. A person signing in never reaches
+    it, and the burst leaves room for many people behind one NAT or for a
+    scripted login test. A loop replaying the callback used to make the gate call Okta's
+    token endpoint each time. `/login` is not limited, because it is the
+    internal target for every 401, and limiting it would turn ordinary
+    session-expiry redirects into 429s.
+  - **If another site links to `/logout`, you are asked before being
+    logged out (GATE-12).** A cross-site GET (Fetch Metadata
+    `Sec-Fetch-Site: cross-site` or `same-site`) shows a static "Log
+    out?" page, and its button POSTs back to the gate. A POST is accepted
+    only if `Origin` equals `DASHBOARD_ORIGIN`. The app's own Log out
+    link, typed URLs, and browsers that send no Fetch Metadata log out
+    as before. Logging out now clears the step-up and in-progress-login
+    cookies as well as the session cookie.
+  - **A sign-in that was halfway through during the deploy has to be
+    retried once (GATE-13).** Login now sends an OIDC `nonce` and
+    requires it in the ID token, and a flow cookie minted before the
+    upgrade has none. Flow cookies last 10 minutes.
+  - **An additional gate whose `access_control.json` is missing or has
+    never parsed refuses sign-in with `503` (GATE-14).** Before, it
+    silently opened sign-in to every user assigned to its Okta app. This
+    applies whenever `OPA_ACCESS_CONTROL_PATH` is set, which
+    `setup-second-gate.sh` always does. The main gate (variable unset)
+    keeps the documented first-boot default.
+- **nginx template (GATE-06).** On every response, including errors
+  (`always`): `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+  `Content-Security-Policy: frame-ancestors 'none'` and
+  `Referrer-Policy: same-origin`. The referrer policy is `same-origin`,
+  not `no-referrer`: under `no-referrer` a browser sends `Origin: null`
+  on a same-origin form POST (WHATWG Fetch), which the Origin checks
+  would refuse. Also added: `server_tokens off` and an explicit
+  `ssl_protocols TLSv1.2 TLSv1.3`. `/healthz` is now an exact-match
+  location (`/healthzanything` goes through the login) and drops any
+  client-sent `X-Auth-*` and proxy-secret headers. The port-80 redirect
+  uses `$server_name` instead of the client's `Host` header. HSTS ships
+  commented out: browsers ignore it for an IP address (RFC 6797
+  §8.1.1), and with a self-signed certificate it removes the
+  click-through (§12.1). A `default_server` that drops unknown hosts was
+  left out, because it would refuse anyone who reaches the LAN site by
+  another name; that is the maintainer's call.
+- **Session key (GATE-07).** A key shorter than 32 bytes refuses to start.
+  The old code accepted an empty file, and with it anyone could forge a
+  cookie. A new key is written to a private temporary file, fsynced, and
+  hard-linked into place, so it is either complete or absent. If two
+  processes start at once, both use whichever key landed first. Mode
+  is `0600`.
+- **Constant-time secret checks (GATE-08).** `serve.py`'s proxy-secret
+  check and the gate's `X-Internal-Secret` check use
+  `hmac.compare_digest`.
+- **Gate error handling and logging (GATE-09).** The outbound Okta calls
+  now also catch read timeouts, truncated bodies and non-JSON replies.
+  The callback no longer echoes exception text to the browser; it logs
+  the detail and shows a reference id. Any unexpected error is a logged
+  `500` with a reference, instead of a dropped connection (which nginx
+  reported as a 502). The journal now records sign-in, denial, step-up,
+  logout and failures, by `sub` only. An e-mail address that isn't plain
+  printable ASCII (any non-ASCII character, a space or control character,
+  or more than 320 characters) falls back to the `sub` in `X-Auth-User`.
+  Before, a non-latin-1 address locked that user out on every request. A session whose `sub` is not printable ASCII is refused.
+- **Group lookup paging (GATE-10).** Okta's spec documents no paging for
+  `GET /api/v1/users/{id}/groups`, so the gate follows its general `Link:
+  rel="next"` convention. It reads every Link header line, because Okta
+  sends `self` and `next` as separate lines. `rel` is matched without
+  regard to case, and quoted parameters are parsed whole. It follows at
+  most 20 pages, within 25 s in total, and
+  only within this org's `/api/v1/`, so the admin-check token is never
+  sent to another host. The lookup fails closed if any page fails,
+  returns something other than a list, or points its next link
+  elsewhere. A refused link logs only its host. The JWKS fetch timeout
+  drops from PyJWT's default of 30 s to 10 s, so a callback against a
+  slow Okta (token exchange + keys + group lookup) still answers inside
+  nginx's 60 s proxy timeout.
+- **ID token checks (GATE-13).** The gate now requires `exp`, `iat`,
+  `sub`, `aud` and `iss`, compares `nonce` and the OAuth `state` in
+  constant time, and requires `sub` to look like an Okta user id.
+- **Access-control file (GATE-14).** A JSON value that is not an object
+  counts as malformed. Reads and the last-good copy are held under a lock.
+- **Second-site generator and host status (GATE-15).**
+  `nginx_second_site.py` now scans braces and `server`/`location`
+  keywords the way nginx's tokenizer does. It ignores comments and quoted
+  strings, including a `#` or a brace inside the proxy secret, and
+  `${var}`. It refuses unbalanced braces and no longer treats a
+  commented-out `location` as real. It rewrites `listen`/`server_name`
+  wherever they sit on a line, and refuses to write a site whose 443
+  listen was not rewritten. It recognises `=`, `^~`, `~` and `~*`
+  locations: a `/api/access_control/save` location with any modifier is
+  removed, and a regex location mentioning `access_control` is refused
+  (quoted patterns included), because it could beat the GATE-04 deny.
+  A `$server_name` variable is never mistaken for the directive. `--listen` must be loopback unless
+  `--allow-public-listen` is passed, and `setup-second-gate.sh` gained
+  the same flag. The gate and `host_status.py` drop idle connections
+  after 30 s. In `host_status`, concurrent requests no longer queue
+  behind the 60 s apt simulation; they get the previous result.
+- **MFA log lookup (batch 2 carry-over).** `/internal/mfa_log_lookup`
+  answers `502` when its own System Log query fails or returns something
+  unusable. It used to answer `200 null`, which `serve.py`'s backfill
+  counted as a definite miss, so an Okta or token outage used up
+  entries' lookup attempts. `serve.py` maps any 5xx to "lookup
+  unavailable": the run stops and no attempt is charged. A `sub` that is
+  not an Okta id shape gets `400` before it reaches the System Log
+  filter expression; that charges an attempt to that entry only. A
+  `near` time with a UTC offset is now converted to UTC; before, it was
+  formatted with the wrong hour. The review's other point, that an
+  additional gate's lookup is never used, needs no change: since GATE-04
+  (5.39.4) a second-org admin cannot reach `/api/access_control`, so no
+  entry from that org needs a lookup.
+- **Tests.** New `tests/test_nginx_template.py` runs the real nginx. It
+  checks the template and the generated second site with `nginx -t`,
+  then serves the template on loopback ports in front of stub upstreams
+  and checks the headers on 200/302/429 responses (including the 401
+  that redirects to login), the `/healthz`
+  exact match and header stripping, the `429`, that `/login` is
+  unlimited, and the port-80 redirect. CI installs nginx and fails rather
+  than skips if it is missing (`OPA_REQUIRE_NGINX_TESTS`).
+  `tests/test_auth_gate.py` goes from 23 to 121 tests. They run the real
+  gate handler on a loopback server and cover GATE-07/09/10/12/13/14
+  and the MFA lookup end to end through `serve.py`'s client and the
+  engine's backfill. The second-site, host-status and HTTP authz matrix
+  suites gain tests for GATE-15, GATE-06 and GATE-08. Full suite: 643
+  Python tests. 53 hand-made mutations of the new checks were each caught
+  by the suite. Two rounds of adversarial review found one real bug before release
+  (paging ignored Okta's second Link header line); it is fixed and
+  covered by a test against a real HTTP server.
+
 5.40.4 — **Evidence chain v2 is on: every new ingestion manifest now seals the content of the curated events it archived, and the end of the chain is recorded (DATA-04).**
 5.40.2 shipped the v2 chain dormant (`audit_store.EVIDENCE_CHAIN_V2 =
 False`) because changing what the Phase 6 chain seals is a maintainer
