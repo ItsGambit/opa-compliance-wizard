@@ -171,6 +171,23 @@ for how to set this up. Every admin override action is itself logged
 power is just as visible in the audit trail as anyone else's activity —
 this is a compliance feature, not a backdoor.
 
+### Shared-environment permissions and MFA for environment changes (5.42.0)
+
+Owners decide whether to share an environment; admins decide what a shared
+user may do with it -- view archived reports, run live read queries, write
+to the OPA tenant / Okta org, import a CSV into the archive, reset the sync
+watermark, run Sync now, change sync settings -- with a global default
+(**Shared permissions** in the sidebar) and per-environment overrides
+(**Environments → Shared permissions**). Each environment row shows what you
+may do with it, and controls you may not use are disabled with the reason.
+Out of the box shared users can do exactly what they could before (all but
+Sync now and the sync settings). Behind the hosted login gate every change
+made in the Environments area -- create, edit, delete, share, sync
+settings, watermark reset, CSV import, archive purge, shared permissions --
+needs a fresh MFA approval, the same step-up the Access Control save uses;
+a form whose approval doesn't complete reopens with your input (secrets
+excepted). See [Hosting on a server](hosting.md#hosting-on-a-server-optional).
+
 ### Resource Groups, Projects, and Groups
 
 Dropdowns for **Resource Group** and **Project** are populated live

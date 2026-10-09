@@ -26,6 +26,10 @@ import type {
   ResourceHistoryResponse,
   SecretsAccessReport,
   ServiceAccountInfo,
+  SharedPermissionsResponse,
+  PermissionSetting,
+  SharedCapabilityKey,
+  StepUpRequired,
   ServiceAccountsReport,
   SyncSchedule,
   SyncStatusResponse,
@@ -179,10 +183,30 @@ export function saveAccessControl(): Promise<AccessControlSaveResponse> {
   return apiFetch('/api/access_control/save', { method: 'POST' }, { notifySessionExpired: false })
 }
 
+// ── Step-up MFA for Environments changes (5.42.0) ────────────────────────
+// Behind the hosted login gate every change made from the Environments area
+// answers 202 StepUpRequired first: the server has checked and stored the
+// change, nothing is applied yet. utils/stepUp.ts takes the browser through
+// the gate's /step-up (the same round trip as the Access Control save) and
+// App.tsx applies it on the way back with saveEnvironmentChange(). In local
+// mode (no gate, no identity provider) the same calls apply at once.
+
+export function isStepUpRequired(value: unknown): value is StepUpRequired {
+  return typeof value === 'object' && value !== null && (value as { step_up_required?: unknown }).step_up_required === true
+}
+
+/** Applies the change the current step-up approval was for. No body: the
+ * server runs the request it stored before the redirect (X-Auth-Action-Id,
+ * from the step-up cookie), never anything sent here. */
+export function saveEnvironmentChange(): Promise<Record<string, unknown> & { action: string; step_up_verified: boolean }> {
+  // A redirect here means the step-up proof lapsed, not the session (same as saveAccessControl).
+  return apiFetch('/api/environment_changes/save', { method: 'POST' }, { notifySessionExpired: false })
+}
+
 // activated=false (5.40.3): an admin edited ANOTHER owner's environment --
 // it was saved, but it isn't the admin's to activate, so `active` is the
 // admin's unchanged active environment (possibly null).
-export function saveEnvironment(values: EnvironmentFormValues): Promise<{ activated: boolean; active: string | null; saved?: boolean }> {
+export function saveEnvironment(values: EnvironmentFormValues): Promise<{ activated: boolean; active: string | null; saved?: boolean } | StepUpRequired> {
   return apiFetch('/api/environments', { method: 'POST', body: JSON.stringify(values) })
 }
 
@@ -201,21 +225,21 @@ export function activateEnvironment(name: string, id?: string): Promise<{ activa
 // own environments are already unambiguous by name. Omit it (or pass
 // undefined) when deleting your own -- the backend falls back to a
 // by-name lookup scoped to the caller in that case.
-export function deleteEnvironment(name: string, id?: string): Promise<{ deleted: string }> {
+export function deleteEnvironment(name: string, id?: string): Promise<{ deleted: string } | StepUpRequired> {
   const qs = id ? `?id=${encodeURIComponent(id)}` : ''
   return apiFetch(`/api/environments/${encodeURIComponent(name)}${qs}`, { method: 'DELETE' })
 }
 
 // Same `id` reasoning as deleteEnvironment above -- only needed for an
 // admin overriding another owner's environment.
-export function setEnvironmentShared(name: string, shared: boolean, id?: string): Promise<{ name: string; shared: boolean }> {
+export function setEnvironmentShared(name: string, shared: boolean, id?: string): Promise<{ name: string; shared: boolean } | StepUpRequired> {
   return apiFetch(`/api/environments/${encodeURIComponent(name)}/share`, {
     method: 'POST',
     body: JSON.stringify({ shared, id }),
   })
 }
 
-export function saveSyncSchedule(name: string, schedule: SyncSchedule): Promise<{ name: string; sync_schedule: SyncSchedule }> {
+export function saveSyncSchedule(name: string, schedule: SyncSchedule): Promise<{ name: string; sync_schedule: SyncSchedule } | StepUpRequired> {
   return apiFetch(`/api/environments/${encodeURIComponent(name)}/sync_schedule`, {
     method: 'POST',
     body: JSON.stringify(schedule),
@@ -237,7 +261,7 @@ export function importSyncCsv(
   name: string,
   csvPath: string,
   ingestionScope: IngestionScope
-): Promise<{ inserted: number; scanned: number; skipped_unparseable?: number; chain_head?: string }> {
+): Promise<{ inserted: number; scanned: number; skipped_unparseable?: number; chain_head?: string } | StepUpRequired> {
   return apiFetch(`/api/environments/${encodeURIComponent(name)}/sync/import_csv`, {
     method: 'POST',
     body: JSON.stringify({ csv_path: csvPath, ingestion_scope: ingestionScope }),
@@ -247,7 +271,7 @@ export function importSyncCsv(
 /** DATA-03 remedy (5.40.2): clears the live-sync watermark so the next sync
  * backfills the full 90-day window. Only offered when the server reports an
  * unusable watermark. */
-export function resetSyncWatermark(name: string): Promise<{ name: string; previous_watermark: string | null }> {
+export function resetSyncWatermark(name: string): Promise<{ name: string; previous_watermark: string | null } | StepUpRequired> {
   return apiFetch(`/api/environments/${encodeURIComponent(name)}/sync/reset_watermark`, { method: 'POST' })
 }
 
@@ -524,7 +548,7 @@ export function fetchOrphanedArchives(): Promise<{ archives: OrphanedArchive[] }
 /** Irreversibly deletes every archive row for one orphaned environment_id.
  * The server refuses (409) while that environment still exists or a sync
  * is running, and audit-logs the per-table counts. */
-export function purgeOrphanedArchive(environmentId: string): Promise<{ purged: string } & Record<string, number | string>> {
+export function purgeOrphanedArchive(environmentId: string): Promise<({ purged: string } & Record<string, number | string>) | StepUpRequired> {
   return apiFetch(`/api/archives/${encodeURIComponent(environmentId)}`, { method: 'DELETE' })
 }
 
@@ -536,4 +560,22 @@ export function purgeOrphanedArchive(environmentId: string): Promise<{ purged: s
  * again until it answers 200 (hooks/useIntegrityCheck does). */
 export function fetchIntegrity(name: string, deep = false): Promise<IntegrityResult | { status: 'running' }> {
   return apiFetch(`/api/environments/${encodeURIComponent(name)}/integrity${deep ? '?deep=1' : ''}`)
+}
+
+// ── Shared-environment permissions (admin-only, 5.42.0) ───────────────────
+
+export function fetchSharedPermissions(): Promise<SharedPermissionsResponse> {
+  return apiFetch('/api/shared_permissions')
+}
+
+/** The global defaults (no environmentId) or one environment's overrides.
+ * Step-up MFA in hosted mode, like every Environments change. */
+export function saveSharedPermissions(
+  changes: Partial<Record<SharedCapabilityKey, PermissionSetting>>,
+  environmentId?: string,
+): Promise<{ changed: { capability: string; before: string; after: string }[] } | StepUpRequired> {
+  return apiFetch('/api/shared_permissions', {
+    method: 'POST',
+    body: JSON.stringify(environmentId ? { environment_id: environmentId, changes } : { changes }),
+  })
 }

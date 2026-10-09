@@ -217,6 +217,20 @@ def test_access_and_sync_jobs_keyed_by_full_environment_id_not_bare_name():
 #     route with two owners each having their own active session, so a
 #     revert back to that global-lookup shape fails HERE.
 # ---------------------------------------------------------------------------
+def _register_environment_row(environment_id, owner):
+    """5.42.0: session routes check the session's environment (shared-
+    environment permissions), so a seeded session needs a real row."""
+    import audit_store
+    conn = audit_store._get_connection()
+    conn.execute(
+        """INSERT OR IGNORE INTO app_environments
+           (environment_id, owner_id, display_name, base_domain, team_name, key_id, okta_url, shared, created_at, updated_at)
+           VALUES (?, ?, ?, 'x.example.com', 't', 'k', '', 0, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')""",
+        (environment_id, owner, f"env-{environment_id[:8]}"),
+    )
+    conn.commit()
+
+
 @pytest.fixture
 def live_server_with_sessions(tmp_schema, tmp_environments_file, fake_keyring, tmp_audit_log, monkeypatch):
     """Same as live_server (section 4 below) but also lets the test seed
@@ -261,6 +275,8 @@ def test_bootstrap_result_route_never_leaks_another_owners_tenant_model(live_ser
     base_url, serve = live_server_with_sessions
     id_a, id_b = "env-id-owner-a", "env-id-owner-b"
 
+    _register_environment_row(id_a, "00uOWNERA")
+    _register_environment_row(id_b, "00uOWNERB")
     with serve._sessions_lock:
         serve._sessions["00uOWNERA"] = {"client": None, "okta_client": None, "env_name": "dev", "env_id": id_a}
         serve._sessions["00uOWNERB"] = {"client": None, "okta_client": None, "env_name": "dev", "env_id": id_b}
@@ -286,6 +302,8 @@ def test_bootstrap_status_route_never_leaks_another_owners_steps(live_server_wit
     base_url, serve = live_server_with_sessions
     id_a, id_b = "env-id-owner-a", "env-id-owner-b"
 
+    _register_environment_row(id_a, "00uOWNERA")
+    _register_environment_row(id_b, "00uOWNERB")
     with serve._sessions_lock:
         serve._sessions["00uOWNERA"] = {"client": None, "okta_client": None, "env_name": "dev", "env_id": id_a}
         serve._sessions["00uOWNERB"] = {"client": None, "okta_client": None, "env_name": "dev", "env_id": id_b}

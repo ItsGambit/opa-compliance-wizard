@@ -45,6 +45,61 @@ export interface Environment {
    * view) and for a shared row hidden by the caller's own same-named
    * environment. Older servers omit it (treated as is_own || shared). */
   addressable?: boolean
+  /** 5.42.0: what the CALLER may do with this environment -- the server's
+   * own resolution (an owner's rows are all "allow", source "owner"). The
+   * UI only mirrors it; the server enforces it. Older servers omit it. */
+  permissions?: Record<SharedCapabilityKey, EffectivePermission>
+  /** 5.42.0, admins only: this environment's stored overrides (a capability
+   * absent here inherits the global default). */
+  permission_overrides?: Partial<Record<SharedCapabilityKey, PermissionValue>>
+}
+
+// ── Shared-environment permissions (5.42.0) ──────────────────────────────
+
+export type SharedCapabilityKey =
+  | 'view_archive' | 'live_read' | 'tenant_write' | 'import_csv' | 'reset_watermark' | 'sync_now' | 'sync_settings'
+
+export type PermissionValue = 'allow' | 'deny'
+/** A stored setting: "inherit" is the absence of one. */
+export type PermissionSetting = PermissionValue | 'inherit'
+/** Where an effective value came from. */
+export type PermissionSource = 'owner' | 'override' | 'default' | 'built_in'
+
+export interface EffectivePermission {
+  value: PermissionValue
+  source: PermissionSource
+}
+
+export interface SharedCapability {
+  key: SharedCapabilityKey
+  label: string
+  description: string
+  builtin: PermissionValue
+}
+
+export interface SharedPermissionDefault extends EffectivePermission {
+  updated_at: string | null
+  updated_by: string | null
+}
+
+export interface SharedPermissionsResponse {
+  capabilities: SharedCapability[]
+  defaults: Record<SharedCapabilityKey, SharedPermissionDefault>
+  environments: Record<string, {
+    name: string
+    shared: boolean
+    overrides: Partial<Record<SharedCapabilityKey, PermissionValue>>
+    effective: Record<SharedCapabilityKey, EffectivePermission>
+  }>
+}
+
+/** 5.42.0: an Environments change answered "approve it with MFA first"
+ * (hosted mode). Nothing has changed yet; the browser takes action_id
+ * through the gate's /step-up and the change is applied on the way back. */
+export interface StepUpRequired {
+  step_up_required: true
+  action_id: string
+  action: string
 }
 
 export interface EnvironmentsResponse {
@@ -348,8 +403,13 @@ export interface ApiErrorBody {
   /** 502 "Saved, but could not connect": the record WAS written (FE-11). */
   saved?: boolean
   /** Machine-readable cause on some refusals (e.g. step-up "expired",
-   * "already_consumed"; audit-log backfill "busy"). */
+   * "already_consumed"; audit-log backfill "busy"; 5.42.0
+   * "shared_permission_denied", "secrets_expired", "step_up_unavailable"). */
   reason?: string
+  /** 5.42.0: the capability a shared_permission_denied refusal names. */
+  capability?: string
+  /** 5.42.0: the Environments change a step-up save applied (or refused). */
+  action?: string
 }
 
 // ── Access Explorer ──────────────────────────────────────────────────────

@@ -2,6 +2,122 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.42.0 — **Admins decide what users may do with an environment shared with them (a global default plus per-environment overrides), and every change in the Environments area now needs a fresh MFA approval.**
+A minor release (two new features). Until now a shared environment gave
+every other logged-in user the owner's credentials for everything this app
+does except the sync controls. Sharing stays the owner's decision; what
+sharing allows is now an admin's. Separately, every change made from the
+Environments area now goes through the same step-up MFA approval as the
+Access Control save, for every user.
+- **Upgrade behaviour: nothing changes until an admin changes a setting.**
+  The built-in defaults are exactly what a shared user could do before:
+  view archived reports, live read queries, write to the owner's OPA team /
+  Okta org, import a CSV into the archive and reset the sync watermark are
+  allowed; **Sync now and the sync settings stay off** (owner-only, as
+  before -- a shared user now gets `403 shared_permission_denied` there
+  instead of the old `404`). Owners are never limited, on any setting. Migration 008 adds two
+  empty tables, so every setting starts at its built-in default.
+- **Shared permissions (admins only).** Seven settings, one per thing a
+  shared user can do: *view archived reports* (reports, resource history,
+  sync status, the basic evidence-chain check), *live read queries* (Access
+  Explorer, Folder Builder lists and preview, the Secrets and Service
+  Accounts dashboards -- these two also need *view archived reports*),
+  *write to the OPA tenant / Okta org* (resource groups, projects, folders,
+  security policies, group membership, new Okta groups with Group Push),
+  *import a CSV into the archive*, *reset the sync watermark*, *run Sync
+  now*, *change sync settings*. Set a global default in **Shared
+  permissions** (sidebar) and override it for one environment under
+  **Environments → Shared permissions**: inherit, allow or don't allow,
+  shown with the value in effect and where it comes from (built-in default,
+  global default or the environment's override). Only admins can see or
+  change them (the local-mode operator is the admin there); every change is
+  audit-logged as `shared_permissions.update` with each capability's stored
+  value before and after. Admins using someone else's shared environment
+  get the same limits as anyone else.
+- **Enforced by the server, on every route.** One check, run after the
+  route's own visibility check (a private environment is still a 404,
+  never a 403 that confirms it exists); a refusal is a `403` with
+  `"reason": "shared_permission_denied"` and the capability. Environment
+  rows in `GET /api/environments` now carry `permissions` (what the caller
+  may do; only on rows the caller's by-name routes reach) and, for admins,
+  `permission_overrides`; the UI only mirrors them:
+  each shared row lists what you may and may not do, a notice above the
+  page names what the active shared environment doesn't allow, and Sync
+  now, the sync settings, the watermark reset, the Folder Builder's Preview
+  and Create Folders are disabled with the reason. Other actions refused by
+  the server show its message.
+- **Sync now on a shared environment, when an admin allows it,** runs the
+  owner's sync: the owner's stored Okta token and the owner's saved sync
+  settings, both looked up by the environment's id, never its display name
+  (display names are not unique across owners, nor among owner-less
+  environments, which could hand a sync another environment's token). Only
+  the owner can choose a different ingestion scope for a run, and a shared
+  user allowed to change sync settings still can't change retention (it
+  deletes archived events). The scheduler and every sync now read the
+  schedule and credentials by id too.
+- **MFA for every Environments change (hosted mode).** Creating, editing
+  (credentials and rename included), deleting (with or without its
+  archive), sharing or unsharing an environment, saving sync settings,
+  resetting the sync watermark, importing a CSV into the archive, purging an
+  orphaned archive and changing shared permissions now each need a fresh
+  Okta MFA approval -- the Access Control save's own mechanism, for every
+  user: the change is checked and stored as a pending action (bound to your
+  Okta identity, single use, 15 minutes), you approve it at the gate's
+  `/step-up`, and it is applied on the way back through
+  `/api/environment_changes/save` (its own nginx location with
+  `auth_request /verify_stepup`). The approval covers exactly the change
+  that was stored: whatever the browser sends with the save is ignored, an
+  approval can't be used twice or for another change, an Access Control
+  approval can't be used here (or the other way round), and every check runs
+  again when the change is applied -- including that the environment's name
+  still means the environment that was checked (otherwise `409
+  target_changed`, nothing applied). A request the server would refuse is
+  refused before the MFA step, as in local mode. One user can have at most
+  20 changes waiting for approval. A form whose approval doesn't complete
+  (cancelled, failed, expired) reopens with your input. The environment
+  form's key secret and Okta API token are never written to the pending
+  action (credentials stay in the keychain only); they wait in the
+  server's memory, and if the server restarts during the round trip the
+  save asks you to type them again. **Not gated** (not configuration
+  changes): activating an environment, Sync now, and read-only views such
+  as the integrity check. **Local mode** has no login gate and no identity
+  provider to step up with, so there these changes apply at once, as
+  before. On a brand-new environment's first sync, "save settings, then
+  import a CSV" is two approvals in hosted mode.
+- **Operator action and deploy impact.**
+  - **Migration 008** (automatic at start): adds `shared_permission_defaults`
+    and `shared_permission_overrides` (overrides are removed with their
+    environment). Nothing existing is altered; no evidence-chain table is
+    touched. **Rollback-safe:** older code ignores both tables; settings
+    made in 5.42.0 simply stop applying until it is re-deployed.
+  - **nginx:** the site template gains the `/api/environment_changes/save`
+    step-up location, and `location /` now drops a client-sent
+    `X-Auth-Action-Id` / `X-Nginx-Stepup-Location`. `deploy.sh` applies it as
+    usual. **An additional gate's site** (`setup-second-gate.sh`) is a
+    snapshot `deploy.sh` doesn't update: until it is rebuilt (remove it and
+    re-run the same `setup-second-gate.sh` command, see docs/hosting.md),
+    Environments changes made through that hostname are refused with
+    `"reason": "step_up_unavailable"` -- they fail closed, never ungated.
+  - Your OIDC app's Authentication Policy must really require a second
+    factor for step-up, as for the Access Control save (docs/hosting.md).
+- **Also:** `consume_pending_admin_action` takes an optional list of the
+  action types its caller applies (the Access Control save now passes its
+  own), so one kind of approval can't be spent on another. A session whose
+  environment was deleted under it gets "no active environment" (`409`).
+- **Tests.** The HTTP authz matrix now pins every environment and session
+  route to the capabilities it checks (read from the route's code, so a new
+  environment route without a declared capability fails CI) and drives each
+  one as a shared non-owner with the built-in defaults, a global deny, a
+  per-environment allow, a per-environment deny and back to inherit -- the
+  owner and an admin alongside. Every Environments change is driven through
+  its step-up: nothing happens before approval, a save not through the
+  step-up location, by another user, without an approval, replayed,
+  expired, or with another kind of approval is refused, and the stored
+  request (not the save's body) is what runs. Plus migration 008, the audit
+  entries, secrets never in the pending table, the nginx location (served
+  by a real nginx), and frontend tests for the permission mirroring, the
+  admin screens and the MFA round trip.
+
 5.41.0 — **Deploy script, launcher and CI: the remaining twenty-three findings from the 2026-10-05 external review (OPS-02, OPS-05..11, OPS-13, OPS-14, OPS-16, OPS-17, LNCH-01..07, TEST-10..13), plus the nginx site template no longer carries one server's values.**
 Batch 6 of the review's remaining findings. A minor release, not a
 patch: `server/deploy.sh` gains settings (`--ref`, `.deploy.conf`, an

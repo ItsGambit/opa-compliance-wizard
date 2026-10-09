@@ -1,4 +1,4 @@
-/** UI-07: Sync now is the environment owner's action. */
+/** UI-07 / 5.42.0: Sync now on a shared environment follows what an admin allows shared users. */
 import { screen } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { fetchEnvironments, fetchSyncStatus, fetchVersion } from '../api/client'
@@ -27,7 +27,20 @@ describe('Footer', () => {
     renderWithClient(<Footer />)
     const btn = (await screen.findByRole('button', { name: /Sync now/ })) as HTMLButtonElement
     expect(btn.disabled).toBe(true)
-    expect(btn.title).toMatch(/Only the owner of 'team'/)
+    expect(btn.title).toMatch(/an admin hasn't allowed shared users to run its sync on 'team'/)
+  })
+
+  it('follows the server-reported permission on a shared environment (5.42.0)', async () => {
+    const permissions = Object.fromEntries(
+      ['view_archive', 'live_read', 'tenant_write', 'import_csv', 'reset_watermark', 'sync_settings'].map(k => [k, { value: 'deny', source: 'default' }]),
+    ) as NonNullable<Environment['permissions']>
+    vi.mocked(fetchEnvironments).mockResolvedValue({
+      environments: [env({ permissions: { ...permissions, sync_now: { value: 'allow', source: 'override' } } })],
+      active: 'team', active_id: 'e1',
+    })
+    renderWithClient(<Footer />)
+    const btn = (await screen.findByRole('button', { name: /Sync now/ })) as HTMLButtonElement
+    expect(btn.disabled).toBe(false)
   })
 
   it('enables it on the user’s own environment', async () => {

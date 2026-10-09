@@ -5,6 +5,7 @@ import { ApiError, activateEnvironment, saveEnvironment, setEnvironmentShared } 
 import { renderWithClient } from '../test/renderWithClient'
 import type { Environment, EnvironmentsResponse } from '../types'
 import { EnvironmentManagerDialog } from './EnvironmentManagerDialog'
+import { beginStepUp } from '../utils/stepUp'
 
 vi.mock('../api/client', async importOriginal => {
   const actual = await importOriginal<typeof import('../api/client')>()
@@ -15,6 +16,10 @@ vi.mock('../api/client', async importOriginal => {
     saveEnvironment: vi.fn(),
     setEnvironmentShared: vi.fn(),
   }
+})
+vi.mock('../utils/stepUp', async importOriginal => {
+  const actual = await importOriginal<typeof import('../utils/stepUp')>()
+  return { ...actual, beginStepUp: vi.fn() }
 })
 vi.mock('./SyncScheduleDialog', () => ({ SyncScheduleDialog: ({ env }: { env: Environment }) => <button type="button">sync {env.id}</button> }))
 
@@ -97,5 +102,53 @@ describe('EnvironmentManagerDialog', () => {
       expect(screen.getByLabelText(label)).toBeTruthy()
     }
     expect(screen.getByRole('button', { name: 'Close' })).toBeTruthy()
+  })
+})
+
+
+describe('EnvironmentManagerDialog -- step-up MFA (5.42.0)', () => {
+  it('a hosted save goes to MFA with the form input but never its secrets', async () => {
+    vi.mocked(saveEnvironment).mockResolvedValue({ step_up_required: true, action_id: 'act1', action: 'environment.upsert' })
+    renderDialog({ environments: [env('d1', 'dev')], active: 'dev', active_id: 'd1' })
+    fireEvent.click(screen.getByRole('button', { name: 'Edit dev' }))
+    fireEvent.change(screen.getByLabelText('Key Secret'), { target: { value: 'TOP-SECRET' } })
+    fireEvent.change(screen.getByLabelText('Base Domain'), { target: { value: 'new.example' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save & Reconnect' }))
+    await waitFor(() => expect(beginStepUp).toHaveBeenCalled())
+    const [actionId, pending] = vi.mocked(beginStepUp).mock.calls[0]
+    expect(actionId).toBe('act1')
+    expect(JSON.stringify(pending)).not.toContain('TOP-SECRET')
+    expect(pending.kind === 'environment_change' && pending.environmentDraft?.base_domain).toBe('new.example')
+  })
+
+  it('reopens a not-applied edit with the user’s input', () => {
+    const restore = {
+      kind: 'environment_change' as const, action: 'environment.upsert', label: "Save environment 'dev'", startedAt: Date.now(),
+      environmentDraft: { id: 'd1', name: 'dev', base_domain: 'typed.example', team_name: 't', key_id: 'k', okta_url: '' },
+    }
+    renderWithClient(<EnvironmentManagerDialog data={{ environments: [env('d1', 'dev')], active: 'dev', active_id: 'd1' }}
+      open onOpenChange={() => {}} restore={restore} />)
+    expect((screen.getByLabelText('Base Domain') as HTMLInputElement).value).toBe('typed.example')
+    expect((screen.getByLabelText('Key Secret') as HTMLInputElement).value).toBe('')
+    expect(screen.getByText(/Your earlier input is restored/)).toBeTruthy()
+  })
+
+  it('a hosted share/unshare goes to MFA', async () => {
+    vi.mocked(setEnvironmentShared).mockResolvedValue({ step_up_required: true, action_id: 'act2', action: 'environment.share' })
+    renderDialog({ environments: [env('d2', 'qa', { shared: true })], active: 'qa', active_id: 'd2' })
+    fireEvent.click(screen.getByRole('button', { name: /Sharing for qa: shared/ }))
+    await waitFor(() => expect(beginStepUp).toHaveBeenCalledWith('act2', expect.objectContaining({ label: "Make 'qa' private" })))
+  })
+
+  it('a shared row lists what the user may and may not do; admins get the per-environment editor', () => {
+    const allow = { value: 'allow', source: 'built_in' } as const
+    const deny = { value: 'deny', source: 'default' } as const
+    const shared = env('s', 'team', {
+      is_own: false, shared: true,
+      permissions: { view_archive: allow, live_read: allow, tenant_write: deny, import_csv: allow, reset_watermark: allow, sync_now: deny, sync_settings: deny },
+    })
+    renderDialog({ environments: [shared], active: null, active_id: null })
+    expect(screen.getByText(/Not allowed for shared users: changes in OPA \/ Okta, Sync now, sync settings/)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Shared permissions for team' })).toBeNull()
   })
 })

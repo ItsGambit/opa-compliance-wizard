@@ -4,6 +4,9 @@ import { Field } from './Field'
 
 interface Props {
   initial?: Environment
+  /** 5.42.0: input restored after an MFA approval that didn't complete --
+   * never secrets, which the user re-enters. */
+  draft?: Partial<EnvironmentFormValues>
   submitLabel: string
   onSubmit: (values: EnvironmentFormValues) => void
   isSubmitting: boolean
@@ -16,9 +19,9 @@ const EMPTY: EnvironmentFormValues = {
 
 /** Callers key this form by the environment being edited, so switching rows
  * (or "Add environment") always starts from that row's values. */
-export function EnvironmentForm({ initial, submitLabel, onSubmit, isSubmitting, errorMessage }: Props) {
+export function EnvironmentForm({ initial, draft, submitLabel, onSubmit, isSubmitting, errorMessage }: Props) {
   const [values, setValues] = useState<EnvironmentFormValues>(
-    initial ? { ...EMPTY, ...initial, key_secret: '', okta_api_token: '' } : EMPTY
+    { ...EMPTY, ...(initial ?? {}), ...(draft ?? {}), key_secret: '', okta_api_token: '' }
   )
 
   const isEditing = !!initial
@@ -88,6 +91,12 @@ export function EnvironmentForm({ initial, submitLabel, onSubmit, isSubmitting, 
         )}
       </Field>
 
+      {draft && (
+        <div className="text-xs text-warn" role="status">
+          Your earlier input is restored. Secrets are never kept in the browser: enter the key secret and Okta API
+          token again if you were changing them.
+        </div>
+      )}
       {errorMessage && <div className="text-xs text-loss" role="alert">{errorMessage}</div>}
 
       <button type="submit" className="btn-primary self-start" disabled={!canSubmit || isSubmitting}>

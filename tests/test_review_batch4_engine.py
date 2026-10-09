@@ -1446,7 +1446,7 @@ def test_sync_start_with_a_locked_keychain_is_a_recorded_refusal(matrix_server, 
     def locked(*a, **k):
         raise engine.CredentialStoreUnavailable("The OS credential store could not be read (KeyringLocked).")
 
-    monkeypatch.setattr(engine, "get_environment_credentials", locked)
+    monkeypatch.setattr(engine, "get_environment_credentials_by_id", locked)  # by id since 5.42.0
     assert serve._start_sync_job(env_id, "dev", "curated", owner=OWNER_A, trigger="scheduled") is False
     state = audit_store.get_sync_state(env_id)
     assert state["last_sync_status"] == "error" and state["last_sync_attempt_at"]

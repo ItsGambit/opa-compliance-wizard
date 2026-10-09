@@ -161,6 +161,100 @@ if DEPLOYMENT_MODE == "hosted" and not NGINX_PROXY_SECRET:
 # without leaving an abandoned pending action claimable indefinitely.
 STEPUP_PREPARE_TTL_SECONDS = 15 * 60
 
+# 5.42.0: every change made from the Environments area needs a fresh MFA
+# challenge, by the SAME mechanism as the Access Control save above (no
+# second step-up system).
+# In hosted mode each of these routes checks the request, stores it as a
+# pending action (audit_store.create_pending_admin_action, these types)
+# and answers 202 {"step_up_required": true, "action_id": ...}; the browser
+# goes through the gate's /step-up and comes back to
+# POST /api/environment_changes/save -- its own nginx location with
+# auth_request /verify_stepup, like /api/access_control/save -- which
+# consumes the action (bound to the caller's sub, single use, expiring)
+# and runs the stored request. Local mode has no Okta identity and no
+# gate, so there the routes act at once, as before. Activating an
+# environment, "Sync now" and read-only views are not configuration
+# changes and are not gated.
+ENV_CHANGE_ACTION_TYPES = (
+    "environment.upsert", "environment.share", "environment.delete",
+    "sync_schedule.update", "sync.reset_watermark", "sync.import_csv",
+    "archive.purge", "shared_permissions.update",
+)
+
+# The environment form's two secrets never go into pending_admin_actions
+# (credentials are never written to disk -- they live only in the OS
+# keychain): they wait here, in this process's memory, for the same TTL,
+# keyed by the action they belong to. A restart during the MFA round trip
+# loses them, and the save then asks for them again instead of saving
+# without them. Bounded so an authenticated caller can't grow it without
+# limit by preparing and abandoning saves.
+MAX_PENDING_ENV_SECRETS = 1024
+# Open (unconsumed, unexpired) Environments approvals one user may have at
+# once -- any authenticated user can prepare one, so this bounds what an
+# abandoned-save loop can add to pending_admin_actions and to the secrets
+# held above.
+MAX_OPEN_ENV_CHANGES_PER_USER = 20
+# The environment form's fields are the only ones stored for a save, each
+# capped (a secret this long is not a real API key or token).
+ENV_FORM_FIELDS = ("id", "name", "base_domain", "team_name", "key_id", "okta_url", "key_secret", "okta_api_token")
+MAX_ENV_FIELD_CHARS = 4096
+_pending_env_secrets_lock = threading.Lock()
+_pending_env_secrets = {}  # action_id -> (expires_monotonic, {field: value})
+# Makes the per-user count and the insert of a new pending change one step.
+_pending_env_changes_lock = threading.Lock()
+
+
+def _remember_pending_secrets(action_id, secrets_by_field):
+    now = time.monotonic()
+    with _pending_env_secrets_lock:
+        for key in [k for k, (expires, _v) in _pending_env_secrets.items() if expires < now]:
+            _pending_env_secrets.pop(key, None)
+        if len(_pending_env_secrets) >= MAX_PENDING_ENV_SECRETS:
+            # Drop the oldest-expiring entry; its save will ask for the
+            # secrets again rather than fail silently.
+            oldest = min(_pending_env_secrets, key=lambda k: _pending_env_secrets[k][0])
+            _pending_env_secrets.pop(oldest, None)
+        _pending_env_secrets[action_id] = (now + STEPUP_PREPARE_TTL_SECONDS, dict(secrets_by_field))
+
+
+def _take_pending_secrets(action_id):
+    """The secrets stored for this action (removed), or None if they are
+    gone (expired, or the process restarted)."""
+    with _pending_env_secrets_lock:
+        entry = _pending_env_secrets.pop(action_id, None)
+    if entry is None or entry[0] < time.monotonic():
+        return None
+    return entry[1]
+
+
+def _step_up_required_for_changes():
+    """True when Environments changes need a step-up approval: behind the
+    hosted login gate. Local mode has no identity provider to step up with."""
+    return DEPLOYMENT_MODE == "hosted"
+
+
+def _request_passed_stepup_location(headers):
+    """The Environments save must have come through nginx's step-up
+    location, not through `location /`. Only that location sets
+    X-Nginx-Stepup-Location (to the proxy secret, which a browser never
+    knows). Needed because an nginx site generated before 5.42.0 -- e.g. an
+    additional gate's site, which deploy.sh does not regenerate -- has no
+    such location: the request would fall through to `location /`, which
+    passes a client-sent X-Auth-Action-Id straight to this process. With
+    this check that site fails closed (the save is refused) instead."""
+    if not NGINX_PROXY_SECRET:
+        return False
+    presented = headers.get("X-Nginx-Stepup-Location")
+    if not isinstance(presented, str):
+        return False
+    return hmac.compare_digest(presented.encode("utf-8"), NGINX_PROXY_SECRET.encode("utf-8"))
+
+
+def _shared_permission_message(capability):
+    label = next((c["label"] for c in engine.SHARED_CAPABILITIES if c["key"] == capability), capability)
+    return (f"Not allowed on this shared environment: {label}. Only its owner can do this unless an admin "
+            "allows it for shared users (Shared permissions).")
+
 
 def _request_is_from_nginx(headers):
     """True if NGINX_PROXY_SECRET is unset (nothing to check -- standalone/
@@ -651,7 +745,9 @@ def _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, trigger
                 client_ip=client_ip, user_agent=user_agent,
             )
             return
-        schedule = engine.get_sync_schedule(env_name, owner=owner)
+        # By id (5.42.0): the environment this sync ran for, never whatever
+        # its display name resolves to for `owner`.
+        schedule = engine.get_sync_schedule_by_id(env_id)
         prune_result = audit_store.prune_events(
             env_id,
             retention_days=schedule.get("retention_days"),
@@ -761,7 +857,11 @@ def _launch_claimed_sync(env_id, env_name, ingestion_scope, owner, trigger, acto
     """Second half of _start_sync_job, run once the slot is claimed:
     resolve credentials (refusing cleanly) and start the worker thread."""
     try:
-        creds = engine.get_environment_credentials(env_name, owner=owner)
+        # By id, under the environment's real owner (5.42.0): a shared
+        # user's "Sync now" runs with the owner's stored token, and display
+        # names are not unique across owners (nor among owner-less rows) --
+        # resolving by name picked another environment's credentials.
+        creds = engine.get_environment_credentials_by_id(env_id, owner=owner)
     except (KeyError, engine.CredentialStoreUnavailable) as exc:
         # ENG1-10: a locked keychain is a refused attempt like any other
         # (recorded, so the scheduler backs off) -- never an exception that
@@ -855,7 +955,7 @@ def _scheduler_tick(now_utc):
         env_name = meta.get("name")
         owner = meta.get("owner")
         try:
-            schedule = engine.get_sync_schedule(env_name, owner=owner)
+            schedule = engine.get_sync_schedule_by_id(environment_id)
         except KeyError:
             continue
         if not schedule.get("enabled"):
@@ -1126,6 +1226,20 @@ class _RequestAborted(Exception):
     sending anything else."""
 
 
+# Action type -> the Handler method that runs it (see _environment_change).
+_ENV_CHANGE_EXECUTORS = {
+    "environment.upsert": "_exec_environment_upsert",
+    "environment.share": "_exec_environment_share",
+    "environment.delete": "_exec_environment_delete",
+    "sync_schedule.update": "_exec_sync_schedule_update",
+    "sync.reset_watermark": "_exec_sync_reset_watermark",
+    "sync.import_csv": "_exec_sync_import_csv",
+    "archive.purge": "_exec_archive_purge",
+    "shared_permissions.update": "_exec_shared_permissions_update",
+}
+assert set(_ENV_CHANGE_EXECUTORS) == set(ENV_CHANGE_ACTION_TYPES)
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(FRONTEND_DIST), **kwargs)
@@ -1270,6 +1384,504 @@ class Handler(SimpleHTTPRequestHandler):
         return body
 
     # -----------------------------------------------------------------
+    # Shared-environment permissions (5.42.0)
+    # -----------------------------------------------------------------
+    def _capability_refused(self, engine_owner, environment_id, capabilities):
+        """THE route-side shared-environment check: every route that reads
+        or acts on an environment (by name, or through the caller's active
+        session) calls this with its fixed capability tuple, AFTER its own
+        visibility/session checks (so it is never an existence oracle).
+        Sends the one 403 shape and returns True when any capability is not
+        allowed; owners always pass (engine.shared_capability_allowed).
+        environment_id None (no active environment) refuses nothing: the
+        route's own "no active environment" answer applies. An id with no
+        environment row behind it is refused (fail closed)."""
+        if environment_id is None:
+            return False
+        if not engine.environment_owner(environment_id)[0]:
+            # The session's environment was deleted under it: that is "no
+            # active environment", not a permission refusal.
+            self._send_json(409, {"error": "No active environment configured. Use the gear menu to set one up."})
+            return True
+        for capability in capabilities:
+            if not engine.shared_capability_allowed(environment_id, engine_owner, capability):
+                self._send_json(403, {
+                    "error": _shared_permission_message(capability),
+                    "reason": "shared_permission_denied", "capability": capability,
+                })
+                return True
+        return False
+
+    def _caller(self):
+        """(owner_key, engine_owner, actor_email, actor_sub) for this request."""
+        owner_key = _owner_key_from_headers(self.headers)
+        actor_sub = None if owner_key == LOCAL_OWNER_KEY_HEADER else owner_key
+        return owner_key, _engine_owner(owner_key), self.headers.get("X-Auth-User"), actor_sub
+
+    # -----------------------------------------------------------------
+    # Environments changes: act now (local mode) or after step-up MFA
+    # -----------------------------------------------------------------
+    def _environment_change(self, action, params):
+        """Runs one Environments change. Every executor below takes
+        (params, dry_run, via_step_up) and returns (status, body); with
+        dry_run it makes every check it can without changing anything and
+        returns (None, None) when the change may go ahead. Local mode: run
+        it. Hosted mode: check it, store it as a pending action and answer
+        202 so the browser can get the step-up approval; the stored request
+        is run by POST /api/environment_changes/save afterwards, with every
+        check made again."""
+        executor = getattr(self, _ENV_CHANGE_EXECUTORS[action])
+        if action == "environment.upsert":
+            # Only the form's own fields, each capped -- the same values a
+            # direct save would use (upsert_environment ignores the rest).
+            body_in = params.get("body") or {}
+            for field in ENV_FORM_FIELDS:
+                value = body_in.get(field)
+                if value is not None and not isinstance(value, str):
+                    return self._send_json(400, {"error": f"{field} must be a string"})
+                if isinstance(value, str) and len(value) > MAX_ENV_FIELD_CHARS:
+                    return self._send_json(400, {"error": f"{field} is too long"})
+            params = {**params, "body": {k: body_in[k] for k in ENV_FORM_FIELDS if k in body_in}}
+        if not _step_up_required_for_changes():
+            status, body = executor(params, dry_run=False, via_step_up=False)
+            return self._send_json(status, body)
+        # The dry run makes every check it can and returns what the change
+        # was checked against ("bound": e.g. the environment id a name
+        # resolved to). That is stored with the change, and the save refuses
+        # (409 target_changed) if it no longer holds -- the approval covers
+        # the environment that was checked, not whatever the name means later.
+        status, body = executor(params, dry_run=True, via_step_up=False)
+        if status is not None:
+            return self._send_json(status, body)
+        import audit_store
+        _owner_key, _engine_owner_, _email, actor_sub = self._caller()
+        stored = json.loads(json.dumps(params))
+        if body:
+            stored["bound"] = body
+        secrets_by_field = {}
+        if action == "environment.upsert":
+            body_in = stored.get("body") or {}
+            for field in engine.ENVIRONMENT_SECRET_FIELDS:
+                value = body_in.pop(field, None)
+                if isinstance(value, str) and value.strip():
+                    secrets_by_field[field] = value
+        payload = {"action": action, "params": stored, "secret_fields": sorted(secrets_by_field)}
+        action_id = None
+        with _pending_env_changes_lock:  # decide under the lock, answer after it (never a socket write inside)
+            if audit_store.count_open_pending_admin_actions(actor_sub, ENV_CHANGE_ACTION_TYPES) < MAX_OPEN_ENV_CHANGES_PER_USER:
+                action_id = audit_store.create_pending_admin_action(
+                    actor_sub, action, payload, ttl_seconds=STEPUP_PREPARE_TTL_SECONDS
+                )
+        if action_id is None:
+            return self._send_json(429, {"error": "Too many changes are waiting for MFA approval; finish or abandon "
+                                                  "them (they expire after 15 minutes) and try again.",
+                                         "reason": "too_many_pending"})
+        if secrets_by_field:
+            _remember_pending_secrets(action_id, secrets_by_field)
+        return self._send_json(202, {"step_up_required": True, "action_id": action_id, "action": action})
+
+    @staticmethod
+    def _target_changed():
+        return 409, {"error": "The environment this change was approved for has changed (renamed, shared, unshared "
+                              "or deleted) since. Nothing was applied -- reload and try again.",
+                     "reason": "target_changed"}
+
+    def _exec_environment_upsert(self, params, dry_run, via_step_up):
+        payload = params.get("body") or {}
+        owner_key, engine_owner, actor_email, actor_sub = self._caller()
+        is_admin = _is_admin_from_headers(self.headers)
+        name = payload.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return 400, {"error": "Environment name is required (e.g. dev, uat, prod)."}
+        environment_id = payload.get("id")
+        if environment_id is not None and not isinstance(environment_id, str):
+            return 400, {"error": "id must be a string"}
+        if dry_run:
+            try:
+                _n, checked_id = engine.upsert_environment(
+                    name, payload, owner=engine_owner, is_admin=is_admin, environment_id=environment_id, dry_run=True,
+                )
+            except PermissionError as exc:
+                return 403, {"error": str(exc)}
+            return None, {"environment_id": checked_id}
+        bound = params.get("bound")
+        # The approved target is checked inside the save's own transaction.
+        expected = {"expected_target_id": bound.get("environment_id")} if bound is not None else {}
+        _c, _o, local_env_name, _i = _session_snapshot(owner_key)
+        ids_before = set(engine.list_all_environments())
+        try:
+            name, upserted_id = engine.upsert_environment(
+                name, payload, owner=engine_owner, is_admin=is_admin, environment_id=environment_id, **expected,
+            )
+        except PermissionError as exc:
+            return 403, {"error": str(exc)}
+        except engine.EnvironmentTargetChanged:
+            return self._target_changed()
+        target_meta = engine.list_all_environments().get(upserted_id) or {}
+        caller_owns_target = target_meta.get("owner") == engine_owner
+        details = {
+            "name": name, "admin_override": is_admin,
+            # Whose environment was written -- an admin editing
+            # someone else's credentials is now explicit in the log.
+            "environment_id": upserted_id, "edited_other_owner": not caller_owns_target,
+        }
+        if via_step_up:
+            details["step_up_verified"] = True
+        self._log_audit_event(actor_email, actor_sub, "environment.upsert", details)
+        # ENG1-06 (external review, 2026-10-05): every OTHER owner's
+        # live session on this environment still holds a client built
+        # from the OLD credentials (able to re-mint tokens on 401).
+        # Drop them and let each owner's next request re-run the
+        # normal saved-environment auto-activation, which re-checks
+        # visibility and builds a client from what is stored now.
+        if upserted_id in ids_before:
+            # The caller's own session is kept only when it is about to
+            # be rebuilt below (they own the target); an admin editing
+            # someone else's environment loses a stale session on it
+            # like everyone else and re-activates with the new values.
+            _drop_sessions_for_environment(
+                upserted_id, except_owner=owner_key if caller_owns_target else None, reactivate=True,
+            )
+        if not caller_owns_target:
+            # An admin edited ANOTHER owner's environment by id. It
+            # was saved; it is not the admin's to activate (by name
+            # it would resolve to the admin's own same-named
+            # environment, or not at all -- this used to 500 with a
+            # KeyError after a successful save).
+            return 200, {"saved": True, "activated": False, "active": local_env_name}
+        # The caller's own environment: (re)activate it, so their own
+        # session also picks up the new credentials.
+        try:
+            activate_environment(owner_key, name)
+        except engine.OpaApiError as exc:
+            return 502, {"error": f"Saved, but could not connect: {exc}", "saved": True}
+        return 200, {"activated": True, "active": name}
+
+    def _exec_environment_share(self, params, dry_run, via_step_up):
+        owner_key, engine_owner, actor_email, actor_sub = self._caller()
+        name = params.get("name") or ""
+        payload = params.get("body") or {}
+        shared = bool(payload.get("shared", False))
+        is_admin = _is_admin_from_headers(self.headers)
+        try:
+            checked = engine.set_environment_shared(
+                name, engine_owner, shared, is_admin=is_admin, environment_id=payload.get("id"), dry_run=True,
+            )
+            if dry_run:
+                return None, {"environment_id": checked}
+            bound = params.get("bound")
+            if bound is not None and bound.get("environment_id") != checked:
+                return self._target_changed()
+            target_id = engine.set_environment_shared(
+                name, engine_owner, shared, is_admin=is_admin, environment_id=payload.get("id"),
+            )
+        except KeyError as exc:
+            return 404, {"error": str(exc)}
+        except PermissionError as exc:
+            return 403, {"error": str(exc)}
+        if not shared:
+            # ENG1-06: an unshare withdraws access NOW, not at the
+            # next restart -- every other owner's live session on it
+            # is dropped (the owner's own stays).
+            _drop_sessions_for_environment(target_id, except_owner=owner_key)
+        details = {"name": name, "shared": shared, "admin_override": is_admin}
+        if via_step_up:
+            details["step_up_verified"] = True
+        self._log_audit_event(actor_email, actor_sub, "environment.share", details)
+        return 200, {"name": name, "shared": shared}
+
+    def _exec_environment_delete(self, params, dry_run, via_step_up):
+        owner_key, engine_owner, actor_email, actor_sub = self._caller()
+        name = params.get("name") or ""
+        is_admin = _is_admin_from_headers(self.headers)
+        environment_id = params.get("id")
+        # DATA-12: deleting the archive too is an explicit choice
+        # (`?purge_archive=1`); the default keeps it as an orphan an
+        # admin can review/purge later via /api/archives. Destroying
+        # evidence is admin-only (local mode exempt), same rule as
+        # /api/archives -- an environment's owner can delete the
+        # environment, but not the compliance history other users
+        # may report from (a shared environment's archive is
+        # everyone's evidence).
+        purge_archive = bool(params.get("purge_archive"))
+        if purge_archive and not _can_admin(owner_key, self.headers):
+            return 403, {"error": "Admin access required to delete an environment's compliance archive; delete without purge_archive to keep it."}
+        try:
+            checked = engine.delete_environment(
+                name, owner=engine_owner, is_admin=is_admin, environment_id=environment_id, dry_run=True,
+            )["environment_id"]
+        except PermissionError as exc:
+            return 403, {"error": str(exc)}
+        except KeyError as exc:
+            return 404, {"error": str(exc)}
+        if dry_run:
+            return None, {"environment_id": checked}
+        bound = params.get("bound")
+        if bound is not None and bound.get("environment_id") != checked:
+            return self._target_changed()
+        try:
+            result = engine.delete_environment(
+                name, owner=engine_owner, is_admin=is_admin, environment_id=environment_id,
+                purge_archive=purge_archive,
+            )
+        except PermissionError as exc:
+            return 403, {"error": str(exc)}
+        except KeyError as exc:
+            return 404, {"error": str(exc)}
+        except Exception as exc:
+            # The environment is gone even if the archive purge failed
+            # (see delete_environment) -- log the delete before
+            # surfacing the error, never lose the audit entry.
+            self._log_audit_event(actor_email, actor_sub, "environment.delete",
+                                  {"name": name, "admin_override": is_admin, "purge_archive": purge_archive,
+                                   "archive_purge_error": str(exc)})
+            raise
+        # ENG1-06: every owner's live session on this environment is
+        # now stale (its cached client still holds the old credentials
+        # in memory) -- drop them all, not just the caller's.
+        _drop_sessions_for_environment(result["environment_id"])
+        details = {"name": name, "admin_override": is_admin, "purge_archive": purge_archive}
+        if result["archive"]:
+            details["archive_purged"] = result["archive"]
+        if via_step_up:
+            details["step_up_verified"] = True
+        self._log_audit_event(actor_email, actor_sub, "environment.delete", details)
+        return 200, {"deleted": name, "archive_purged": purge_archive}
+
+    def _visible_environment(self, name, params=None):
+        """(meta, None) for the environment `name` resolves to for this
+        caller, or (None, (status, body)): 404 when it resolves to nothing,
+        409 target_changed when an approved change was checked against a
+        different environment than the name resolves to now."""
+        _owner_key, engine_owner, _email, _sub = self._caller()
+        meta = engine.list_environments_for(engine_owner).get(name)
+        if meta is None:
+            return None, (404, {"error": f"No environment named '{name}' visible to this user."})
+        bound = (params or {}).get("bound")
+        if bound is not None and bound.get("environment_id") != meta["environment_id"]:
+            return None, self._target_changed()
+        return meta, None
+
+    def _shared_refusal(self, meta, capability):
+        """(403, body) when this caller may not use `capability` on `meta`'s
+        environment, else None -- the executors' form of
+        _capability_refused (same check, returned instead of sent)."""
+        _owner_key, engine_owner, _email, _sub = self._caller()
+        if engine.shared_capability_allowed(meta["environment_id"], engine_owner, capability):
+            return None
+        return 403, {"error": _shared_permission_message(capability), "reason": "shared_permission_denied",
+                     "capability": capability}
+
+    def _exec_sync_reset_watermark(self, params, dry_run, via_step_up):
+        # DATA-03 remedy: the only supported way out of an unusable
+        # watermark. Same visibility rule as /sync/start; the next
+        # sync backfills the full 90-day window (dedup makes that
+        # free of duplicates).
+        import audit_store
+        _owner_key, _engine_owner_, actor_email, actor_sub = self._caller()
+        name = params.get("name") or ""
+        meta, refusal = self._visible_environment(name, params)
+        if refusal:
+            return refusal
+        refusal = self._shared_refusal(meta, "reset_watermark")
+        if refusal:
+            return refusal
+        if _ingest_running(meta["environment_id"]):
+            return 409, {"error": "A sync or import is running for this environment; reset the watermark after it finishes."}
+        if dry_run:
+            return None, {"environment_id": meta["environment_id"]}
+        previous = audit_store.reset_sync_watermark(meta["environment_id"])
+        details = {"name": name, "previous_watermark": previous}
+        if via_step_up:
+            details["step_up_verified"] = True
+        self._log_audit_event(actor_email, actor_sub, "sync.reset_watermark", details)
+        return 200, {"name": name, "previous_watermark": previous}
+
+    def _exec_sync_schedule_update(self, params, dry_run, via_step_up):
+        _owner_key, _engine_owner_, actor_email, actor_sub = self._caller()
+        name = params.get("name") or ""
+        config = params.get("body")
+        meta, refusal = self._visible_environment(name, params)
+        if refusal:
+            return refusal
+        refusal = self._shared_refusal(meta, "sync_settings")
+        if refusal:
+            return refusal
+        try:
+            clean = engine.validate_sync_schedule_config(config)
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        if meta.get("owner") != self._caller()[1]:
+            # Retention prunes archived evidence at the next sync, and
+            # destroying evidence is never a shared user's call: a shared
+            # user allowed to change sync settings can't change retention.
+            current = engine.get_sync_schedule_by_id(meta["environment_id"])
+            if any(f in clean and clean[f] != current.get(f) for f in ("retention_days", "retention_max_size_mb")):
+                return 403, {"error": "Only the environment's owner can change its retention (it deletes archived events).",
+                             "reason": "owner_only"}
+        if dry_run:
+            return None, {"environment_id": meta["environment_id"]}
+        try:
+            # By id (5.42.0): exactly the environment just checked.
+            saved = engine.set_sync_schedule_by_id(meta["environment_id"], config)
+        except KeyError as exc:
+            return 404, {"error": str(exc)}
+        details = {"name": name, **saved}
+        if meta.get("owner") != self._caller()[1]:
+            details["shared_user"] = True
+        if via_step_up:
+            details["step_up_verified"] = True
+        self._log_audit_event(actor_email, actor_sub, "sync_schedule.update", details)
+        return 200, {"name": name, "sync_schedule": saved}
+
+    def _exec_sync_import_csv(self, params, dry_run, via_step_up):
+        import audit_store
+        _owner_key, _engine_owner_, actor_email, actor_sub = self._caller()
+        name = params.get("name") or ""
+        payload = params.get("body") or {}
+        # SECURITY FIX (external review, 2026-09-30), two bugs fixed
+        # together since both gate the same route:
+        # (1) csv_path previously came straight from the request
+        # body with only an os.path.isfile() check -- no
+        # confinement at all, so any authenticated user could point
+        # this at an arbitrary server-readable file (e.g.
+        # /etc/passwd) and have its contents parsed as CSV and
+        # ingested into the compliance archive. Reuses
+        # _safe_csv_path's exact existing pattern (basename-only,
+        # .csv suffix, confined to PROJECT_ROOT) -- same tradeoff
+        # already accepted for /api/csv: the admin drops the Okta
+        # System Log export into the project root first, then
+        # picks it by bare filename, same as CsvFileBar.tsx's
+        # existing file-picker workflow for the folder-template CSV.
+        # (2) this route had NO ownership check at all, unlike its
+        # sibling /sync/status -- any authenticated user who knew
+        # (or guessed, e.g. "dev"/"prod") another owner's
+        # environment display name could inject rows directly into
+        # that owner's audit archive. Same cross-tenant class as
+        # the report-read leaks fixed above, just on the write side.
+        meta, refusal = self._visible_environment(name, params)
+        if refusal:
+            return refusal
+        refusal = self._shared_refusal(meta, "import_csv")
+        if refusal:
+            return refusal
+        try:
+            csv_path = _safe_csv_path(payload.get("csv_path"))
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        ingestion_scope = payload.get("ingestion_scope", "curated")
+        if ingestion_scope not in ("curated", "all"):
+            return 400, {"error": 'ingestion_scope must be "curated" or "all"'}
+        if not csv_path.is_file():
+            return 400, {"error": f"{csv_path.name} not found on server filesystem"}
+        env_id = meta["environment_id"]
+        if dry_run:
+            if _ingest_running(env_id):
+                return 409, {"error": "A sync is running for this environment; import the CSV after it finishes."}
+            return None, {"environment_id": env_id}
+        # DATA-11 (external review, 2026-10-05): an import racing a
+        # live sync for the same environment writes the same tables
+        # from two threads; refuse rather than interleave. The
+        # import takes the SAME ingest slot a sync does (atomically,
+        # under the lock), so _start_sync_job's own "already running"
+        # check refuses a sync for the duration of the import too.
+        with _sync_jobs_lock:
+            if _sync_jobs.get(env_id, {}).get("status") == "running":
+                return 409, {"error": "A sync is running for this environment; import the CSV after it finishes."}
+            previous_job = _sync_jobs.get(env_id)
+            _sync_jobs[env_id] = {"status": "running", "steps": [], "error": None, "kind": "csv_import"}
+        try:
+            try:
+                result = audit_store.import_from_csv(str(csv_path), env_id, ingestion_scope)
+            except ValueError as exc:
+                return 400, {"error": str(exc)}
+        finally:
+            with _sync_jobs_lock:
+                if previous_job is None:
+                    _sync_jobs.pop(env_id, None)
+                else:
+                    _sync_jobs[env_id] = previous_job
+        details = {"name": name, "csv_path": csv_path.name, **result}
+        if via_step_up:
+            details["step_up_verified"] = True
+        self._log_audit_event(actor_email, actor_sub, "sync.import_csv", details)
+        return 200, result
+
+    def _exec_archive_purge(self, params, dry_run, via_step_up):
+        # DATA-12 (external review, 2026-10-05): purge the archive a
+        # deleted environment left behind. Admin-only (local mode
+        # exempt, same rule as /api/audit_log) -- this destroys
+        # evidence, so it is never a per-owner action, and it is
+        # audit-logged with the per-table counts.
+        import audit_store
+        owner_key, _engine_owner_, actor_email, actor_sub = self._caller()
+        if not _can_admin(owner_key, self.headers):
+            return 403, {"error": "Admin access required to purge an orphaned archive."}
+        archive_id = params.get("archive_id") or ""
+        if not archive_id:
+            return 400, {"error": "missing environment_id"}
+        if _ingest_running(archive_id):
+            return 409, {"error": "A sync or import is still running for that environment; purge it after it finishes."}
+        if dry_run:
+            if archive_id in engine.list_all_environments():
+                return 409, {"error": "That environment still exists; only an orphaned archive can be purged."}
+            if not audit_store.archive_has_rows(archive_id):
+                return 404, {"error": "No archive rows exist for that environment_id."}
+            return None, None
+        try:
+            counts = audit_store.purge_environment_archive(archive_id)
+        except ValueError as exc:
+            return 409, {"error": str(exc)}
+        if not any(counts.values()):
+            return 404, {"error": "No archive rows exist for that environment_id."}
+        details = {"environment_id": archive_id, **counts}
+        if via_step_up:
+            details["step_up_verified"] = True
+        self._log_audit_event(actor_email, actor_sub, "archive.purge", details)
+        return 200, {"purged": archive_id, **counts}
+
+    def _exec_shared_permissions_update(self, params, dry_run, via_step_up):
+        """Admin-only: the global defaults (no environment_id) or one
+        environment's overrides. Audit-logged with every changed
+        capability's stored value before and after."""
+        owner_key, _engine_owner_, actor_email, actor_sub = self._caller()
+        if not _can_admin(owner_key, self.headers):
+            return 403, {"error": "Admin access required to change shared-environment permissions."}
+        payload = params.get("body") or {}
+        environment_id = payload.get("environment_id")
+        if environment_id is not None and (not isinstance(environment_id, str) or not environment_id):
+            return 400, {"error": "environment_id must be a non-empty string, or omitted for the global defaults"}
+        try:
+            changes = engine.validate_shared_permission_changes(payload.get("changes"))
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        meta = None
+        if environment_id is not None:
+            meta = engine.list_all_environments().get(environment_id)
+            if meta is None:
+                return 404, {"error": f"No saved environment with id '{environment_id}'"}
+        if dry_run:
+            return None, None
+        try:
+            diff = engine.set_shared_permissions(changes, environment_id=environment_id, updated_by=actor_email or actor_sub)
+        except KeyError as exc:
+            return 404, {"error": str(exc)}
+        details = {"scope": "environment" if environment_id else "default", "changes": diff}
+        if environment_id:
+            details.update({"environment_id": environment_id, "name": meta.get("name")})
+        if via_step_up:
+            details["step_up_verified"] = True
+        if diff:
+            self._log_audit_event(actor_email, actor_sub, "shared_permissions.update", details)
+        return 200, {
+            "changed": diff,
+            "defaults": engine.get_shared_permission_defaults(),
+            **({"environment_id": environment_id,
+                "overrides": engine.get_shared_permission_overrides(environment_id),
+                "effective": engine.effective_shared_permissions(environment_id)} if environment_id else {}),
+        }
+
+    # -----------------------------------------------------------------
     def do_HEAD(self):
         """Inherited from SimpleHTTPRequestHandler it served static-file
         metadata with no hosted-mode check at all (5.40.3 review). Same
@@ -1405,8 +2017,26 @@ class Handler(SimpleHTTPRequestHandler):
                 # (and shared rows their own same-named environment hides);
                 # those are not addressable by name.
                 resolves_to = {n: m["environment_id"] for n, m in engine.list_environments_for(engine_owner).items()}
+                # 5.42.0: what THIS caller may do with each row (the same
+                # resolution the routes enforce) -- the UI only mirrors it.
+                # An owner's own rows are always "allow" (source "owner").
+                # Admins also get each row's stored overrides, for the
+                # per-environment editor.
+                defaults = engine.get_shared_permission_defaults()
+                can_admin = _can_admin(owner_key, self.headers)
                 for entry in envs:
                     entry["addressable"] = resolves_to.get(entry["name"]) == entry["id"]
+                    if not entry["addressable"]:
+                        # Not what this caller's by-name routes reach (another
+                        # owner's private row, or one hidden by the caller's
+                        # own same-named environment): nothing to say.
+                        pass
+                    elif entry["is_own"]:
+                        entry["permissions"] = {k: {"value": "allow", "source": "owner"} for k in engine.SHARED_CAPABILITY_KEYS}
+                    else:
+                        entry["permissions"] = engine.effective_shared_permissions(entry["id"], defaults=defaults)
+                    if can_admin:
+                        entry["permission_overrides"] = engine.get_shared_permission_overrides(entry["id"])
                 return self._send_json(200, {"environments": envs, "active": local_env_name, "active_id": local_env_id})
 
             if path == "/api/banner":
@@ -1424,6 +2054,8 @@ class Handler(SimpleHTTPRequestHandler):
                 if meta is None:
                     return self._send_json(404, {"error": f"No environment named '{name}' visible to this user."})
                 environment_id = meta["environment_id"]
+                if self._capability_refused(engine_owner, environment_id, ("view_archive",)):
+                    return
                 with _sync_jobs_lock:
                     job = dict(_sync_jobs.get(environment_id, {"status": "idle", "steps": [], "error": None}))
                 job["sync_state"] = audit_store.get_sync_state(environment_id)
@@ -1443,20 +2075,20 @@ class Handler(SimpleHTTPRequestHandler):
                     # Deep mode re-reads every sealed event (one streamed
                     # query per manifest) -- an admin-only cost.
                     return self._send_json(403, {"error": "Admin access required for a deep integrity check."})
+                # Visibility is resolved here, before any job (or a cached
+                # result) is touched, then the shared-environment check.
+                meta = engine.list_environments_for(engine_owner).get(name)
+                if meta is None:
+                    return self._send_json(404, {"error": f"No saved environment named '{name}'"})
+                if self._capability_refused(engine_owner, meta["environment_id"], ("view_archive",)):
+                    return
                 if deep:
                     # Bounded per request, single-flight per environment --
-                    # see DEEP_VERIFY_WAIT_SECS. Visibility is resolved here,
-                    # before any job (or a cached result) is touched.
-                    meta = engine.list_environments_for(engine_owner).get(name)
-                    if meta is None:
-                        return self._send_json(404, {"error": f"No saved environment named '{name}'"})
+                    # see DEEP_VERIFY_WAIT_SECS.
                     status, body = _deep_verify(meta["environment_id"])
                     return self._send_json(status, body)
-                try:
-                    result = engine.verify_environment_evidence_chain(name, owner=engine_owner, deep=False)
-                except KeyError as exc:
-                    return self._send_json(404, {"error": str(exc)})
-                return self._send_json(200, result)
+                import audit_store
+                return self._send_json(200, audit_store.verify_ingestion_chain(meta["environment_id"], deep=False))
 
             if path == "/api/archives/orphaned":
                 # DATA-12: archives whose environment no longer exists.
@@ -1476,6 +2108,8 @@ class Handler(SimpleHTTPRequestHandler):
                     if meta is None:
                         return self._send_json(404, {"error": f"No environment named '{environment}' visible to this user."})
                     environment_id = meta["environment_id"]
+                    if self._capability_refused(engine_owner, environment_id, ("view_archive",)):
+                        return
                 reports = audit_store.list_reports()
                 if environment_id:
                     since = (qs.get("from") or [None])[0]
@@ -1493,6 +2127,8 @@ class Handler(SimpleHTTPRequestHandler):
                 meta = engine.list_environments_for(engine_owner).get(environment)
                 if meta is None:
                     return self._send_json(404, {"error": f"No environment named '{environment}' visible to this user."})
+                if self._capability_refused(engine_owner, meta["environment_id"], ("view_archive",)):
+                    return
                 since = (qs.get("from") or [None])[0]
                 until = (qs.get("to") or [None])[0]
                 try:
@@ -1527,6 +2163,8 @@ class Handler(SimpleHTTPRequestHandler):
                 meta = engine.list_environments_for(engine_owner).get(environment)
                 if meta is None:
                     return self._send_json(404, {"error": f"No environment named '{environment}' visible to this user."})
+                if self._capability_refused(engine_owner, meta["environment_id"], ("view_archive",)):
+                    return
                 # resource_name: fallback exact-displayName match for
                 # resource kinds with no discoverable log-side id at all
                 # (database accounts, individual AD accounts -- see
@@ -1555,6 +2193,8 @@ class Handler(SimpleHTTPRequestHandler):
             if path.startswith("/api/active_directory_connections/") and path.endswith("/discovery_config"):
                 if not _require_client(self._send_json, local_client):
                     return
+                if self._capability_refused(engine_owner, local_env_id, ("live_read",)):
+                    return
                 connection_id = unquote(
                     path[len("/api/active_directory_connections/"):-len("/discovery_config")]
                 )
@@ -1566,10 +2206,14 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/resource_groups":
                 if not _require_client(self._send_json, local_client):
                     return
+                if self._capability_refused(engine_owner, local_env_id, ("live_read",)):
+                    return
                 return self._send_json(200, {"resource_groups": local_client.list_resource_groups()})
 
             if path.startswith("/api/resource_groups/") and path.endswith("/projects"):
                 if not _require_client(self._send_json, local_client):
+                    return
+                if self._capability_refused(engine_owner, local_env_id, ("live_read",)):
                     return
                 rg_id = path[len("/api/resource_groups/"):-len("/projects")]
                 if not rg_id:
@@ -1580,12 +2224,16 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/groups":
                 if not _require_client(self._send_json, local_client):
                     return
+                if self._capability_refused(engine_owner, local_env_id, ("live_read",)):
+                    return
                 contains = (qs.get("contains") or [None])[0]
                 return self._send_json(200, {"groups": local_client.list_groups(contains=contains)})
 
             if (path.startswith("/api/resource_groups/") and path.endswith("/folders")
                     and "/projects/" in path):
                 if not _require_client(self._send_json, local_client):
+                    return
+                if self._capability_refused(engine_owner, local_env_id, ("live_read",)):
                     return
                 inner = path[len("/api/resource_groups/"):-len("/folders")]
                 rg_id, _, proj_id = inner.partition("/projects/")
@@ -1610,6 +2258,8 @@ class Handler(SimpleHTTPRequestHandler):
             if (path.startswith("/api/resource_groups/") and path.endswith("/secrets_access_report")
                     and "/projects/" in path):
                 if not _require_client(self._send_json, local_client):
+                    return
+                if self._capability_refused(engine_owner, local_env_id, ("live_read", "view_archive")):
                     return
                 inner = path[len("/api/resource_groups/"):-len("/secrets_access_report")]
                 rg_id, _, proj_id = inner.partition("/projects/")
@@ -1664,6 +2314,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # to do instead of silently returning a thinner report.
                 if not _require_client(self._send_json, local_client):
                     return
+                if self._capability_refused(engine_owner, local_env_id, ("live_read", "view_archive")):
+                    return
                 if not local_env_id:
                     return self._send_json(409, {"error": "No active environment configured. Use the gear menu to set one up."})
                 import audit_store
@@ -1707,6 +2359,8 @@ class Handler(SimpleHTTPRequestHandler):
             if path.startswith("/api/resource_groups/") and path.endswith("/security_policies"):
                 if not _require_client(self._send_json, local_client):
                     return
+                if self._capability_refused(engine_owner, local_env_id, ("live_read",)):
+                    return
                 rg_id = path[len("/api/resource_groups/"):-len("/security_policies")]
                 if not rg_id:
                     return self._send_json(400, {"error": "missing resource_group_id"})
@@ -1721,11 +2375,15 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/workload_roles":
                 if not _require_client(self._send_json, local_client):
                     return
+                if self._capability_refused(engine_owner, local_env_id, ("live_read",)):
+                    return
                 contains = (qs.get("contains") or [None])[0]
                 return self._send_json(200, {"workload_roles": local_client.list_workload_roles(contains=contains)})
 
             if path == "/api/service_account":
                 if not _require_client(self._send_json, local_client):
+                    return
+                if self._capability_refused(engine_owner, local_env_id, ("live_read",)):
                     return
                 current_user = local_client.get_current_user()
                 # `list_user_groups` already returns each group's real `id`
@@ -1743,6 +2401,8 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/access/bootstrap/status":
                 if not local_env_id:
                     return self._send_json(200, {"status": "idle", "steps": [], "error": None})
+                if self._capability_refused(engine_owner, local_env_id, ("live_read",)):
+                    return
                 # Snapshot (shallow-copy the steps list) WHILE holding the
                 # lock, then serialize/send OUTSIDE it -- holding a lock
                 # through json.dumps + a socket write (self.wfile.write can
@@ -1758,6 +2418,8 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/access/bootstrap/result":
                 if not local_env_id:
                     return self._send_json(409, {"error": "No active environment."})
+                if self._capability_refused(engine_owner, local_env_id, ("live_read",)):
+                    return
                 with _access_jobs_lock:
                     job = _access_jobs.get(local_env_id)
                     if job is None or job["status"] != "done" or job.get("result") is None:
@@ -1795,6 +2457,24 @@ class Handler(SimpleHTTPRequestHandler):
                 except ValueError:
                     return self._send_json(400, {"error": "limit/offset must be integers"})
                 return self._send_json(200, {"entries": engine.read_audit_log(limit=limit, offset=offset)})
+
+            if path == "/api/shared_permissions":
+                # 5.42.0: the capability catalogue, the global defaults and
+                # every environment's overrides. Admin-only (local-mode
+                # operator exempt), same rule as /api/access_control.
+                if not _can_admin(owner_key, self.headers):
+                    return self._send_json(403, {"error": "Admin access required to view shared-environment permissions."})
+                defaults = engine.get_shared_permission_defaults()
+                return self._send_json(200, {
+                    "capabilities": [dict(c) for c in engine.SHARED_CAPABILITIES],
+                    "defaults": defaults,
+                    "environments": {
+                        env_id: {"name": meta.get("name"), "shared": bool(meta.get("shared")),
+                                 "overrides": engine.get_shared_permission_overrides(env_id),
+                                 "effective": engine.effective_shared_permissions(env_id, defaults=defaults)}
+                        for env_id, meta in engine.list_all_environments().items()
+                    },
+                })
 
             if path == "/api/access_control":
                 # Admin-only read, same shape as /api/audit_log just above
@@ -1911,7 +2591,11 @@ class Handler(SimpleHTTPRequestHandler):
                 if not action_id:
                     return self._send_json(409, {"error": "No pending action -- start the save flow again.", "reason": "not_found"})
                 try:
-                    config = audit_store.consume_pending_admin_action(action_id, actor_sub)
+                    # action_types (5.42.0): an Environments approval can't be
+                    # spent here -- it is left for its own save route.
+                    config = audit_store.consume_pending_admin_action(
+                        action_id, actor_sub, action_types=("access_control.update",)
+                    )
                 except audit_store.PendingActionError as exc:
                     status = 409 if exc.reason in ("already_consumed", "expired") else 403
                     return self._send_json(status, {"error": f"Could not apply this change ({exc.reason}) -- please try again.", "reason": exc.reason})
@@ -1951,6 +2635,61 @@ class Handler(SimpleHTTPRequestHandler):
                 # computing a second, separately-timed one.
                 return self._send_json(200, {**config, "step_up_verified": True, "saved_at": audit_entry["timestamp"]})
 
+            if path == "/api/environment_changes/save":
+                # 5.42.0: applies one Environments change after its step-up
+                # MFA -- the same flow as /api/access_control/save above.
+                # nginx sends this path through auth_request /verify_stepup
+                # (a fresh step-up cookie for THIS session's sub), which
+                # forwards the action id bound into that cookie; the request
+                # body is never read. The stored request is then run with
+                # every check made again (_environment_change's executors).
+                if not _step_up_required_for_changes():
+                    return self._send_json(404, {"error": "Step-up saves are only used behind the hosted login gate; "
+                                                          "in local mode changes apply directly."})
+                if not _request_passed_stepup_location(self.headers):
+                    return self._send_json(403, {
+                        "error": "This change needs a fresh MFA approval, and this site's nginx configuration does "
+                                 "not have the step-up location for it. An operator must regenerate the site.",
+                        "reason": "step_up_unavailable",
+                    })
+                import audit_store
+                action_id = self.headers.get("X-Auth-Action-Id")
+                if not action_id:
+                    return self._send_json(409, {"error": "No pending action -- start the save flow again.", "reason": "not_found"})
+                try:
+                    stored, row_type = audit_store.consume_pending_admin_action(
+                        action_id, actor_sub, action_types=ENV_CHANGE_ACTION_TYPES, return_action_type=True,
+                    )
+                except audit_store.PendingActionError as exc:
+                    status = 409 if exc.reason in ("already_consumed", "expired") else 403
+                    return self._send_json(status, {"error": f"Could not apply this change ({exc.reason}) -- please try again.", "reason": exc.reason})
+                action = stored.get("action")
+                if action != row_type or action not in _ENV_CHANGE_EXECUTORS:
+                    return self._send_json(403, {"error": "Could not apply this change (action_type_mismatch) -- please try again.",
+                                                 "reason": "action_type_mismatch"})
+                params = stored.get("params") or {}
+                if stored.get("secret_fields"):
+                    held = _take_pending_secrets(action_id)
+                    if held is None or set(held) != set(stored["secret_fields"]):
+                        return self._send_json(409, {
+                            "error": "The server restarted or the approval took too long, so the secrets you typed "
+                                     "are gone (they are never stored on disk). Enter them again and save.",
+                            "reason": "secrets_expired", "action": action,
+                        })
+                    params = {**params, "body": {**(params.get("body") or {}), **held}}
+                status, body = getattr(self, _ENV_CHANGE_EXECUTORS[action])(params, dry_run=False, via_step_up=True)
+                body = {**(body or {}), "action": action}
+                if 200 <= status < 300:
+                    body["step_up_verified"] = True
+                return self._send_json(status, body)
+
+            if path == "/api/shared_permissions":
+                # 5.42.0, admin-only (local-mode operator exempt): the global
+                # defaults ({"changes": {...}}) or one environment's overrides
+                # ({"environment_id": ..., "changes": {...}}); each change is
+                # allow / deny / inherit. Step-up MFA in hosted mode.
+                return self._environment_change("shared_permissions.update", {"body": payload})
+
             if path == "/api/audit_log/backfill_mfa":
                 # Same admin gate as GET /api/audit_log -- this both READS
                 # and rewrites audit_log.jsonl, so it deserves at least the
@@ -1970,51 +2709,9 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_json(200, {"updated_count": updated_count})
 
             if path == "/api/environments":
-                is_admin = _is_admin_from_headers(self.headers)
-                ids_before = set(engine.list_all_environments())
-                try:
-                    name, upserted_id = engine.upsert_environment(
-                        payload.get("name"), payload, owner=engine_owner, is_admin=is_admin,
-                        environment_id=payload.get("id"),
-                    )
-                except PermissionError as exc:
-                    return self._send_json(403, {"error": str(exc)})
-                target_meta = engine.list_all_environments().get(upserted_id) or {}
-                caller_owns_target = target_meta.get("owner") == engine_owner
-                self._log_audit_event(actor_email, actor_sub, "environment.upsert", {
-                    "name": name, "admin_override": is_admin,
-                    # Whose environment was written -- an admin editing
-                    # someone else's credentials is now explicit in the log.
-                    "environment_id": upserted_id, "edited_other_owner": not caller_owns_target,
-                })
-                # ENG1-06 (external review, 2026-10-05): every OTHER owner's
-                # live session on this environment still holds a client built
-                # from the OLD credentials (able to re-mint tokens on 401).
-                # Drop them and let each owner's next request re-run the
-                # normal saved-environment auto-activation, which re-checks
-                # visibility and builds a client from what is stored now.
-                if upserted_id in ids_before:
-                    # The caller's own session is kept only when it is about to
-                    # be rebuilt below (they own the target); an admin editing
-                    # someone else's environment loses a stale session on it
-                    # like everyone else and re-activates with the new values.
-                    _drop_sessions_for_environment(
-                        upserted_id, except_owner=owner_key if caller_owns_target else None, reactivate=True,
-                    )
-                if not caller_owns_target:
-                    # An admin edited ANOTHER owner's environment by id. It
-                    # was saved; it is not the admin's to activate (by name
-                    # it would resolve to the admin's own same-named
-                    # environment, or not at all -- this used to 500 with a
-                    # KeyError after a successful save).
-                    return self._send_json(200, {"saved": True, "activated": False, "active": _local_env_name})
-                # The caller's own environment: (re)activate it, so their own
-                # session also picks up the new credentials.
-                try:
-                    activate_environment(owner_key, name)
-                except engine.OpaApiError as exc:
-                    return self._send_json(502, {"error": f"Saved, but could not connect: {exc}", "saved": True})
-                return self._send_json(200, {"activated": True, "active": name})
+                # Create or edit (5.42.0: step-up MFA in hosted mode -- see
+                # _environment_change). The executor holds the route's logic.
+                return self._environment_change("environment.upsert", {"body": payload})
 
             if path.startswith("/api/environments/") and path.endswith("/activate"):
                 name = unquote(path[len("/api/environments/"):-len("/activate")])
@@ -2066,62 +2763,37 @@ class Handler(SimpleHTTPRequestHandler):
 
             if path.startswith("/api/environments/") and path.endswith("/share"):
                 name = unquote(path[len("/api/environments/"):-len("/share")])
-                shared = bool(payload.get("shared", False))
-                is_admin = _is_admin_from_headers(self.headers)
-                try:
-                    target_id = engine.set_environment_shared(
-                        name, engine_owner, shared, is_admin=is_admin,
-                        environment_id=payload.get("id"),
-                    )
-                except KeyError as exc:
-                    return self._send_json(404, {"error": str(exc)})
-                except PermissionError as exc:
-                    return self._send_json(403, {"error": str(exc)})
-                if not shared:
-                    # ENG1-06: an unshare withdraws access NOW, not at the
-                    # next restart -- every other owner's live session on it
-                    # is dropped (the owner's own stays).
-                    _drop_sessions_for_environment(target_id, except_owner=owner_key)
-                self._log_audit_event(actor_email, actor_sub, "environment.share", {"name": name, "shared": shared, "admin_override": is_admin})
-                return self._send_json(200, {"name": name, "shared": shared})
+                return self._environment_change("environment.share", {"name": name, "body": payload})
 
             if path.startswith("/api/environments/") and path.endswith("/sync/reset_watermark"):
-                # DATA-03 remedy: the only supported way out of an unusable
-                # watermark. Same visibility rule as /sync/start; the next
-                # sync backfills the full 90-day window (dedup makes that
-                # free of duplicates).
                 name = unquote(path[len("/api/environments/"):-len("/sync/reset_watermark")])
-                import audit_store
-                meta = engine.list_environments_for(engine_owner).get(name)
-                if meta is None:
-                    return self._send_json(404, {"error": f"No environment named '{name}' visible to this user."})
-                if _ingest_running(meta["environment_id"]):
-                    return self._send_json(409, {"error": "A sync or import is running for this environment; reset the watermark after it finishes."})
-                previous = audit_store.reset_sync_watermark(meta["environment_id"])
-                self._log_audit_event(actor_email, actor_sub, "sync.reset_watermark", {"name": name, "previous_watermark": previous})
-                return self._send_json(200, {"name": name, "previous_watermark": previous})
+                return self._environment_change("sync.reset_watermark", {"name": name})
 
             if path.startswith("/api/environments/") and path.endswith("/sync_schedule"):
                 name = unquote(path[len("/api/environments/"):-len("/sync_schedule")])
-                try:
-                    saved = engine.set_sync_schedule(name, payload, owner=engine_owner)
-                except KeyError as exc:
-                    return self._send_json(404, {"error": str(exc)})
-                except ValueError as exc:
-                    return self._send_json(400, {"error": str(exc)})
-                self._log_audit_event(actor_email, actor_sub, "sync_schedule.update", {"name": name, **saved})
-                return self._send_json(200, {"name": name, "sync_schedule": saved})
+                return self._environment_change("sync_schedule.update", {"name": name, "body": payload})
 
             if path.startswith("/api/environments/") and path.endswith("/sync/start"):
                 name = unquote(path[len("/api/environments/"):-len("/sync/start")])
-                try:
-                    schedule = engine.get_sync_schedule(name, owner=engine_owner)
-                except KeyError as exc:
-                    return self._send_json(404, {"error": str(exc)})
                 meta = engine.list_environments_for(engine_owner).get(name)
                 if meta is None:
                     return self._send_json(404, {"error": f"No environment named '{name}' visible to this user."})
-                ingestion_scope = payload.get("ingestion_scope") or schedule.get("ingestion_scope", "curated")
+                if self._capability_refused(engine_owner, meta["environment_id"], ("sync_now",)):
+                    return
+                # 5.42.0: a shared user allowed to run "Sync now" runs the
+                # OWNER's sync: the owner's saved schedule (by id), the
+                # owner's stored Okta token (by id, see _launch_claimed_sync)
+                # and the owner recorded as the environment's owner. Only the
+                # owner may choose a different ingestion scope for a run.
+                schedule = engine.get_sync_schedule_by_id(meta["environment_id"])
+                saved_scope = schedule.get("ingestion_scope", "curated")
+                requested_scope = payload.get("ingestion_scope")
+                if requested_scope and requested_scope != saved_scope and meta.get("owner") != engine_owner:
+                    return self._send_json(403, {
+                        "error": "Only the environment's owner can choose the ingestion scope; Sync now uses the owner's saved setting.",
+                        "reason": "owner_only",
+                    })
+                ingestion_scope = requested_scope or saved_scope
                 # Logging (start, and later completion/failure) now happens
                 # INSIDE _start_sync_job/_run_sync_job themselves -- see
                 # those functions' docstrings -- so it's captured
@@ -2140,7 +2812,7 @@ class Handler(SimpleHTTPRequestHandler):
                 # HTTP route today) -- now passes meta["environment_id"]
                 # explicitly, matching _start_sync_job's real signature.
                 started = _start_sync_job(
-                    meta["environment_id"], name, ingestion_scope, owner=engine_owner, trigger="manual",
+                    meta["environment_id"], name, ingestion_scope, owner=meta.get("owner"), trigger="manual",
                     actor_email=actor_email, actor_sub=actor_sub,
                     client_ip=self._request_client_ip(),
                     user_agent=self.headers.get("User-Agent"),
@@ -2150,65 +2822,12 @@ class Handler(SimpleHTTPRequestHandler):
 
             if path.startswith("/api/environments/") and path.endswith("/sync/import_csv"):
                 name = unquote(path[len("/api/environments/"):-len("/sync/import_csv")])
-                import audit_store
-                # SECURITY FIX (external review, 2026-09-30), two bugs fixed
-                # together since both gate the same route:
-                # (1) csv_path previously came straight from the request
-                # body with only an os.path.isfile() check -- no
-                # confinement at all, so any authenticated user could point
-                # this at an arbitrary server-readable file (e.g.
-                # /etc/passwd) and have its contents parsed as CSV and
-                # ingested into the compliance archive. Reuses
-                # _safe_csv_path's exact existing pattern (basename-only,
-                # .csv suffix, confined to PROJECT_ROOT) -- same tradeoff
-                # already accepted for /api/csv: the admin drops the Okta
-                # System Log export into the project root first, then
-                # picks it by bare filename, same as CsvFileBar.tsx's
-                # existing file-picker workflow for the folder-template CSV.
-                # (2) this route had NO ownership check at all, unlike its
-                # sibling /sync/status -- any authenticated user who knew
-                # (or guessed, e.g. "dev"/"prod") another owner's
-                # environment display name could inject rows directly into
-                # that owner's audit archive. Same cross-tenant class as
-                # the report-read leaks fixed above, just on the write side.
-                meta = engine.list_environments_for(engine_owner).get(name)
-                if meta is None:
-                    return self._send_json(404, {"error": f"No environment named '{name}' visible to this user."})
-                try:
-                    csv_path = _safe_csv_path(payload.get("csv_path"))
-                except ValueError as exc:
-                    return self._send_json(400, {"error": str(exc)})
-                ingestion_scope = payload.get("ingestion_scope", "curated")
-                if not csv_path.is_file():
-                    return self._send_json(400, {"error": f"{csv_path.name} not found on server filesystem"})
-                # DATA-11 (external review, 2026-10-05): an import racing a
-                # live sync for the same environment writes the same tables
-                # from two threads; refuse rather than interleave. The
-                # import takes the SAME ingest slot a sync does (atomically,
-                # under the lock), so _start_sync_job's own "already running"
-                # check refuses a sync for the duration of the import too.
-                env_id = meta["environment_id"]
-                with _sync_jobs_lock:
-                    if _sync_jobs.get(env_id, {}).get("status") == "running":
-                        return self._send_json(409, {"error": "A sync is running for this environment; import the CSV after it finishes."})
-                    previous_job = _sync_jobs.get(env_id)
-                    _sync_jobs[env_id] = {"status": "running", "steps": [], "error": None, "kind": "csv_import"}
-                try:
-                    try:
-                        result = audit_store.import_from_csv(str(csv_path), env_id, ingestion_scope)
-                    except ValueError as exc:
-                        return self._send_json(400, {"error": str(exc)})
-                finally:
-                    with _sync_jobs_lock:
-                        if previous_job is None:
-                            _sync_jobs.pop(env_id, None)
-                        else:
-                            _sync_jobs[env_id] = previous_job
-                self._log_audit_event(actor_email, actor_sub, "sync.import_csv", {"name": name, "csv_path": csv_path.name, **result})
-                return self._send_json(200, result)
+                return self._environment_change("sync.import_csv", {"name": name, "body": payload})
 
             if path == "/api/access/bootstrap/start":
                 if not _require_client(self._send_json, local_client):
+                    return
+                if self._capability_refused(engine_owner, _local_env_id, ("live_read",)):
                     return
                 with _access_jobs_lock:
                     if _access_jobs.get(_local_env_id, {}).get("status") == "running":
@@ -2224,6 +2843,8 @@ class Handler(SimpleHTTPRequestHandler):
 
             if path == "/api/resource_groups":
                 if not _require_client(self._send_json, local_client):
+                    return
+                if self._capability_refused(engine_owner, _local_env_id, ("tenant_write",)):
                     return
                 name = (payload.get("name") or "").strip()
                 if not name:
@@ -2244,6 +2865,8 @@ class Handler(SimpleHTTPRequestHandler):
             if path.startswith("/api/resource_groups/") and path.endswith("/projects"):
                 if not _require_client(self._send_json, local_client):
                     return
+                if self._capability_refused(engine_owner, _local_env_id, ("tenant_write",)):
+                    return
                 rg_id = path[len("/api/resource_groups/"):-len("/projects")]
                 name = (payload.get("name") or "").strip()
                 if not rg_id or not name:
@@ -2258,6 +2881,8 @@ class Handler(SimpleHTTPRequestHandler):
             if (path.startswith("/api/resource_groups/") and path.endswith("/policy")
                     and "/projects/" in path and "/folders/" in path):
                 if not _require_client(self._send_json, local_client):
+                    return
+                if self._capability_refused(engine_owner, _local_env_id, ("tenant_write",)):
                     return
                 inner = path[len("/api/resource_groups/"):-len("/policy")]
                 rg_id, _, rest = inner.partition("/projects/")
@@ -2377,6 +3002,8 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/groups":
                 if not _require_client(self._send_json, local_client):
                     return
+                if self._capability_refused(engine_owner, _local_env_id, ("tenant_write",)):
+                    return
                 if not _require_okta_client(self._send_json, local_okta_client):
                     return
                 name = (payload.get("name") or "").strip()
@@ -2443,6 +3070,8 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/service_account/groups":
                 if not _require_client(self._send_json, local_client):
                     return
+                if self._capability_refused(engine_owner, _local_env_id, ("tenant_write",)):
+                    return
                 group_id = payload.get("group_id")
                 if not group_id:
                     return self._send_json(400, {"error": "group_id is required"})
@@ -2485,6 +3114,8 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/preview":
                 if not _require_client(self._send_json, local_client):
                     return
+                if self._capability_refused(engine_owner, _local_env_id, ("live_read",)):
+                    return
                 rg_id = payload.get("resource_group_id")
                 proj_id = payload.get("project_id")
                 if not rg_id or not proj_id:
@@ -2499,6 +3130,8 @@ class Handler(SimpleHTTPRequestHandler):
 
             if path == "/api/execute":
                 if not _require_client(self._send_json, local_client):
+                    return
+                if self._capability_refused(engine_owner, _local_env_id, ("tenant_write",)):
                     return
                 rg_id = payload.get("resource_group_id")
                 proj_id = payload.get("project_id")
@@ -2538,6 +3171,8 @@ class Handler(SimpleHTTPRequestHandler):
 
             if path.startswith("/api/access/users/") and path.endswith("/resource_access"):
                 if not _require_okta_client(self._send_json, local_okta_client):
+                    return
+                if self._capability_refused(engine_owner, _local_env_id, ("live_read",)):
                     return
                 user_id = path[len("/api/access/users/"):-len("/resource_access")]
                 if not user_id:
@@ -2593,73 +3228,21 @@ class Handler(SimpleHTTPRequestHandler):
         local_client, _local_okta_client, local_env_name, _local_env_id = _session_snapshot(owner_key)
         try:
             if path.startswith("/api/archives/"):
-                # DATA-12 (external review, 2026-10-05): purge the archive a
-                # deleted environment left behind. Admin-only (local mode
-                # exempt, same rule as /api/audit_log) -- this destroys
-                # evidence, so it is never a per-owner action, and it is
-                # audit-logged with the per-table counts.
-                if not _can_admin(owner_key, self.headers):
-                    return self._send_json(403, {"error": "Admin access required to purge an orphaned archive."})
-                import audit_store
                 archive_id = unquote(path[len("/api/archives/"):]).rstrip("/")
-                if not archive_id:
-                    return self._send_json(400, {"error": "missing environment_id"})
-                if _ingest_running(archive_id):
-                    return self._send_json(409, {"error": "A sync or import is still running for that environment; purge it after it finishes."})
-                try:
-                    counts = audit_store.purge_environment_archive(archive_id)
-                except ValueError as exc:
-                    return self._send_json(409, {"error": str(exc)})
-                if not any(counts.values()):
-                    return self._send_json(404, {"error": "No archive rows exist for that environment_id."})
-                self._log_audit_event(actor_email, actor_sub, "archive.purge", {"environment_id": archive_id, **counts})
-                return self._send_json(200, {"purged": archive_id, **counts})
+                return self._environment_change("archive.purge", {"archive_id": archive_id})
 
             if path.startswith("/api/environments/"):
                 name = unquote(path[len("/api/environments/"):])
-                is_admin = _is_admin_from_headers(self.headers)
-                environment_id = (qs.get("id") or [None])[0]
-                # DATA-12: deleting the archive too is an explicit choice
-                # (`?purge_archive=1`); the default keeps it as an orphan an
-                # admin can review/purge later via /api/archives. Destroying
-                # evidence is admin-only (local mode exempt), same rule as
-                # /api/archives -- an environment's owner can delete the
-                # environment, but not the compliance history other users
-                # may report from (a shared environment's archive is
-                # everyone's evidence).
-                purge_archive = (qs.get("purge_archive") or ["0"])[0] in ("1", "true")
-                if purge_archive and not _can_admin(owner_key, self.headers):
-                    return self._send_json(403, {"error": "Admin access required to delete an environment's compliance archive; delete without purge_archive to keep it."})
-                try:
-                    result = engine.delete_environment(
-                        name, owner=engine_owner, is_admin=is_admin, environment_id=environment_id,
-                        purge_archive=purge_archive,
-                    )
-                except PermissionError as exc:
-                    return self._send_json(403, {"error": str(exc)})
-                except KeyError as exc:
-                    return self._send_json(404, {"error": str(exc)})
-                except Exception as exc:
-                    # The environment is gone even if the archive purge failed
-                    # (see delete_environment) -- log the delete before
-                    # surfacing the error, never lose the audit entry.
-                    self._log_audit_event(actor_email, actor_sub, "environment.delete",
-                                          {"name": name, "admin_override": is_admin, "purge_archive": purge_archive,
-                                           "archive_purge_error": str(exc)})
-                    raise
-                # ENG1-06: every owner's live session on this environment is
-                # now stale (its cached client still holds the old credentials
-                # in memory) -- drop them all, not just the caller's.
-                _drop_sessions_for_environment(result["environment_id"])
-                details = {"name": name, "admin_override": is_admin, "purge_archive": purge_archive}
-                if result["archive"]:
-                    details["archive_purged"] = result["archive"]
-                self._log_audit_event(actor_email, actor_sub, "environment.delete", details)
-                return self._send_json(200, {"deleted": name, "archive_purged": purge_archive})
+                return self._environment_change("environment.delete", {
+                    "name": name, "id": (qs.get("id") or [None])[0],
+                    "purge_archive": (qs.get("purge_archive") or ["0"])[0] in ("1", "true"),
+                })
 
             if (path.startswith("/api/resource_groups/") and "/projects/" in path
                     and "/folders/" in path):
                 if not _require_client(self._send_json, local_client):
+                    return
+                if self._capability_refused(engine_owner, _local_env_id, ("tenant_write",)):
                     return
                 inner = path[len("/api/resource_groups/"):]
                 rg_id, _, rest = inner.partition("/projects/")
@@ -2687,6 +3270,8 @@ class Handler(SimpleHTTPRequestHandler):
 
             if path.startswith("/api/groups/") and "/members/" in path:
                 if not _require_client(self._send_json, local_client):
+                    return
+                if self._capability_refused(engine_owner, _local_env_id, ("tenant_write",)):
                     return
                 inner = path[len("/api/groups/"):]
                 group_id, _, user_name = inner.partition("/members/")

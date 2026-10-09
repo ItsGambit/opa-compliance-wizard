@@ -2,10 +2,11 @@ import { useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Trash2 } from 'lucide-react'
-import { fetchOrphanedArchives, purgeOrphanedArchive } from '../api/client'
+import { fetchOrphanedArchives, isStepUpRequired, purgeOrphanedArchive } from '../api/client'
 import { toast } from '../hooks/useToast'
 import { formatDateTime } from '../utils/format'
 import { formatBytes, purgeConfirmationToken } from '../utils/orphanedArchives'
+import { beginStepUp } from '../utils/stepUp'
 import { DialogCloseButton } from './DialogCloseButton'
 import { ErrorNotice } from './ErrorNotice'
 import { Field } from './Field'
@@ -37,7 +38,15 @@ export function OrphanedArchivesDialog({ open, onOpenChange }: Props) {
 
   const purge = useMutation({
     mutationFn: (environmentId: string) => purgeOrphanedArchive(environmentId),
-    onSuccess: (resp) => {
+    onSuccess: (resp, environmentId) => {
+      if (isStepUpRequired(resp)) {
+        // 5.42.0: hosted mode -- approve the purge with MFA first.
+        beginStepUp(resp.action_id, {
+          kind: 'environment_change', action: resp.action, label: `Purge the archive of ${environmentId.slice(0, 8)}…`,
+          startedAt: Date.now(), reopen: 'orphaned_archives',
+        })
+        return
+      }
       const events = typeof resp.events === 'number' ? resp.events : 0
       const manifests = typeof resp.ingestion_manifests === 'number' ? resp.ingestion_manifests : 0
       toast({

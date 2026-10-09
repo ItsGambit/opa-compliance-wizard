@@ -58,7 +58,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.41.0
+# Version     : 5.42.0
 # =============================================================================
 
 import argparse
@@ -84,7 +84,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.41.0"
+SCRIPT_VERSION = "5.42.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 # ENG2-12: OPA's spec documents no pattern or length for a secret-folder
 # name (SecretFolderCreateRequest.name is a bare string); 255 is the limit
@@ -1180,7 +1180,16 @@ def _undo_environment_row(conn, target_id, is_create, previous, written):
             log("ERROR", f"Could not undo the environment row for {target_id}: {type(exc).__name__}")
 
 
-def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, environment_id=None):
+class EnvironmentTargetChanged(Exception):
+    """upsert_environment(expected_target_id=...): the save would now write
+    a different environment than the one it was checked against."""
+
+
+_UNSET = object()
+
+
+def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, environment_id=None, dry_run=False,
+                       expected_target_id=_UNSET):
     """Saves non-secret metadata to app_environments and secret fields to
     the OS keychain. Blank secret fields on an update leave the previously
     stored secret untouched (so editing metadata doesn't force re-entering
@@ -1221,7 +1230,19 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, envi
     the non-admin path -- never a cross-owner adoption. The by-name scan
     is gone entirely; an admin editing an existing environment belonging to
     someone else must pass that environment's real environment_id (which
-    the UI already has for every row it lists)."""
+    the UI already has for every row it lists).
+
+    dry_run (5.42.0): every check -- permission, required fields, domain
+    and URL validation, the duplicate-name check -- runs inside the same
+    transaction as a real save, which is then rolled back; nothing is
+    written anywhere. Returns (name, environment_id of the existing
+    environment this would edit, or None for a create). The server's
+    step-up flow runs it before asking for MFA.
+
+    expected_target_id (5.42.0): the environment id (None = a create) the
+    dry run reported. Checked inside the same transaction as the write;
+    a different target raises EnvironmentTargetChanged and nothing is
+    written."""
     if not name or not name.strip():
         raise ValueError("Environment name is required (e.g. dev, uat, prod).")
     name = name.strip()
@@ -1267,16 +1288,33 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, envi
             has_stored_secret = bool(keyring_get(expected_target, "key_secret"))
 
     with audit_store._db_lock:
-        if not conn.in_transaction:
+        started = not conn.in_transaction
+        if started:
             conn.execute("BEGIN IMMEDIATE")
+        elif dry_run:
+            # Inside a caller's transaction: undo only this dry run's writes.
+            conn.execute("SAVEPOINT upsert_dry_run")
         try:
             target_id, is_create, previous_row, written_row = _write_environment_row(
                 conn, name, fields, owner, is_admin, environment_id, expected_target, has_stored_secret,
                 secret_values,
             )
+            if expected_target_id is not _UNSET and (None if is_create else target_id) != expected_target_id:
+                raise EnvironmentTargetChanged(name)
+            if dry_run:
+                if started:
+                    conn.rollback()
+                else:
+                    conn.execute("ROLLBACK TO upsert_dry_run")
+                    conn.execute("RELEASE upsert_dry_run")
+                return name, (None if is_create else target_id)
             conn.commit()
         except BaseException:
-            conn.rollback()
+            if started or not dry_run:
+                conn.rollback()
+            else:
+                conn.execute("ROLLBACK TO upsert_dry_run")
+                conn.execute("RELEASE upsert_dry_run")
             raise
 
     written = {}  # (environment_id, field) -> value stored before this call (None = there was none)
@@ -1316,7 +1354,7 @@ def _resolve_admin_target(environment_id):
     return row["environment_id"], _row_to_environment_meta(row)
 
 
-def set_environment_shared(name, owner, shared, is_admin=False, environment_id=None):
+def set_environment_shared(name, owner, shared, is_admin=False, environment_id=None, dry_run=False):
     """Toggles an environment's `shared` flag. Only its owner may do this
     unless `is_admin` is True. An admin with a real cross-owner
     `environment_id` (editing a row that isn't theirs) resolves it
@@ -1324,7 +1362,10 @@ def set_environment_shared(name, owner, shared, is_admin=False, environment_id=N
     a non-admin -- always acts on their OWN (owner, name) row, never a
     cross-owner scan by name (see ENG1-01 in _resolve_admin_target's
     docstring). Raises PermissionError if not the owner and not an admin,
-    KeyError if unknown."""
+    KeyError if unknown.
+
+    dry_run (5.42.0): every check above, nothing written -- the server's
+    step-up flow runs it before asking for MFA, then calls again for real."""
     import audit_store
     conn = audit_store._get_connection()
     if is_admin and environment_id:
@@ -1335,13 +1376,16 @@ def set_environment_shared(name, owner, shared, is_admin=False, environment_id=N
             raise KeyError(f"No environment named '{name}' owned by this user.")
         if meta.get("owner") != owner:
             raise PermissionError(f"Environment '{name}' is not owned by this user.")
+    if dry_run:
+        return target_id
     with audit_store._db_lock:
         conn.execute("UPDATE app_environments SET shared = ? WHERE environment_id = ?", (int(bool(shared)), target_id))
         conn.commit()
     return target_id  # ENG1-06: lets the caller drop other owners' live sessions on an unshare
 
 
-def delete_environment(name, owner=LOCAL_OWNER_KEY, is_admin=False, environment_id=None, purge_archive=False):
+def delete_environment(name, owner=LOCAL_OWNER_KEY, is_admin=False, environment_id=None, purge_archive=False,
+                       dry_run=False):
     """Removes an environment's metadata and both keychain secrets. Returns
     {"was_active": bool, "environment_id": str, "archive": counts|None}:
     was_active is True if it was the active environment for THIS caller
@@ -1372,7 +1416,11 @@ def delete_environment(name, owner=LOCAL_OWNER_KEY, is_admin=False, environment_
     design, which needed delete_environment to remember to hand-clean the
     "someone else's active pointer might dangle" case (still checked below,
     for the return value's sake, but no longer needed to prevent a dangling
-    pointer -- SQLite guarantees that now)."""
+    pointer -- SQLite guarantees that now).
+
+    dry_run (5.42.0): resolves and checks only; returns
+    {"environment_id": target} and deletes nothing (see
+    set_environment_shared)."""
     import audit_store
     conn = audit_store._get_connection()
     if is_admin and environment_id:
@@ -1383,6 +1431,8 @@ def delete_environment(name, owner=LOCAL_OWNER_KEY, is_admin=False, environment_
             raise KeyError(f"No saved environment named '{name}'")
         if meta.get("owner") != owner:
             raise PermissionError(f"Environment '{name}' is not owned by this user.")
+    if dry_run:
+        return {"environment_id": target_id}
     owner_key = _owner_storage_key(owner)
     was_active = conn.execute(
         "SELECT 1 FROM active_environments WHERE owner_key = ? AND environment_id = ?", (owner_key, target_id)
@@ -4116,6 +4166,25 @@ def get_sync_schedule(name, owner=LOCAL_OWNER_KEY):
     _, meta = _find_own_environment_sql(conn, owner, name)
     if meta is None:
         raise KeyError(f"No saved environment named '{name}'")
+    return _merged_sync_schedule(meta)
+
+
+def get_sync_schedule_by_id(environment_id):
+    """get_sync_schedule addressed by the real environment_id (5.42.0).
+    Display names are only unique per owner -- and not even that for
+    owner-less rows (UNIQUE(owner_id, display_name) never matches NULLs) --
+    so the scheduler, a sync worker and a shared user's "Sync now" read the
+    schedule of exactly the environment they act on. No visibility rule:
+    callers resolve visibility first. Raises KeyError if the id is unknown."""
+    import audit_store
+    conn = audit_store._get_connection()
+    row = conn.execute("SELECT * FROM app_environments WHERE environment_id = ?", (environment_id,)).fetchone()
+    if row is None:
+        raise KeyError(f"No saved environment with id '{environment_id}'")
+    return _merged_sync_schedule(_row_to_environment_meta(row))
+
+
+def _merged_sync_schedule(meta):
     stored = meta.get("sync_schedule") or {}
     merged = {**SYNC_SCHEDULE_DEFAULTS, **stored}
     # ENG2-04: a retention value saved before validation existed (0, a
@@ -4126,7 +4195,7 @@ def get_sync_schedule(name, owner=LOCAL_OWNER_KEY):
     for field in ("retention_days", "retention_max_size_mb"):
         value = merged.get(field)
         if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or value < 1):
-            log("WARN", f"sync schedule for '{name}' has an invalid stored {field}={value!r}; treating it as no limit")
+            log("WARN", f"sync schedule for '{meta.get('name')}' has an invalid stored {field}={value!r}; treating it as no limit")
             merged[field] = None
     return merged
 
@@ -4188,6 +4257,25 @@ def set_sync_schedule(name, config, owner=LOCAL_OWNER_KEY):
     target_id, meta = _find_own_environment_sql(conn, owner, name)
     if meta is None:
         raise KeyError(f"No saved environment named '{name}'")
+    return _write_sync_schedule(conn, target_id, meta, config)
+
+
+def set_sync_schedule_by_id(environment_id, config):
+    """set_sync_schedule addressed by the real environment_id (5.42.0) --
+    used once the caller has resolved visibility and the shared-environment
+    permission (see shared_capability_allowed). Raises KeyError if the id is
+    unknown, ValueError for an invalid config."""
+    config = validate_sync_schedule_config(config)
+    import audit_store
+    conn = audit_store._get_connection()
+    row = conn.execute("SELECT * FROM app_environments WHERE environment_id = ?", (environment_id,)).fetchone()
+    if row is None:
+        raise KeyError(f"No saved environment with id '{environment_id}'")
+    return _write_sync_schedule(conn, environment_id, _row_to_environment_meta(row), config)
+
+
+def _write_sync_schedule(conn, target_id, meta, config):
+    import audit_store
     merged = {**SYNC_SCHEDULE_DEFAULTS, **(meta.get("sync_schedule") or {}), **config}
     with audit_store._db_lock:
         conn.execute(
@@ -4203,6 +4291,191 @@ def set_sync_schedule(name, config, owner=LOCAL_OWNER_KEY):
         )
         conn.commit()
     return merged
+
+
+# ---------------------------------------------------------------------------
+# Shared-environment permissions (5.42.0)
+# ---------------------------------------------------------------------------
+# What a user may do with an environment ANOTHER user owns and has shared.
+# Sharing itself stays the owner's decision (set_environment_shared); what a
+# shared user may then do with it is an admin's. An owner is never limited
+# by any of this. Each capability resolves per environment: an override for
+# that environment (allow/deny), else the global default (allow/deny), else
+# the built-in default below. The built-in defaults are exactly what a
+# shared user could do before 5.42.0, so an upgrade changes nothing until an
+# admin changes a setting. "inherit" is never stored: it is the absence of a
+# row (migration 008's two tables).
+SHARED_CAPABILITIES = (
+    {"key": "view_archive", "label": "View archived reports", "builtin": "allow",
+     "description": "Compliance reports, resource history, sync status and the basic evidence-chain check, read from this app's archive."},
+    {"key": "live_read", "label": "Live read queries", "builtin": "allow",
+     "description": "Reads from the owner's OPA team and Okta org with the owner's credentials: Access Explorer, Folder Builder lists and preview, the Secrets and Service Accounts dashboards."},
+    {"key": "tenant_write", "label": "Write to the OPA tenant / Okta org", "builtin": "allow",
+     "description": "Creates and changes things with the owner's credentials: resource groups, projects, folders, security policies, group membership, and new Okta groups with Group Push."},
+    {"key": "import_csv", "label": "Import a CSV into the archive", "builtin": "allow",
+     "description": "Adds System Log events from a CSV file in the project folder to this environment's compliance archive."},
+    {"key": "reset_watermark", "label": "Reset the sync watermark", "builtin": "allow",
+     "description": "Makes the next sync backfill the full 90-day window."},
+    {"key": "sync_now", "label": "Run Sync now", "builtin": "deny",
+     "description": "Starts a compliance sync with the owner's Okta API token and the owner's saved sync settings."},
+    {"key": "sync_settings", "label": "Change sync settings", "builtin": "deny",
+     "description": "Turns the daily sync on or off and changes its time and ingestion scope. Retention stays the owner's (it deletes archived events)."},
+)
+SHARED_CAPABILITY_KEYS = tuple(c["key"] for c in SHARED_CAPABILITIES)
+SHARED_PERMISSION_VALUES = ("allow", "deny")
+
+
+def _validate_shared_capability(capability):
+    if capability not in SHARED_CAPABILITY_KEYS:
+        raise ValueError(f"unknown shared-environment capability {capability!r}")
+
+
+def get_shared_permission_defaults():
+    """{capability: {"value": allow|deny, "source": "default"|"built_in",
+    "updated_at", "updated_by"}} -- the effective global default for every
+    capability and where it comes from."""
+    import audit_store
+    conn = audit_store._get_connection()
+    stored = {row["capability"]: row for row in conn.execute("SELECT * FROM shared_permission_defaults")}
+    out = {}
+    for cap in SHARED_CAPABILITIES:
+        row = stored.get(cap["key"])
+        if row is not None and row["value"] in SHARED_PERMISSION_VALUES:
+            out[cap["key"]] = {"value": row["value"], "source": "default",
+                               "updated_at": row["updated_at"], "updated_by": row["updated_by"]}
+        else:
+            out[cap["key"]] = {"value": cap["builtin"], "source": "built_in", "updated_at": None, "updated_by": None}
+    return out
+
+
+def get_shared_permission_overrides(environment_id):
+    """{capability: allow|deny} -- only the capabilities this environment
+    overrides (the rest inherit)."""
+    import audit_store
+    conn = audit_store._get_connection()
+    return {
+        row["capability"]: row["value"]
+        for row in conn.execute(
+            "SELECT capability, value FROM shared_permission_overrides WHERE environment_id = ?", (environment_id,)
+        )
+        if row["capability"] in SHARED_CAPABILITY_KEYS and row["value"] in SHARED_PERMISSION_VALUES
+    }
+
+
+def effective_shared_permissions(environment_id, defaults=None):
+    """{capability: {"value": allow|deny, "source": "override"|"default"|"built_in"}}
+    for a shared (non-owner) user of this environment. `defaults` lets a
+    caller listing many environments read the global defaults once."""
+    defaults = defaults if defaults is not None else get_shared_permission_defaults()
+    overrides = get_shared_permission_overrides(environment_id)
+    out = {}
+    for key in SHARED_CAPABILITY_KEYS:
+        if key in overrides:
+            out[key] = {"value": overrides[key], "source": "override"}
+        else:
+            out[key] = {"value": defaults[key]["value"], "source": defaults[key]["source"]}
+    return out
+
+
+def environment_owner(environment_id):
+    """(exists, owner_id) for one environment id."""
+    import audit_store
+    conn = audit_store._get_connection()
+    row = conn.execute("SELECT owner_id FROM app_environments WHERE environment_id = ?", (environment_id,)).fetchone()
+    return (False, None) if row is None else (True, row["owner_id"])
+
+
+def shared_capability_allowed(environment_id, caller_owner, capability):
+    """THE shared-environment permission check (5.42.0). True when
+    `caller_owner` (engine-layer owner: an Okta sub, or LOCAL_OWNER_KEY)
+    owns the environment -- owners are never limited -- or when the
+    capability resolves to "allow" for it (override, else global default,
+    else built-in). An unknown environment id is False (callers resolve
+    visibility before asking; this never grants anything on a row that
+    isn't there). An unknown capability is a programming error (ValueError)."""
+    _validate_shared_capability(capability)
+    exists, owner = environment_owner(environment_id)
+    if not exists:
+        return False
+    if owner == caller_owner:
+        return True
+    return effective_shared_permissions(environment_id)[capability]["value"] == "allow"
+
+
+def validate_shared_permission_changes(changes, allow_inherit=True):
+    """`changes` = {capability: "allow"|"deny"|"inherit"}; returns it
+    validated (ValueError names the problem). Empty is refused."""
+    if not isinstance(changes, dict) or not changes:
+        raise ValueError("changes must be a non-empty object of capability -> allow / deny / inherit")
+    allowed = SHARED_PERMISSION_VALUES + (("inherit",) if allow_inherit else ())
+    clean = {}
+    for capability, value in changes.items():
+        _validate_shared_capability(capability)
+        if value not in allowed:
+            raise ValueError(f"{capability} must be one of {', '.join(allowed)}")
+        clean[capability] = value
+    return clean
+
+
+def set_shared_permissions(changes, environment_id=None, updated_by=None):
+    """Applies `changes` ({capability: allow|deny|inherit}) to the global
+    defaults (environment_id None) or to one environment's overrides, in
+    one transaction. "inherit" deletes the row. Returns
+    [{"capability", "before", "after"}] for every capability whose stored
+    value actually changed (before/after are "allow"/"deny"/"inherit" --
+    the STORED setting, not the effective one), for the audit entry.
+    Raises KeyError for an unknown environment, ValueError for bad input."""
+    changes = validate_shared_permission_changes(changes)
+    import audit_store
+    conn = audit_store._get_connection()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    diff = []
+    with audit_store._db_lock:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        try:
+            if environment_id is not None:
+                if conn.execute("SELECT 1 FROM app_environments WHERE environment_id = ?", (environment_id,)).fetchone() is None:
+                    raise KeyError(f"No saved environment with id '{environment_id}'")
+                rows = conn.execute(
+                    "SELECT capability, value FROM shared_permission_overrides WHERE environment_id = ?", (environment_id,)
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT capability, value FROM shared_permission_defaults").fetchall()
+            current = {r["capability"]: r["value"] for r in rows}
+            for capability, value in changes.items():
+                before = current.get(capability, "inherit")
+                if before == value:
+                    continue
+                if environment_id is not None:
+                    if value == "inherit":
+                        conn.execute("DELETE FROM shared_permission_overrides WHERE environment_id = ? AND capability = ?",
+                                     (environment_id, capability))
+                    else:
+                        conn.execute(
+                            """INSERT INTO shared_permission_overrides (environment_id, capability, value, updated_at, updated_by)
+                               VALUES (?, ?, ?, ?, ?)
+                               ON CONFLICT(environment_id, capability) DO UPDATE SET
+                                   value=excluded.value, updated_at=excluded.updated_at, updated_by=excluded.updated_by""",
+                            (environment_id, capability, value, now, updated_by),
+                        )
+                else:
+                    if value == "inherit":
+                        conn.execute("DELETE FROM shared_permission_defaults WHERE capability = ?", (capability,))
+                    else:
+                        conn.execute(
+                            """INSERT INTO shared_permission_defaults (capability, value, updated_at, updated_by)
+                               VALUES (?, ?, ?, ?)
+                               ON CONFLICT(capability) DO UPDATE SET
+                                   value=excluded.value, updated_at=excluded.updated_at, updated_by=excluded.updated_by""",
+                            (capability, value, now, updated_by),
+                        )
+                diff.append({"capability": capability, "before": before, "after": value})
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    return diff
 
 
 def build_secrets_access_report(client, okta_client, resource_group_id, project_id, since_days=90, reveal_limit=5):

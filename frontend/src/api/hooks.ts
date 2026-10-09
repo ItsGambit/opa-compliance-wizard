@@ -14,6 +14,7 @@ import {
   fetchSecretsAccessReport,
   fetchServiceAccount,
   fetchServiceAccountsReport,
+  fetchSharedPermissions,
   fetchSyncStatus,
   fetchUserResourceAccess,
   fetchVersion,
@@ -57,6 +58,17 @@ export function useAccessControl(enabled: boolean) {
     // Only ever opened by an admin from the dialog -- gated by `enabled`
     // (React Query's own conditional-fetch flag) so a non-admin's browser
     // never even attempts this admin-only request in the background.
+    enabled,
+  })
+}
+
+/** 5.42.0, admin-only: the shared-environment permission settings. Fetched
+ * only while an admin screen that shows them is open. */
+export function useSharedPermissions(enabled: boolean) {
+  return useQuery({
+    queryKey: ['shared_permissions'],
+    queryFn: fetchSharedPermissions,
+    staleTime: 0,
     enabled,
   })
 }

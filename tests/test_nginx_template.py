@@ -173,11 +173,15 @@ def served(tmp_path):
         def do_GET(self):
             path = self.path.split("?", 1)[0]
             if path == "/verify":
-                if "opa_wizard_session=good" in (self.headers.get("Cookie") or ""):
+                cookie = self.headers.get("Cookie") or ""
+                stepup = "require_stepup=1" in self.path
+                if "opa_wizard_session=good" in cookie and (not stepup or "opa_wizard_stepup=good" in cookie):
                     self.send_response(200)
                     self.send_header("X-Auth-Sub", "00uREALUSER")
                     self.send_header("X-Auth-User", "user@example.com")
                     self.send_header("X-Auth-Is-Admin", "false")
+                    if stepup:
+                        self.send_header("X-Auth-Action-Id", "action-from-the-signed-cookie")
                 else:
                     self.send_response(401)
                 self.send_header("Content-Length", "0")
@@ -310,3 +314,28 @@ def test_port_80_redirect_ignores_the_client_host_header(served):
     assert resp.status == 301
     # nginx keeps $server_name lowercased (the template holds a placeholder name)
     assert resp.getheader("Location") == f"https://{server_name.lower()}/x?y=1"
+
+
+# 5.42.0: Environments changes are applied only through the step-up location.
+def test_environment_save_requires_a_step_up_and_forwards_only_the_gates_action_id(served):
+    request, rec, _ = served
+    forged = {"X-Auth-Action-Id": "forged", "X-Nginx-Stepup-Location": "guess"}
+    before = len(rec.backend_requests)
+    resp = request("/api/environment_changes/save", {"Cookie": "opa_wizard_session=good", **forged})
+    assert resp.status == 302 and len(rec.backend_requests) == before  # no step-up cookie -> sign in, backend untouched
+    resp = request("/api/environment_changes/save",
+                   {"Cookie": "opa_wizard_session=good; opa_wizard_stepup=good", **forged})
+    assert resp.status == 200
+    _path, headers = rec.backend_requests[-1]
+    assert headers["X-Auth-Action-Id"] == "action-from-the-signed-cookie"
+    assert headers["X-Nginx-Stepup-Location"] == headers["X-Nginx-Proxy-Secret"] != "guess"
+
+
+def test_ordinary_routes_drop_client_sent_step_up_headers(served):
+    request, rec, _ = served
+    resp = request("/api/environments", {"Cookie": "opa_wizard_session=good", "X-Auth-Action-Id": "forged",
+                                         "X-Nginx-Stepup-Location": "guess"})
+    assert resp.status == 200
+    _path, headers = rec.backend_requests[-1]
+    lowered = {k.lower() for k in headers}
+    assert "x-auth-action-id" not in lowered and "x-nginx-stepup-location" not in lowered

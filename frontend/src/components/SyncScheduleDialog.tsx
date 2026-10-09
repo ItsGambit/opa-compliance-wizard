@@ -2,7 +2,7 @@ import { useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { useQueryClient } from '@tanstack/react-query'
 import { CalendarClock, Cloud, FileText, Play, ShieldCheck } from 'lucide-react'
-import { importSyncCsv, resetSyncWatermark, saveSyncSchedule } from '../api/client'
+import { importSyncCsv, isStepUpRequired, resetSyncWatermark, saveSyncSchedule } from '../api/client'
 import { useCsvFiles, useWhoami } from '../api/hooks'
 import { useIntegrityCheck } from '../hooks/useIntegrityCheck'
 import { useSyncJob } from '../hooks/useSyncJob'
@@ -10,12 +10,17 @@ import { toast } from '../hooks/useToast'
 import type { Environment, IngestionScope, SyncSchedule } from '../types'
 import { getSyncProgressPercent } from '../utils/syncProgress'
 import { canAdminFrom } from '../utils/whoami'
+import { can, permissionReason } from '../utils/environmentRows'
+import { beginStepUp } from '../utils/stepUp'
 import { DialogCloseButton } from './DialogCloseButton'
 import { IntegrityResultView } from './IntegrityResultView'
 import { Select } from './Select'
 
 interface Props {
   env: Environment
+  /** 5.42.0: settings restored after an MFA approval that didn't complete --
+   * the dialog opens with them. */
+  restoreDraft?: SyncSchedule
 }
 
 type FirstRunChoice = 'backfill' | 'csv' | 'fresh'
@@ -42,8 +47,8 @@ function formatLocalEquivalent(utcHHMM: string): string {
  * enable for an environment with no prior sync_state, shows a 3-way
  * choice (live 90-day backfill / CSV import / start fresh) before
  * saving, matching the reviewed mockup exactly. */
-export function SyncScheduleDialog({ env }: Props) {
-  const [open, setOpen] = useState(false)
+export function SyncScheduleDialog({ env, restoreDraft }: Props) {
+  const [open, setOpen] = useState(!!restoreDraft)
   // The content (and with it the sync-status request and any polling)
   // mounts only while this dialog is open -- the Environments list used to
   // fire one /sync/status request per row as soon as it rendered (UI-07).
@@ -60,14 +65,20 @@ export function SyncScheduleDialog({ env }: Props) {
           aria-describedby={undefined}
           className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[30rem] max-h-[85vh] overflow-y-auto p-5"
         >
-          <SyncScheduleContent env={env} />
+          <SyncScheduleContent env={env} restoreDraft={restoreDraft} />
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>
   )
 }
 
-function SyncScheduleContent({ env }: Props) {
+function SyncScheduleContent({ env, restoreDraft }: Props) {
+  // 5.42.0: on an environment shared with this user, each part follows what
+  // an admin allows shared users (the server enforces the same thing).
+  const canEditSettings = can(env, 'sync_settings')
+  const canSyncNow = can(env, 'sync_now')
+  const canImport = can(env, 'import_csv')
+  const canReset = can(env, 'reset_watermark')
   const [firstRunPrompt, setFirstRunPrompt] = useState(false)
   const [firstRunChoice, setFirstRunChoice] = useState<FirstRunChoice>('backfill')
   // Bare filename, not a full path -- the backend's import_csv route
@@ -83,14 +94,15 @@ function SyncScheduleContent({ env }: Props) {
 
   // Initialised from the saved schedule each time the dialog opens (this
   // component mounts with it).
-  const [enabled, setEnabled] = useState(env.sync_schedule.enabled)
-  const [runTime, setRunTime] = useState(env.sync_schedule.run_time)
-  const [ingestionScope, setIngestionScope] = useState<IngestionScope>(env.sync_schedule.ingestion_scope)
+  const initial = restoreDraft ?? env.sync_schedule
+  const [enabled, setEnabled] = useState(initial.enabled)
+  const [runTime, setRunTime] = useState(initial.run_time)
+  const [ingestionScope, setIngestionScope] = useState<IngestionScope>(initial.ingestion_scope)
   const [retentionDays, setRetentionDays] = useState<string>(
-    env.sync_schedule.retention_days != null ? String(env.sync_schedule.retention_days) : ''
+    initial.retention_days != null ? String(initial.retention_days) : ''
   )
   const [retentionMaxSizeMb, setRetentionMaxSizeMb] = useState<string>(
-    env.sync_schedule.retention_max_size_mb != null ? String(env.sync_schedule.retention_max_size_mb) : ''
+    initial.retention_max_size_mb != null ? String(initial.retention_max_size_mb) : ''
   )
   const [saving, setSaving] = useState(false)
 
@@ -126,7 +138,17 @@ function SyncScheduleContent({ env }: Props) {
   const doSave = async (config: SyncSchedule): Promise<boolean> => {
     setSaving(true)
     try {
-      await saveSyncSchedule(env.name, config)
+      const resp = await saveSyncSchedule(env.name, config)
+      if (isStepUpRequired(resp)) {
+        // 5.42.0: hosted mode -- approve with MFA first; the page leaves here.
+        // (A first-run backfill or CSV import is started separately after
+        // the approval: Sync now, or the import, from this dialog.)
+        beginStepUp(resp.action_id, {
+          kind: 'environment_change', action: resp.action, label: `Sync settings for '${env.name}'`,
+          startedAt: Date.now(), syncDraft: { environmentId: env.id, schedule: config }, reopen: 'environments',
+        })
+        return false
+      }
       queryClient.invalidateQueries({ queryKey: ['environments'] })
       toast({ title: config.enabled ? 'Daily sync enabled' : 'Daily sync disabled', variant: 'success' })
       return true
@@ -159,12 +181,19 @@ function SyncScheduleContent({ env }: Props) {
     const config = buildConfig()
     if (!(await doSave(config))) return // keep the prompt open; nothing else may start on a failed save
     setFirstRunPrompt(false)
-    if (firstRunChoice === 'backfill') {
-      job.start(config.ingestion_scope)
+    if (firstRunChoice === 'backfill' && canSyncNow) {
+      job.start(env.is_own ? config.ingestion_scope : undefined)
     } else if (firstRunChoice === 'csv' && csvFile) {
       setSaving(true)
       try {
         const result = await importSyncCsv(env.name, csvFile, config.ingestion_scope)
+        if (isStepUpRequired(result)) {
+          beginStepUp(result.action_id, {
+            kind: 'environment_change', action: result.action, label: `Import ${csvFile} into '${env.name}'`,
+            startedAt: Date.now(), reopen: 'environments',
+          })
+          return
+        }
         toast({
           title: `Imported ${result.inserted} event(s) from CSV`,
           description: result.skipped_unparseable
@@ -201,6 +230,10 @@ function SyncScheduleContent({ env }: Props) {
           {!firstRunPrompt ? (
             <>
               <div className="flex flex-col gap-3">
+                {!canEditSettings && (
+                  <p className="text-xs text-text-dim" role="note">{permissionReason(env, 'sync_settings')} The settings below are shown read-only.</p>
+                )}
+                <fieldset disabled={!canEditSettings} className="flex flex-col gap-3 disabled:opacity-70">
                 <label className="flex items-center gap-2 text-sm text-text cursor-pointer">
                   <input type="checkbox" checked={enabled} onChange={e => setEnabled(e.target.checked)} className="accent-accent" />
                   Enable daily sync
@@ -245,6 +278,7 @@ function SyncScheduleContent({ env }: Props) {
                     <label htmlFor={`${env.id}-retention-days`} className="section-label block mb-1">Retention (days)</label>
                     <input
                       id={`${env.id}-retention-days`}
+                      disabled={!env.is_own}
                       type="number" min="1" step="1" placeholder="Forever" className="text-input w-full"
                       value={retentionDays} onChange={e => setRetentionDays(e.target.value)}
                     />
@@ -253,6 +287,7 @@ function SyncScheduleContent({ env }: Props) {
                     <label htmlFor={`${env.id}-retention-mb`} className="section-label block mb-1">Max size (MB)</label>
                     <input
                       id={`${env.id}-retention-mb`}
+                      disabled={!env.is_own}
                       type="number" min="1" step="1" placeholder="No limit" className="text-input w-full"
                       value={retentionMaxSizeMb} onChange={e => setRetentionMaxSizeMb(e.target.value)}
                     />
@@ -261,7 +296,9 @@ function SyncScheduleContent({ env }: Props) {
                 <p className="text-[0.6875rem] text-text-faint">
                   Curated events are never pruned regardless of retention or ingestion scope. Leave a limit empty for
                   no limit — 0 is not accepted. The size cap counts this environment's own archived event payload.
+                  {!env.is_own && ' Only the owner can change retention: it deletes archived events.'}
                 </p>
+                </fieldset>
 
                 {job.statusError && (
                   <div className="card p-2.5 text-xs text-loss">Could not load the sync status: {job.statusError}</div>
@@ -280,11 +317,19 @@ function SyncScheduleContent({ env }: Props) {
                       <button
                         type="button"
                         className="btn-secondary self-start"
-                        disabled={saving || isRunning}
+                        disabled={saving || isRunning || !canReset}
+                        title={permissionReason(env, 'reset_watermark') || undefined}
                         onClick={async () => {
                           setSaving(true)
                           try {
-                            await resetSyncWatermark(env.name)
+                            const resp = await resetSyncWatermark(env.name)
+                            if (isStepUpRequired(resp)) {
+                              beginStepUp(resp.action_id, {
+                                kind: 'environment_change', action: resp.action,
+                                label: `Reset the sync watermark of '${env.name}'`, startedAt: Date.now(), reopen: 'environments',
+                              })
+                              return
+                            }
                             toast({ title: 'Sync watermark reset', description: 'The next sync will backfill the full 90-day window.', variant: 'success' })
                             job.refreshStatus()
                           } catch (err) {
@@ -296,6 +341,9 @@ function SyncScheduleContent({ env }: Props) {
                       >
                         Reset watermark
                       </button>
+                    )}
+                    {state.last_sync_status === 'error' && state.last_sync_error?.includes('watermark') && !canReset && (
+                      <div className="text-text-dim">{permissionReason(env, 'reset_watermark')}</div>
                     )}
                   </div>
                 )}
@@ -338,11 +386,14 @@ function SyncScheduleContent({ env }: Props) {
                 <button
                   type="button"
                   className="btn-secondary self-start"
-                  disabled={isRunning || !env.name}
-                  onClick={() => job.start(ingestionScope)}
+                  disabled={isRunning || !env.name || !canSyncNow}
+                  title={permissionReason(env, 'sync_now') || undefined}
+                  // A shared user's Sync now always uses the owner's saved scope.
+                  onClick={() => job.start(env.is_own ? ingestionScope : undefined)}
                 >
                   <Play size={12} aria-hidden="true" /> {isRunning ? 'Syncing…' : 'Sync now'}
                 </button>
+                {!canSyncNow && <p className="text-[0.6875rem] text-text-dim">{permissionReason(env, 'sync_now')}</p>}
 
                 {/* FE-15: the evidence-chain check, reachable from the UI. */}
                 <div className="card p-2.5 flex flex-col gap-2">
@@ -387,8 +438,8 @@ function SyncScheduleContent({ env }: Props) {
                 <button
                   type="button"
                   className="btn-primary"
-                  disabled={saving || !job.statusLoaded}
-                  title={!job.statusLoaded ? 'Loading sync status…' : undefined}
+                  disabled={saving || !job.statusLoaded || !canEditSettings}
+                  title={!canEditSettings ? permissionReason(env, 'sync_settings') : !job.statusLoaded ? 'Loading sync status…' : undefined}
                   onClick={handleSaveClick}
                 >
                   Save
@@ -403,7 +454,7 @@ function SyncScheduleContent({ env }: Props) {
               </p>
               <div className="flex flex-col gap-2 mb-4">
                 <label className="card p-2.5 flex items-start gap-2 cursor-pointer">
-                  <input type="radio" checked={firstRunChoice === 'backfill'} onChange={() => setFirstRunChoice('backfill')} className="mt-0.5" />
+                  <input type="radio" checked={firstRunChoice === 'backfill'} disabled={!canSyncNow} onChange={() => setFirstRunChoice('backfill')} className="mt-0.5" />
                   <Cloud size={14} className="mt-0.5 text-text-faint" />
                   <div>
                     <div className="text-xs font-medium text-text">Backfill last 90 days (live)</div>
@@ -411,7 +462,7 @@ function SyncScheduleContent({ env }: Props) {
                   </div>
                 </label>
                 <label className="card p-2.5 flex items-start gap-2 cursor-pointer">
-                  <input type="radio" checked={firstRunChoice === 'csv'} onChange={() => setFirstRunChoice('csv')} className="mt-0.5" />
+                  <input type="radio" checked={firstRunChoice === 'csv'} disabled={!canImport} onChange={() => setFirstRunChoice('csv')} className="mt-0.5" />
                   <FileText size={14} className="mt-0.5 text-text-faint" />
                   <div className="flex-1">
                     <div className="text-xs font-medium text-text">Import from a CSV export</div>

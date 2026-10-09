@@ -6,6 +6,7 @@ import { toast } from '../hooks/useToast'
 import { useAccessControl } from '../api/hooks'
 import { prepareAccessControl } from '../api/client'
 import type { AccessControlConfig } from '../types'
+import { beginStepUp } from '../utils/stepUp'
 
 interface Props {
   open: boolean
@@ -38,9 +39,9 @@ export function AccessControlDialog({ open, onOpenChange: setOpen }: Props) {
   // the one shown on screen here).
   const prepareMutation = useMutation({
     mutationFn: (values: AccessControlConfig) => prepareAccessControl(values),
-    onSuccess: ({ action_id }) => {
-      window.location.href = `/step-up?action_id=${encodeURIComponent(action_id)}`
-    },
+    // 5.42.0: the shared step-up helper -- it also records that this round
+    // trip is the Access Control save, so App.tsx finishes the right change.
+    onSuccess: ({ action_id }) => beginStepUp(action_id, { kind: 'access_control' }),
     onError: (err: Error) => toast({ title: 'Could not start the save flow', description: err.message, variant: 'error' }),
   })
 

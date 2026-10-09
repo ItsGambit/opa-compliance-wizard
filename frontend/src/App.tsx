@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useEnvironments, useWhoami } from './api/hooks'
-import { isSessionExpiredError, saveAccessControl } from './api/client'
+import { isSessionExpiredError, saveAccessControl, saveEnvironmentChange, type ApiError } from './api/client'
 import { useHashRoute } from './hooks/useHashRoute'
 import { toast } from './hooks/useToast'
 import { AboutDialog } from './components/AboutDialog'
@@ -24,6 +24,9 @@ import { REPORTS_SUB_TABS, SideNav } from './components/SideNav'
 import { UserMenu } from './components/UserMenu'
 import { environmentScopeKey } from './utils/environmentRows'
 import { canAdminFrom } from './utils/whoami'
+import { SharedPermissionsDialog } from './components/SharedPermissionsDialog'
+import { SharedEnvironmentNotice } from './components/SharedEnvironmentNotice'
+import { clearPendingStepUp, readPendingStepUp, stepUpReturnAction, type PendingStepUp } from './utils/stepUp'
 
 // Every navigable view is a hash route (see utils/route.ts) so the browser
 // keeps a history entry per in-app navigation -- the mouse back button on
@@ -45,6 +48,10 @@ export default function App() {
   const [accessControlOpen, setAccessControlOpen] = useState(false)
   const [aboutOpen, setAboutOpen] = useState(false)
   const [orphansOpen, setOrphansOpen] = useState(false)
+  const [sharedPermissionsOpen, setSharedPermissionsOpen] = useState(false)
+  // 5.42.0: an Environments change whose step-up approval didn't complete --
+  // its screen reopens with the user's input (see utils/stepUp.ts).
+  const [restore, setRestore] = useState<Extract<PendingStepUp, { kind: 'environment_change' }> | null>(null)
   const { data: environments, isLoading: environmentsLoading } = useEnvironments()
   const { data: whoami } = useWhoami()
   // UI-06: the Audit Log and banner settings follow what the server will
@@ -100,15 +107,89 @@ export default function App() {
     },
   })
 
+  // 5.42.0: the same finish step for an Environments change (create, edit,
+  // delete, share, sync settings, CSV import, watermark reset, archive purge,
+  // shared permissions) -- the server runs the request it stored before the
+  // redirect. On failure the screen reopens with the user's input.
+  const finishEnvironmentChange = useMutation({
+    mutationFn: (_pending: Extract<PendingStepUp, { kind: 'environment_change' }>) => saveEnvironmentChange(),
+    onSuccess: (resp, pending) => {
+      clearPendingStepUp()
+      const active = typeof resp.active === 'string' ? resp.active : null
+      toast({
+        title: resp.activated && active ? `Connected to '${active}'` : `${pending.label}: done`,
+        description: 'Approved via step-up MFA.',
+        variant: 'success',
+      })
+      for (const key of ['environments', 'shared_permissions', 'orphaned_archives', 'audit_log', 'sync_status']) {
+        queryClient.invalidateQueries({ queryKey: [key] })
+      }
+    },
+    onError: (err: ApiError, pending) => {
+      clearPendingStepUp()
+      const reason = err.body?.reason
+      if (err.body?.saved) {
+        // The environment WAS saved (502 "Saved, but could not connect").
+        queryClient.invalidateQueries({ queryKey: ['environments'] })
+        toast({ title: 'Saved, but could not connect', description: err.message, variant: 'error' })
+        return
+      }
+      setRestore(pending)
+      toast({
+        title: `${pending.label}: not applied`,
+        description: isSessionExpiredError(err as unknown) || reason === 'expired'
+          ? 'The MFA approval expired before the change was applied. Your input is restored -- try again.'
+          : reason === 'already_consumed' || reason === 'not_found'
+            ? 'This approval was already used or abandoned. Your input is restored -- check the current state and try again.'
+            : reason === 'secrets_expired'
+              ? 'The secrets you typed are no longer held by the server (they are never stored). Enter them again and save.'
+              : err.message,
+        variant: 'error',
+      })
+    },
+  })
+
   useEffect(() => {
     const url = new URL(window.location.href)
-    if (url.searchParams.get('stepup_complete') !== '1') return
-    url.searchParams.delete('stepup_complete')
-    window.history.replaceState({}, '', url.toString())
-
+    const returned = url.searchParams.get('stepup_complete') === '1'
+    if (returned) {
+      url.searchParams.delete('stepup_complete')
+      window.history.replaceState({}, '', url.toString())
+    }
+    const pending = readPendingStepUp(Date.now(), returned)
+    const next = stepUpReturnAction(returned, pending)
+    if (pending?.kind === 'environment_change') {
+      if (next === 'finish_environment_change') {
+        finishEnvironmentChange.mutate(pending)
+      } else {
+        // Back without finishing the MFA step (cancelled at Okta, or the
+        // tab was reopened): nothing changed on the server.
+        clearPendingStepUp()
+        setRestore(pending)
+        toast({
+          title: `${pending.label}: not applied`,
+          description: "The MFA approval wasn't completed, so nothing changed. Your input is restored.",
+          variant: 'error',
+        })
+      }
+      return
+    }
+    if (next !== 'finish_access_control') {
+      if (pending?.kind === 'access_control') clearPendingStepUp()  // never came back: nothing to finish
+      return
+    }
+    clearPendingStepUp()
     finishStepUpMutation.mutate()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Reopen the screen a not-applied change came from.
+  useEffect(() => {
+    if (!restore) return
+    if (restore.reopen === 'orphaned_archives') setOrphansOpen(true)
+    else if (restore.reopen === 'shared_permissions') setSharedPermissionsOpen(true)
+    else setEnvironmentsOpen(true)
+  }, [restore])
 
   if (environmentsLoading) {
     return (
@@ -125,7 +206,7 @@ export default function App() {
         <AnnouncementBanner />
         <div className="px-6 py-8">
           <div className="max-w-4xl mx-auto">
-            <EnvironmentSetup />
+            <EnvironmentSetup draft={restore?.action === 'environment.upsert' ? restore.environmentDraft : undefined} />
           </div>
           <Footer />
         </div>
@@ -152,6 +233,7 @@ export default function App() {
           onOpenAccessControl={() => setAccessControlOpen(true)}
           onOpenAbout={() => setAboutOpen(true)}
           onOpenOrphanedArchives={() => setOrphansOpen(true)}
+          onOpenSharedPermissions={() => setSharedPermissionsOpen(true)}
         />
 
         <EnvironmentScope scopeKey={scopeKey}>
@@ -190,6 +272,8 @@ export default function App() {
             </div>
           </header>
 
+          <SharedEnvironmentNotice />
+
           {activeTab === 'reports' && reportsSubTab === 'browse' && (
             <ComplianceReports selectedReport={route.reportKey} onSelectReport={key => navigate({ tab: 'reports', reportsSubTab: 'browse', reportKey: key })} />
           )}
@@ -208,10 +292,19 @@ export default function App() {
       <EnvironmentManagerDialog
         data={environments}
         open={environmentsOpen}
-        onOpenChange={setEnvironmentsOpen}
+        onOpenChange={next => { setEnvironmentsOpen(next); if (!next) setRestore(null) }}
         isAdmin={whoami?.is_admin}
+        canAdmin={canAdmin}
+        restore={restore && restore.reopen !== 'orphaned_archives' && restore.reopen !== 'shared_permissions' ? restore : null}
       />
-      {canAdmin && <OrphanedArchivesDialog open={orphansOpen} onOpenChange={setOrphansOpen} />}
+      {canAdmin && <OrphanedArchivesDialog open={orphansOpen} onOpenChange={next => { setOrphansOpen(next); if (!next) setRestore(null) }} />}
+      {canAdmin && (
+        <SharedPermissionsDialog
+          open={sharedPermissionsOpen}
+          onOpenChange={next => { setSharedPermissionsOpen(next); if (!next) setRestore(null) }}
+          draft={restore?.permissionsDraft && !restore.permissionsDraft.environmentId ? restore.permissionsDraft.settings : undefined}
+        />
+      )}
       <BannerSettingsDialog open={bannerOpen} onOpenChange={setBannerOpen} />
       <AccessControlDialog open={accessControlOpen} onOpenChange={setAccessControlOpen} />
       <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />

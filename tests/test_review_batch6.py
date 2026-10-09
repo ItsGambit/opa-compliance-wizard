@@ -22,12 +22,14 @@ def tick(monkeypatch):
     envs, schedules, states, started = {}, {}, {}, []
     monkeypatch.setattr(engine, "list_all_environments", lambda: envs)
 
-    def get_schedule(name, owner=None):
+    def get_schedule(environment_id):
+        # By id since 5.42.0 (display names aren't unique across owners).
+        name = (envs.get(environment_id) or {}).get("name")
         if name not in schedules:
-            raise KeyError(name)
+            raise KeyError(environment_id)
         return schedules[name]
 
-    monkeypatch.setattr(engine, "get_sync_schedule", get_schedule)
+    monkeypatch.setattr(engine, "get_sync_schedule_by_id", get_schedule)
     monkeypatch.setattr(audit_store, "get_sync_state", lambda env_id: states.get(env_id))
     monkeypatch.setattr(serve, "_start_sync_job", lambda *a, **k: started.append((a, k)))
 

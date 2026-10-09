@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from server.nginx_second_site import build, server_blocks
+from server.nginx_second_site import _location_blocks, build, server_blocks
 
 TEMPLATE = (Path(__file__).resolve().parent.parent / "server" / "nginx-opa-secrets-wizard.conf").read_text()
 MAIN = TEMPLATE.replace("REPLACE_WITH_NGINX_PROXY_SECRET_VALUE", "s3cr3t-live-value")
@@ -46,11 +46,15 @@ def test_backend_auth_rules_and_secret_are_kept(site):
     assert site.count("127.0.0.1:8766") == MAIN.count("127.0.0.1:8766") - 1
     assert 'set $nginx_proxy_secret "s3cr3t-live-value";' in site
     https_block = [b for b in server_blocks(MAIN) if re.search(r"listen\s+443", b)][0]
-    # auth_request /verify_stepup and the step-up X-Auth-Action-Id plumbing
-    # lived ONLY in the now-removed /api/access_control/save block.
+    # The access-control step-up location is removed; the Environments one
+    # (5.42.0) is kept -- every user of this gate needs MFA for those changes,
+    # and this gate runs the same /step-up.
     assert site.count("auth_request /verify;") == https_block.count("auth_request /verify;")
-    assert site.count("auth_request /verify_stepup;") == 0
-    assert https_block.count("auth_request /verify_stepup;") >= 1
+    assert https_block.count("auth_request /verify_stepup;") == 2
+    assert site.count("auth_request /verify_stepup;") == 1
+    saves = [blk for path, blk in _location_blocks(site) if "verify_stepup;" in blk and path != "/verify_stepup"]
+    assert len(saves) == 1 and "location = /api/environment_changes/save" in saves[0]
+    assert "X-Nginx-Stepup-Location $nginx_proxy_secret" in saves[0]
 
 
 # ---------------------------------------------------------------------------

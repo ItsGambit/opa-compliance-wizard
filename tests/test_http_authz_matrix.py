@@ -56,7 +56,16 @@ ORPHAN = "aaaaaaaa-0000-4000-8000-0000000000ff"
 #   env      keyed by an environment display name; visibility-scoped
 #   session  acts through the caller's own active session client
 # a_status: what owner A (env/session kinds) or an admin (admin kind) gets.
-Route = namedtuple("Route", "method sample kind body a_status")
+# caps (5.42.0): the shared-environment capabilities the route checks
+#   (create_secret_folders.SHARED_CAPABILITIES). REQUIRED for every env and
+#   session route -- None (not declared) fails test_every_environment_route_
+#   declares_its_capability; () only for the owner/admin-only routes listed
+#   in NO_CAPABILITY_ROUTES. Pinned to the code by an AST check and driven
+#   behaviourally for a shared non-owner.
+# stepup (5.42.0): the pending-action type of an Environments change that
+#   needs step-up MFA in hosted mode; must match the route's
+#   _environment_change(...) call exactly (and every such call needs one).
+Route = namedtuple("Route", "method sample kind body a_status caps stepup", defaults=(None, None))
 
 ROUTES = {
     ("GET", "path == '/api/version'"): Route("GET", "/api/version", "public", None, 200),
@@ -65,37 +74,38 @@ ROUTES = {
     ("GET", "path == '/api/environments'"): Route("GET", "/api/environments", "open", None, 200),
     ("GET", "path == '/api/banner'"): Route("GET", "/api/banner", "open", None, 200),
     ("GET", "path.startswith('/api/environments/') and path.endswith('/sync/status')"):
-        Route("GET", "/api/environments/dev/sync/status", "env", None, 200),
+        Route("GET", "/api/environments/dev/sync/status", "env", None, 200, caps=('view_archive',)),
     ("GET", "path.startswith('/api/environments/') and path.endswith('/integrity')"):
-        Route("GET", "/api/environments/dev/integrity", "env", None, 200),
+        Route("GET", "/api/environments/dev/integrity", "env", None, 200, caps=('view_archive',)),
     ("GET", "path == '/api/archives/orphaned'"): Route("GET", "/api/archives/orphaned", "admin", None, 200),
-    ("GET", "path == '/api/reports'"): Route("GET", "/api/reports?environment=dev", "env", None, 200),
+    ("GET", "path == '/api/reports'"): Route("GET", "/api/reports?environment=dev", "env", None, 200, caps=('view_archive',)),
     ("GET", "path.startswith('/api/reports/')"):
-        Route("GET", "/api/reports/session_activity?environment=dev", "env", None, 200),
+        Route("GET", "/api/reports/session_activity?environment=dev", "env", None, 200, caps=('view_archive',)),
     ("GET", "path.startswith('/api/resources/') and path.endswith('/history')"):
-        Route("GET", f"/api/resources/{FOLDER}/history?environment=dev", "env", None, 200),
+        Route("GET", f"/api/resources/{FOLDER}/history?environment=dev", "env", None, 200, caps=('view_archive',)),
     ("GET", "path.startswith('/api/active_directory_connections/') and path.endswith('/discovery_config')"):
-        Route("GET", f"/api/active_directory_connections/{RG}/discovery_config", "session", None, 502),
-    ("GET", "path == '/api/resource_groups'"): Route("GET", "/api/resource_groups", "session", None, 502),
+        Route("GET", f"/api/active_directory_connections/{RG}/discovery_config", "session", None, 502, caps=('live_read',)),
+    ("GET", "path == '/api/resource_groups'"): Route("GET", "/api/resource_groups", "session", None, 502, caps=('live_read',)),
     ("GET", "path.startswith('/api/resource_groups/') and path.endswith('/projects')"):
-        Route("GET", f"/api/resource_groups/{RG}/projects", "session", None, 502),
-    ("GET", "path == '/api/groups'"): Route("GET", "/api/groups", "session", None, 502),
+        Route("GET", f"/api/resource_groups/{RG}/projects", "session", None, 502, caps=('live_read',)),
+    ("GET", "path == '/api/groups'"): Route("GET", "/api/groups", "session", None, 502, caps=('live_read',)),
     ("GET", "path.startswith('/api/resource_groups/') and path.endswith('/folders') and ('/projects/' in path)"):
-        Route("GET", f"/api/resource_groups/{RG}/projects/{PROJ}/folders", "session", None, 502),
+        Route("GET", f"/api/resource_groups/{RG}/projects/{PROJ}/folders", "session", None, 502, caps=('live_read',)),
     ("GET", "path.startswith('/api/resource_groups/') and path.endswith('/secrets_access_report') and ('/projects/' in path)"):
-        Route("GET", f"/api/resource_groups/{RG}/projects/{PROJ}/secrets_access_report", "session", None, 502),
+        Route("GET", f"/api/resource_groups/{RG}/projects/{PROJ}/secrets_access_report", "session", None, 502, caps=('live_read', 'view_archive')),
     # A has a session but no completed sync -> the route's own not_synced 409.
-    ("GET", "path == '/api/service_accounts_report'"): Route("GET", "/api/service_accounts_report", "session", None, 409),
+    ("GET", "path == '/api/service_accounts_report'"): Route("GET", "/api/service_accounts_report", "session", None, 409, caps=('live_read', 'view_archive')),
     ("GET", "path.startswith('/api/resource_groups/') and path.endswith('/security_policies')"):
-        Route("GET", f"/api/resource_groups/{RG}/security_policies", "session", None, 502),
-    ("GET", "path == '/api/workload_roles'"): Route("GET", "/api/workload_roles", "session", None, 502),
-    ("GET", "path == '/api/service_account'"): Route("GET", "/api/service_account", "session", None, 502),
-    ("GET", "path == '/api/access/bootstrap/status'"): Route("GET", "/api/access/bootstrap/status", "session", None, 200),
-    ("GET", "path == '/api/access/bootstrap/result'"): Route("GET", "/api/access/bootstrap/result", "session", None, 200),
+        Route("GET", f"/api/resource_groups/{RG}/security_policies", "session", None, 502, caps=('live_read',)),
+    ("GET", "path == '/api/workload_roles'"): Route("GET", "/api/workload_roles", "session", None, 502, caps=('live_read',)),
+    ("GET", "path == '/api/service_account'"): Route("GET", "/api/service_account", "session", None, 502, caps=('live_read',)),
+    ("GET", "path == '/api/access/bootstrap/status'"): Route("GET", "/api/access/bootstrap/status", "session", None, 200, caps=('live_read',)),
+    ("GET", "path == '/api/access/bootstrap/result'"): Route("GET", "/api/access/bootstrap/result", "session", None, 200, caps=('live_read',)),
     ("GET", "path == '/api/csv_files'"): Route("GET", "/api/csv_files", "open", None, 200),
     ("GET", "path == '/api/csv'"): Route("GET", "/api/csv?file=folders_template.csv", "open", None, 200),
     ("GET", "path == '/api/audit_log'"): Route("GET", "/api/audit_log", "admin", None, 200),
     ("GET", "path == '/api/access_control'"): Route("GET", "/api/access_control", "admin", None, 200),
+    ("GET", "path == '/api/shared_permissions'"): Route("GET", "/api/shared_permissions", "admin", None, 200),
     ("POST", "path == '/api/banner'"):
         Route("POST", "/api/banner", "admin", {"enabled": True, "message": "Maintenance tonight", "variant": "info"}, 200),
     ("POST", "path == '/api/access_control/prepare'"):
@@ -104,48 +114,53 @@ ROUTES = {
     # Past the admin gate an admin with no step-up action id gets the route's own 409.
     ("POST", "path == '/api/access_control/save'"): Route("POST", "/api/access_control/save", "admin", {}, 409),
     ("POST", "path == '/api/audit_log/backfill_mfa'"): Route("POST", "/api/audit_log/backfill_mfa", "admin", {}, 200),
+    # Only used in hosted mode (behind nginx's step-up location); local mode answers 404.
+    ("POST", "path == '/api/environment_changes/save'"): Route("POST", "/api/environment_changes/save", "open", {}, 404),
+    ("POST", "path == '/api/shared_permissions'"):
+        Route("POST", "/api/shared_permissions", "admin", {"changes": {"sync_now": "allow"}}, 200,
+              stepup="shared_permissions.update"),
     ("POST", "path == '/api/environments'"):
         Route("POST", "/api/environments", "open",
-              {"name": "mine", "base_domain": "b.example.com", "team_name": "t", "key_id": "k", "key_secret": "s"}, 200),
+              {"name": "mine", "base_domain": "b.example.com", "team_name": "t", "key_id": "k", "key_secret": "s"}, 200, stepup='environment.upsert'),
     ("POST", "path.startswith('/api/environments/') and path.endswith('/activate')"):
-        Route("POST", "/api/environments/dev/activate", "env", {}, 200),
+        Route("POST", "/api/environments/dev/activate", "env", {}, 200, caps=()),
     ("POST", "path.startswith('/api/environments/') and path.endswith('/share')"):
-        Route("POST", "/api/environments/dev/share", "env", {"shared": False}, 200),
+        Route("POST", "/api/environments/dev/share", "env", {"shared": False}, 200, caps=(), stepup='environment.share'),
     ("POST", "path.startswith('/api/environments/') and path.endswith('/sync/reset_watermark')"):
-        Route("POST", "/api/environments/dev/sync/reset_watermark", "env", {}, 200),
+        Route("POST", "/api/environments/dev/sync/reset_watermark", "env", {}, 200, caps=('reset_watermark',), stepup='sync.reset_watermark'),
     ("POST", "path.startswith('/api/environments/') and path.endswith('/sync_schedule')"):
-        Route("POST", "/api/environments/dev/sync_schedule", "env", {"enabled": False}, 200),
+        Route("POST", "/api/environments/dev/sync_schedule", "env", {"enabled": False}, 200, caps=('sync_settings',), stepup='sync_schedule.update'),
     ("POST", "path.startswith('/api/environments/') and path.endswith('/sync/start')"):
-        Route("POST", "/api/environments/dev/sync/start", "env", {}, 200),
+        Route("POST", "/api/environments/dev/sync/start", "env", {}, 200, caps=('sync_now',)),
     ("POST", "path.startswith('/api/environments/') and path.endswith('/sync/import_csv')"):
-        Route("POST", "/api/environments/dev/sync/import_csv", "env", {"csv_path": "syslog_export.csv"}, 200),
-    ("POST", "path == '/api/access/bootstrap/start'"): Route("POST", "/api/access/bootstrap/start", "session", {}, 200),
+        Route("POST", "/api/environments/dev/sync/import_csv", "env", {"csv_path": "syslog_export.csv"}, 200, caps=('import_csv',), stepup='sync.import_csv'),
+    ("POST", "path == '/api/access/bootstrap/start'"): Route("POST", "/api/access/bootstrap/start", "session", {}, 200, caps=('live_read',)),
     ("POST", "path == '/api/resource_groups'"):
-        Route("POST", "/api/resource_groups", "session", {"name": "rg", "group_ids": ["g1"]}, 502),
+        Route("POST", "/api/resource_groups", "session", {"name": "rg", "group_ids": ["g1"]}, 502, caps=('tenant_write',)),
     ("POST", "path.startswith('/api/resource_groups/') and path.endswith('/projects')"):
-        Route("POST", f"/api/resource_groups/{RG}/projects", "session", {"name": "p"}, 502),
+        Route("POST", f"/api/resource_groups/{RG}/projects", "session", {"name": "p"}, 502, caps=('tenant_write',)),
     ("POST", "path.startswith('/api/resource_groups/') and path.endswith('/policy') and ('/projects/' in path) and ('/folders/' in path)"):
         Route("POST", f"/api/resource_groups/{RG}/projects/{PROJ}/folders/{FOLDER}/policy", "session",
-              {"mode": "existing", "policy_id": FOLDER}, 502),
-    ("POST", "path == '/api/groups'"): Route("POST", "/api/groups", "session", {"name": "g"}, 502),
+              {"mode": "existing", "policy_id": FOLDER}, 502, caps=('tenant_write',)),
+    ("POST", "path == '/api/groups'"): Route("POST", "/api/groups", "session", {"name": "g"}, 502, caps=('tenant_write',)),
     ("POST", "path == '/api/service_account/groups'"):
-        Route("POST", "/api/service_account/groups", "session", {"group_id": "g1"}, 502),
+        Route("POST", "/api/service_account/groups", "session", {"group_id": "g1"}, 502, caps=('tenant_write',)),
     ("POST", "path == '/api/csv'"):
         Route("POST", "/api/csv", "open", {"file": "folders_template.csv", "rows": [{"path": "A", "description": ""}]}, 200),
     ("POST", "path == '/api/preview'"):
-        Route("POST", "/api/preview", "session", {"resource_group_id": RG, "project_id": PROJ, "rows": [{"path": "A"}]}, 502),
+        Route("POST", "/api/preview", "session", {"resource_group_id": RG, "project_id": PROJ, "rows": [{"path": "A"}]}, 502, caps=('live_read',)),
     ("POST", "path == '/api/execute'"):
-        Route("POST", "/api/execute", "session", {"resource_group_id": RG, "project_id": PROJ, "rows": [{"path": "A"}]}, 502),
+        Route("POST", "/api/execute", "session", {"resource_group_id": RG, "project_id": PROJ, "rows": [{"path": "A"}]}, 502, caps=('tenant_write',)),
     ("POST", "path.startswith('/api/access/users/') and path.endswith('/resource_access')"):
         Route("POST", f"/api/access/users/{OPA_USER}/resource_access", "session",
-              {"resources": [{"resource_kind": "secret", "resource_id": FOLDER}]}, 502),
+              {"resources": [{"resource_kind": "secret", "resource_id": FOLDER}]}, 502, caps=('live_read',)),
     # Past the admin gate: no archive rows for that id -> the route's own 404.
-    ("DELETE", "path.startswith('/api/archives/')"): Route("DELETE", f"/api/archives/{ORPHAN}", "admin", None, 404),
-    ("DELETE", "path.startswith('/api/environments/')"): Route("DELETE", "/api/environments/dev", "env", None, 200),
+    ("DELETE", "path.startswith('/api/archives/')"): Route("DELETE", f"/api/archives/{ORPHAN}", "admin", None, 404, stepup='archive.purge'),
+    ("DELETE", "path.startswith('/api/environments/')"): Route("DELETE", "/api/environments/dev", "env", None, 200, caps=(), stepup='environment.delete'),
     ("DELETE", "path.startswith('/api/resource_groups/') and '/projects/' in path and ('/folders/' in path)"):
-        Route("DELETE", f"/api/resource_groups/{RG}/projects/{PROJ}/folders/{FOLDER}", "session", None, 502),
+        Route("DELETE", f"/api/resource_groups/{RG}/projects/{PROJ}/folders/{FOLDER}", "session", None, 502, caps=('tenant_write',)),
     ("DELETE", "path.startswith('/api/groups/') and '/members/' in path"):
-        Route("DELETE", "/api/groups/g1/members/someone", "session", None, 502),
+        Route("DELETE", "/api/groups/g1/members/someone", "session", None, 502, caps=('tenant_write',)),
 }
 
 # Admin-only variants of non-admin routes (same route, an admin-only flag).
@@ -367,6 +382,15 @@ def test_admin_routes_refuse_non_admins_and_admit_admins(matrix_server, monkeypa
     refused = _call(base_url, route.method, route.sample, route.body, _who(OWNER_B))
     assert refused.status_code == 403, refused.text
     allowed = _call(base_url, route.method, route.sample, route.body, _who(ADMIN, admin=True))
+    if hosted and route.stepup:
+        # 5.42.0: past the admin check, a hosted admin is sent to step-up MFA.
+        # A request the route itself refuses (this sample's archive id has no
+        # rows -> 404) is refused before any MFA, exactly as in local mode.
+        if route.a_status >= 400:
+            assert allowed.status_code == route.a_status, allowed.text
+        else:
+            assert allowed.status_code == 202 and allowed.json()["step_up_required"] is True, allowed.text
+        return
     assert allowed.status_code == route.a_status, allowed.text
 
 
@@ -943,3 +967,678 @@ def test_proxy_secret_compare_is_constant_time(monkeypatch):
     monkeypatch.setattr(serve, "NGINX_PROXY_SECRET", "abc")
     assert serve._request_is_from_nginx({"X-Nginx-Proxy-Secret": "abc"}) is True
     assert calls == [(b"abc", b"abc")]
+
+
+# ---------------------------------------------------------------------------
+# 5.42.0: shared-environment permissions, pinned per route
+# ---------------------------------------------------------------------------
+# Environment routes that take no shared-environment capability on purpose:
+# activating is what sharing grants; share/unshare and delete are the
+# owner's (or an admin's) own actions, never a shared user's.
+NO_CAPABILITY_ROUTES = {
+    ("POST", "path.startswith('/api/environments/') and path.endswith('/activate')"),
+    ("POST", "path.startswith('/api/environments/') and path.endswith('/share')"),
+    ("DELETE", "path.startswith('/api/environments/')"),
+}
+
+
+def _handler_methods():
+    tree = ast.parse(SERVE_PY.read_text(encoding="utf-8"))
+    handler = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Handler")
+    return {fn.name: fn for fn in handler.body if isinstance(fn, ast.FunctionDef)}
+
+
+def _route_if_nodes():
+    """{(method, condition source): the route's `if` node}."""
+    out = {}
+    for name, fn in _handler_methods().items():
+        if name not in ("do_GET", "do_POST", "do_DELETE"):
+            continue
+        for node in fn.body:
+            if isinstance(node, ast.Try):
+                for stmt in node.body:
+                    if isinstance(stmt, ast.If) and _mentions_route(stmt.test):
+                        out[(name[3:], ast.unparse(stmt.test))] = stmt
+    return out
+
+
+def _self_calls(node, method):
+    return [n for n in ast.walk(node) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == method and isinstance(n.func.value, ast.Name) and n.func.value.id == "self"]
+
+
+def _checked_capabilities(if_node):
+    """(capabilities the route checks, the step-up action type it uses or
+    None). Direct checks are self._capability_refused(owner, env, (caps,));
+    a route handing over to self._environment_change("type", ...) is
+    checked through that action's executor (self._shared_refusal(meta, cap))."""
+    import server.serve as serve
+
+    caps = set()
+    for call in _self_calls(if_node, "_capability_refused"):
+        tup = call.args[2]
+        assert isinstance(tup, ast.Tuple), ast.unparse(call)
+        caps.update(elt.value for elt in tup.elts)
+    stepups = [call.args[0].value for call in _self_calls(if_node, "_environment_change")]
+    assert len(stepups) <= 1
+    stepup = stepups[0] if stepups else None
+    if stepup:
+        executor = _handler_methods()[serve._ENV_CHANGE_EXECUTORS[stepup]]
+        for call in _self_calls(executor, "_shared_refusal"):
+            caps.add(call.args[1].value)
+    return caps, stepup
+
+
+def test_every_environment_route_declares_its_capability():
+    """A new env/session route without a declared capability fails here;
+    so does a declared capability the code doesn't check (or the reverse),
+    and a step-up type that doesn't match the code."""
+    nodes = _route_if_nodes()
+    known = set(engine.SHARED_CAPABILITY_KEYS)
+    for key, route in ROUTES.items():
+        caps, stepup = _checked_capabilities(nodes[key])
+        assert stepup == route.stepup, (key, stepup, route.stepup)
+        assert caps <= known, (key, caps)
+        if route.kind in ("env", "session"):
+            assert route.caps is not None, f"{key}: declare caps= for this environment route"
+            if key not in NO_CAPABILITY_ROUTES:
+                assert route.caps, f"{key}: an environment route must check at least one capability"
+            assert caps == set(route.caps), (key, caps, route.caps)
+        else:
+            assert not caps, (key, caps)
+
+
+def test_every_environment_change_type_has_a_route_and_an_executor():
+    import server.serve as serve
+
+    used = {r.stepup for r in ROUTES.values() if r.stepup}
+    assert used == set(serve.ENV_CHANGE_ACTION_TYPES) == set(serve._ENV_CHANGE_EXECUTORS)
+
+
+def _share_a_dev_with_b_session(serve):
+    """A's "dev", shared, with B holding a live session on it (B has no
+    "dev" of their own, so the name resolves to A's)."""
+    env_id = _seed_owner_a_with_session(serve)
+    engine.set_environment_shared("dev", OWNER_A, True)
+    for who in (OWNER_B, ADMIN):
+        with serve._sessions_lock:
+            serve._sessions[who] = {"client": _UpstreamProbe(), "okta_client": _UpstreamProbe(),
+                                    "env_name": "dev", "env_id": env_id}
+    return env_id
+
+
+CAP_ROUTES = [r for r in ROUTES.values() if r.caps]
+
+
+def _expected_when_allowed(route):
+    # B reaches exactly what A reaches (B's session client is an upstream probe too).
+    return route.a_status
+
+
+@pytest.mark.parametrize("route", CAP_ROUTES, ids=[f"{r.method} {r.sample}" for r in CAP_ROUTES])
+def test_shared_capabilities_default_global_and_override(matrix_server, route):
+    base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    builtin = {c["key"]: c["builtin"] for c in engine.SHARED_CAPABILITIES}
+
+    def as_(who, admin=False):
+        return _call(base_url, route.method, route.sample, route.body, _who(who, admin=admin))
+
+    def assert_denied(resp):
+        assert resp.status_code == 403, (route.sample, resp.status_code, resp.text)
+        assert resp.json()["reason"] == "shared_permission_denied" and resp.json()["capability"] in route.caps
+        assert "upstream reached" not in resp.text and "a-only" not in resp.text
+
+    def reset():
+        with serve._sync_jobs_lock:
+            serve._sync_jobs.clear()
+
+    # 1. Built-in defaults (= the behaviour before 5.42.0).
+    resp = as_(OWNER_B)
+    if all(builtin[c] == "allow" for c in route.caps):
+        assert resp.status_code == _expected_when_allowed(route), (route.sample, resp.status_code, resp.text)
+    else:
+        assert_denied(resp)
+    reset()
+    # 2. Global default deny for every capability the route checks.
+    engine.set_shared_permissions({c: "deny" for c in route.caps})
+    assert_denied(as_(OWNER_B))
+    assert_denied(as_(ADMIN, admin=True))           # an admin using someone else's shared env is not exempt
+    assert as_(OWNER_A).status_code == route.a_status  # the owner never is limited
+    reset()
+    # 3. A per-environment allow overrides the global deny.
+    engine.set_shared_permissions({c: "allow" for c in route.caps}, environment_id=env_id)
+    assert as_(OWNER_B).status_code == _expected_when_allowed(route)
+    reset()
+    # 4. Global allow, per-environment deny -> denied.
+    engine.set_shared_permissions({c: "allow" for c in route.caps})
+    engine.set_shared_permissions({c: "deny" for c in route.caps}, environment_id=env_id)
+    assert_denied(as_(OWNER_B))
+    reset()
+    # 5. Inherit again -> the global allow applies.
+    engine.set_shared_permissions({c: "inherit" for c in route.caps}, environment_id=env_id)
+    assert as_(OWNER_B).status_code == _expected_when_allowed(route)
+
+
+def test_capability_check_never_reveals_a_private_environment(matrix_server):
+    """The capability check runs after visibility: a private environment is
+    still a 404, never a 403 that would confirm it exists."""
+    base_url, serve = matrix_server
+    _seed_owner_a_with_session(serve)  # A's "dev" stays private
+    engine.set_shared_permissions({k: "deny" for k in engine.SHARED_CAPABILITY_KEYS})
+    for route in ROUTES.values():
+        if route.kind == "env" and route.caps:
+            assert _call(base_url, route.method, route.sample, route.body, _who(OWNER_B)).status_code == 404
+
+
+def test_shared_sync_now_runs_the_owners_sync_with_the_owners_schedule(matrix_server, monkeypatch):
+    base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    engine.set_sync_schedule("dev", {"ingestion_scope": "all"}, owner=OWNER_A)
+    # Another owner's same-named, owner-less environment must not be picked up.
+    engine.upsert_environment("dev", {"base_domain": "x.example.com", "team_name": "t", "key_id": "k", "key_secret": "s",
+                                      "okta_url": "https://x.example.com", "okta_api_token": "other"})
+    calls = []
+    monkeypatch.setattr(serve, "_start_sync_job", lambda *a, **k: calls.append((a, k)) or True)
+    url = base_url + "/api/environments/dev/sync/start"
+    assert requests.post(url, json={}, headers=_who(OWNER_B), timeout=10).status_code == 403  # built-in: deny
+    engine.set_shared_permissions({"sync_now": "allow"}, environment_id=env_id)
+    resp = requests.post(url, json={}, headers=_who(OWNER_B), timeout=10)
+    assert resp.status_code == 200, resp.text
+    (args, kwargs), = calls
+    assert args[0] == env_id and args[2] == "all" and kwargs["owner"] == OWNER_A
+    # Only the owner may pick another ingestion scope for a run.
+    resp = requests.post(url, json={"ingestion_scope": "curated"}, headers=_who(OWNER_B), timeout=10)
+    assert resp.status_code == 403 and resp.json()["reason"] == "owner_only"
+    assert requests.post(url, json={"ingestion_scope": "all"}, headers=_who(OWNER_B), timeout=10).status_code == 200
+    assert requests.post(url, json={"ingestion_scope": "curated"}, headers=_who(OWNER_A), timeout=10).status_code == 200
+
+
+def test_shared_sync_worker_uses_the_owners_credentials_by_id(matrix_server, monkeypatch):
+    """_launch_claimed_sync resolves the token by id under the real owner --
+    a same-named environment elsewhere can't hand it someone else's token."""
+    _base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    engine.upsert_environment("dev", {"base_domain": "x.example.com", "team_name": "t", "key_id": "k", "key_secret": "s",
+                                      "okta_url": "https://x.example.com", "okta_api_token": "other"}, owner=OWNER_B)
+    built = []
+    monkeypatch.setattr(engine, "OktaClient", lambda url, token: built.append((url, token)) or _UpstreamProbe())
+    assert serve._start_sync_job(env_id, "dev", "curated", owner=OWNER_A, trigger="manual") is True
+    assert built == [("https://a.example.com", "tok")]
+
+
+def test_environment_list_reports_effective_permissions(matrix_server):
+    base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    engine.set_shared_permissions({"tenant_write": "deny"})
+    engine.set_shared_permissions({"sync_now": "allow"}, environment_id=env_id)
+    row = next(e for e in requests.get(base_url + "/api/environments", headers=_who(OWNER_B), timeout=10).json()["environments"])
+    assert row["permissions"]["tenant_write"] == {"value": "deny", "source": "default"}
+    assert row["permissions"]["sync_now"] == {"value": "allow", "source": "override"}
+    assert row["permissions"]["live_read"] == {"value": "allow", "source": "built_in"}
+    assert "permission_overrides" not in row  # admins only
+    own = requests.get(base_url + "/api/environments", headers=_who(OWNER_A), timeout=10).json()["environments"][0]
+    assert all(v == {"value": "allow", "source": "owner"} for v in own["permissions"].values())
+    admin_row = next(e for e in requests.get(base_url + "/api/environments", headers=_who(ADMIN, admin=True),
+                                             timeout=10).json()["environments"] if e["id"] == env_id)
+    assert admin_row["permission_overrides"] == {"sync_now": "allow"}
+
+
+def test_shared_permission_settings_are_admin_only_and_audited(matrix_server, tmp_audit_log):
+    base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    url = base_url + "/api/shared_permissions"
+    assert requests.get(url, headers=_who(OWNER_A), timeout=10).status_code == 403  # owners don't decide this
+    assert requests.post(url, json={"changes": {"sync_now": "allow"}}, headers=_who(OWNER_A), timeout=10).status_code == 403
+    assert requests.post(url, json={"changes": {"bogus": "allow"}}, headers=_who(ADMIN, admin=True), timeout=10).status_code == 400
+    assert requests.post(url, json={"changes": {"sync_now": "maybe"}}, headers=_who(ADMIN, admin=True), timeout=10).status_code == 400
+    assert requests.post(url, json={"environment_id": "nope", "changes": {"sync_now": "allow"}},
+                         headers=_who(ADMIN, admin=True), timeout=10).status_code == 404
+    resp = requests.post(url, json={"changes": {"tenant_write": "deny"}}, headers=_who(ADMIN, admin=True), timeout=10)
+    assert resp.status_code == 200 and resp.json()["defaults"]["tenant_write"]["source"] == "default"
+    resp = requests.post(url, json={"environment_id": env_id, "changes": {"tenant_write": "allow", "sync_now": "deny"}},
+                         headers=_who(ADMIN, admin=True), timeout=10)
+    assert resp.status_code == 200 and resp.json()["overrides"] == {"tenant_write": "allow", "sync_now": "deny"}
+    entries = [json.loads(line) for line in open(tmp_audit_log, encoding="utf-8") if line.strip()]
+    updates = [e for e in entries if e["action"] == "shared_permissions.update"]
+    assert updates[0]["details"] == {"scope": "default", "changes": [
+        {"capability": "tenant_write", "before": "inherit", "after": "deny"}]}
+    assert updates[1]["details"]["scope"] == "environment" and updates[1]["details"]["environment_id"] == env_id
+    assert updates[1]["details"]["name"] == "dev"
+    assert sorted(updates[1]["details"]["changes"], key=lambda c: c["capability"]) == [
+        {"capability": "sync_now", "before": "inherit", "after": "deny"},
+        {"capability": "tenant_write", "before": "inherit", "after": "allow"}]
+    # A no-op change is not logged.
+    requests.post(url, json={"changes": {"tenant_write": "deny"}}, headers=_who(ADMIN, admin=True), timeout=10)
+    assert len([e for e in (json.loads(line) for line in open(tmp_audit_log, encoding="utf-8") if line.strip())
+                if e["action"] == "shared_permissions.update"]) == 2
+    body = requests.get(url, headers=_who(ADMIN, admin=True), timeout=10).json()
+    assert [c["key"] for c in body["capabilities"]] == list(engine.SHARED_CAPABILITY_KEYS)
+    assert body["environments"][env_id]["overrides"] == {"tenant_write": "allow", "sync_now": "deny"}
+    # The local-mode operator is the admin there.
+    assert requests.get(url, timeout=10).status_code == 200
+
+
+def test_overrides_go_with_their_environment(matrix_server):
+    _base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    engine.set_shared_permissions({"sync_now": "allow"}, environment_id=env_id)
+    engine.delete_environment("dev", owner=OWNER_A)
+    assert audit_store._get_connection().execute("SELECT COUNT(*) FROM shared_permission_overrides").fetchone()[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# 5.42.0: step-up MFA for every Environments change (hosted mode)
+# ---------------------------------------------------------------------------
+STEPUP_ROUTES = [r for r in ROUTES.values() if r.stepup]
+
+
+def _stepup(base_url, who, action_id, admin=False, location=True):
+    headers = {**_who(who, admin=admin), "X-Auth-Action-Id": action_id}
+    if location:
+        headers["X-Nginx-Stepup-Location"] = SECRET
+    return requests.post(base_url + "/api/environment_changes/save", json={}, headers=headers, timeout=10)
+
+
+def _stepup_case(serve, route):
+    """(caller, admin flag, sample, body) that the route accepts for owner A's
+    shared "dev" -- and a state probe to prove nothing happened before the
+    approval."""
+    env_id = _share_a_dev_with_b_session(serve)
+    who, admin, sample, body = OWNER_A, False, route.sample, route.body
+    if route.stepup == "archive.purge":
+        conn = audit_store._get_connection()
+        conn.execute("INSERT INTO sync_state (environment_id, total_events_ingested) VALUES (?, 0)", (ORPHAN,))
+        conn.commit()
+        who, admin = ADMIN, True
+    elif route.stepup == "shared_permissions.update":
+        who, admin = ADMIN, True
+    elif route.stepup == "environment.share":
+        body = {"shared": False}
+    return env_id, who, admin, sample, body
+
+
+def _state():
+    conn = audit_store._get_connection()
+    return (sorted((m["name"], m["shared"], m["base_domain"]) for m in engine.list_all_environments().values()),
+            conn.execute("SELECT COUNT(*) FROM shared_permission_defaults").fetchone()[0],
+            [tuple(r) for r in conn.execute("SELECT * FROM sync_schedules")],
+            conn.execute("SELECT COUNT(*) FROM sync_state").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+
+
+@pytest.mark.parametrize("route", STEPUP_ROUTES, ids=[f"{r.method} {r.sample}" for r in STEPUP_ROUTES])
+def test_every_environment_change_needs_a_step_up_bound_to_it(matrix_server, monkeypatch, tmp_audit_log, route):
+    base_url, serve = matrix_server
+    env_id, who, admin, sample, body = _stepup_case(serve, route)
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    before = _state()
+    resp = _call(base_url, route.method, sample, body, _who(who, admin=admin))
+    assert resp.status_code == 202, resp.text
+    prepared = resp.json()
+    assert prepared["step_up_required"] is True and prepared["action"] == route.stepup
+    assert _state() == before                      # nothing happened yet
+    action_id = prepared["action_id"]
+    # Not through nginx's step-up location -> refused, and the action stays claimable.
+    refused = _stepup(base_url, who, action_id, admin=admin, location=False)
+    assert refused.status_code == 403 and refused.json()["reason"] == "step_up_unavailable"
+    # Another user's approval can't spend it.
+    other = _stepup(base_url, OWNER_B, action_id)
+    assert other.status_code == 403 and other.json()["reason"] == "actor_mismatch"
+    # No action id at all.
+    none = requests.post(base_url + "/api/environment_changes/save", json={},
+                         headers={**_who(who, admin=admin), "X-Nginx-Stepup-Location": SECRET}, timeout=10)
+    assert none.status_code == 409 and none.json()["reason"] == "not_found"
+    assert _state() == before
+    # The approved request runs, whatever this request's own body says.
+    done = requests.post(base_url + "/api/environment_changes/save",
+                         json={"shared": True, "name": "evil", "changes": {"live_read": "deny"}},
+                         headers={**_who(who, admin=admin), "X-Auth-Action-Id": action_id,
+                                  "X-Nginx-Stepup-Location": SECRET}, timeout=10)
+    assert 200 <= done.status_code < 300, done.text
+    assert done.json()["step_up_verified"] is True and done.json()["action"] == route.stepup
+    entry = [json.loads(line) for line in open(tmp_audit_log, encoding="utf-8") if line.strip()][-1]
+    assert entry["action"] == route.stepup
+    assert entry["details"]["step_up_verified"] is True
+    # Single use: a replay of the same approval is refused.
+    replay = _stepup(base_url, who, action_id, admin=admin)
+    assert replay.status_code == 409 and replay.json()["reason"] == "already_consumed"
+
+
+def test_a_step_up_approval_expires(matrix_server, monkeypatch):
+    base_url, serve = matrix_server
+    _share_a_dev_with_b_session(serve)
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    action_id = requests.post(base_url + "/api/environments/dev/share", json={"shared": False},
+                              headers=_who(OWNER_A), timeout=10).json()["action_id"]
+    conn = audit_store._get_connection()
+    conn.execute("UPDATE pending_admin_actions SET expires_at = '2000-01-01T00:00:00.000Z' WHERE action_id = ?", (action_id,))
+    conn.commit()
+    resp = _stepup(base_url, OWNER_A, action_id)
+    assert resp.status_code == 409 and resp.json()["reason"] == "expired"
+    assert next(iter(engine.list_all_environments().values()))["shared"] is True
+
+
+def test_one_approval_cannot_be_used_for_another_kind_of_change(matrix_server, monkeypatch):
+    base_url, serve = matrix_server
+    _share_a_dev_with_b_session(serve)
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    # An Access Control approval is never an Environments approval...
+    ac_id = audit_store.create_pending_admin_action(ADMIN, "access_control.update",
+                                                    {"admin_group_id": "g", "user_group_id": None, "restrict_login": False}, 60)
+    resp = _stepup(base_url, ADMIN, ac_id, admin=True)
+    assert resp.status_code == 403 and resp.json()["reason"] == "action_type_mismatch"
+    # ...and an Environments approval can't be spent on (or burned by) the Access Control save.
+    env_action = requests.post(base_url + "/api/environments/dev/share", json={"shared": False},
+                               headers=_who(OWNER_A), timeout=10).json()["action_id"]
+    resp = requests.post(base_url + "/api/access_control/save", json={},
+                         headers={**_who(OWNER_A, admin=True), "X-Auth-Action-Id": env_action}, timeout=10)
+    assert resp.status_code == 403 and resp.json()["reason"] == "action_type_mismatch"
+    assert _stepup(base_url, OWNER_A, env_action).status_code == 200  # still claimable by its own route
+    # The Access Control approval is also still claimable by its own route.
+    resp = requests.post(base_url + "/api/access_control/save", json={},
+                         headers={**_who(ADMIN, admin=True), "X-Auth-Action-Id": ac_id}, timeout=10)
+    assert resp.status_code == 200, resp.text
+
+
+def test_two_approvals_each_apply_only_their_own_payload(matrix_server, monkeypatch):
+    base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    url = base_url + "/api/environments/dev/sync_schedule"
+    first = requests.post(url, json={"run_time": "03:00"}, headers=_who(OWNER_A), timeout=10).json()["action_id"]
+    second = requests.post(url, json={"run_time": "04:00"}, headers=_who(OWNER_A), timeout=10).json()["action_id"]
+    assert _stepup(base_url, OWNER_A, second).status_code == 200
+    assert engine.get_sync_schedule_by_id(env_id)["run_time"] == "04:00"
+    assert _stepup(base_url, OWNER_A, first).status_code == 200
+    assert engine.get_sync_schedule_by_id(env_id)["run_time"] == "03:00"
+
+
+def test_environment_secrets_never_reach_the_pending_actions_table(matrix_server, monkeypatch, fake_keyring):
+    base_url, serve = matrix_server
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    body = {"name": "new", "base_domain": "n.example.com", "team_name": "t", "key_id": "k",
+            "key_secret": "TOP-SECRET-KEY", "okta_url": "https://n.example.com", "okta_api_token": "TOP-SECRET-TOKEN"}
+    action_id = requests.post(base_url + "/api/environments", json=body, headers=_who(OWNER_A), timeout=10).json()["action_id"]
+    raw = audit_store._get_connection().execute("SELECT payload_json FROM pending_admin_actions").fetchall()
+    assert raw and all("TOP-SECRET" not in r[0] for r in raw)
+    resp = _stepup(base_url, OWNER_A, action_id)
+    assert resp.status_code == 200, resp.text
+    env_id = next(i for i, m in engine.list_all_environments().items() if m["name"] == "new")
+    assert fake_keyring[(env_id, "key_secret")] == "TOP-SECRET-KEY"
+    assert fake_keyring[(env_id, "okta_api_token")] == "TOP-SECRET-TOKEN"
+    # A restart during the round trip loses the secrets: the save asks again, nothing is saved.
+    action_id = requests.post(base_url + "/api/environments", json={**body, "name": "newer"},
+                              headers=_who(OWNER_A), timeout=10).json()["action_id"]
+    with serve._pending_env_secrets_lock:
+        serve._pending_env_secrets.clear()
+    resp = _stepup(base_url, OWNER_A, action_id)
+    assert resp.status_code == 409 and resp.json()["reason"] == "secrets_expired"
+    assert "newer" not in {m["name"] for m in engine.list_all_environments().values()}
+
+
+def test_a_refused_change_is_refused_before_any_mfa(matrix_server, monkeypatch):
+    """The checks run before the step-up too: a change the caller may not
+    make never sends them through MFA for nothing."""
+    base_url, serve = matrix_server
+    _share_a_dev_with_b_session(serve)
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    assert requests.post(base_url + "/api/environments/dev/share", json={"shared": False},
+                         headers=_who(OWNER_B), timeout=10).status_code == 404   # not B's
+    assert requests.post(base_url + "/api/environments/dev/sync_schedule", json={"enabled": True},
+                         headers=_who(OWNER_B), timeout=10).status_code == 403   # sync_settings: built-in deny
+    assert requests.post(base_url + "/api/environments/dev/sync_schedule", json={"run_time": "25:00"},
+                         headers=_who(OWNER_A), timeout=10).status_code == 400
+    assert requests.delete(base_url + "/api/environments/dev?purge_archive=1", headers=_who(OWNER_A),
+                           timeout=10).status_code == 403
+    assert audit_store._get_connection().execute("SELECT COUNT(*) FROM pending_admin_actions").fetchone()[0] == 0
+
+
+def test_the_approved_change_is_checked_again_when_it_runs(matrix_server, monkeypatch):
+    """Rights withdrawn between the approval request and the save win."""
+    base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    engine.set_shared_permissions({"sync_settings": "allow"}, environment_id=env_id)
+    action_id = requests.post(base_url + "/api/environments/dev/sync_schedule", json={"enabled": True},
+                              headers=_who(OWNER_B), timeout=10).json()["action_id"]
+    engine.set_shared_permissions({"sync_settings": "deny"}, environment_id=env_id)
+    resp = _stepup(base_url, OWNER_B, action_id)
+    assert resp.status_code == 403 and resp.json()["reason"] == "shared_permission_denied"
+    assert engine.get_sync_schedule_by_id(env_id)["enabled"] is False
+
+
+def test_activate_and_sync_now_need_no_step_up(matrix_server, monkeypatch):
+    base_url, serve = matrix_server
+    _share_a_dev_with_b_session(serve)
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    assert requests.post(base_url + "/api/environments/dev/activate", json={}, headers=_who(OWNER_B),
+                         timeout=10).status_code == 200
+    assert requests.post(base_url + "/api/environments/dev/sync/start", json={}, headers=_who(OWNER_A),
+                         timeout=10).status_code == 200
+
+
+def test_local_mode_applies_environment_changes_directly(matrix_server):
+    base_url, serve = matrix_server
+    _share_a_dev_with_b_session(serve)
+    resp = requests.post(base_url + "/api/environments/dev/share", json={"shared": False}, headers=_who(OWNER_A), timeout=10)
+    assert resp.status_code == 200 and resp.json() == {"name": "dev", "shared": False}
+    assert requests.post(base_url + "/api/environment_changes/save", json={}, timeout=10).status_code == 404
+
+
+# --- review round 1 (5.42.0) ---------------------------------------------------
+def test_the_saves_own_body_never_changes_what_is_applied(matrix_server, monkeypatch):
+    base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    action_id = requests.post(base_url + "/api/environments/dev/share", json={"shared": False},
+                              headers=_who(OWNER_A), timeout=10).json()["action_id"]
+    resp = requests.post(base_url + "/api/environment_changes/save", json={"shared": True, "id": env_id},
+                         headers={**_who(OWNER_A), "X-Auth-Action-Id": action_id, "X-Nginx-Stepup-Location": SECRET},
+                         timeout=10)
+    assert resp.status_code == 200
+    assert engine.list_all_environments()[env_id]["shared"] is False
+    action_id = requests.post(base_url + "/api/shared_permissions", json={"changes": {"sync_now": "allow"}},
+                              headers=_who(ADMIN, admin=True), timeout=10).json()["action_id"]
+    resp = requests.post(base_url + "/api/environment_changes/save", json={"changes": {"live_read": "deny"}},
+                         headers={**_who(ADMIN, admin=True), "X-Auth-Action-Id": action_id,
+                                  "X-Nginx-Stepup-Location": SECRET}, timeout=10)
+    assert resp.status_code == 200
+    defaults = engine.get_shared_permission_defaults()
+    assert defaults["sync_now"]["value"] == "allow" and defaults["live_read"]["source"] == "built_in"
+
+
+def _prepare(base_url, method, path, body, who, admin=False):
+    resp = _call(base_url, method, path, body, _who(who, admin=admin))
+    assert resp.status_code == 202, resp.text
+    return resp.json()["action_id"]
+
+
+@pytest.mark.parametrize("case", [
+    "reset_watermark_revoked", "import_csv_revoked", "purge_admin_demoted", "permissions_admin_demoted",
+    "delete_purge_admin_demoted", "unshared_during_mfa", "name_now_means_another_environment",
+])
+def test_every_check_runs_again_when_the_approved_change_is_applied(matrix_server, monkeypatch, case):
+    base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    conn = audit_store._get_connection()
+    if case == "reset_watermark_revoked":
+        aid = _prepare(base_url, "POST", "/api/environments/dev/sync/reset_watermark", {}, OWNER_B)
+        engine.set_shared_permissions({"reset_watermark": "deny"}, environment_id=env_id)
+        expected, who, admin = (403, "shared_permission_denied"), OWNER_B, False
+    elif case == "import_csv_revoked":
+        aid = _prepare(base_url, "POST", "/api/environments/dev/sync/import_csv", {"csv_path": "syslog_export.csv"}, OWNER_B)
+        engine.set_shared_permissions({"import_csv": "deny"})
+        expected, who, admin = (403, "shared_permission_denied"), OWNER_B, False
+    elif case == "purge_admin_demoted":
+        conn.execute("INSERT INTO sync_state (environment_id, total_events_ingested) VALUES (?, 0)", (ORPHAN,))
+        conn.commit()
+        aid = _prepare(base_url, "DELETE", f"/api/archives/{ORPHAN}", None, ADMIN, admin=True)
+        expected, who, admin = (403, None), ADMIN, False
+    elif case == "permissions_admin_demoted":
+        aid = _prepare(base_url, "POST", "/api/shared_permissions", {"changes": {"sync_now": "allow"}}, ADMIN, admin=True)
+        expected, who, admin = (403, None), ADMIN, False
+    elif case == "delete_purge_admin_demoted":
+        aid = _prepare(base_url, "DELETE", "/api/environments/dev?purge_archive=1", None, OWNER_A, admin=True)
+        expected, who, admin = (403, None), OWNER_A, False
+    elif case == "unshared_during_mfa":
+        aid = _prepare(base_url, "POST", "/api/environments/dev/sync/reset_watermark", {}, OWNER_B)
+        engine.set_environment_shared("dev", OWNER_A, False)
+        expected, who, admin = (404, None), OWNER_B, False
+    else:
+        # B's "dev" resolves to A's when prepared; then a newer shared "dev"
+        # (C's) takes the name -- the approval must not move to C's archive.
+        aid = _prepare(base_url, "POST", "/api/environments/dev/sync/reset_watermark", {}, OWNER_B)
+        engine.upsert_environment("dev", {"base_domain": "c.example.com", "team_name": "t", "key_id": "k",
+                                          "key_secret": "s"}, owner="00uOWNERC")
+        conn.execute("UPDATE app_environments SET created_at = '2999-01-01T00:00:00.000Z' WHERE owner_id = '00uOWNERC'")
+        conn.commit()
+        engine.set_environment_shared("dev", "00uOWNERC", True)
+        expected, who, admin = (409, "target_changed"), OWNER_B, False
+    resp = _stepup(base_url, who, aid, admin=admin)
+    assert resp.status_code == expected[0], resp.text
+    if expected[1]:
+        assert resp.json()["reason"] == expected[1]
+    assert env_id in engine.list_all_environments()
+    assert engine.get_shared_permission_defaults()["sync_now"]["source"] == "built_in"
+
+
+def test_held_secrets_expire_with_the_approval(matrix_server, monkeypatch):
+    base_url, serve = matrix_server
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    aid = _prepare(base_url, "POST", "/api/environments", {"name": "new", "base_domain": "n.example.com",
+                                                           "team_name": "t", "key_id": "k", "key_secret": "S"}, OWNER_A)
+    with serve._pending_env_secrets_lock:
+        expires, held = serve._pending_env_secrets[aid]
+        serve._pending_env_secrets[aid] = (0.0, held)
+    resp = _stepup(base_url, OWNER_A, aid)
+    assert resp.status_code == 409 and resp.json()["reason"] == "secrets_expired"
+
+
+def test_a_denied_shared_user_gets_403_whatever_the_body(matrix_server):
+    """The permission check comes before the request's own validation."""
+    base_url, serve = matrix_server
+    _share_a_dev_with_b_session(serve)
+    engine.set_shared_permissions({"import_csv": "deny", "reset_watermark": "deny"})
+    for path, body in [("/api/environments/dev/sync_schedule", {"run_time": "99:99"}),
+                       ("/api/environments/dev/sync/import_csv", {"csv_path": "../etc/passwd"}),
+                       ("/api/environments/dev/sync/reset_watermark", {})]:
+        resp = requests.post(base_url + path, json=body, headers=_who(OWNER_B), timeout=10)
+        assert resp.status_code == 403 and resp.json()["reason"] == "shared_permission_denied", (path, resp.text)
+
+
+def test_sync_worker_credentials_follow_the_id_not_a_same_named_environment(matrix_server, monkeypatch):
+    _base_url, serve = matrix_server
+    ids = []
+    for domain, token in (("first.example.com", "tok-1"), ("second.example.com", "tok-2")):
+        _, env_id = engine.upsert_environment("dev", {"base_domain": domain, "team_name": "t", "key_id": "k",
+                                                      "key_secret": "s", "okta_url": f"https://{domain}",
+                                                      "okta_api_token": token}, owner=OWNER_A)
+        ids.append(env_id)
+        conn = audit_store._get_connection()  # rename it so the second "dev" can be created
+        conn.execute("UPDATE app_environments SET display_name = 'tmp-' || environment_id WHERE environment_id = ?", (env_id,))
+        conn.commit()
+    conn = audit_store._get_connection()
+    conn.execute("UPDATE app_environments SET display_name = 'dev', owner_id = NULL")  # two owner-less "dev" rows
+    conn.execute("UPDATE app_environments SET created_at = '2000-01-01T00:00:00.000Z' WHERE environment_id = ?", (ids[0],))
+    conn.commit()
+    built = []
+    monkeypatch.setattr(engine, "OktaClient", lambda url, token: built.append(token) or _UpstreamProbe())
+    assert serve._start_sync_job(ids[0], "dev", "curated", owner=None, trigger="manual") is True
+    assert built == ["tok-1"]
+
+
+def test_one_user_cannot_pile_up_pending_changes(matrix_server, monkeypatch):
+    base_url, serve = matrix_server
+    _share_a_dev_with_b_session(serve)
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    monkeypatch.setattr(serve, "MAX_OPEN_ENV_CHANGES_PER_USER", 3)
+    for _ in range(3):
+        _prepare(base_url, "POST", "/api/environments/dev/share", {"shared": False}, OWNER_A)
+    resp = requests.post(base_url + "/api/environments/dev/share", json={"shared": False}, headers=_who(OWNER_A), timeout=10)
+    assert resp.status_code == 429 and resp.json()["reason"] == "too_many_pending"
+    # Someone else is not affected.
+    assert _call(base_url, "POST", "/api/environments/dev/sync/reset_watermark", {}, _who(OWNER_B)).status_code == 202
+
+
+def test_only_the_upsert_form_fields_are_stored_and_they_are_capped(matrix_server, monkeypatch):
+    base_url, serve = matrix_server
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    body = {"name": "x", "base_domain": "x.example.com", "team_name": "t", "key_id": "k", "key_secret": "s",
+            "junk": "y" * 10000}
+    _prepare(base_url, "POST", "/api/environments", body, OWNER_A)
+    raw = audit_store._get_connection().execute("SELECT payload_json FROM pending_admin_actions").fetchone()[0]
+    assert "junk" not in raw
+    resp = requests.post(base_url + "/api/environments", json={**body, "team_name": "t" * 5000},
+                         headers=_who(OWNER_A), timeout=10)
+    assert resp.status_code == 400
+    # Invalid input is refused before the MFA round trip, as in local mode.
+    resp = requests.post(base_url + "/api/environments", json={**body, "base_domain": "evil.example.com/path"},
+                         headers=_who(OWNER_A), timeout=10)
+    assert resp.status_code == 400
+
+
+def test_a_shared_user_with_sync_settings_cannot_change_retention(matrix_server):
+    base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    engine.set_shared_permissions({"sync_settings": "allow"}, environment_id=env_id)
+    url = base_url + "/api/environments/dev/sync_schedule"
+    resp = requests.post(url, json={"retention_days": 1}, headers=_who(OWNER_B), timeout=10)
+    assert resp.status_code == 403 and resp.json()["reason"] == "owner_only"
+    assert requests.post(url, json={"run_time": "04:00", "retention_days": None}, headers=_who(OWNER_B),
+                         timeout=10).status_code == 200
+    assert requests.post(url, json={"retention_days": 30}, headers=_who(OWNER_A), timeout=10).status_code == 200
+
+
+def test_a_session_on_a_deleted_environment_is_no_active_environment(matrix_server):
+    base_url, serve = matrix_server
+    _seed_owner_a_with_session(serve)
+    with serve._sessions_lock:
+        serve._sessions[OWNER_A]["env_id"] = "gone"
+    resp = requests.get(base_url + "/api/resource_groups", headers=_who(OWNER_A), timeout=10)
+    assert resp.status_code == 409 and "No active environment" in resp.json()["error"]
+
+
+def test_permissions_are_listed_only_for_rows_the_caller_can_address(matrix_server):
+    base_url, serve = matrix_server
+    _seed_owner_a_with_session(serve)  # A's private "dev"
+    rows = requests.get(base_url + "/api/environments", headers=_who(ADMIN, admin=True), timeout=10).json()["environments"]
+    assert rows and all("permissions" not in r for r in rows if not r["addressable"])
+
+
+@pytest.mark.parametrize("method, path, body", [
+    ("POST", "/api/environments/dev/share", {"shared": True}),
+    ("DELETE", "/api/environments/dev", None),
+    ("POST", "/api/environments", {"name": "dev", "base_domain": "a.example.com", "team_name": "t", "key_id": "k2"}),
+])
+def test_owner_changes_stay_bound_to_the_environment_that_was_checked(matrix_server, monkeypatch, method, path, body):
+    """The approval names the environment the change was checked against: if
+    the owner's "dev" is a different environment by the time it is applied,
+    nothing happens."""
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    aid = _prepare(base_url, method, path, body, OWNER_A)
+    conn = audit_store._get_connection()
+    conn.execute("UPDATE app_environments SET display_name = 'old-dev' WHERE environment_id = ?", (env_id,))
+    conn.commit()
+    _, new_id = engine.upsert_environment("dev", {"base_domain": "n.example.com", "team_name": "t", "key_id": "k",
+                                                  "key_secret": "s"}, owner=OWNER_A)
+    resp = _stepup(base_url, OWNER_A, aid)
+    assert resp.status_code == 409 and resp.json()["reason"] == "target_changed", resp.text
+    envs = engine.list_all_environments()
+    assert envs[new_id]["shared"] is False and envs[new_id]["key_id"] == "k" and env_id in envs
+
+
+def test_a_stored_action_must_match_its_rows_type(matrix_server, monkeypatch):
+    """Defence in depth: the save runs only the action its pending row was
+    created for, even if a stored payload named another one."""
+    base_url, serve = matrix_server
+    _share_a_dev_with_b_session(serve)
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    aid = audit_store.create_pending_admin_action(
+        OWNER_A, "environment.share",
+        {"action": "archive.purge", "params": {"archive_id": ORPHAN}, "secret_fields": []}, 60)
+    resp = _stepup(base_url, OWNER_A, aid)
+    assert resp.status_code == 403 and resp.json()["reason"] == "action_type_mismatch"

@@ -1,7 +1,7 @@
 /** UI-07: rows are compared by id and acted on only when addressable. */
 import { describe, expect, it } from 'vitest'
 import type { Environment, EnvironmentsResponse } from '../types'
-import { activeRow, canManageSync, isActiveRow, isAddressable } from './environmentRows'
+import { activeRow, can, canManageSync, isActiveRow, isAddressable, permissionReason } from './environmentRows'
 import { usableEnvironments } from './usableEnvironments'
 
 const env = (id: string, name: string, o: Partial<Environment> = {}): Environment => ({
@@ -32,9 +32,33 @@ describe('environment rows', () => {
     expect(isAddressable(env('e', 'x', { is_own: false, shared: false }))).toBe(false)
   })
 
-  it('offers sync controls only on the caller’s own rows', () => {
+  it('offers sync controls on own rows, and on shared rows only when an admin allows it (5.42.0)', () => {
     expect(canManageSync(mine)).toBe(true)
     expect(canManageSync(env('f', 'team', { is_own: false, shared: true, addressable: true }))).toBe(false)
+    const allow = { value: 'allow', source: 'override' } as const
+    const deny = { value: 'deny', source: 'built_in' } as const
+    const perms = { view_archive: allow, live_read: allow, tenant_write: allow, import_csv: allow, reset_watermark: allow, sync_now: deny, sync_settings: deny }
+    expect(canManageSync(env('g', 'team', { is_own: false, shared: true, permissions: perms }))).toBe(false)
+    expect(canManageSync(env('g', 'team', { is_own: false, shared: true, permissions: { ...perms, sync_now: allow } }))).toBe(true)
+    // never on a row the name-keyed routes don't reach (UI-07), nor another owner's private row (admin view)
+    expect(canManageSync(env('g', 'team', { is_own: false, shared: true, addressable: false, permissions: { ...perms, sync_now: allow } }))).toBe(false)
+    expect(canManageSync(env('g', 'team', { is_own: false, shared: false, permissions: { ...perms, sync_now: allow } }))).toBe(false)
+  })
+
+  it('mirrors the server-reported permission, owners always allowed, old servers as before (5.42.0)', () => {
+    const deny = { value: 'deny', source: 'default' } as const
+    const shared = env('s', 'team', {
+      is_own: false, shared: true,
+      permissions: { view_archive: deny, live_read: deny, tenant_write: deny, import_csv: deny, reset_watermark: deny, sync_now: deny, sync_settings: deny },
+    })
+    expect(can(shared, 'live_read')).toBe(false)
+    expect(permissionReason(shared, 'tenant_write')).toMatch(/hasn't allowed shared users to make changes/)
+    expect(can({ ...shared, is_own: true }, 'live_read')).toBe(true)
+    expect(permissionReason({ ...shared, is_own: true }, 'live_read')).toBe('')
+    const old = env('o', 'team', { is_own: false, shared: true })
+    expect(can(old, 'tenant_write')).toBe(true)
+    expect(can(old, 'sync_now')).toBe(false)
+    expect(can(env('n', 'team', { is_own: false, shared: false, addressable: false }), 'view_archive')).toBe(false)
   })
 
   it('the setup screen offers exactly the addressable rows', () => {

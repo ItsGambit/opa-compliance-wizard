@@ -5,7 +5,7 @@ import { useSyncJob } from '../hooks/useSyncJob'
 import { toast } from '../hooks/useToast'
 import { formatDateTime } from '../utils/format'
 import { getSyncProgressPercent } from '../utils/syncProgress'
-import { activeRow, canManageSync } from '../utils/environmentRows'
+import { activeRow, can, permissionReason } from '../utils/environmentRows'
 
 // This project split out of the ItsGambit/Okta monorepo into its own
 // standalone repo 2026-09-30 -- these were left pointing at the old
@@ -23,11 +23,10 @@ export function Footer() {
   const { data: environments } = useEnvironments()
   const activeEnv = environments?.active ?? undefined  // null (no active env) -> undefined, which the hooks treat as "disabled"
   const { data: syncStatus } = useSyncStatus(activeEnv)
-  // UI-07: "Sync now" is the environment owner's action on the server (it
-  // reads the owner's own schedule); for an environment shared with this
-  // user it always failed with "No saved environment named …".
+  // 5.42.0: "Sync now" on an environment shared with this user follows what
+  // an admin allows shared users (off unless allowed); the server enforces it.
   const active = activeRow(environments)
-  const canSync = !active || canManageSync(active)
+  const canSync = !active || can(active, 'sync_now')
 
   // ONE global sync trigger, not a Refresh button on every report/
   // resource-history view -- every one of those reads the SAME shared
@@ -77,12 +76,14 @@ export function Footer() {
             disabled={isSyncing || !canSync}
             title={canSync
               ? 'Pull the latest events from live Okta for every report and resource history'
-              : `Only the owner of '${activeEnv}' can run its sync. Reports show what its owner's syncs have archived.`}
+              : `${active ? permissionReason(active, 'sync_now') : ''} Reports show what its owner's syncs have archived.`}
+            aria-describedby={!canSync ? 'footer-sync-reason' : undefined}
             className="inline-flex items-center gap-1 hover:text-text-dim disabled:opacity-60"
           >
             <RefreshCw size={11} aria-hidden="true" className={isSyncing ? 'animate-spin' : ''} />
             {isSyncing ? 'Syncing…' : 'Sync now'}
           </button>
+          {!canSync && active && <span id="footer-sync-reason" className="sr-only">{permissionReason(active, 'sync_now')}</span>}
           {isSyncing && (
             <span
               className="h-1 w-16 rounded-full bg-bg-hover overflow-hidden"

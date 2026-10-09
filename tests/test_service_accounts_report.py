@@ -614,11 +614,27 @@ def live_server(schema, fake_keyring, tmp_audit_log, monkeypatch):
     server_instance.server_close()
 
 
+def _register_environment_row(environment_id, owner):
+    """5.42.0: session routes check the session's environment (shared-
+    environment permissions), so a seeded session needs a real row."""
+    import audit_store
+    conn = audit_store._get_connection()
+    conn.execute(
+        """INSERT OR IGNORE INTO app_environments
+           (environment_id, owner_id, display_name, base_domain, team_name, key_id, okta_url, shared, created_at, updated_at)
+           VALUES (?, ?, ?, 'x.example.com', 't', 'k', '', 0, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')""",
+        (environment_id, owner, f"env-{environment_id[:8]}"),
+    )
+    conn.commit()
+
+
 def _headers(sub="00uOWNERA", admin="false"):
     return {"X-Nginx-Proxy-Secret": "test-proxy-secret", "X-Auth-Sub": sub, "X-Auth-Is-Admin": admin}
 
 
 def _seed_session(serve, sub, env_id, client=None):
+    if env_id is not None:
+        _register_environment_row(env_id, None if sub == serve.LOCAL_OWNER_KEY_HEADER else sub)
     with serve._sessions_lock:
         serve._sessions[sub] = {"client": client if client is not None else object(), "okta_client": None,
                                 "env_name": "dev", "env_id": env_id}

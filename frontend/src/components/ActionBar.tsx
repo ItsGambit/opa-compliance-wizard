@@ -6,6 +6,7 @@ import { execute, preview } from '../api/client'
 import { toast } from '../hooks/useToast'
 import type { ExecuteResponse, FolderNode, PreviewResponse, Project, ResourceGroup } from '../types'
 import { countNodes, flattenTree, treeProblems } from '../utils/tree'
+import { useActiveCapability } from '../hooks/useActiveCapability'
 
 interface Props {
   nodes: FolderNode[]
@@ -23,6 +24,9 @@ export function ActionBar({ nodes, resourceGroup, project, onPreviewResult, onEx
   const problems = treeProblems(nodes)
   const ready = !!resourceGroup && !!project && nodes.length > 0 && problems.length === 0
   const blockedReason = problems.length > 0 ? `Fix the folder names first: ${problems.join(' ')}` : undefined
+  // 5.42.0: a shared environment may not allow live reads or tenant writes.
+  const liveRead = useActiveCapability('live_read')
+  const tenantWrite = useActiveCapability('tenant_write')
 
   const previewMutation = useMutation({
     mutationFn: () => preview(resourceGroup!.id, project!.id, flattenTree(nodes)),
@@ -50,13 +54,14 @@ export function ActionBar({ nodes, resourceGroup, project, onPreviewResult, onEx
     onSettled: () => setConfirmOpen(false),
   })
 
+  const capabilityNote = liveRead.reason || tenantWrite.reason
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex flex-wrap items-center gap-2">
       <button
         type="button"
         className="btn-secondary"
-        disabled={!ready || previewMutation.isPending}
-        title={blockedReason}
+        disabled={!ready || previewMutation.isPending || !liveRead.allowed}
+        title={liveRead.reason || blockedReason}
         onClick={() => previewMutation.mutate()}
       >
         <Eye size={13} aria-hidden="true" /> {previewMutation.isPending ? 'Previewing…' : 'Preview (dry-run)'}
@@ -64,7 +69,7 @@ export function ActionBar({ nodes, resourceGroup, project, onPreviewResult, onEx
 
       <AlertDialog.Root open={confirmOpen} onOpenChange={setConfirmOpen}>
         <AlertDialog.Trigger asChild>
-          <button type="button" className="btn-primary" disabled={!ready} title={blockedReason}>
+          <button type="button" className="btn-primary" disabled={!ready || !tenantWrite.allowed} title={tenantWrite.reason || blockedReason}>
             <FolderPlus size={13} aria-hidden="true" /> Create Folders
           </button>
         </AlertDialog.Trigger>
@@ -94,6 +99,7 @@ export function ActionBar({ nodes, resourceGroup, project, onPreviewResult, onEx
           </AlertDialog.Content>
         </AlertDialog.Portal>
       </AlertDialog.Root>
+      {capabilityNote && <p className="w-full text-xs text-text-dim" role="note">{capabilityNote}</p>}
     </div>
   )
 }

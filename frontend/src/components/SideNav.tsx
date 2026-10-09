@@ -105,6 +105,8 @@ interface Props {
   onOpenAbout: () => void
   /** Admin-only (canAdmin): archives left behind by deleted environments. */
   onOpenOrphanedArchives?: () => void
+  /** Admin-only (canAdmin, 5.42.0): what shared users may do by default. */
+  onOpenSharedPermissions?: () => void
 }
 
 const TOP_LEVEL_ICON: Record<string, typeof FolderTree> = {
@@ -232,6 +234,7 @@ export function SideNav({
   onOpenAccessControl,
   onOpenAbout,
   onOpenOrphanedArchives,
+  onOpenSharedPermissions,
 }: Props) {
   const { theme, toggle } = useTheme()
 
@@ -384,6 +387,9 @@ export function SideNav({
               matters. */}
           {canAdmin && (
             <UtilityPill label="Announcement banner" icon={Megaphone} onClick={() => { onOpenBanner(); closeDrawer() }} collapsed={collapsed} />
+          )}
+          {canAdmin && onOpenSharedPermissions && (
+            <UtilityPill label="Shared permissions" icon={KeyRound} onClick={() => { onOpenSharedPermissions(); closeDrawer() }} collapsed={collapsed} />
           )}
           {canAdmin && onOpenOrphanedArchives && (
             <UtilityPill label="Orphaned archives" icon={Archive} onClick={() => { onOpenOrphanedArchives(); closeDrawer() }} collapsed={collapsed} />

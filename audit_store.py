@@ -707,6 +707,42 @@ def _migration_007_manifest_entries_and_chain_heads(conn):
     )
 
 
+def _migration_008_shared_environment_permissions(conn):
+    """5.42.0: admin-configurable permissions for shared environments --
+    what a user may do with an environment another user owns and has
+    shared (see create_secret_folders.SHARED_CAPABILITIES). Two new tables,
+    both IF NOT EXISTS; nothing existing is altered, and no evidence-chain
+    table (ingestion_manifests, manifest_entries, chain_heads, events) is
+    touched. Both start empty: no row means "inherit", so every capability
+    resolves to its built-in default -- exactly what a shared user could do
+    before this release -- until an admin changes something.
+
+    - shared_permission_defaults: the global default per capability.
+    - shared_permission_overrides: per-environment overrides, removed with
+      their environment (ON DELETE CASCADE, same convention as
+      sync_schedules).
+
+    A rollback to older code leaves both tables unused and harmless."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS shared_permission_defaults (
+               capability TEXT PRIMARY KEY,
+               value TEXT NOT NULL CHECK (value IN ('allow', 'deny')),
+               updated_at TEXT NOT NULL,
+               updated_by TEXT
+           )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS shared_permission_overrides (
+               environment_id TEXT NOT NULL REFERENCES app_environments(environment_id) ON DELETE CASCADE,
+               capability TEXT NOT NULL,
+               value TEXT NOT NULL CHECK (value IN ('allow', 'deny')),
+               updated_at TEXT NOT NULL,
+               updated_by TEXT,
+               PRIMARY KEY (environment_id, capability)
+           )"""
+    )
+
+
 MIGRATIONS = {
     1: _migration_001_unified_schema,
     2: _migration_002_ingestion_manifests,
@@ -715,6 +751,7 @@ MIGRATIONS = {
     5: _migration_005_service_account_report_indexes,
     6: _migration_006_evidence_chain_v2_and_sync_attempts,
     7: _migration_007_manifest_entries_and_chain_heads,
+    8: _migration_008_shared_environment_permissions,
 }
 
 # DATA-08: migration 4 needs ALTER TABLE ... DROP COLUMN (SQLite 3.35.0,
@@ -1548,11 +1585,19 @@ def create_pending_admin_action(actor_sub, action_type, payload, ttl_seconds):
     return action_id
 
 
-def consume_pending_admin_action(action_id, actor_sub):
+def consume_pending_admin_action(action_id, actor_sub, action_types=None, return_action_type=False):
     """Looks up `action_id`, verifies it belongs to `actor_sub`, hasn't
     expired, and hasn't already been consumed -- if all three hold,
     marks it consumed and returns the stored payload (parsed from JSON).
     Raises PendingActionError otherwise, with a specific `reason`.
+
+    `action_types` (5.42.0, optional): the action types this caller
+    applies. A pending action of any other type is refused with
+    "action_type_mismatch" and left untouched -- a step-up approval for an
+    Environments change can't be spent on (or burned by) the Access
+    Control save, nor the other way round. None keeps the old behaviour.
+    return_action_type=True returns (payload, action_type) instead, so a
+    caller can check the stored payload against the row's own type.
 
     Single-use is enforced via one UPDATE ... WHERE consumed_at IS NULL
     followed by checking cur.rowcount, inside the SAME _db_lock-held
@@ -1569,6 +1614,8 @@ def consume_pending_admin_action(action_id, actor_sub):
             raise PendingActionError("not_found")
         if row["actor_sub"] != actor_sub:
             raise PendingActionError("actor_mismatch")
+        if action_types is not None and row["action_type"] not in action_types:
+            raise PendingActionError("action_type_mismatch")
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
         if row["expires_at"] < now_iso:
             raise PendingActionError("expired")
@@ -1579,7 +1626,22 @@ def consume_pending_admin_action(action_id, actor_sub):
         conn.commit()
         if cur.rowcount == 0:
             raise PendingActionError("already_consumed")
-    return json.loads(row["payload_json"])
+    payload = json.loads(row["payload_json"])
+    return (payload, row["action_type"]) if return_action_type else payload
+
+
+def count_open_pending_admin_actions(actor_sub, action_types):
+    """How many of these types `actor_sub` has prepared and not yet applied
+    (unexpired) -- 5.42.0, bounds what one user can leave pending."""
+    conn = _get_connection()
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    marks = ",".join("?" * len(action_types))
+    row = conn.execute(
+        f"""SELECT COUNT(*) FROM pending_admin_actions
+            WHERE actor_sub IS ? AND consumed_at IS NULL AND expires_at >= ? AND action_type IN ({marks})""",
+        (actor_sub, now_iso, *action_types),
+    ).fetchone()
+    return row[0]
 
 
 def _cleanup_expired_pending_admin_actions():
@@ -2117,6 +2179,20 @@ def list_orphaned_archives():
     return out
 
 
+# Every table holding one environment's archive, in purge order (children first).
+ARCHIVE_TABLES = ("event_targets", "events", "sync_state", "manifest_entries", "chain_heads", "ingestion_manifests")
+
+
+def archive_has_rows(environment_id):
+    """True if any archive table holds a row for this environment id (the
+    same tables purge_environment_archive empties)."""
+    conn = _get_connection()
+    return any(
+        conn.execute(f"SELECT 1 FROM {table} WHERE environment_id = ? LIMIT 1", (environment_id,)).fetchone()
+        for table in ARCHIVE_TABLES
+    )
+
+
 def purge_environment_archive(environment_id):
     """DATA-12: removes every archive row for an environment that no
     longer exists -- events, event_targets, sync_state, ingestion_manifests
@@ -2132,7 +2208,7 @@ def purge_environment_archive(environment_id):
             if conn.execute("SELECT 1 FROM app_environments WHERE environment_id = ?", (environment_id,)).fetchone():
                 raise ValueError("That environment still exists; delete the environment itself to purge its archive.")
             counts = {}
-            for table in ("event_targets", "events", "sync_state", "manifest_entries", "chain_heads", "ingestion_manifests"):
+            for table in ARCHIVE_TABLES:
                 counts[table] = conn.execute(f"DELETE FROM {table} WHERE environment_id = ?", (environment_id,)).rowcount
             conn.commit()
         except Exception:

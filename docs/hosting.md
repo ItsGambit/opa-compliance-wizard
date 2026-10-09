@@ -543,6 +543,48 @@ login gate in front of them at all) is entirely unaffected by any of
 this -- there's exactly one shared, unscoped environment list, matching
 this tool's original single-user design.
 
+**What shared users may do (5.42.0).** Sharing is the owner's decision;
+what a shared user may then do with someone else's environment is an
+admin's. A shared user acts with the owner's stored OPA key and Okta
+token, so each of these is a separate setting: view archived reports,
+live read queries, write to the OPA tenant / Okta org (resource groups,
+projects, folders, policies, group membership, new Okta groups), import a
+CSV into the archive, reset the sync watermark, run Sync now, change sync
+settings. Admins set a global default in **Shared permissions** (sidebar)
+and can override any of them per environment (**Environments → Shared
+permissions** on a row): inherit, allow or don't allow. Owners are never
+limited, and retention (which deletes archived events) stays the owner's
+even for a shared user allowed to change sync settings. The server enforces every setting on every route (a refused call
+answers `403` with `"reason": "shared_permission_denied"`); the UI only
+mirrors it. The built-in defaults are exactly what shared users could do
+before 5.42.0 -- everything except Sync now and the sync settings -- so an
+upgrade changes nothing until an admin changes a setting. Admins using
+someone else's shared environment get the same limits as anyone else
+(they can change the setting, which is audited). Every change is logged as
+`shared_permissions.update` with each capability's stored value before and
+after.
+
+**Every change in the Environments area needs a fresh MFA approval
+(5.42.0).** Creating, editing (credentials and rename included), deleting
+(with or without the archive), sharing or unsharing an environment, saving
+sync settings, resetting the sync watermark, importing a CSV into the
+archive, purging an orphaned archive and changing shared permissions all
+use the Access Control save's step-up flow below, for every user, not just
+admins: the server checks the change and stores it as a pending action
+(`pending_admin_actions`, bound to your Okta `sub`, single use, 15 minutes),
+the browser goes through the gate's `/step-up`, and the change is applied
+on the way back through `/api/environment_changes/save` -- an nginx
+location with `auth_request /verify_stepup`, like
+`/api/access_control/save`. The approval covers exactly the change that
+was stored; whatever the browser sends with the save is ignored, and every
+check runs again when it is applied. The environment form's secrets are
+never written to the pending action (credentials stay in the keychain
+only): they wait in the server's memory, and a restart during the round
+trip asks for them again. Activating an environment, Sync now and
+read-only views are not gated. **Local mode** has no login gate and no
+identity provider to step up with, so there these changes apply at once,
+as before.
+
 **Admin access.** Members of one designated Okta group get full admin
 rights across the whole dashboard: every environment becomes visible and
 editable (not just their own or explicitly shared ones), and a new
@@ -767,6 +809,17 @@ the dashboard's Access control page only ever edits the one, default file.
 
 `server/deploy.sh` restarts every enabled `opa-auth-gate-*` unit after the
 main gate, so deploys keep both gates on the same code.
+
+**Environments changes through an additional gate (5.42.0).** The
+generated site keeps the main site's `/api/environment_changes/save`
+step-up location (pointed at the additional gate, which serves `/step-up`
+the same way), so its users approve Environments changes with their own
+org's MFA. A site generated before 5.42.0 doesn't have that location: there
+those changes are refused (`"reason": "step_up_unavailable"`) until the site
+is rebuilt as described below -- serve.py accepts the save only with a
+header that location alone sets. As with every admin route, an admin of the
+additional org's admin group is an admin of the shared backend, including
+the shared-permission settings.
 
 **The generated site is a snapshot.** It is built once from the live main
 site and `deploy.sh` never updates it, so changes to the main template

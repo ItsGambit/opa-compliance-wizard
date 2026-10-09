@@ -1,17 +1,31 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useEnvironments } from '../api/hooks'
-import { activateEnvironment, saveEnvironment, type ApiError } from '../api/client'
+import { activateEnvironment, isStepUpRequired, saveEnvironment, type ApiError } from '../api/client'
 import { toast } from '../hooks/useToast'
 import type { EnvironmentFormValues } from '../types'
+import { beginStepUp, environmentDraftFrom } from '../utils/stepUp'
 import { usableEnvironments } from '../utils/usableEnvironments'
 import { EnvironmentForm } from './EnvironmentForm'
 
-export function EnvironmentSetup() {
+interface Props {
+  /** 5.42.0: input restored after an MFA approval that didn't complete. */
+  draft?: Partial<EnvironmentFormValues>
+}
+
+export function EnvironmentSetup({ draft }: Props = {}) {
   const queryClient = useQueryClient()
 
   const mutation = useMutation({
     mutationFn: (values: EnvironmentFormValues) => saveEnvironment(values),
-    onSuccess: (data) => {
+    onSuccess: (data, values) => {
+      if (isStepUpRequired(data)) {
+        // Hosted mode: approve this save with MFA first (5.42.0).
+        beginStepUp(data.action_id, {
+          kind: 'environment_change', action: data.action, label: `Save environment '${values.name.trim()}'`,
+          startedAt: Date.now(), environmentDraft: environmentDraftFrom(values), reopen: 'environments',
+        })
+        return
+      }
       toast({ title: `Connected to '${data.active}'`, variant: 'success' })
       queryClient.invalidateQueries({ queryKey: ['environments'] })
     },
@@ -75,6 +89,7 @@ export function EnvironmentSetup() {
       <div className="card p-4">
         {usable.length > 0 && <h2 className="text-sm font-semibold text-text mb-3">Add a new environment</h2>}
         <EnvironmentForm
+          draft={draft}
           submitLabel="Save & Connect"
           isSubmitting={mutation.isPending}
           errorMessage={apiError}
