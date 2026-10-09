@@ -101,15 +101,19 @@ http {{
     return tmp / "nginx.conf"
 
 
-def _template_with(tmp, crt, key, *, http_port=80, https_port=443, backend=8766, gate=8767):
+def _template_with(tmp, crt, key, *, http_port=None, https_port=None, backend=8766, gate=8767):
+    http_port = http_port or _free_port()
+    https_port = https_port or _free_port()
     text = TEMPLATE.read_text()
     text = text.replace("/etc/nginx/ssl/opa-secrets-wizard.crt", str(crt))
     text = text.replace("/etc/nginx/ssl/opa-secrets-wizard.key", str(key))
-    if http_port != 80:
-        text = text.replace("listen 80;", f"listen 127.0.0.1:{http_port};", 1)
-        text = text.replace("listen 443 ssl;", f"listen 127.0.0.1:{https_port} ssl;", 1)
-        text = text.replace("127.0.0.1:8766", f"127.0.0.1:{backend}")
-        text = text.replace("127.0.0.1:8767", f"127.0.0.1:{gate}")
+    # `nginx -t` binds the listen sockets on Linux, so an unprivileged run
+    # (CI) needs ports it may bind: always rewrite 80/443 to loopback ports.
+    text = text.replace("listen 80;", f"listen 127.0.0.1:{http_port};", 1)
+    text = text.replace("listen 443 ssl;", f"listen 127.0.0.1:{https_port} ssl;", 1)
+    assert f"listen 127.0.0.1:{http_port};" in text and f"listen 127.0.0.1:{https_port} ssl;" in text
+    text = text.replace("127.0.0.1:8766", f"127.0.0.1:{backend}")
+    text = text.replace("127.0.0.1:8767", f"127.0.0.1:{gate}")
     return text
 
 
@@ -121,7 +125,10 @@ def _nginx_t(conf, prefix):
 def test_template_and_generated_second_site_pass_nginx_t(tmp_path):
     crt, key = _self_signed(tmp_path)
     main = _template_with(tmp_path, crt, key)
-    second = nginx_second_site.build(main, 8768, "127.0.0.1:8080", "opa.example.com", "second")
+    # The generator needs the real `listen 443 ssl;` shape, so build the
+    # second site from the unmodified template, then serve both on free ports.
+    raw = TEMPLATE.read_text()
+    second = nginx_second_site.build(raw, 8768, f"127.0.0.1:{_free_port()}", "opa.example.com", "second")
     conf = _write_config(tmp_path, main, [second])
     result = _nginx_t(conf, tmp_path)
     assert result.returncode == 0, result.stderr

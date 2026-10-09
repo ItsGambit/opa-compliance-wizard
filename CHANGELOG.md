@@ -151,7 +151,8 @@ need a maintainer decision and are not in this release.
   and checks the headers on 200/302/429 responses (including the 401
   that redirects to login), the `/healthz`
   exact match and header stripping, the `429`, that `/login` is
-  unlimited, and the port-80 redirect. CI installs nginx and fails rather
+  unlimited, and the port-80 redirect. On Linux `nginx -t` binds
+  the listen sockets, so the tests rewrite 80/443 to free loopback ports. CI installs nginx and fails rather
   than skips if it is missing (`OPA_REQUIRE_NGINX_TESTS`).
   `tests/test_auth_gate.py` goes from 23 to 121 tests. They run the real
   gate handler on a loopback server and cover GATE-07/09/10/12/13/14
