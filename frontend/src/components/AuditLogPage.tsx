@@ -58,14 +58,19 @@ export function AuditLogPage() {
   const handleRefresh = async () => {
     const previousTopTimestamp = entries[0]?.timestamp
     const previousTopAction = entries[0]?.action
-    const backfill = await backfillMfaLogEvents().catch(() => null)
+    let backfillBusy = false
+    const backfill = await backfillMfaLogEvents().catch((err: Error & { body?: { reason?: string } }) => {
+      // 409 reason=busy (5.40.3): another Refresh's MFA lookups are still running.
+      backfillBusy = err.body?.reason === 'busy'
+      return null
+    })
     const result = await refetch()
     if (result.error) return // isError effect above already handles this
     const freshEntries = result.data?.entries ?? []
     const isNew = freshEntries[0] && (freshEntries[0].timestamp !== previousTopTimestamp || freshEntries[0].action !== previousTopAction)
     const backfillNote = backfill && backfill.updated_count > 0
       ? ` Found Okta MFA corroboration for ${backfill.updated_count} earlier ${backfill.updated_count === 1 ? 'entry' : 'entries'}.`
-      : ''
+      : backfillBusy ? ' (MFA corroboration lookups from another refresh are still running.)' : ''
     toast({
       title: 'Audit log refreshed',
       description: (isNew ? 'New activity loaded.' : 'No new entries since last refresh.') + backfillNote,

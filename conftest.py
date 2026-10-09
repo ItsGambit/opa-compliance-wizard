@@ -7,6 +7,7 @@ and real tenant data. Every fixture below exists specifically to redirect this
 project's module-level, hardcoded file paths and OS-keyring calls to
 disposable per-test substitutes.
 """
+import os
 import sys
 from pathlib import Path
 
@@ -14,7 +15,19 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import create_secret_folders as engine
+# TEST-07 (external review, 2026-10-05): the suite must not depend on the
+# developer's own environment. A repo-root .env (documented for CLI use via
+# .env.example) used to be re-read by create_secret_folders._load_dotenv on
+# import, so DEPLOYMENT_MODE=hosted there turned unrelated tests red (or
+# aborted collection). Both the .env file and the ambient shell variables
+# the server reads at import time are neutralised BEFORE the engine is
+# imported; subprocess tests inherit the opt-out via os.environ.
+os.environ["OPA_WIZARD_SKIP_DOTENV"] = "1"
+for _ambient in ("DEPLOYMENT_MODE", "NGINX_PROXY_SECRET", "EXTRA_ALLOWED_ORIGINS",
+                 "INTERNAL_API_SHARED_SECRET", "OPA_AUDIT_DB_PATH"):
+    os.environ.pop(_ambient, None)
+
+import create_secret_folders as engine  # noqa: E402
 
 
 @pytest.fixture
@@ -93,6 +106,18 @@ def tmp_audit_store(tmp_path, monkeypatch):
     banner_path = tmp_path / "banner_config.json"
     monkeypatch.setattr(engine, "_banner_config_path", lambda: str(banner_path))
 
+    return path
+
+
+@pytest.fixture(autouse=True)
+def never_write_the_real_audit_log(tmp_path, monkeypatch):
+    """Every test writes audit_log.jsonl to its own temp dir unless it asks
+    for tmp_audit_log (which points at the same place). Found by the 5.40.3
+    review: tests that used tmp_audit_store without tmp_audit_log appended
+    `evidence_chain.sealed` entries (and others) to the developer's REAL
+    repo-root audit_log.jsonl on every run."""
+    path = tmp_path / "audit_log.jsonl"
+    monkeypatch.setattr(engine, "_audit_log_path", lambda: str(path))
     return path
 
 

@@ -122,3 +122,64 @@ def test_permissions_restricted_on_posix(tmp_path):
     path = tmp_path / "data.json"
     engine._atomic_write_json(str(path), {"a": 1})
     assert oct(os.stat(path).st_mode & 0o777) == oct(0o600)
+
+
+# ---------------------------------------------------------------------------
+# TEST-09 (external review, 2026-10-05): the thread race above caught a
+# plain truncating rewrite only ~2 times in 30, and the permissions test
+# passed without the chmod (mkstemp already creates 0600). These assert the
+# mechanism itself, deterministically.
+# ---------------------------------------------------------------------------
+def test_target_is_never_opened_for_writing_only_replaced(tmp_path, monkeypatch):
+    import builtins
+
+    path = tmp_path / "data.json"
+    engine._atomic_write_json(str(path), {"n": 0})
+    target = os.path.realpath(path)
+    direct_writes, replaces = [], []
+    real_open, real_os_open, real_replace = builtins.open, os.open, os.replace
+
+    def spy_open(file, mode="r", *args, **kwargs):
+        if isinstance(file, (str, bytes, os.PathLike)) and os.path.realpath(file) == target and any(c in mode for c in "wax+"):
+            direct_writes.append(("open", mode))
+        return real_open(file, mode, *args, **kwargs)
+
+    def spy_os_open(file, flags, *args, **kwargs):
+        if os.path.realpath(file) == target and flags & (os.O_WRONLY | os.O_RDWR):
+            direct_writes.append(("os.open", flags))
+        return real_os_open(file, flags, *args, **kwargs)
+
+    def spy_replace(src, dst):
+        # At the moment of the swap the target still holds the complete OLD
+        # content, and the new content is complete in a sibling temp file.
+        with real_open(dst, encoding="utf-8") as f:
+            assert json.load(f) == {"n": 0}
+        with real_open(src, encoding="utf-8") as f:
+            assert json.load(f) == {"n": 1}
+        replaces.append((os.path.dirname(os.path.realpath(src)), os.path.realpath(dst)))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(builtins, "open", spy_open)
+    monkeypatch.setattr(os, "open", spy_os_open)
+    monkeypatch.setattr(os, "replace", spy_replace)
+    engine._atomic_write_json(str(path), {"n": 1})
+    monkeypatch.undo()
+
+    assert direct_writes == []
+    assert replaces == [(os.path.dirname(target), target)]
+    with open(path, encoding="utf-8") as f:
+        assert json.load(f) == {"n": 1}
+
+
+def test_requested_mode_is_applied_explicitly(tmp_path):
+    """mode=0o640 can only come out as 0o640 if the explicit chmod runs
+    (mkstemp alone always gives 0600); the default stays owner-only."""
+    if sys.platform.startswith("win"):
+        import pytest
+
+        pytest.skip("POSIX chmod bits aren't meaningful on Windows")
+    path = tmp_path / "data.json"
+    engine._atomic_write_json(str(path), {"a": 1}, mode=0o640)
+    assert oct(os.stat(path).st_mode & 0o777) == oct(0o640)
+    engine._atomic_write_json(str(path), {"a": 2})
+    assert oct(os.stat(path).st_mode & 0o777) == oct(0o600)

@@ -2,6 +2,185 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.40.3 — **Server routes and tests: an HTTP authorization matrix for every route, plus twelve findings from the 2026-10-05 external review (TEST-01/03/07/08/09, SRV-03/05/06, ENG2-16, ENG1-05, ENG1-06, UI-06).**
+Batch 2 of the review's remaining findings. Behaviour changes an operator
+or user can notice are listed first.
+- **Noticeable changes.**
+  - **Local mode now shows the Audit Log and the Announcement banner
+    settings (UI-06).** The server always let a local run's operator read
+    the audit log and set the banner, but the UI only showed them to a
+    hosted Okta admin, so a single-user install had no way to see its
+    own audit trail. `/api/whoami` gains `can_admin` (what the admin-only
+    routes will actually allow this caller) and the sidebar follows it.
+    Access control stays hosted-admin-only: saving it needs the hosted
+    step-up MFA flow.
+  - **Unexpected server errors no longer return the raw exception text
+    (SRV-03).** A 500 now says `Internal server error (reference <id>)`
+    and carries `correlation_id`; the exception and traceback go to the
+    server log under that same id. `/healthz` (unauthenticated) reports a
+    failed check as `"error"` and logs the detail. A failed Access
+    Explorer or sync background job reports the same generic message (with
+    its reference) on the status routes unless the error is the tenant's
+    own OPA/Okta response or a deliberate validation message. An internal
+    `KeyError` in a DELETE route is a 500 now, not a 404 naming the key.
+    Deliberate 400/404/409 messages, and 502s carrying the tenant's own
+    OPA/Okta error, are unchanged.
+  - **Save CSV (`POST /api/csv`) only writes folder templates (SRV-06).**
+    Any authenticated user could create or overwrite any bare `*.csv` in
+    the project folder -- including an Okta System Log export waiting to
+    be imported, or a `folders_result_*.csv` execution record. Now: the
+    name must be ASCII letters, digits, spaces and `. _ ( ) -` ending in a
+    lower-case `.csv` (so `Prüfung.csv` or `x.CSV` is a 400); result files
+    are never overwritten (409); an existing file is overwritten only if
+    it is already a `path,description` template (409 otherwise); at most
+    500 CSV files (execution results not counted) can exist before a new
+    name is refused; the write is atomic, keeps an existing file's
+    permissions and creates a new file owner-only (`0600`). A CSV name containing a path separator (e.g.
+    `../x.csv`, `./x.csv`) is now a 400 everywhere (read, save, import)
+    instead of being silently reduced to its basename.
+  - **IDs that could reshape an upstream URL are a 400 (ENG2-16).**
+    Resource group, project, folder, policy and AD connection ids taken
+    from a request path or body must match `[A-Za-z0-9_-]{1,128}`
+    (OPA/Okta ids are UUID/alphanumeric); the OPA client also
+    percent-quotes every id it puts in a URL path, and the two Okta
+    System Log filter builders validate the id they embed. An id like
+    `..%2F..%2Fusers` used to be sent to OPA as-is.
+  - **A request body that is not a JSON object is a 400** (it was a 500).
+  - **An admin editing another user's environment is saved without
+    activating it for the admin (ENG1-06).** After a successful save the
+    route used to activate the environment *by name* for the admin, which
+    either failed with a 500 (the admin can't see it by name) or silently
+    switched the admin to their own same-named environment. The response
+    is now `{"saved": true, "activated": false}` and the dialog says the
+    admin's active environment didn't change. The audit entry gains
+    `environment_id` and `edited_other_owner`.
+  - **Restoring a saved session is by environment id, not by name.**
+    When a user's live session is restored (first request after a
+    restart, or after an edit dropped it), the stored active pointer --
+    an environment id -- used to be turned back into a display name and
+    resolved again, so a rename, or the user's own same-named environment
+    shadowing a shared one, could silently connect them to a DIFFERENT
+    tenant. It now reconnects to exactly that id if it is still theirs or
+    still shared AND its name still resolves to that same id for them
+    (`restorable_active_environment_credentials`, shared by the server and
+    the CLI's "use the dashboard's active environment"); otherwise the user
+    is left with no active environment and picks one, rather than ending up
+    with a session on one tenant while the UI and every name-keyed route
+    show another.
+  - **`HEAD` requests are behind the hosted-mode guard too.** The
+    inherited static-file `HEAD` handler skipped it (it only exposed the
+    public bundle's metadata); it now answers 401 without a body, like
+    every other method.
+  - **Hosted mode refuses a proxied request with no verified identity**
+    (401). A request carrying the nginx proxy secret but no `X-Auth-Sub`
+    would have resolved to the exempt local owner; no real request has
+    that shape (both proxied nginx locations sit behind `auth_request`),
+    so this only closes a fail-open if the gate ever misbehaves. The
+    local-operator admin exemption itself now applies only in
+    `DEPLOYMENT_MODE=local`.
+- **ENG1-06 (rest) -- editing an environment ends other users' stale
+  sessions.** Saving changes to an existing environment (an owner
+  rotating a shared environment's key, or an admin fixing someone's
+  credentials) used to leave every other user who had activated it on a
+  client built from the OLD credentials until the next restart. Those
+  sessions are dropped -- including the editing admin's own, if they had
+  it active -- and each user's next request re-runs the saved-session
+  restore (by id, see above), which re-checks visibility and connects with
+  the stored credentials. (Unshare and delete were covered in 5.40.2.)
+- **ENG1-05 -- the Audit Log's MFA "Refresh" can no longer stall the app
+  or lose the log.** It held the audit-log lock across up to 20 network
+  lookups (15 s timeout each), so every audited action blocked behind
+  one click; it rewrote the file in place (a crash or full disk lost the
+  whole trail); and it retried the same oldest entries forever, so 20
+  uncorroboratable entries starved every newer one. Now: lookups run
+  without the lock and results are applied to a fresh re-read of the file
+  by exact line (entries appended meanwhile are kept); the rewrite is
+  atomic (temp file + rename, via the shared `_atomic_write_text` that
+  `_atomic_write_json` now also uses) and keeps the file's permissions;
+  entries are tried newest-first; a definite "no such event" for an entry
+  more than an hour old (so not just indexing lag) increments
+  `okta_mfa_log_lookup_attempts`, and an entry stops being retried after 5
+  such attempts or once it is older than Okta's 90-day System Log
+  retention; a lookup that could not be made at all (lookup secret unset,
+  auth gate down, timeout, gate 5xx) costs no attempt -- the run stops
+  and keeps what it already found; an entry the gate refuses outright
+  (HTTP 4xx other than 401/403/404) is counted and skipped so it can't
+  block the entries behind it; a second concurrent Refresh gets a 409
+  `reason: "busy"` at once (the page says so) instead of repeating the
+  same lookups;
+  valid-JSON non-object lines are skipped (one used to 500 every Refresh)
+  and `read_audit_log` no longer returns them. A cross-process lock for
+  the CLI appending at the same time remains open (ENG1-11).
+- **SRV-05 -- expired step-up actions are swept at runtime.** Abandoned
+  `pending_admin_actions` rows were only deleted at process start; each
+  prepare now sweeps never-consumed rows that expired over an hour ago,
+  in the same transaction (the hour keeps a late return from the step-up
+  redirect reporting "expired", not "not found"). (`_seen_owners` is bounded by the number of authenticated
+  users -- unauthenticated requests were already refused by SRV-01's fix
+  -- and the job dicts by the number of environments; left as is.)
+- **One admin predicate.** `_can_admin(owner_key, headers)` replaces the
+  `owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers()`
+  check that was copied into ten routes; `/api/whoami`'s `can_admin` is
+  the same function.
+- **Tests.**
+  - **TEST-01 / TEST-03 / TEST-08:** `tests/test_http_authz_matrix.py`
+    (108). The route list is parsed from `serve.py` with `ast` and must
+    equal the matrix (a new route without an entry fails); each sample
+    path is checked to reach its own route under serve.py's first-match
+    order. Every route is driven through a real server: hosted mode with
+    no secret, a wrong secret or no identity -> 401 (static files too);
+    every admin route 403 for a non-admin and through for an admin, in
+    both modes, and through for the local operator; the admin-only
+    `?deep=1` / `?purge_archive=1` flags; every environment-name route
+    404 for another owner (with that owner's real id in the request) and
+    served for the owner; every session route 409 for an owner with no
+    session while another owner's live client exists, and served through
+    the caller's OWN client; the environment list for a non-admin vs an
+    admin; a non-admin save carrying another owner's id; the ENG1-06
+    edit/session cases; disallowed Origin on every mutating route;
+    Content-Length `-1`/`-5`/`abc`/oversize; non-object and invalid JSON
+    bodies; CSV traversal on read and import; the SRV-06 write rules;
+    ENG2-16 ids; SRV-03 responses and `/healthz`. Upstream clients are
+    probes that never touch the network. Mutation-checked: removing any
+    of the ten admin checks, M18, M20, M22, M23, M24, M35, M36 and M37
+    (the `-1` case -- any value below -1 raises on its own and masked
+    the mutation), plus each fix in this release, now fails the suite.
+  - **TEST-03 (engine):** admin edit by id across three same-named
+    owners; own beats a same-named shared environment
+    (`tests/test_review_batch2_engine.py`, with ENG1-05 and SRV-05).
+  - **The suite no longer writes the developer's real `audit_log.jsonl`.**
+    Tests that used the temporary database but not the temporary audit
+    log appended entries (mostly `evidence_chain.sealed`) to the
+    repo-root file on every run; an autouse fixture now redirects it for
+    every test. A developer who ran the suite before 5.40.3 may want to
+    review that file for test entries (environment ids such as
+    `11111111-1111-4111-8111-111111111111`).
+  - **TEST-07:** the suite no longer reads a developer's repo-root `.env`
+    or ambient `DEPLOYMENT_MODE`/`NGINX_PROXY_SECRET`: `_load_dotenv`
+    honours `OPA_WIZARD_SKIP_DOTENV=1`, which `conftest.py` sets before
+    the engine is imported, and the deployment-mode subprocesses run
+    outside the checkout. Verified by running the full suite with a
+    repo-root `.env` containing `DEPLOYMENT_MODE=hosted`.
+  - **TEST-09:** `_atomic_write_json` is now tested by mechanism (the
+    target is never opened for writing; it is only ever swapped in by
+    `os.replace` from a complete sibling temp file) and with a
+    non-default mode (`0o640`) so the explicit chmod is exercised.
+  - The matrix's route scan also refuses a new `do_*` method handler or a
+    route-shaped condition outside the three dispatchers, and treats any
+    comparison with a `/...` literal as a route, whatever it compares.
+  - Every `OpaClient` method that takes an id is driven with a hostile
+    value (no path gains a segment, query or fragment), and the Secrets
+    report's System Log filter is tested on its own.
+  - Frontend: `utils/whoami.test.ts` (3) and `components/SideNav.test.tsx`
+    (3).
+- **CI type check now checks something (OPS-04 follow-through).** The
+  frontend job ran `npx tsc --noEmit` against a root `tsconfig.json` that
+  only holds project references (`"files": []`), so it type-checked zero
+  files. It runs `npx tsc -b` now, and the ten type errors that had
+  accumulated unseen (a nullable active-environment name passed where
+  `undefined` was expected, and a global `JSX` namespace reference) are
+  fixed. CONTRIBUTING.md says the same.
+
 5.40.2 — **Archive integrity: nine data-integrity findings from the 2026-10-05 external review (DATA-03/04/05/08/09/11/12/13/14, ENG2-04/UI-09, TEST-06).**
 Batch 1 of the review's remaining findings, all in the compliance
 archive's ingest, sync and retention paths. No API shape an existing

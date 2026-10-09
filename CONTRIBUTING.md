@@ -33,7 +33,13 @@ GitHub Actions (`.github/workflows/ci.yml`). The backend suite covers
 the functions with the most direct history of silent breakage (admin
 same-owner-name disambiguation, the P0 header-spoofing fix, the sync
 watermark, atomic-write crash safety, the Phase 3 step-up transaction
-binding) plus a two-owner collision integration test. The frontend
+binding) plus a two-owner collision integration test, and an HTTP
+authorization matrix (`tests/test_http_authz_matrix.py`) that drives
+**every** route in `server/serve.py` as an unauthenticated caller, a
+non-admin, an admin, the local-mode operator and a second owner. Its route
+list is parsed out of `serve.py` itself, so **a new route fails CI until
+you add a matrix entry for it** (say which kind it is: public, open,
+admin, env-scoped or session-scoped). The frontend
 suite covers the two hooks with a documented history of a real,
 once-fixed bug (`useAccessBootstrapJob`'s polling-stops-too-early fix,
 `useFuzzyFilter`'s stale-array-reference behavior). Neither is
@@ -52,8 +58,9 @@ pytest
 # Backend: confirm every touched Python file still parses
 python -c "import ast; ast.parse(open('path/to/file.py', encoding='utf-8').read())"
 
-# Frontend: type-check
-cd frontend && npx tsc --noEmit
+# Frontend: type-check (build mode -- the root tsconfig.json only holds
+# project references, so a plain `tsc --noEmit` checks nothing)
+cd frontend && npx tsc -b
 
 # Frontend: run the test suite
 npm test

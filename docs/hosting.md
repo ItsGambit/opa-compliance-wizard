@@ -327,7 +327,9 @@ this tool's original single-user design.
 rights across the whole dashboard: every environment becomes visible and
 editable (not just their own or explicitly shared ones), and a new
 Audit Log panel (sidebar, admin-only) shows every write action ever
-logged, by anyone. To set this up:
+logged, by anyone. (A local run, with no login gate, shows the Audit Log
+and banner settings to its operator; Access control needs the hosted
+step-up flow and stays hosted-admin-only.) To set this up:
 1. Create (or reuse) an Okta group for admins of this tool, and note its
    **group ID** (Admin Console -> Directory -> Groups -> click the
    group -> the ID is in the URL, `.../groups/<id>/...`) -- a group ID,

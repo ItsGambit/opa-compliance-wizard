@@ -33,7 +33,7 @@ export function ResourceHistoryPanel({
   matchByName?: boolean
 }) {
   const { data: environments } = useEnvironments()
-  const activeEnv = environments?.active
+  const activeEnv = environments?.active ?? undefined  // null (no active env) -> undefined, which the hooks treat as "disabled"
   const today = new Date().toISOString().slice(0, 10)
   const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
   const [from, setFrom] = useState(ninetyDaysAgo)

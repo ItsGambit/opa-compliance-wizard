@@ -101,7 +101,7 @@ interface Props {
 
 export function ComplianceReports({ selectedReport, onSelectReport }: Props) {
   const { data: environments } = useEnvironments()
-  const activeEnv = environments?.active
+  const activeEnv = environments?.active ?? undefined  // null (no active env) -> undefined, which the hooks treat as "disabled"
   const { data: reports } = useReportDefs(activeEnv)
   // Phase 10: point-in-time, non-polling read (see useSyncStatus's own
   // doc comment) -- this page just needs to know "is the data behind

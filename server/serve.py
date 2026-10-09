@@ -22,11 +22,14 @@ saves it via POST /api/environments.
 
 import argparse
 import csv as _csv
+import io
 import json
+import re
 import os
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 import uuid
@@ -207,6 +210,11 @@ def _engine_owner(owner_key):
     return engine.LOCAL_OWNER_KEY if owner_key == LOCAL_OWNER_KEY_HEADER else owner_key
 
 
+# The two routes reachable without the nginx proxy secret in hosted mode
+# (see _reject_if_hosted_without_nginx's docstring for why each is safe).
+UNAUTHENTICATED_PATHS = frozenset({"/healthz", "/api/version"})
+
+
 def _reject_if_hosted_without_nginx(handler, path):
     """SECURITY FIX (external review, 2026-10-05, SRV-01): in hosted mode, a
     request that fails the nginx proxy-secret check used to be silently
@@ -240,10 +248,39 @@ def _reject_if_hosted_without_nginx(handler, path):
     there would make every deploy fail this exact guard. Both routes
     return only a version string / non-tenant health summary, no admin
     check, no owner-scoped data -- staying reachable here costs nothing."""
-    if DEPLOYMENT_MODE == "hosted" and path not in ("/healthz", "/api/version") and not _request_is_from_nginx(handler.headers):
+    if _hosted_request_unauthenticated(handler.headers, path):
         handler._send_json(401, {"error": "Authentication required."})
         return True
     return False
+
+
+def _hosted_request_unauthenticated(headers, path):
+    """The hosted-mode authentication test shared by every method handler
+    (GET/POST/DELETE, and HEAD, which answers without a body).
+
+    Defense in depth (5.40.3): a request that DID transit nginx but carries
+    no verified identity (X-Auth-Sub empty -- e.g. a gate bug returning 2xx
+    without the header) would otherwise also map to the exempt `__local__`
+    owner. In hosted mode no real request is identity-less, so both shapes
+    are rejected the same way."""
+    if DEPLOYMENT_MODE != "hosted" or path in UNAUTHENTICATED_PATHS:
+        return False
+    return not _request_is_from_nginx(headers) or not headers.get("X-Auth-Sub")
+
+
+def _can_admin(owner_key, headers):
+    """The ONE admin predicate every admin-only route uses (it was copied
+    into ten routes as `owner_key != LOCAL_OWNER_KEY_HEADER and not
+    _is_admin_from_headers(...)`). True for a verified admin (auth_gate.py's
+    X-Auth-Is-Admin via nginx), or for the local operator of a local-mode
+    run (no login gate exists there; that operator already sees every
+    environment it owns -- see the /api/audit_log route). The local
+    exemption never applies in hosted mode, whatever owner_key a request
+    resolves to. Also exposed to the frontend as /api/whoami's
+    `can_admin` (UI-06), so the UI shows exactly what the server allows."""
+    if _is_admin_from_headers(headers):
+        return True
+    return DEPLOYMENT_MODE == "local" and owner_key == LOCAL_OWNER_KEY_HEADER
 
 
 def _is_admin_from_headers(headers):
@@ -270,24 +307,35 @@ def _lookup_mfa_log_event(actor_sub, near_iso_timestamp):
     """The `lookup_fn` engine.backfill_mfa_log_events expects (see that
     function's docstring for why the actual Okta call is injected rather
     than made by create_secret_folders.py directly) -- calls
-    auth_gate.py's loopback-only GET /internal/mfa_log_lookup. Returns
-    None on ANY failure (secret not configured, auth_gate.py unreachable,
-    bad response) -- same fail-open reasoning as everywhere else this
-    corroboration is best-effort, never something a backfill attempt
-    should error out over."""
+    auth_gate.py's loopback-only GET /internal/mfa_log_lookup.
+
+    Returns the event dict, or None when the gate answered "no matching
+    event". Raises engine.MfaLookupUnavailable when it could not ask at all
+    (secret not configured, gate unreachable, timeout, non-200, bad body)
+    -- ENG1-05 follow-up: those used to look identical to "not found", so a
+    gate outage or a few quick Refresh clicks would use up an entry's
+    lookup attempts for good. The backfill still never errors out over it:
+    it stops and keeps what it already found."""
     if not INTERNAL_API_SHARED_SECRET:
-        return None
+        raise engine.MfaLookupUnavailable("INTERNAL_API_SHARED_SECRET is not configured")
     params = urlencode({"sub": actor_sub, "near": near_iso_timestamp})
     url = f"{AUTH_GATE_INTERNAL_URL}/internal/mfa_log_lookup?{params}"
     req = urllib.request.Request(url, headers={"X-Internal-Secret": INTERNAL_API_SHARED_SECRET})
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
-            return json.loads(r.read())
-    except (urllib.error.HTTPError, urllib.error.URLError, ValueError):
-        return None
+            result = json.loads(r.read())
+    except urllib.error.HTTPError as exc:
+        if 400 <= exc.code < 500 and exc.code not in (401, 403, 404):
+            # The gate refused THIS entry's parameters -- skip it (counted),
+            # don't stop the run for every other entry.
+            raise engine.MfaLookupEntryRejected(f"HTTP {exc.code}") from exc
+        raise engine.MfaLookupUnavailable(f"HTTP {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        raise engine.MfaLookupUnavailable(f"{type(exc).__name__}: {exc}") from exc
+    return result if isinstance(result, dict) else None
 
 
-def _drop_sessions_for_environment(environment_id, except_owner=None):
+def _drop_sessions_for_environment(environment_id, except_owner=None, reactivate=False):
     """ENG1-06 (external review, 2026-10-05): "unshare", admin edit and
     delete used to leave every OTHER owner's already-activated session on
     that environment alive -- its cached OpaClient (key id/secret and a
@@ -295,10 +343,18 @@ def _drop_sessions_for_environment(environment_id, except_owner=None):
     process restarted, so withdrawing access took effect only at the next
     deploy. Drops every session whose env_id matches; those owners get the
     ordinary "No active environment" 409 on their next call and must
-    activate something they are still allowed to see."""
+    activate something they are still allowed to see.
+
+    reactivate=True (an EDIT, not a withdrawal -- 5.40.3) also forgets that
+    those owners were seen this process, so their next request re-runs
+    _try_activate_saved_environment: exactly what a restart would do. It
+    re-resolves visibility and credentials from storage, so they reconnect
+    with the new credentials (or get the 409 if no longer allowed)."""
     with _sessions_lock:
         for key in [k for k, s in _sessions.items() if s.get("env_id") == environment_id and k != except_owner]:
             _sessions.pop(key, None)
+            if reactivate:
+                _seen_owners.discard(key)
 
 
 def _ingest_running(environment_id):
@@ -358,6 +414,21 @@ def _access_job_progress(storage_name):
     return _progress
 
 
+def _job_error_message(exc):
+    """SRV-03 for background jobs (their error is returned by the status
+    routes): an upstream OPA/Okta error or a deliberate ValueError (e.g. the
+    DATA-03 "unusable watermark" message) is the user's own, actionable
+    information and is kept; anything else is replaced by a generic message
+    with the job's correlation id, and the detail is logged."""
+    if isinstance(exc, (engine.OpaApiError, engine.OktaApiError, ValueError)) and not isinstance(
+        exc, (UnicodeError, json.JSONDecodeError)  # these quote fragments of the input they choked on
+    ):
+        return str(exc)
+    correlation_id = engine.CORRELATION_ID.get()
+    engine.log("ERROR", f"Background job failed with {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+    return f"Internal error (reference {correlation_id}). The details are in the server log."
+
+
 def _run_access_job(storage_name, job_client, job_okta_client, correlation_id=None):
     # A new thread does NOT inherit the parent thread's contextvars, so
     # the triggering request's own id (if any) has to be set again here
@@ -373,7 +444,7 @@ def _run_access_job(storage_name, job_client, job_okta_client, correlation_id=No
     except Exception as exc:
         with _access_jobs_lock:
             _access_jobs[storage_name]["status"] = "error"
-            _access_jobs[storage_name]["error"] = str(exc)
+            _access_jobs[storage_name]["error"] = _job_error_message(exc)
 
 
 # Compliance-reporting daily sync job -- one job per environment (not a
@@ -496,7 +567,7 @@ def _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, trigger
     except Exception as exc:
         with _sync_jobs_lock:
             _sync_jobs[storage_name]["status"] = "error"
-            _sync_jobs[storage_name]["error"] = str(exc)
+            _sync_jobs[storage_name]["error"] = _job_error_message(exc)
         engine.log_audit_event(
             actor_email, actor_sub, f"{action_prefix}_failed", {"name": env_name, "error": str(exc)},
             client_ip=client_ip, user_agent=user_agent,
@@ -737,7 +808,7 @@ def _public_entry(environment_id, name, meta, requesting_owner):
     }
 
 
-def activate_environment(owner_key, name):
+def activate_environment(owner_key, name, environment_id=None):
     """Loads `name` (visible to this owner) from the encrypted store,
     authenticates to OPA, and (if Okta credentials are present) to Okta
     too. On success stores the new client/okta_client/env_name/env_id in
@@ -748,9 +819,17 @@ def activate_environment(owner_key, name):
     `creds["environment_id"]` (get_environment_credentials already
     returns it, since it reads straight from the stored record) -- every
     downstream route reads it back out of the session via
-    _session_snapshot instead of recomputing it per-request."""
+    _session_snapshot instead of recomputing it per-request.
+
+    environment_id (5.40.3): restore exactly that environment (own or
+    shared, re-checked here) rather than whatever `name` resolves to now --
+    used when re-activating a saved session, where the pointer IS an id."""
     engine_owner = _engine_owner(owner_key)
-    creds = engine.get_environment_credentials(name, owner=engine_owner)  # raises KeyError if unknown/not visible
+    if environment_id is not None:
+        creds = engine.get_environment_credentials_by_id(environment_id, owner=engine_owner)
+        name = creds["name"]
+    else:
+        creds = engine.get_environment_credentials(name, owner=engine_owner)  # raises KeyError if unknown/not visible
 
     new_client = engine.OpaClient(creds["base_domain"], creds["team_name"], creds["key_id"], creds["key_secret"])
     new_okta_client = None
@@ -763,7 +842,9 @@ def activate_environment(owner_key, name):
             "env_name": name, "env_id": creds["environment_id"],
         }
 
-    engine.set_active_environment(engine_owner, name)
+    if environment_id is None:
+        # (by id, the pointer already names exactly this environment)
+        engine.set_active_environment(engine_owner, name)
     engine.log("INFO", f"Activated environment '{name}' ({creds['base_domain']}) for owner '{owner_key}'.")
 
 
@@ -786,11 +867,72 @@ def _plan_dict(ordered_paths, existing, collisions):
 
 def _safe_csv_path(filename):
     """Only allow a bare filename ending in .csv, resolved inside PROJECT_ROOT
-    (no path traversal via '..' or absolute paths)."""
-    name = os.path.basename((filename or "").strip())
-    if not name or not name.lower().endswith(".csv"):
+    (no path traversal via '..' or absolute paths). A name containing a path
+    separator is refused outright (5.40.3) rather than silently reduced to
+    its basename -- "../x.csv" used to quietly mean "x.csv"."""
+    raw = (filename or "").strip() if isinstance(filename, str) else ""
+    name = os.path.basename(raw)
+    if not name or name != raw or "\\" in raw or not name.lower().endswith(".csv"):
         raise ValueError("filename must be a bare name ending in .csv")
     return PROJECT_ROOT / name
+
+
+# SRV-06 (external review, 2026-10-05): POST /api/csv could create or
+# overwrite ANY bare *.csv in the project root -- including an Okta System
+# Log export waiting to be imported via /sync/import_csv, or a
+# folders_result_*.csv execution record. Writes are now limited to
+# folder-template files: a conservative name, never a result file, and an
+# existing file is only overwritten if it already is a folder template
+# (header path,description). New files are capped in number so an
+# authenticated caller can't fill the disk one 5 MB body at a time.
+# ASCII-only and case-sensitive on purpose: re.IGNORECASE would also accept
+# Unicode look-alikes (U+017F matches "s"), slipping past the result-file
+# prefix check, and a ".CSV" name would escape the case-sensitive
+# "*.csv" listing (and the file cap) on Linux.
+_CSV_WRITE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._() -]{0,120}\.csv$", re.ASCII)
+_CSV_RESULT_PREFIX = "folders_result_"
+FOLDER_TEMPLATE_FIELDS = ["path", "description"]
+MAX_PROJECT_CSV_FILES = 500
+
+
+def _writable_template_csv_path(filename):
+    """Resolves a POST /api/csv target, raising ValueError (-> 400) for a
+    bad name and _CsvWriteRefused (-> 409) for a file that must not be
+    overwritten."""
+    csv_path = _safe_csv_path(filename)
+    name = csv_path.name
+    if not _CSV_WRITE_NAME_RE.match(name):
+        raise ValueError("filename may only use ASCII letters, digits, spaces and . _ ( ) - and must end in lower-case .csv")
+    if name.casefold().startswith(_CSV_RESULT_PREFIX):
+        raise _CsvWriteRefused(f"{name} is an execution result record and can't be overwritten -- save under another name.")
+    if csv_path.exists() and csv_path.stat().st_size > 0:
+        try:
+            with open(csv_path, newline="", encoding="utf-8-sig") as f:
+                header = next(_csv.reader(f), None)
+        except (OSError, UnicodeDecodeError, _csv.Error):
+            header = None
+        if [h.strip().lower() for h in (header or [])] != FOLDER_TEMPLATE_FIELDS:
+            raise _CsvWriteRefused(f"{name} exists and is not a folder-template CSV (path,description) -- "
+                                   "save under another name.")
+    elif _count_template_csv_files() >= MAX_PROJECT_CSV_FILES:
+        raise _CsvWriteRefused(f"Too many CSV files in the project folder (limit {MAX_PROJECT_CSV_FILES}) -- "
+                               "remove some or overwrite an existing template.")
+    return csv_path
+
+
+def _count_template_csv_files():
+    """CSV files in the project root that count toward the cap: any case of
+    the .csv extension, excluding /api/execute's own folders_result_* records
+    (which must never block saving a template)."""
+    try:
+        names = os.listdir(PROJECT_ROOT)
+    except OSError:
+        return 0
+    return sum(1 for n in names if n.casefold().endswith(".csv") and not n.casefold().startswith(_CSV_RESULT_PREFIX))
+
+
+class _CsvWriteRefused(Exception):
+    """POST /api/csv target exists but must not be overwritten (409)."""
 
 
 def _run_pipeline(active_client, rows, resource_group_id, project_id):
@@ -809,6 +951,14 @@ def _run_pipeline(active_client, rows, resource_group_id, project_id):
     collisions = engine.detect_name_collisions(ordered_paths)
     existing = engine.resolve_existing_folders(active_client, resource_group_id, project_id, ordered_paths)
     return ordered_paths, descriptions, existing, collisions, invalid_names
+
+
+def _validate_ids(**ids):
+    """ENG2-16: every id that ends up inside an OPA URL path or an Okta
+    filter is checked once at the route layer (ValueError -> 400). The
+    client also percent-quotes ids (engine._path_id) as a second layer."""
+    for label, value in ids.items():
+        engine.validate_resource_id(value, label)
 
 
 def _require_client(send_json, active_client):
@@ -902,6 +1052,21 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_internal_error(self, exc):
+        """SRV-03 (external review, 2026-10-05): an unexpected exception used
+        to be returned verbatim (`str(exc)` -- filesystem paths, SQLite
+        errors, KeyError internals) to any authenticated caller. The detail
+        (with traceback) now goes to the server log only; the response
+        carries a generic message plus the request's correlation id, which
+        is on every log line for this request, so an operator can find it."""
+        correlation_id = engine.CORRELATION_ID.get()
+        engine.log("ERROR", f"Unhandled {type(exc).__name__} in {self.command} {urlparse(self.path).path}: "
+                            f"{exc}\n{traceback.format_exc()}")
+        return self._send_json(500, {
+            "error": f"Internal server error (reference {correlation_id}). The details are in the server log.",
+            "correlation_id": correlation_id,
+        })
+
     def _allowed_origins(self):
         port = self.server.server_address[1]
         return {DEV_FRONTEND_ORIGIN, f"http://127.0.0.1:{port}", f"http://localhost:{port}"} | EXTRA_ALLOWED_ORIGINS
@@ -955,7 +1120,24 @@ class Handler(SimpleHTTPRequestHandler):
             self.close_connection = True
             raise _RequestAborted()
         raw = self.rfile.read(length) if length else b""
-        return json.loads(raw.decode("utf-8")) if raw else {}
+        body = json.loads(raw.decode("utf-8")) if raw else {}
+        if not isinstance(body, dict):
+            # A JSON array/string/number body used to surface as a 500
+            # ("'list' object has no attribute 'get'") -- TEST-08's probe.
+            raise ValueError("Request body must be a JSON object.")
+        return body
+
+    # -----------------------------------------------------------------
+    def do_HEAD(self):
+        """Inherited from SimpleHTTPRequestHandler it served static-file
+        metadata with no hosted-mode check at all (5.40.3 review). Same
+        guard as every other method; a refusal has no body (HEAD)."""
+        if _hosted_request_unauthenticated(self.headers, urlparse(self.path).path):
+            self.send_response(401)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        super().do_HEAD()
 
     # -----------------------------------------------------------------
     def do_GET(self):
@@ -1004,13 +1186,17 @@ class Handler(SimpleHTTPRequestHandler):
                         engine.get_environment_credentials(local_env_name, owner=engine_owner)
                     checks["active_environment_credentials"] = "ok"
                 except Exception as exc:
-                    checks["active_environment_credentials"] = f"error: {exc}"
+                    # SRV-03: /healthz is unauthenticated -- the detail goes
+                    # to the log, never into the response.
+                    engine.log("WARN", f"healthz: active environment credentials check failed: {exc}")
+                    checks["active_environment_credentials"] = "error"
                 try:
                     import audit_store
                     audit_store._get_connection().execute("SELECT 1")
                     checks["archive_writable"] = "ok"
                 except Exception as exc:
-                    checks["archive_writable"] = f"error: {exc}"
+                    engine.log("WARN", f"healthz: archive check failed: {exc}")
+                    checks["archive_writable"] = "error"
                 status = "ok" if all(v == "ok" for v in checks.values()) else "degraded"
                 return self._send_json(200, {"status": status, "version": engine.SCRIPT_VERSION, "checks": checks})
 
@@ -1024,7 +1210,16 @@ class Handler(SimpleHTTPRequestHandler):
                 # out" of that, so the frontend can hide the control instead
                 # of showing one that does nothing.
                 email = self.headers.get("X-Auth-User")
-                return self._send_json(200, {"email": email, "is_local": email is None, "is_admin": _is_admin_from_headers(self.headers)})
+                # can_admin (UI-06, external review 2026-10-05): what the
+                # admin-only routes will actually allow THIS caller -- a
+                # local-mode operator is exempt server-side (see _can_admin)
+                # but is_admin is False there, so the UI used to hide the
+                # Audit Log and banner settings the server would serve.
+                return self._send_json(200, {
+                    "email": email, "is_local": email is None,
+                    "is_admin": _is_admin_from_headers(self.headers),
+                    "can_admin": _can_admin(owner_key, self.headers),
+                })
 
             if path == "/api/environments":
                 is_admin = _is_admin_from_headers(self.headers)
@@ -1084,7 +1279,7 @@ class Handler(SimpleHTTPRequestHandler):
                 # audit_store.verify_ingestion_chain's docstring).
                 name = unquote(path[len("/api/environments/"):-len("/integrity")])
                 deep = (qs.get("deep") or ["0"])[0] in ("1", "true")  # DATA-04: also re-hash sealed curated events
-                if deep and owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers(self.headers):
+                if deep and not _can_admin(owner_key, self.headers):
                     # Deep mode re-reads every sealed event (one SELECT per
                     # row) inside the request -- an admin-only cost.
                     return self._send_json(403, {"error": "Admin access required for a deep integrity check."})
@@ -1098,7 +1293,7 @@ class Handler(SimpleHTTPRequestHandler):
                 # DATA-12: archives whose environment no longer exists.
                 # Admin-only read (local mode exempt), same rule as
                 # /api/audit_log -- these rows belong to no owner any more.
-                if owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers(self.headers):
+                if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to list orphaned archives."})
                 import audit_store
                 return self._send_json(200, {"archives": audit_store.list_orphaned_archives()})
@@ -1196,6 +1391,7 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 if not connection_id:
                     return self._send_json(400, {"error": "missing connection_id"})
+                engine.validate_resource_id(connection_id, "connection_id")
                 return self._send_json(200, engine.get_ad_connection_discovery_config(local_client, connection_id))
 
             if path == "/api/resource_groups":
@@ -1209,6 +1405,7 @@ class Handler(SimpleHTTPRequestHandler):
                 rg_id = path[len("/api/resource_groups/"):-len("/projects")]
                 if not rg_id:
                     return self._send_json(400, {"error": "missing resource_group_id"})
+                engine.validate_resource_id(rg_id, "resource_group_id")
                 return self._send_json(200, {"projects": local_client.list_projects(rg_id)})
 
             if path == "/api/groups":
@@ -1225,6 +1422,7 @@ class Handler(SimpleHTTPRequestHandler):
                 rg_id, _, proj_id = inner.partition("/projects/")
                 if not rg_id or not proj_id:
                     return self._send_json(400, {"error": "missing resource_group_id or project_id"})
+                _validate_ids(resource_group_id=rg_id, project_id=proj_id)
                 # The plain folders list is top-level only (see engine docstring
                 # fact #2) -- walk the full tree via fetch_all_folders() and
                 # rebuild each folder's "Root/Child/.../Leaf" path from its
@@ -1248,6 +1446,7 @@ class Handler(SimpleHTTPRequestHandler):
                 rg_id, _, proj_id = inner.partition("/projects/")
                 if not rg_id or not proj_id:
                     return self._send_json(400, {"error": "missing resource_group_id or project_id"})
+                _validate_ids(resource_group_id=rg_id, project_id=proj_id)
                 # Phase 5 of the compliance-reporting-dashboard plan: once an
                 # environment has a real compliance-sync archive (audit_store.py),
                 # this report is sourced from THAT instead of a bounded live
@@ -1342,6 +1541,7 @@ class Handler(SimpleHTTPRequestHandler):
                 rg_id = path[len("/api/resource_groups/"):-len("/security_policies")]
                 if not rg_id:
                     return self._send_json(400, {"error": "missing resource_group_id"})
+                engine.validate_resource_id(rg_id, "resource_group_id")
                 policies = [
                     engine.summarize_security_policy(p)
                     for p in local_client.list_security_policies()
@@ -1418,7 +1618,7 @@ class Handler(SimpleHTTPRequestHandler):
                 # /api/environments admin branch above), so it gets the
                 # same access here rather than being permanently locked
                 # out of its own audit log.
-                if owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers(self.headers):
+                if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to view the audit log."})
                 try:
                     limit = min(int((qs.get("limit") or [200])[0]), 1000)
@@ -1433,7 +1633,7 @@ class Handler(SimpleHTTPRequestHandler):
                 # Okta group IDs that gate login/admin rights for EVERY
                 # user, not a per-owner setting, so a non-admin has no
                 # legitimate reason to see (let alone change) them.
-                if owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers(self.headers):
+                if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to view access control settings."})
                 return self._send_json(200, engine.get_access_control_config())
         except ValueError as exc:
@@ -1441,7 +1641,7 @@ class Handler(SimpleHTTPRequestHandler):
         except (engine.OpaApiError, engine.OktaApiError) as exc:
             return self._send_json(502, {"error": str(exc)})
         except Exception as exc:
-            return self._send_json(500, {"error": str(exc)})
+            return self._send_internal_error(exc)
 
         super().do_GET()
 
@@ -1475,7 +1675,7 @@ class Handler(SimpleHTTPRequestHandler):
                 # authenticated user could publish/modify/disable the
                 # org-wide announcement banner. Same check every other
                 # admin-only write in this file already uses.
-                if owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers(self.headers):
+                if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to change the announcement banner."})
                 config = engine.set_banner_config(
                     payload.get("enabled", False),
@@ -1496,7 +1696,7 @@ class Handler(SimpleHTTPRequestHandler):
                 # below -- preparing a change an admin isn't allowed to
                 # make at all shouldn't even reach the point of minting a
                 # pending action for it.
-                if owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers(self.headers):
+                if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to change access control settings."})
                 import audit_store
                 config = engine.validate_access_control_config(
@@ -1519,7 +1719,7 @@ class Handler(SimpleHTTPRequestHandler):
                 # no nginx-level admin gate of its own). A direct/local run
                 # (no login gate in front at all) is exempt, same as
                 # /api/audit_log and GET /api/access_control above.
-                if owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers(self.headers):
+                if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to change access control settings."})
                 # Phase 3 FIX (real gap, confirmed via code review before
                 # this change): previously trusted the LIVE request body
@@ -1590,21 +1790,55 @@ class Handler(SimpleHTTPRequestHandler):
                 # access_control.update entry's corroboration was still
                 # missing at save time, even though the real event existed
                 # in Okta moments later).
-                if owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers(self.headers):
+                if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to refresh MFA log corroboration."})
-                updated_count = engine.backfill_mfa_log_events(_lookup_mfa_log_event)
+                try:
+                    updated_count = engine.backfill_mfa_log_events(_lookup_mfa_log_event)
+                except engine.MfaBackfillBusy as exc:
+                    return self._send_json(409, {"error": f"{exc} Try again in a moment.", "reason": "busy"})
                 return self._send_json(200, {"updated_count": updated_count})
 
             if path == "/api/environments":
                 is_admin = _is_admin_from_headers(self.headers)
+                ids_before = set(engine.list_all_environments())
                 try:
-                    name, _upserted_id = engine.upsert_environment(
+                    name, upserted_id = engine.upsert_environment(
                         payload.get("name"), payload, owner=engine_owner, is_admin=is_admin,
                         environment_id=payload.get("id"),
                     )
                 except PermissionError as exc:
                     return self._send_json(403, {"error": str(exc)})
-                self._log_audit_event(actor_email, actor_sub, "environment.upsert", {"name": name, "admin_override": is_admin})
+                target_meta = engine.list_all_environments().get(upserted_id) or {}
+                caller_owns_target = target_meta.get("owner") == engine_owner
+                self._log_audit_event(actor_email, actor_sub, "environment.upsert", {
+                    "name": name, "admin_override": is_admin,
+                    # Whose environment was written -- an admin editing
+                    # someone else's credentials is now explicit in the log.
+                    "environment_id": upserted_id, "edited_other_owner": not caller_owns_target,
+                })
+                # ENG1-06 (external review, 2026-10-05): every OTHER owner's
+                # live session on this environment still holds a client built
+                # from the OLD credentials (able to re-mint tokens on 401).
+                # Drop them and let each owner's next request re-run the
+                # normal saved-environment auto-activation, which re-checks
+                # visibility and builds a client from what is stored now.
+                if upserted_id in ids_before:
+                    # The caller's own session is kept only when it is about to
+                    # be rebuilt below (they own the target); an admin editing
+                    # someone else's environment loses a stale session on it
+                    # like everyone else and re-activates with the new values.
+                    _drop_sessions_for_environment(
+                        upserted_id, except_owner=owner_key if caller_owns_target else None, reactivate=True,
+                    )
+                if not caller_owns_target:
+                    # An admin edited ANOTHER owner's environment by id. It
+                    # was saved; it is not the admin's to activate (by name
+                    # it would resolve to the admin's own same-named
+                    # environment, or not at all -- this used to 500 with a
+                    # KeyError after a successful save).
+                    return self._send_json(200, {"saved": True, "activated": False, "active": _local_env_name})
+                # The caller's own environment: (re)activate it, so their own
+                # session also picks up the new credentials.
                 try:
                     activate_environment(owner_key, name)
                 except engine.OpaApiError as exc:
@@ -1804,6 +2038,7 @@ class Handler(SimpleHTTPRequestHandler):
                 name = (payload.get("name") or "").strip()
                 if not rg_id or not name:
                     return self._send_json(400, {"error": "resource_group_id (in URL) and name are required"})
+                engine.validate_resource_id(rg_id, "resource_group_id")
                 created = local_client.create_project(rg_id, name)
                 self._log_audit_event(actor_email, actor_sub, "project.create", {
                     "env_name": _local_env_name, "resource_group_id": rg_id, "name": name, "project_id": created.get("id"),
@@ -1820,6 +2055,7 @@ class Handler(SimpleHTTPRequestHandler):
                 folder_id = folder_part.rstrip("/")
                 if not rg_id or not proj_id or not folder_id:
                     return self._send_json(400, {"error": "missing resource_group_id, project_id, or folder_id"})
+                _validate_ids(resource_group_id=rg_id, project_id=proj_id, folder_id=folder_id)
 
                 mode = payload.get("mode")
                 folder_name = payload.get("folder_name", "")
@@ -1854,6 +2090,7 @@ class Handler(SimpleHTTPRequestHandler):
                     policy_id = payload.get("policy_id")
                     if not policy_id:
                         return self._send_json(400, {"error": "policy_id is required to attach to an existing policy"})
+                    engine.validate_resource_id(policy_id, "policy_id")
                     current = local_client.get_security_policy(policy_id)
                     current["principals"] = engine.merge_principals(current.get("principals"), group_refs, workload_role_refs)
                     # UI-01: a rule whose selector already names more than
@@ -1957,13 +2194,25 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_json(200, {"added": True, "group_id": group_id})
 
             if path == "/api/csv":
-                csv_path = _safe_csv_path(payload.get("file"))
+                try:
+                    csv_path = _writable_template_csv_path(payload.get("file"))
+                except _CsvWriteRefused as exc:
+                    return self._send_json(409, {"error": str(exc)})
                 rows = payload.get("rows") or []
-                with open(csv_path, "w", newline="", encoding="utf-8") as f:
-                    writer = _csv.DictWriter(f, fieldnames=["path", "description"])
-                    writer.writeheader()
-                    for row in rows:
-                        writer.writerow({"path": row.get("path", ""), "description": row.get("description", "")})
+                if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+                    return self._send_json(400, {"error": "rows must be a list of objects"})
+                buf = io.StringIO()
+                writer = _csv.DictWriter(buf, fieldnames=FOLDER_TEMPLATE_FIELDS)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({"path": row.get("path", ""), "description": row.get("description", "")})
+                # Atomic (temp file + os.replace): a crash mid-save can't
+                # leave a truncated template behind.
+                try:
+                    mode = csv_path.stat().st_mode & 0o777  # keep an existing template's permissions
+                except OSError:
+                    mode = 0o600
+                engine._atomic_write_text(str(csv_path), buf.getvalue(), mode=mode)
                 engine.log("INFO", f"Saved {len(rows)} row(s) to {csv_path.name}")
                 self._log_audit_event(actor_email, actor_sub, "csv.save", {
                     "file": csv_path.name, "row_count": len(rows),
@@ -1977,6 +2226,7 @@ class Handler(SimpleHTTPRequestHandler):
                 proj_id = payload.get("project_id")
                 if not rg_id or not proj_id:
                     return self._send_json(400, {"error": "resource_group_id and project_id are required"})
+                _validate_ids(resource_group_id=rg_id, project_id=proj_id)
                 ordered_paths, _descriptions, existing, collisions, invalid_names = _run_pipeline(
                     local_client, payload.get("rows") or [], rg_id, proj_id
                 )
@@ -1991,6 +2241,7 @@ class Handler(SimpleHTTPRequestHandler):
                 proj_id = payload.get("project_id")
                 if not rg_id or not proj_id:
                     return self._send_json(400, {"error": "resource_group_id and project_id are required"})
+                _validate_ids(resource_group_id=rg_id, project_id=proj_id)
                 ordered_paths, descriptions, existing, collisions, invalid_names = _run_pipeline(
                     local_client, payload.get("rows") or [], rg_id, proj_id
                 )
@@ -2042,7 +2293,7 @@ class Handler(SimpleHTTPRequestHandler):
         except (engine.OpaApiError, engine.OktaApiError) as exc:
             return self._send_json(502, {"error": str(exc)})
         except Exception as exc:
-            return self._send_json(500, {"error": str(exc)})
+            return self._send_internal_error(exc)
 
     # -----------------------------------------------------------------
     def do_DELETE(self):
@@ -2072,7 +2323,7 @@ class Handler(SimpleHTTPRequestHandler):
                 # exempt, same rule as /api/audit_log) -- this destroys
                 # evidence, so it is never a per-owner action, and it is
                 # audit-logged with the per-table counts.
-                if owner_key != LOCAL_OWNER_KEY_HEADER and not _is_admin_from_headers(self.headers):
+                if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to purge an orphaned archive."})
                 import audit_store
                 archive_id = unquote(path[len("/api/archives/"):]).rstrip("/")
@@ -2102,7 +2353,7 @@ class Handler(SimpleHTTPRequestHandler):
                 # may report from (a shared environment's archive is
                 # everyone's evidence).
                 purge_archive = (qs.get("purge_archive") or ["0"])[0] in ("1", "true")
-                if purge_archive and owner_key != LOCAL_OWNER_KEY_HEADER and not is_admin:
+                if purge_archive and not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to delete an environment's compliance archive; delete without purge_archive to keep it."})
                 try:
                     result = engine.delete_environment(
@@ -2141,6 +2392,7 @@ class Handler(SimpleHTTPRequestHandler):
                 folder_id = folder_id.rstrip("/")
                 if not rg_id or not proj_id or not folder_id:
                     return self._send_json(400, {"error": "missing resource_group_id, project_id, or folder_id"})
+                _validate_ids(resource_group_id=rg_id, project_id=proj_id, folder_id=folder_id)
                 # The raw API gives no cascade guarantee for a non-empty
                 # folder (see engine delete_folder docstring), so this
                 # dashboard refuses to delete one rather than risk
@@ -2176,12 +2428,15 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_json(200, {"removed": True, "group_id": group_id, "user_name": user_name})
 
             return self._send_json(404, {"error": "not found"})
-        except KeyError as exc:
-            return self._send_json(404, {"error": str(exc)})
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        # (no blanket KeyError -> 404 here any more: the routes catch the
+        # engine's deliberate not-found KeyErrors themselves; an internal
+        # KeyError is a 500 like any other bug -- SRV-03.)
         except (engine.OpaApiError, engine.OktaApiError) as exc:
             return self._send_json(502, {"error": str(exc)})
         except Exception as exc:
-            return self._send_json(500, {"error": str(exc)})
+            return self._send_internal_error(exc)
 
 
 def _try_activate_saved_environment(owner_key):
@@ -2194,13 +2449,21 @@ def _try_activate_saved_environment(owner_key):
     environment boot behavior exactly) and lazily, the first time any given
     logged-in owner is ever seen by a request in this process."""
     engine_owner = _engine_owner(owner_key)
-    name = engine.get_active_environment_name(engine_owner)
-    if not name:
-        return
+    # By id (5.40.3): the pointer stores an environment_id; turning it back
+    # into a display name and resolving that could pick a different
+    # same-named environment (after a rename, or one the owner owns
+    # shadowing one shared with them). Visibility is re-checked by id.
+    # The shared rule (engine.restorable_active_environment_credentials)
+    # also refuses an id whose name now resolves to a different environment
+    # for this owner -- the UI and every name-keyed route would otherwise
+    # point at a different tenant than the session client.
     try:
-        activate_environment(owner_key, name)
+        creds = engine.restorable_active_environment_credentials(engine_owner)
+        if creds is None:
+            return
+        activate_environment(owner_key, None, environment_id=creds["environment_id"])
     except Exception as exc:
-        engine.log("WARN", f"Could not auto-activate saved environment '{name}' for owner '{owner_key}': {exc}")
+        engine.log("WARN", f"Could not auto-activate the saved environment for owner '{owner_key}': {exc}")
 
 
 def _ensure_session_initialized(owner_key):

@@ -1316,16 +1316,34 @@ def create_pending_admin_action(actor_sub, action_type, payload, ttl_seconds):
     payload_json = json.dumps(payload, separators=(",", ":"))
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     payload_hash = hashlib.sha256(canonical.encode()).hexdigest()
+    now_iso = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    # Rows are swept an hour AFTER they expire, so an admin returning late
+    # from the step-up redirect still gets the accurate "expired", not
+    # "not_found".
+    sweep_before = (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     with _db_lock:
-        conn.execute(
-            """INSERT INTO pending_admin_actions
-               (action_id, actor_sub, action_type, payload_json, payload_hash, created_at, expires_at, consumed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, NULL)""",
-            (action_id, actor_sub, action_type, payload_json, payload_hash,
-             now.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-             (now + timedelta(seconds=ttl_seconds)).strftime("%Y-%m-%dT%H:%M:%S.000Z")),
-        )
-        conn.commit()
+        try:
+            # SRV-05 (external review, 2026-10-05): the expired-and-abandoned
+            # sweep used to run only at process start, so between restarts
+            # every prepare added a row with no runtime bound. Swept here,
+            # in the same transaction (index-served by
+            # idx_pending_admin_actions_expires), so the table only ever
+            # holds actions that are still claimable or already consumed.
+            conn.execute(
+                "DELETE FROM pending_admin_actions WHERE expires_at < ? AND consumed_at IS NULL",
+                (sweep_before,),
+            )
+            conn.execute(
+                """INSERT INTO pending_admin_actions
+                   (action_id, actor_sub, action_type, payload_json, payload_hash, created_at, expires_at, consumed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, NULL)""",
+                (action_id, actor_sub, action_type, payload_json, payload_hash, now_iso,
+                 (now + timedelta(seconds=ttl_seconds)).strftime("%Y-%m-%dT%H:%M:%S.000Z")),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     return action_id
 
 

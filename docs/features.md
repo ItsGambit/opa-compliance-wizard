@@ -161,7 +161,8 @@ shared server — for onboarding, cleanup, or troubleshooting another
 admin's stuck sync — membership in a designated **Okta group** grants
 full admin rights: every environment becomes visible and editable, not
 just your own or shared ones, and a new **Audit Log** panel (sidebar,
-admin-only) shows every write action ever taken, by whom, across every
+admin-only in hosted mode; always shown to the single operator of a
+local run, which has no login gate) shows every write action ever taken, by whom, across every
 user and environment — sourced from the same `audit_log.jsonl` this
 tool has always written, just newly given a UI. See
 `OKTA_ADMIN_GROUP_ID` in [Hosting on a server](hosting.md#hosting-on-a-server-optional)

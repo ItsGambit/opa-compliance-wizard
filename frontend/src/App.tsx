@@ -19,6 +19,7 @@ import { SecretsAccessDashboard } from './components/SecretsAccessDashboard'
 import { ServiceAccountsDashboard } from './components/ServiceAccountsDashboard'
 import { REPORTS_SUB_TABS, SideNav } from './components/SideNav'
 import { UserMenu } from './components/UserMenu'
+import { canAdminFrom } from './utils/whoami'
 
 // Every navigable view is a hash route (see utils/route.ts) so the browser
 // keeps a history entry per in-app navigation -- the mouse back button on
@@ -41,6 +42,9 @@ export default function App() {
   const [aboutOpen, setAboutOpen] = useState(false)
   const { data: environments, isLoading: environmentsLoading } = useEnvironments()
   const { data: whoami } = useWhoami()
+  // UI-06: the Audit Log and banner settings follow what the server will
+  // actually serve this caller (verified admin, or a local-mode operator).
+  const canAdmin = canAdminFrom(whoami)
   const isConfigured = !!environments?.active
   const queryClient = useQueryClient()
 
@@ -119,6 +123,7 @@ export default function App() {
           onReportsSubTabChange={setReportsSubTab}
           onOpenEnvironments={() => setEnvironmentsOpen(true)}
           isAdmin={whoami?.is_admin}
+          canAdmin={canAdmin}
           onOpenBanner={() => setBannerOpen(true)}
           onOpenAccessControl={() => setAccessControlOpen(true)}
           onOpenAbout={() => setAboutOpen(true)}
@@ -165,7 +170,7 @@ export default function App() {
           {activeTab === 'reports' && reportsSubTab === 'service_accounts' && <ServiceAccountsDashboard />}
           {activeTab === 'access' && <AccessExplorer subTab={accessSubTab} />}
           {activeTab === 'builder' && <FolderBuilder />}
-          {activeTab === 'audit_log' && whoami?.is_admin && <AuditLogPage />}
+          {activeTab === 'audit_log' && canAdmin && <AuditLogPage />}
 
           <Footer />
         </main>

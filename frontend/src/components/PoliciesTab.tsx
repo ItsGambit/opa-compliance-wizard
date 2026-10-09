@@ -19,7 +19,7 @@ interface Props {
  * entry, not a browsable table. */
 function PolicyLastModified({ policyId }: { policyId: string }) {
   const { data: environments } = useEnvironments()
-  const activeEnv = environments?.active
+  const activeEnv = environments?.active ?? undefined  // null (no active env) -> undefined, which the hooks treat as "disabled"
   const { data, isLoading } = useResourceHistory(policyId, activeEnv)
   const latest = data?.rows.find(r => r.event_type === 'pam.security_policy.create' || r.event_type === 'pam.security_policy.update')
   if (isLoading) return null

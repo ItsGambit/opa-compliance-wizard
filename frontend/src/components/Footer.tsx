@@ -21,7 +21,7 @@ const REPO_CHANGELOG_URL = 'https://github.com/ItsGambit/opa-compliance-wizard/b
 export function Footer() {
   const { data: version } = useVersion()
   const { data: environments } = useEnvironments()
-  const activeEnv = environments?.active
+  const activeEnv = environments?.active ?? undefined  // null (no active env) -> undefined, which the hooks treat as "disabled"
   const { data: syncStatus } = useSyncStatus(activeEnv)
   const queryClient = useQueryClient()
 

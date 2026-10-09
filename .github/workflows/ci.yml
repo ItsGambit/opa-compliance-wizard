@@ -59,10 +59,13 @@ jobs:
         with:
           node-version: "24"
       - run: npm ci
-      - run: npx tsc --noEmit
+      # `tsc -b`, not `tsc --noEmit`: the root tsconfig.json is a solution
+      # file with "files": [] and only references, so a plain `tsc --noEmit`
+      # type-checked ZERO files and always passed (OPS-04). Build mode
+      # checks both referenced projects (app + node), which carry noEmit
+      # themselves; its pre-existing errors were fixed in 5.40.3.
+      - run: npx tsc -b
       - run: npm test
       # Matches server/deploy.sh's own exact build invocation (npx vite
-      # build directly, not `npm run build`'s stricter `tsc -b` chain --
-      # that stricter mode has pre-existing, unrelated type errors not
-      # yet cleaned up, so CI mirrors what actually gets deployed).
+      # build directly) -- the type check above runs separately.
       - run: npx vite build

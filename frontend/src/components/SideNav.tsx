@@ -94,6 +94,11 @@ interface Props {
   // these are the Okta group IDs that control login/admin rights for
   // every user, not a cosmetic org-wide notice.
   isAdmin?: boolean
+  // UI-06: Audit Log + Announcement banner key off this (verified admin OR
+  // a local-mode operator -- the server exempts the latter, see /api/whoami's
+  // can_admin). Access Control stays on isAdmin: saving it needs the hosted
+  // step-up MFA flow, which a local run doesn't have.
+  canAdmin?: boolean
   onOpenBanner: () => void
   onOpenAccessControl: () => void
   onOpenAbout: () => void
@@ -215,6 +220,7 @@ export function SideNav({
   onReportsSubTabChange,
   onOpenEnvironments,
   isAdmin,
+  canAdmin,
   onOpenBanner,
   onOpenAccessControl,
   onOpenAbout,
@@ -336,7 +342,7 @@ export function SideNav({
             collapsed={collapsed}
           />
 
-          {isAdmin && (
+          {canAdmin && (
             <NavItem
               active={activeTab === 'audit_log'}
               label={TOP_LEVEL_LABEL.audit_log}
@@ -366,7 +372,7 @@ export function SideNav({
               non-admin here is a usability improvement, NOT the real
               enforcement boundary -- the backend check is what actually
               matters. */}
-          {isAdmin && (
+          {canAdmin && (
             <UtilityPill label="Announcement banner" icon={Megaphone} onClick={() => { onOpenBanner(); closeDrawer() }} collapsed={collapsed} />
           )}
           <UtilityPill label="About" icon={Info} onClick={() => { onOpenAbout(); closeDrawer() }} collapsed={collapsed} />

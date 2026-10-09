@@ -95,9 +95,33 @@ def test_hosted_mode_rejects_request_with_wrong_proxy_secret(monkeypatch):
 def test_hosted_mode_allows_request_with_matching_proxy_secret(monkeypatch):
     monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
     monkeypatch.setattr(serve, "NGINX_PROXY_SECRET", "real-secret")
-    handler = _FakeHandler({"X-Nginx-Proxy-Secret": "real-secret"})
+    handler = _FakeHandler({"X-Nginx-Proxy-Secret": "real-secret", "X-Auth-Sub": "00uUSER"})
     assert serve._reject_if_hosted_without_nginx(handler, "/api/audit_log") is False
     assert handler.sent is None
+
+
+def test_hosted_mode_rejects_a_proxied_request_with_no_verified_identity(monkeypatch):
+    """5.40.3 defense in depth: a request that transited nginx (correct
+    proxy secret) but carries no X-Auth-Sub would otherwise resolve to the
+    `__local__` owner. In hosted mode no real request is identity-less."""
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    monkeypatch.setattr(serve, "NGINX_PROXY_SECRET", "real-secret")
+    for headers in ({"X-Nginx-Proxy-Secret": "real-secret"}, {"X-Nginx-Proxy-Secret": "real-secret", "X-Auth-Sub": ""}):
+        handler = _FakeHandler(headers)
+        assert serve._reject_if_hosted_without_nginx(handler, "/api/audit_log") is True
+        assert handler.sent[0] == 401
+
+
+def test_can_admin_local_exemption_applies_only_in_local_mode(monkeypatch):
+    monkeypatch.setattr(serve, "NGINX_PROXY_SECRET", "real-secret")
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "local")
+    assert serve._can_admin(serve.LOCAL_OWNER_KEY_HEADER, {}) is True
+    assert serve._can_admin("00uUSER", {"X-Nginx-Proxy-Secret": "real-secret", "X-Auth-Is-Admin": "false"}) is False
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    assert serve._can_admin(serve.LOCAL_OWNER_KEY_HEADER, {}) is False
+    assert serve._can_admin("00uADMIN", {"X-Nginx-Proxy-Secret": "real-secret", "X-Auth-Is-Admin": "true"}) is True
+    # A spoofed admin header without the proxy secret is never admin.
+    assert serve._can_admin("00uADMIN", {"X-Auth-Is-Admin": "true"}) is False
 
 
 def test_hosted_mode_still_allows_healthz_with_no_proxy_secret(monkeypatch):

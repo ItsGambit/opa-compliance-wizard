@@ -43,8 +43,10 @@ export function EnvironmentManagerDialog({ data, open: openProp, onOpenChange, i
 
   const saveMutation = useMutation({
     mutationFn: (values: EnvironmentFormValues) => saveEnvironment(values),
-    onSuccess: (resp) => {
-      toast({ title: `Connected to '${resp.active}'`, variant: 'success' })
+    onSuccess: (resp, values) => {
+      toast(resp.activated
+        ? { title: `Connected to '${resp.active}'`, variant: 'success' }
+        : { title: `Saved '${values.name}'`, description: "It belongs to another user, so your active environment didn't change.", variant: 'success' })
       setEditing(null)
       invalidateAll()
     },

@@ -1,5 +1,5 @@
 import Fuse from 'fuse.js'
-import { useMemo } from 'react'
+import { useMemo, type JSX } from 'react'
 
 export interface FuzzyMatch {
   item: unknown

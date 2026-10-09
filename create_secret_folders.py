@@ -59,7 +59,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.40.2
+# Version     : 5.40.3
 # =============================================================================
 
 import argparse
@@ -80,7 +80,7 @@ import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.40.2"
+SCRIPT_VERSION = "5.40.3"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # ---------------------------------------------------------------------------
@@ -408,7 +408,15 @@ def _load_dotenv():
     this only fills in values that aren't already set). Lets the CLI and
     the dashboard server both pick up credentials without the user having
     to fuss with OS-level environment variable settings. No external
-    dependency -- this is intentionally a minimal parser, not python-dotenv."""
+    dependency -- this is intentionally a minimal parser, not python-dotenv.
+
+    OPA_WIZARD_SKIP_DOTENV=1 disables it (TEST-07, external review
+    2026-10-05): the test suite sets it so a developer's own repo-root
+    .env (e.g. DEPLOYMENT_MODE=hosted for CLI use) can never leak into
+    tests -- clearing os.environ alone doesn't help, since this function
+    re-reads the FILE."""
+    if os.environ.get("OPA_WIZARD_SKIP_DOTENV") == "1":
+        return
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     if not os.path.isfile(env_path):
         return
@@ -556,11 +564,20 @@ def _atomic_write_json(path, value, mode=0o600):
     this file genuinely doesn't need -- it's a single, infrequently
     written, admin-only config blob with nothing else to be
     cross-table-consistent with)."""
+    _atomic_write_text(path, json.dumps(value, indent=2), mode=mode)
+
+
+def _atomic_write_text(path, text, mode=0o600):
+    """The write-temp-then-os.replace mechanism behind _atomic_write_json,
+    shared with every other whole-file rewrite (the audit log's MFA
+    backfill, POST /api/csv) so none of them can leave a truncated file
+    behind on a crash, kill or full disk. `mode` is applied explicitly
+    (mkstemp's own 0600 default is not relied on)."""
     directory = os.path.dirname(path) or "."
     fd, temp_path = tempfile.mkstemp(dir=directory, prefix=".tmp-")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(value, f, indent=2)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
             f.flush()
             os.fsync(f.fileno())
         os.chmod(temp_path, mode)
@@ -1190,6 +1207,40 @@ def get_environment_credentials(name, owner=LOCAL_OWNER_KEY):
     return creds
 
 
+def get_active_environment_id(owner):
+    """The stored active pointer's environment_id for `owner` (or None) --
+    the id itself, never re-resolved through a display name."""
+    import audit_store
+    conn = audit_store._get_connection()
+    row = conn.execute(
+        "SELECT environment_id FROM active_environments WHERE owner_key = ?", (_owner_storage_key(owner),)
+    ).fetchone()
+    return row["environment_id"] if row else None
+
+
+def get_environment_credentials_by_id(environment_id, owner=LOCAL_OWNER_KEY):
+    """Like get_environment_credentials, but addressed by the real
+    environment_id instead of a display name: an environment `owner` owns,
+    or one shared by anyone. Used to restore a saved session exactly (5.40.3
+    review follow-up): re-resolving the pointer through its NAME could land
+    a user in a different, same-named environment after a rename, or when
+    their own environment shadows a shared one. Raises KeyError if the id
+    doesn't exist or isn't visible to `owner`."""
+    import audit_store
+    conn = audit_store._get_connection()
+    row = conn.execute(
+        "SELECT * FROM app_environments WHERE environment_id = ? AND (owner_id IS ? OR shared = 1)",
+        (environment_id, owner),
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"No saved environment with id '{environment_id}' visible to this user")
+    creds = _row_to_environment_meta(row)
+    for field in ENVIRONMENT_SECRET_FIELDS:
+        creds[field] = keyring_get(environment_id, field) or ""
+    creds["name"] = row["display_name"]
+    return creds
+
+
 def verify_environment_evidence_chain(name, owner=LOCAL_OWNER_KEY, deep=False):
     """Phase 6: resolves `name` to its real environment_id (same
     visibility rule as get_environment_credentials -- a shared
@@ -1208,15 +1259,38 @@ def verify_environment_evidence_chain(name, owner=LOCAL_OWNER_KEY, deep=False):
 
 def get_active_environment_credentials(owner=LOCAL_OWNER_KEY):
     """Returns credentials for the currently-active saved environment for
-    `owner`, or None if none is set/active. Default `owner` preserves the
-    CLI's and every pre-existing caller's exact behavior."""
-    name = get_active_environment_name(owner)
-    if not name:
-        return None
+    `owner`, or None if none is set/active, no longer visible, or no longer
+    addressable by its name (see restorable_active_environment_credentials
+    -- the CLI and the server restore the same environment, by id)."""
     try:
-        return get_environment_credentials(name, owner=owner)
+        return restorable_active_environment_credentials(owner)
     except KeyError:
         return None
+
+
+def restorable_active_environment_credentials(owner=LOCAL_OWNER_KEY):
+    """The ONE rule for restoring `owner`'s saved active environment (server
+    session restore and CLI alike, 5.40.3). The pointer stores an
+    environment_id; restore exactly that environment if it is still the
+    owner's own or still shared -- AND only if its display name still
+    resolves to that same id for this owner. The second check matters
+    because the rest of the app addresses environments by name: after a
+    rename (or once the owner's own same-named environment shadows a shared
+    one) a session restored by id would act on one tenant while every
+    name-keyed route and the UI resolved to another. Returns None when
+    there is no pointer; raises KeyError (with the reason) when the pointer
+    can't be restored, so the caller can log it and let the user choose."""
+    environment_id = get_active_environment_id(owner)
+    if not environment_id:
+        return None
+    creds = get_environment_credentials_by_id(environment_id, owner=owner)
+    by_name = list_environments_for(owner).get(creds["name"])
+    if by_name is None or by_name["environment_id"] != environment_id:
+        raise KeyError(
+            f"Saved environment '{creds['name']}' ({environment_id}) is shadowed by another environment of "
+            "the same name for this user; choose one explicitly."
+        )
+    return creds
 
 
 def migrate_legacy_environments_json():
@@ -1449,14 +1523,55 @@ def read_audit_log(limit=200, offset=0):
             if not line:
                 continue
             try:
-                entries.append(json.loads(line))
+                entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if isinstance(entry, dict):  # ENG1-05: a valid-JSON non-object line is not an entry
+                entries.append(entry)
     entries.reverse()
     return entries[offset:offset + limit]
 
 
-def backfill_mfa_log_events(lookup_fn, max_lookups=20):
+# ENG1-05: an access_control.update entry gets at most this many
+# corroboration lookups (one per Refresh click) before it stops consuming
+# the per-click budget, and none at all once it is older than Okta's
+# System Log retention -- the event can no longer be found either way.
+MFA_BACKFILL_MAX_ATTEMPTS = 5
+MFA_BACKFILL_RETENTION_DAYS = 90
+# A miss within this long of the save is Okta's System Log indexing lag
+# (the very case this backfill exists for) -- it is retried but never
+# counted against MFA_BACKFILL_MAX_ATTEMPTS.
+MFA_BACKFILL_UNCOUNTED_GRACE = timedelta(hours=1)
+# One backfill at a time: a second concurrent Refresh would repeat the same
+# lookups and have its results discarded (the lines already changed).
+_mfa_backfill_running = threading.Lock()
+
+
+class MfaBackfillBusy(Exception):
+    """Another backfill is already running in this process."""
+
+
+class MfaLookupEntryRejected(Exception):
+    """lookup_fn asked, and the lookup service refused THIS entry's
+    parameters (e.g. HTTP 400). Deterministic for that entry, so it counts
+    as an attempt (it ages out) and the run moves on to the next entry
+    instead of stopping -- otherwise one bad entry, always first in line,
+    would starve every older one."""
+
+
+class MfaLookupUnavailable(Exception):
+    """Raised by a backfill lookup_fn when it could not ASK at all (lookup
+    secret unset, auth gate unreachable, timeout) -- as opposed to asking
+    and getting "no such event" (None). An unavailable lookup never counts
+    as an attempt; it ends the run, keeping whatever was already found."""
+
+
+def _read_audit_log_lines(path):
+    with open(path, encoding="utf-8") as f:
+        return [line.rstrip("\n") for line in f if line.rstrip("\n")]
+
+
+def backfill_mfa_log_events(lookup_fn, max_lookups=20, now=None):
     """Closes the Okta System-Log-indexing-lag gap confirmed live 2026-09-30
     (see server/auth_gate.py's _query_mfa_log_event docstring):
     access_control.update entries whose okta_mfa_log_event is still None
@@ -1468,62 +1583,131 @@ def backfill_mfa_log_events(lookup_fn, max_lookups=20):
     (see server/serve.py's caller) rather than this module calling
     auth_gate.py directly -- this module has no Okta org URL/token of its
     own for this purpose (that lives in auth_gate.py's separate process/
-    keyring entry, see this project's existing deliberate isolation
-    between the two), so the actual Okta call is always made by whichever
-    caller HAS that access; this function only knows how to find/rewrite
-    audit_log.jsonl rows.
+    keyring entry), so the actual Okta call is always made by whichever
+    caller HAS that access; this function only finds/rewrites rows.
 
     `max_lookups` bounds how many entries get a fresh Okta call in one
-    Refresh click -- a real cap, not just a nice-to-have: someone
-    repeatedly clicking Refresh while several old entries are all still
-    missing corroboration (e.g. after a period this feature was down)
-    shouldn't be able to trigger unbounded Okta API calls per click.
+    Refresh click, so repeated clicks can't trigger unbounded Okta calls.
 
-    Returns the number of entries actually updated (0 if none needed it or
-    every lookup came back empty) -- rewrites the whole file only if at
-    least one entry changed, using the same lock as log_audit_event so a
-    concurrent append from a live save can't be lost mid-rewrite."""
+    ENG1-05 (external review, 2026-10-05) -- three defects fixed:
+    1. The lookups (up to max_lookups x a 15 s network timeout) used to run
+       while holding _audit_log_lock, so every audited write in the app
+       blocked behind one Refresh. Now: candidates are read, the lock is
+       released for the lookups, then re-taken to re-read the file and
+       apply the results.
+    2. The rewrite truncated the log in place (a crash or full disk lost
+       the whole audit trail). Now written via _atomic_write_text, and
+       results are applied by EXACT original line text to the freshly
+       re-read file, so anything appended during the lookups is kept.
+    3. Iteration was oldest-first with no memory of failures, so 20
+       never-resolvable entries starved every newer one forever. Now
+       newest-first; each failed lookup increments
+       details.okta_mfa_log_lookup_attempts, and an entry is skipped once it
+       reaches MFA_BACKFILL_MAX_ATTEMPTS or is older than
+       MFA_BACKFILL_RETENTION_DAYS. Valid-JSON non-object lines are skipped
+       (they used to raise AttributeError -> 500 on every Refresh).
+
+    5.40.3 review follow-up: only a definite "not found" (lookup_fn returns
+    None) for an entry older than MFA_BACKFILL_UNCOUNTED_GRACE counts as an
+    attempt. lookup_fn raises MfaLookupUnavailable (or anything else) when
+    it could not ask; the run then stops, applying the results it already
+    has, without charging anyone an attempt. A second concurrent call
+    raises MfaBackfillBusy at once instead of repeating the same lookups.
+    MfaLookupEntryRejected from lookup_fn counts an attempt for that entry
+    and moves on.
+
+    Returns the number of entries that gained corroboration."""
+    if not _mfa_backfill_running.acquire(blocking=False):
+        raise MfaBackfillBusy("An MFA log refresh is already running.")
+    try:
+        return _backfill_mfa_log_events_locked(lookup_fn, max_lookups, now)
+    finally:
+        _mfa_backfill_running.release()
+
+
+def _backfill_mfa_log_events_locked(lookup_fn, max_lookups, now):
     path = _audit_log_path()
     if not os.path.isfile(path):
         return 0
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=MFA_BACKFILL_RETENTION_DAYS)
 
     with _audit_log_lock:
-        lines = []
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                stripped = line.rstrip("\n")
-                if stripped:
-                    lines.append(stripped)
+        lines = _read_audit_log_lines(path)
 
-        updated_count = 0
-        lookups_used = 0
-        for i, line in enumerate(lines):
-            if lookups_used >= max_lookups:
-                break
+    candidates = []  # (original_line, entry)
+    for line in reversed(lines):  # newest first
+        if len(candidates) >= max_lookups:
+            break
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict) or entry.get("action") != "access_control.update":
+            continue
+        details = entry.get("details")
+        if not isinstance(details, dict) or details.get("okta_mfa_log_event") is not None:
+            continue
+        actor_sub = entry.get("actor_sub")
+        timestamp = entry.get("timestamp")
+        if not actor_sub or not isinstance(timestamp, str):
+            continue
+        attempts = details.get("okta_mfa_log_lookup_attempts")
+        if isinstance(attempts, int) and attempts >= MFA_BACKFILL_MAX_ATTEMPTS:
+            continue
+        try:
+            entry_dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if entry_dt.tzinfo is None:
+                entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if entry_dt < cutoff:
+            continue
+        candidates.append((line, entry, entry_dt))
+
+    if not candidates:
+        return 0
+
+    # Network lookups run WITHOUT the lock.
+    replacements = {}
+    updated_count = 0
+    for line, entry, entry_dt in candidates:
+        rejected = False
+        try:
+            found = lookup_fn(entry["actor_sub"], entry["timestamp"])
+        except MfaLookupEntryRejected as exc:
+            log("WARN", f"MFA log backfill: lookup refused for the entry at {entry['timestamp']}: {exc}")
+            found, rejected = None, True
+        except Exception as exc:  # MfaLookupUnavailable, or a transport error the caller didn't map
+            log("WARN", f"MFA log backfill stopped: lookup unavailable ({type(exc).__name__}: {exc})")
+            break
+        details = dict(entry["details"])
+        if found is not None:
+            details["okta_mfa_log_event"] = found
+            updated_count += 1
+        elif rejected or now - entry_dt >= MFA_BACKFILL_UNCOUNTED_GRACE:
+            attempts = details.get("okta_mfa_log_lookup_attempts")
+            details["okta_mfa_log_lookup_attempts"] = (attempts if isinstance(attempts, int) else 0) + 1
+        else:
+            continue  # indexing lag: retry next time, nothing to write
+        replacements[line] = json.dumps({**entry, "details": details}, separators=(",", ":"))
+
+    if not replacements:
+        return 0
+    with _audit_log_lock:
+        current = _read_audit_log_lines(path)
+        changed = False
+        for i, line in enumerate(current):
+            new_line = replacements.get(line)
+            if new_line is not None:
+                current[i] = new_line
+                changed = True
+        if changed:
             try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if entry.get("action") != "access_control.update":
-                continue
-            details = entry.get("details") or {}
-            if details.get("okta_mfa_log_event") is not None:
-                continue
-            actor_sub = entry.get("actor_sub")
-            timestamp = entry.get("timestamp")
-            if not actor_sub or not timestamp:
-                continue
-            lookups_used += 1
-            found = lookup_fn(actor_sub, timestamp)
-            if found is not None:
-                details["okta_mfa_log_event"] = found
-                entry["details"] = details
-                lines[i] = json.dumps(entry, separators=(",", ":"))
-                updated_count += 1
-
-        if updated_count:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines) + "\n")
+                mode = os.stat(path).st_mode & 0o777
+            except OSError:
+                mode = 0o600
+            _atomic_write_text(path, "\n".join(current) + "\n", mode=mode)
     return updated_count
 
 
@@ -1848,6 +2032,30 @@ def http_json_request(method, url, headers=None, body=None, error_cls=OpaApiErro
             raise
 
 
+# ENG2-16 (external review, 2026-10-05): resource identifiers reach the
+# OPA client from request paths and payloads. They are opaque UUID-shaped
+# ids, so a conservative charset check at the route layer
+# (validate_resource_id) plus percent-quoting every id interpolated into a
+# URL path (_path_id) means an id containing "/", "?", "#", "%" or ".."
+# can never make the service key call a different collection than the
+# route intends, nor alter an Okta System Log filter expression.
+_RESOURCE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def validate_resource_id(value, label="id"):
+    """Returns `value` if it is a plausible opaque OPA/Okta id
+    ([A-Za-z0-9_-], 1-128 chars); raises ValueError otherwise (-> 400 at
+    the route layer)."""
+    if not isinstance(value, str) or not _RESOURCE_ID_RE.match(value):
+        raise ValueError(f"{label} is not a valid identifier")
+    return value
+
+
+def _path_id(value):
+    """Percent-quotes one id for use as a single URL path segment."""
+    return urllib.parse.quote(str(value), safe="")
+
+
 class OpaClient:
     def __init__(self, base_domain, team_name, key_id, key_secret):
         self.base_url = f"https://{base_domain}"
@@ -1917,11 +2125,11 @@ class OpaClient:
         return self.request("POST", path, body=body)
 
     def list_projects(self, resource_group_id):
-        path = PROJECTS_PATH.format(team=self.team_name, resource_group_id=resource_group_id)
+        path = PROJECTS_PATH.format(team=self.team_name, resource_group_id=_path_id(resource_group_id))
         return self._list(path)
 
     def create_project(self, resource_group_id, name):
-        path = PROJECTS_PATH.format(team=self.team_name, resource_group_id=resource_group_id)
+        path = PROJECTS_PATH.format(team=self.team_name, resource_group_id=_path_id(resource_group_id))
         return self.request("POST", path, body={FIELD_NAME: name})
 
     def list_groups(self, contains=None):
@@ -1991,7 +2199,7 @@ class OpaClient:
         return self._list(path)
 
     def get_security_policy(self, security_policy_id):
-        path = SECURITY_POLICY_ITEM_PATH.format(team=self.team_name, security_policy_id=security_policy_id)
+        path = SECURITY_POLICY_ITEM_PATH.format(team=self.team_name, security_policy_id=_path_id(security_policy_id))
         return self.request("GET", path)
 
     def create_security_policy(self, policy_body):
@@ -2003,11 +2211,11 @@ class OpaClient:
         (returns 204, no body). Callers must GET the current policy first
         and submit the complete modified object; see
         upsert_folder_rule_in_policy for the one place that matters here."""
-        path = SECURITY_POLICY_ITEM_PATH.format(team=self.team_name, security_policy_id=security_policy_id)
+        path = SECURITY_POLICY_ITEM_PATH.format(team=self.team_name, security_policy_id=_path_id(security_policy_id))
         return self.request("PUT", path, body=policy_body)
 
     def delete_security_policy(self, security_policy_id):
-        path = SECURITY_POLICY_ITEM_PATH.format(team=self.team_name, security_policy_id=security_policy_id)
+        path = SECURITY_POLICY_ITEM_PATH.format(team=self.team_name, security_policy_id=_path_id(security_policy_id))
         return self.request("DELETE", path)
 
     def list_workload_roles(self, contains=None):
@@ -2070,19 +2278,19 @@ class OpaClient:
 
     def list_project_servers(self, resource_group_id, project_id):
         path = PROJECT_SERVERS_PATH.format(
-            team=self.team_name, resource_group_id=resource_group_id, project_id=project_id
+            team=self.team_name, resource_group_id=_path_id(resource_group_id), project_id=_path_id(project_id)
         )
         return self._list(path)
 
     def list_project_saas_app_accounts(self, resource_group_id, project_id):
         path = PROJECT_SAAS_APP_ACCOUNTS_PATH.format(
-            team=self.team_name, resource_group_id=resource_group_id, project_id=project_id
+            team=self.team_name, resource_group_id=_path_id(resource_group_id), project_id=_path_id(project_id)
         )
         return self._list(path)
 
     def list_project_okta_ud_accounts(self, resource_group_id, project_id):
         path = PROJECT_OKTA_UD_ACCOUNTS_PATH.format(
-            team=self.team_name, resource_group_id=resource_group_id, project_id=project_id
+            team=self.team_name, resource_group_id=_path_id(resource_group_id), project_id=_path_id(project_id)
         )
         return self._list(path)
 
@@ -2092,7 +2300,7 @@ class OpaClient:
         sam_account_name, distinguished_name, sid, domain.name, email,
         account_status_detail."""
         path = PROJECT_ACTIVE_DIRECTORY_ACCOUNTS_PATH.format(
-            team=self.team_name, resource_group_id=resource_group_id, project_id=project_id
+            team=self.team_name, resource_group_id=_path_id(resource_group_id), project_id=_path_id(project_id)
         )
         return self._list(path)
 
@@ -2102,7 +2310,7 @@ class OpaClient:
         account_name, database_connection.name,
         database_connection_auth_type, account_status_detail."""
         path = PROJECT_DATABASE_ACCOUNTS_PATH.format(
-            team=self.team_name, resource_group_id=resource_group_id, project_id=project_id
+            team=self.team_name, resource_group_id=_path_id(resource_group_id), project_id=_path_id(project_id)
         )
         return self._list(path)
 
@@ -2124,7 +2332,7 @@ class OpaClient:
         """The per-item detail fetch -- see list_assignments' docstring for
         why this is required (the list endpoint alone omits
         resource_assignments/relationship_assignments)."""
-        path = f"{ASSIGNMENTS_PATH.format(team=self.team_name)}/{assignment_id}"
+        path = f"{ASSIGNMENTS_PATH.format(team=self.team_name)}/{_path_id(assignment_id)}"
         return self.request("GET", path)
 
     def list_relationships(self):
@@ -2140,14 +2348,14 @@ class OpaClient:
         (SHARED/INDIVIDUAL, OU-scoped). Plain list fetch, not paginated in
         practice for a real tenant's AD connection count, but uses _list
         for consistency with every other collection endpoint."""
-        path = AD_CONNECTION_RULES_PATH.format(team=self.team_name, ad_connection_id=ad_connection_id)
+        path = AD_CONNECTION_RULES_PATH.format(team=self.team_name, ad_connection_id=_path_id(ad_connection_id))
         return self._list(path)
 
     def get_ad_connection_rule_settings(self, ad_connection_id):
         """Confirmed live 2026-09-30 -- a single object (is_configured/
         matching_criteria/partial_matching_criteria/allow_partial_matches),
         not a collection -- plain GET, not _list."""
-        path = AD_CONNECTION_RULE_SETTINGS_PATH.format(team=self.team_name, ad_connection_id=ad_connection_id)
+        path = AD_CONNECTION_RULE_SETTINGS_PATH.format(team=self.team_name, ad_connection_id=_path_id(ad_connection_id))
         return self.request("GET", path)
 
     def list_folders(self, resource_group_id, project_id):
@@ -2158,7 +2366,7 @@ class OpaClient:
         absent. Use fetch_all_folders() for the full tree -- see module
         docstring fact #2."""
         path = FOLDERS_COLLECTION_PATH.format(
-            team=self.team_name, resource_group_id=resource_group_id, project_id=project_id
+            team=self.team_name, resource_group_id=_path_id(resource_group_id), project_id=_path_id(project_id)
         )
         return self._list(path)
 
@@ -2168,14 +2376,14 @@ class OpaClient:
         "key_value_secret"). This is the only way to discover nesting;
         there's no parent_id on any read response (see fetch_all_folders)."""
         path = FOLDER_ITEMS_PATH.format(
-            team=self.team_name, resource_group_id=resource_group_id,
-            project_id=project_id, folder_id=folder_id,
+            team=self.team_name, resource_group_id=_path_id(resource_group_id),
+            project_id=_path_id(project_id), folder_id=_path_id(folder_id),
         )
         return self._list(path)
 
     def create_folder(self, resource_group_id, project_id, name, description, parent_id=None):
         path = FOLDERS_COLLECTION_PATH.format(
-            team=self.team_name, resource_group_id=resource_group_id, project_id=project_id
+            team=self.team_name, resource_group_id=_path_id(resource_group_id), project_id=_path_id(project_id)
         )
         body = {FIELD_NAME: name}
         if description:
@@ -2194,7 +2402,7 @@ class OpaClient:
         check list_folder_items() first and refuse to delete a non-empty
         folder; see the server route."""
         path = FOLDER_ITEM_PATH.format(
-            team=self.team_name, resource_group_id=resource_group_id, project_id=project_id, folder_id=folder_id
+            team=self.team_name, resource_group_id=_path_id(resource_group_id), project_id=_path_id(project_id), folder_id=_path_id(folder_id)
         )
         return self.request("DELETE", path)
 
@@ -3106,7 +3314,7 @@ def find_last_access_for_user(okta_client, actor_user_id, resources, limit_per_r
             continue
 
         type_filter = " or ".join(f'eventType eq "{t}"' for t in mapping["event_types"])
-        filter_expr = f'actor.id eq "{actor_user_id}" and ({type_filter})'
+        filter_expr = f'actor.id eq "{validate_resource_id(actor_user_id, "actor id")}" and ({type_filter})'
         # No watermark to protect here (read-only lookup, nothing persisted)
         # -- completeness only matters to sync_okta_events, see
         # get_system_log's docstring.
@@ -3305,7 +3513,7 @@ def build_secrets_access_report(client, okta_client, resource_group_id, project_
         f'eventType eq "{t}"' for types in SECRETS_ACCESS_REPORT_EVENT_TYPES.values() for t in types
     )
     since = (datetime.now(timezone.utc) - timedelta(days=since_days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    filter_expr = f'target.id eq "{project_id}" and ({type_filter})'
+    filter_expr = f'target.id eq "{validate_resource_id(project_id, "project_id")}" and ({type_filter})'
     # No watermark to protect here (read-only report, nothing persisted) --
     # completeness only matters to sync_okta_events, see get_system_log's
     # docstring.

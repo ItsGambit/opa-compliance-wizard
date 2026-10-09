@@ -53,7 +53,11 @@ export function fetchEnvironments(): Promise<EnvironmentsResponse> {
   return apiFetch('/api/environments')
 }
 
-export function fetchWhoami(): Promise<{ email: string | null; is_local: boolean; is_admin: boolean }> {
+// can_admin (UI-06): whether the admin-only routes will serve THIS caller --
+// true for a verified admin, and for the operator of a local-mode run (no
+// login gate there; the server exempts it). is_admin stays the verified-admin
+// flag (Access Control needs the hosted step-up flow, so it keys off that).
+export function fetchWhoami(): Promise<{ email: string | null; is_local: boolean; is_admin: boolean; can_admin?: boolean }> {
   return apiFetch('/api/whoami')
 }
 
@@ -94,7 +98,10 @@ export function saveAccessControl(): Promise<AccessControlSaveResponse> {
   return apiFetch('/api/access_control/save', { method: 'POST' })
 }
 
-export function saveEnvironment(values: EnvironmentFormValues): Promise<{ activated: boolean; active: string }> {
+// activated=false (5.40.3): an admin edited ANOTHER owner's environment --
+// it was saved, but it isn't the admin's to activate, so `active` is the
+// admin's unchanged active environment (possibly null).
+export function saveEnvironment(values: EnvironmentFormValues): Promise<{ activated: boolean; active: string | null; saved?: boolean }> {
   return apiFetch('/api/environments', { method: 'POST', body: JSON.stringify(values) })
 }
 
