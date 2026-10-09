@@ -389,10 +389,12 @@ def test_wrapper_script_refuses_an_old_python(tmp_path):
         pytest.skip("sh wrapper")
     fake = tmp_path / "bin"
     fake.mkdir()
-    (fake / "python3").write_text("#!/bin/sh\n"
-                                  "case \"$*\" in *version_info*) exit 1;; esac\n"
-                                  "echo launched\n")
-    (fake / "python3").chmod(0o755)
+    # both names the wrapper tries (a CI runner also has a real `python` in /usr/bin)
+    for name in ("python3", "python"):
+        (fake / name).write_text("#!/bin/sh\n"
+                                 "case \"$*\" in *version_info*) exit 1;; esac\n"
+                                 "echo launched\n")
+        (fake / name).chmod(0o755)
     script = launch.PROJECT_ROOT / "start-wizard.sh"
     proc = subprocess.run(["bash", str(script)], env={**os.environ, "PATH": f"{fake}:/usr/bin:/bin"},
                           capture_output=True, text=True, timeout=30)
