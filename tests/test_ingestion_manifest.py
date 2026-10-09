@@ -71,7 +71,9 @@ def test_sync_records_one_manifest_per_call_not_per_day_chunk(tmp_audit_store):
     assert manifests[0]["prev_manifest_hash"] is None  # first manifest for this environment_id
 
 
-def test_second_sync_chains_to_first_manifests_hash(tmp_audit_store):
+def test_second_sync_chains_to_first_manifests_hash(tmp_audit_store, monkeypatch):
+    """Legacy (v1) linking, as written before 5.40.4: prev -> batch_hash."""
+    monkeypatch.setattr(audit_store, "EVIDENCE_CHAIN_V2", False)
     audit_store.run_migrations()
     since = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
@@ -88,6 +90,20 @@ def test_second_sync_chains_to_first_manifests_hash(tmp_audit_store):
     assert len(rows) == 2
     assert rows[0]["prev_manifest_hash"] is None
     assert rows[1]["prev_manifest_hash"] == rows[0]["batch_hash"]
+
+
+def test_second_sync_chains_to_first_manifests_entry_hash_by_default(tmp_audit_store):
+    """Default (v2, 5.40.4+) linking: prev -> the previous row's entry_hash."""
+    audit_store.run_migrations()
+    since = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    audit_store.sync_okta_events(FakeOktaClient([([_event("evt-1", since)], True)]), ENV_A, "all", since=since)
+    audit_store.sync_okta_events(FakeOktaClient([([_event("evt-2", since)], True)]), ENV_A, "all", since=since)
+    rows = audit_store._get_connection().execute(
+        "SELECT entry_hash, prev_manifest_hash FROM ingestion_manifests WHERE environment_id = ? ORDER BY id",
+        (ENV_A,),
+    ).fetchall()
+    assert len(rows) == 2 and rows[0]["prev_manifest_hash"] is None
+    assert rows[0]["entry_hash"] and rows[1]["prev_manifest_hash"] == rows[0]["entry_hash"]
 
 
 def test_zero_new_rows_batch_still_recorded_not_skipped(tmp_audit_store):
@@ -197,11 +213,13 @@ def test_verify_ingestion_chain_valid_and_empty_with_no_manifests(tmp_audit_stor
     assert result["head_hash"] is None
 
 
-def test_verify_ingestion_chain_detects_a_tampered_hash(tmp_audit_store):
+@pytest.mark.parametrize("chain_v2", [False, True], ids=["v1-legacy", "v2-default"])
+def test_verify_ingestion_chain_detects_a_tampered_hash(tmp_audit_store, monkeypatch, chain_v2):
     """Directly corrupts a stored batch_hash (simulating tampering with
     the archive after the fact) and confirms verify_ingestion_chain
     actually detects it -- proves the mechanism catches tampering, not
     just that it runs without error."""
+    monkeypatch.setattr(audit_store, "EVIDENCE_CHAIN_V2", chain_v2)
     audit_store.run_migrations()
     since = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     audit_store.sync_okta_events(FakeOktaClient([([_event("evt-1", since)], True)]), ENV_A, "all", since=since)
@@ -217,11 +235,14 @@ def test_verify_ingestion_chain_detects_a_tampered_hash(tmp_audit_store):
 
     result = audit_store.verify_ingestion_chain(ENV_A)
     assert result["valid"] is False
-    # The THIRD row's prev_manifest_hash no longer matches the (tampered) second row's batch_hash.
     third_id = conn.execute(
         "SELECT id FROM ingestion_manifests WHERE environment_id = ? ORDER BY id LIMIT 1 OFFSET 2", (ENV_A,)
     ).fetchone()["id"]
-    assert result["broken_at"] == third_id
+    # v1: the THIRD row's prev_manifest_hash no longer matches the tampered
+    # second row's batch_hash. v2: the second row's own entry_hash (which
+    # seals batch_hash) no longer recomputes, so the break is found a row
+    # earlier, at the edited row itself.
+    assert result["broken_at"] == (middle_id if chain_v2 else third_id)
 
 
 # ---------------------------------------------------------------------------

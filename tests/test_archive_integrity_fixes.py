@@ -4,7 +4,7 @@
 - DATA-03  CSV import never moves the live-sync watermark; timestamps are
            canonicalised; an unusable stored watermark is an explicit error.
 - DATA-04  Evidence chain v2 (content-bearing, field-sealing links, deep
-           verify) -- implemented, shipped dormant behind EVIDENCE_CHAIN_V2.
+           verify) -- on by default since 5.40.4 (EVIDENCE_CHAIN_V2).
 - DATA-05  Exception mid-sync records the manifest + error status; the
            scheduler's "ran today" is driven by completion, retries by attempt.
 - DATA-08  SQLite floor, idempotent migration 4, transactional migrations.
@@ -280,9 +280,29 @@ def test_successful_sync_sets_completion_and_clears_the_error(schema):
 
 
 # ---------------------------------------------------------------------------
-# DATA-04: evidence chain v2 (dormant by default)
+# DATA-04: evidence chain v2 (on by default since 5.40.4)
 # ---------------------------------------------------------------------------
-def test_chain_is_v1_by_default_and_verifies(schema):
+def test_chain_is_v2_by_default(schema):
+    """5.40.4: the shipped default seals content -- no fixture, no flag
+    override -- so a regression back to v1 fails here, not in production."""
+    assert audit_store.EVIDENCE_CHAIN_V2 is True
+    _sync(ENV, [_event("e1", _ts(2), event_type="user.authentication.auth_via_mfa")])
+    _sync(ENV, [_event("e2", _ts(1), event_type="example.noise")])
+    conn = audit_store._get_connection()
+    rows = conn.execute("SELECT entry_hash, content_hash, entries_json FROM ingestion_manifests").fetchall()
+    assert len(rows) == 2
+    assert all(r["entry_hash"] and r["content_hash"] and r["entries_json"] is None for r in rows)  # entries live in manifest_entries
+    assert conn.execute("SELECT COUNT(*) FROM manifest_entries WHERE environment_id = ?", (ENV,)).fetchone()[0] == 1
+    head = conn.execute("SELECT head_hash FROM chain_heads WHERE environment_id = ?", (ENV,)).fetchone()["head_hash"]
+    result = audit_store.verify_ingestion_chain(ENV, deep=True)
+    assert result["valid"] is True and result["manifest_count"] == 2 and result["legacy_manifests"] == 0
+    assert result["deep_applicable"] is True and result["verified_rows"] == 1
+    assert result["head_hash"] == head
+
+
+def test_legacy_v1_chain_still_verifies(schema, monkeypatch):
+    """An archive written before 5.40.4 (all v1 rows) must keep verifying."""
+    monkeypatch.setattr(audit_store, "EVIDENCE_CHAIN_V2", False)
     _sync(ENV, [_event("e1", _ts(2))])
     _sync(ENV, [_event("e2", _ts(1))])
     conn = audit_store._get_connection()
@@ -293,12 +313,7 @@ def test_chain_is_v1_by_default_and_verifies(schema):
     assert result["broken_at"] is None and result["reason"] is None
 
 
-@pytest.fixture
-def chain_v2(monkeypatch):
-    monkeypatch.setattr(audit_store, "EVIDENCE_CHAIN_V2", True)
-
-
-def test_chain_v2_links_to_the_last_v1_row_and_deep_verifies(schema, chain_v2, monkeypatch):
+def test_chain_v2_links_to_the_last_v1_row_and_deep_verifies(schema, monkeypatch):
     monkeypatch.setattr(audit_store, "EVIDENCE_CHAIN_V2", False)
     _sync(ENV, [_event("v1-row", _ts(3))])  # a pre-upgrade manifest
     monkeypatch.setattr(audit_store, "EVIDENCE_CHAIN_V2", True)
@@ -312,8 +327,8 @@ def test_chain_v2_links_to_the_last_v1_row_and_deep_verifies(schema, chain_v2, m
     assert rows[1]["prev_manifest_hash"] == rows[0]["batch_hash"]  # explicit v1 -> v2 boundary
     assert rows[2]["prev_manifest_hash"] == rows[1]["entry_hash"]
     assert rows[1]["entry_hash"] != rows[2]["entry_hash"]  # two different links even though row 3 is empty
-    entries = json.loads(rows[1]["entries_json"])
-    assert [u for u, _s in entries] == ["e1"]  # curated rows only are listed; row_count still counts both
+    entries = conn.execute("SELECT uuid FROM manifest_entries WHERE manifest_id = ?", (rows[1]["id"],)).fetchall()
+    assert [r["uuid"] for r in entries] == ["e1"]  # curated rows only are listed; row_count still counts both
     assert rows[1]["row_count"] == 2
 
     shallow = audit_store.verify_ingestion_chain(ENV)
@@ -323,7 +338,7 @@ def test_chain_v2_links_to_the_last_v1_row_and_deep_verifies(schema, chain_v2, m
     assert deep["valid"] is True and deep["verified_rows"] == 1 and deep["unverifiable_rows"] == 1
 
 
-def test_chain_v2_rejects_a_downgrade_to_legacy_rows(schema, chain_v2, monkeypatch):
+def test_chain_v2_rejects_a_downgrade_to_legacy_rows(schema, monkeypatch):
     _sync(ENV, [_event("e1", _ts(2), event_type="user.authentication.auth_via_mfa")])
     monkeypatch.setattr(audit_store, "EVIDENCE_CHAIN_V2", False)
     _sync(ENV, [])  # what nulling the v2 columns of the tail and relinking by batch_hash looks like
@@ -331,7 +346,8 @@ def test_chain_v2_rejects_a_downgrade_to_legacy_rows(schema, chain_v2, monkeypat
     assert result["valid"] is False and "downgraded" in result["reason"]
 
 
-def test_v1_chain_reports_deep_not_applicable(schema):
+def test_v1_chain_reports_deep_not_applicable(schema, monkeypatch):
+    monkeypatch.setattr(audit_store, "EVIDENCE_CHAIN_V2", False)
     _sync(ENV, [_event("e1", _ts(2))])
     result = audit_store.verify_ingestion_chain(ENV, deep=True)
     assert result["valid"] is True and result["deep"] is True and result["deep_applicable"] is False
@@ -345,8 +361,14 @@ def test_v1_chain_reports_deep_not_applicable(schema):
     ("DELETE FROM ingestion_manifests WHERE id = (SELECT MIN(id) + 1 FROM ingestion_manifests)", "prev_manifest_hash"),
     ("UPDATE events SET raw_json = '{\"uuid\":\"e1\",\"eventType\":\"user.authentication.auth_via_mfa\",\"edited\":true}' WHERE uuid = 'e1'", "content does not match"),
     ("DELETE FROM event_targets WHERE uuid = 'e1'; DELETE FROM events WHERE uuid = 'e1'", "missing from the archive"),
+    # 5.40.4 review: the sealed entries and the end of the chain.
+    ("DELETE FROM manifest_entries WHERE uuid = 'e1'", "content_hash does not match"),
+    ("UPDATE manifest_entries SET sha = 'x' WHERE uuid = 'e1'", "content_hash does not match"),
+    ("DELETE FROM ingestion_manifests WHERE id = (SELECT MAX(id) FROM ingestion_manifests)", "removed from the end"),
+    ("DELETE FROM manifest_entries; DELETE FROM ingestion_manifests", "removed from the end"),
+    ("DELETE FROM chain_heads", "recorded chain head is missing"),
 ])
-def test_chain_v2_detects_every_tamper_the_review_reproduced_against_v1(schema, chain_v2, tamper, reason_fragment):
+def test_chain_v2_detects_every_tamper_the_review_reproduced_against_v1(schema, tamper, reason_fragment):
     """DATA-04 reproduced each of these against the v1 chain and got
     valid=True every time. Each must now break the chain, with a reason."""
     _sync(ENV, [_event("e1", _ts(3), event_type="user.authentication.auth_via_mfa")])
@@ -361,7 +383,244 @@ def test_chain_v2_detects_every_tamper_the_review_reproduced_against_v1(schema, 
     assert reason_fragment in result["reason"]
 
 
-def test_chain_v2_tolerates_a_pruned_non_curated_row(schema, chain_v2):
+def test_upgrade_from_a_pre_006_archive_chains_v2_onto_the_last_v1_row(tmp_audit_store, tmp_environments_file):
+    """The real deploy path: an archive created by 5.40.1 or earlier
+    (migrations 1-5 only, v1 manifests written the old way), upgraded
+    straight to 5.40.4 -- migrations 006 and 007 run, then the first
+    sync writes the first sealed row."""
+    import hashlib
+    conn = audit_store._get_connection()
+    for v in (1, 2, 3, 4, 5):
+        audit_store.MIGRATIONS[v](conn)
+        conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, 'x')", (v,))
+    assert "entry_hash" not in audit_store._table_columns(conn, "ingestion_manifests")
+    prev = None
+    for uuids in (["old-1"], [], ["old-2", "old-3"]):
+        batch_hash = hashlib.sha256("\n".join(sorted(uuids)).encode()).hexdigest()
+        conn.execute(
+            """INSERT INTO ingestion_manifests (environment_id, source, since, until, row_count, batch_hash,
+                   prev_manifest_hash, created_at) VALUES (?, 'okta_sync', NULL, NULL, ?, ?, ?, '2026-10-01T00:00:00.000Z')""",
+            (ENV, len(uuids), batch_hash, prev),
+        )
+        prev = batch_hash
+    conn.commit()
+    audit_store.run_migrations()
+    assert audit_store._schema_version(conn) == max(audit_store.MIGRATIONS)
+    assert audit_store.verify_ingestion_chain(ENV)["valid"] is True  # all-v1, no recorded head yet
+
+    _sync(ENV, [_event("new-1", _ts(1), event_type="user.authentication.auth_via_mfa")])
+    first_v2 = conn.execute("SELECT * FROM ingestion_manifests ORDER BY id DESC LIMIT 1").fetchone()
+    assert first_v2["prev_manifest_hash"] == prev  # explicit boundary onto the last v1 batch_hash
+    deep = audit_store.verify_ingestion_chain(ENV, deep=True)
+    assert deep["valid"] is True and deep["legacy_manifests"] == 3 and deep["verified_rows"] == 1
+
+
+def test_a_cut_short_chain_stays_broken_after_the_next_sync(schema):
+    """5.40.4 review C1: the next routine sync must not paper over a
+    removed tail by chaining onto the surviving row."""
+    for uuid in ("e1", "e2", "e3"):
+        _sync(ENV, [_event(uuid, _ts(3), event_type="user.authentication.auth_via_mfa")])
+    conn = audit_store._get_connection()
+    conn.executescript(
+        "DELETE FROM manifest_entries WHERE uuid = 'e3'; DELETE FROM event_targets WHERE uuid = 'e3'; "
+        "DELETE FROM events WHERE uuid = 'e3'; DELETE FROM ingestion_manifests WHERE id = (SELECT MAX(id) FROM ingestion_manifests)"
+    )
+    conn.commit()
+    assert "removed from the end" in audit_store.verify_ingestion_chain(ENV)["reason"]
+    _sync(ENV, [_event("e4", _ts(1), event_type="user.authentication.auth_via_mfa")])
+    result = audit_store.verify_ingestion_chain(ENV)
+    assert result["valid"] is False and "prev_manifest_hash" in result["reason"]
+
+
+def test_turning_v2_off_reports_a_downgrade_not_a_cut_short_chain(schema, monkeypatch):
+    _sync(ENV, [_event("e1", _ts(2), event_type="user.authentication.auth_via_mfa")])
+    monkeypatch.setattr(audit_store, "EVIDENCE_CHAIN_V2", False)
+    _sync(ENV, [])
+    _sync(ENV, [])
+    result = audit_store.verify_ingestion_chain(ENV)
+    assert result["valid"] is False and "downgraded" in result["reason"]
+
+
+def test_manifest_and_its_entries_and_head_commit_together(schema, monkeypatch):
+    """A failure while recording the head must leave no manifest and no
+    sealed entries behind (one transaction)."""
+    _sync(ENV, [_event("e1", _ts(3), event_type="user.authentication.auth_via_mfa")])
+    conn = audit_store._get_connection()
+    before = [conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("ingestion_manifests", "manifest_entries")]
+    head_before = conn.execute("SELECT head_hash FROM chain_heads").fetchone()[0]
+    conn.execute("CREATE TRIGGER fail_head BEFORE UPDATE ON chain_heads BEGIN SELECT RAISE(ABORT, 'boom'); END")
+    conn.commit()
+    with pytest.raises(Exception):
+        audit_store._record_ingestion_manifest(conn, ENV, "okta_sync", None, None, [("e9", 1, "a" * 64)])
+    assert [conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("ingestion_manifests", "manifest_entries")] == before
+    assert conn.execute("SELECT head_hash FROM chain_heads").fetchone()[0] == head_before
+    conn.execute("DROP TRIGGER fail_head")
+    conn.commit()
+    assert audit_store.verify_ingestion_chain(ENV, deep=True)["valid"] is True
+
+
+def test_a_manifest_listing_more_sealed_rows_than_row_count_is_broken(schema):
+    _sync(ENV, [_event("e1", _ts(3), event_type="user.authentication.auth_via_mfa")])
+    conn = audit_store._get_connection()
+    mid = conn.execute("SELECT MAX(id) FROM ingestion_manifests").fetchone()[0]
+    conn.execute("INSERT INTO manifest_entries (environment_id, manifest_id, uuid, sha) VALUES (?, ?, 'extra', 'x')", (ENV, mid))
+    conn.commit()
+    result = audit_store.verify_ingestion_chain(ENV, deep=True)
+    assert result["valid"] is False and "more sealed rows than row_count" in result["reason"]
+
+
+def test_a_5_40_2_format_entries_json_row_still_deep_verifies(schema):
+    """Rows written by a 5.40.2/5.40.3 install that enabled v2 by hand
+    keep their sealed entries in entries_json; the verifier reads them."""
+    _sync(ENV, [_event("e1", _ts(3), event_type="user.authentication.auth_via_mfa")])
+    conn = audit_store._get_connection()
+    mid = conn.execute("SELECT MAX(id) FROM ingestion_manifests").fetchone()[0]
+    pairs = [[r["uuid"], r["sha"]] for r in conn.execute("SELECT uuid, sha FROM manifest_entries WHERE manifest_id = ?", (mid,))]
+    conn.execute("UPDATE ingestion_manifests SET entries_json = ? WHERE id = ?", (json.dumps(pairs), mid))
+    conn.execute("DELETE FROM manifest_entries WHERE manifest_id = ?", (mid,))
+    conn.commit()
+    ok = audit_store.verify_ingestion_chain(ENV, deep=True)
+    assert ok["valid"] is True and ok["verified_rows"] == 1
+    conn.execute("UPDATE events SET raw_json = '{\"uuid\":\"e1\",\"edited\":true}' WHERE uuid = 'e1'")
+    conn.commit()
+    bad = audit_store.verify_ingestion_chain(ENV, deep=True)
+    assert bad["valid"] is False and "does not match its sealed hash" in bad["reason"]
+
+
+def test_upgrade_records_the_existing_head_so_a_cut_short_v1_tail_is_caught(tmp_audit_store, tmp_environments_file):
+    """5.40.4 review M2: migration 007 backfills chain_heads from each
+    chain's last row."""
+    import hashlib
+    conn = audit_store._get_connection()
+    for v in (1, 2, 3, 4, 5, 6):
+        audit_store.MIGRATIONS[v](conn)
+        conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, 'x')", (v,))
+    prev = None
+    for uuids in (["old-1"], ["old-2"]):
+        batch_hash = hashlib.sha256("\n".join(uuids).encode()).hexdigest()
+        conn.execute(
+            """INSERT INTO ingestion_manifests (environment_id, source, row_count, batch_hash, prev_manifest_hash, created_at)
+               VALUES (?, 'okta_sync', 1, ?, ?, '2026-10-01T00:00:00.000Z')""",
+            (ENV, batch_hash, prev),
+        )
+        prev = batch_hash
+    conn.commit()
+    audit_store.run_migrations()
+    assert conn.execute("SELECT head_hash FROM chain_heads WHERE environment_id = ?", (ENV,)).fetchone()[0] == prev
+    assert audit_store.verify_ingestion_chain(ENV)["valid"] is True
+    conn.execute("DELETE FROM ingestion_manifests WHERE id = (SELECT MAX(id) FROM ingestion_manifests)")
+    conn.commit()
+    assert "removed from the end" in audit_store.verify_ingestion_chain(ENV)["reason"]
+
+
+def test_a_sync_committing_mid_check_is_not_reported_as_tampering(schema, monkeypatch):
+    """5.40.4 review M1: the manifests read and the recorded-head read are
+    one snapshot. A sync that commits between them (from another thread,
+    on its own connection) must not make the head look "removed"."""
+    import threading
+    _sync(ENV, [_event("e1", _ts(3), event_type="user.authentication.auth_via_mfa")])
+    real_conn = audit_store._get_connection()
+
+    class Interleaving:
+        fired = False
+
+        def __getattr__(self, name):
+            return getattr(real_conn, name)
+
+        def execute(self, sql, *args):
+            cur = real_conn.execute(sql, *args)
+            if not Interleaving.fired and "FROM ingestion_manifests WHERE environment_id" in sql:
+                Interleaving.fired = True
+                worker = threading.Thread(target=lambda: _sync(ENV, [_event("e2", _ts(1), event_type="user.authentication.auth_via_mfa")]))
+                worker.start()
+                worker.join()
+            return cur
+
+    real_get = audit_store._get_connection
+    checker = threading.get_ident()
+    monkeypatch.setattr(audit_store, "_get_connection", lambda: Interleaving() if threading.get_ident() == checker else real_get())
+    result = audit_store.verify_ingestion_chain(ENV)
+    assert Interleaving.fired
+    assert result["valid"] is True and result["manifest_count"] == 1  # the snapshot predates the concurrent sync
+    monkeypatch.undo()
+    assert audit_store.verify_ingestion_chain(ENV)["manifest_count"] == 2
+
+
+def test_rows_appended_by_older_code_after_the_recorded_head_are_not_tampering(schema):
+    """5.40.4 round-3 review: 5.40.4 started once (head recorded), then a
+    code-only rollback let older code sync -- it appends v1 rows and never
+    updates chain_heads. On re-upgrade that is a stale head, not a cut-short
+    chain, and the next sync links past it."""
+    import hashlib
+    conn = audit_store._get_connection()
+    for uuids in (["old-1"], ["old-2"]):  # what 5.40.1's writer appends
+        last = conn.execute("SELECT batch_hash FROM ingestion_manifests ORDER BY id DESC LIMIT 1").fetchone()
+        batch_hash = hashlib.sha256("\n".join(uuids).encode()).hexdigest()
+        conn.execute(
+            """INSERT INTO ingestion_manifests (environment_id, source, row_count, batch_hash, prev_manifest_hash, created_at)
+               VALUES (?, 'okta_sync', 1, ?, ?, '2026-10-01T00:00:00.000Z')""",
+            (ENV, batch_hash, last[0] if last else None),
+        )
+        if uuids == ["old-1"]:  # the backfill / a 5.40.4 start recorded this row as the head
+            mid = conn.execute("SELECT MAX(id) FROM ingestion_manifests").fetchone()[0]
+            conn.execute("INSERT INTO chain_heads VALUES (?, ?, ?, 'x')", (ENV, mid, batch_hash))
+    conn.commit()
+    stale = audit_store.verify_ingestion_chain(ENV)
+    assert stale["valid"] is True and stale["head_stale"] is True
+    _sync(ENV, [_event("e1", _ts(1), event_type="user.authentication.auth_via_mfa")])
+    after = audit_store.verify_ingestion_chain(ENV, deep=True)
+    assert after["valid"] is True and after["head_stale"] is False and after["legacy_manifests"] == 2
+
+
+def test_hashes_match_known_answers_and_keep_the_v1_batch_hash_format():
+    import hashlib
+    assert audit_store._sha256_of_lines(["b", "a"]) == hashlib.sha256(b"b\na").hexdigest()
+    assert audit_store._sha256_of_lines([]) == hashlib.sha256(b"").hexdigest()
+    entries = [("u2", 1, "s2"), ("u1", 0, "s1"), ("u3", 1, "s3")]
+    assert audit_store._manifest_content_hash(entries) == hashlib.sha256(b"u2:s2\nu3:s3").hexdigest()
+
+
+def test_batch_hash_written_by_the_manifest_writer_is_the_v1_format(schema):
+    import hashlib
+    _sync(ENV, [_event("zz", _ts(2)), _event("aa", _ts(2))])
+    batch_hash = audit_store._get_connection().execute("SELECT batch_hash FROM ingestion_manifests").fetchone()[0]
+    assert batch_hash == hashlib.sha256(b"aa\nzz").hexdigest()
+
+
+def test_deep_verify_orders_sealed_entries_like_the_content_hash(schema):
+    """uuid order and `uuid:sha` order differ when one uuid is a prefix of
+    another followed by a character below ':' -- the verifier must use the
+    content hash's own order."""
+    _sync(ENV, [_event("ev", _ts(2), event_type="user.authentication.auth_via_mfa"),
+                _event("ev-1", _ts(2), event_type="user.authentication.auth_via_mfa")])
+    result = audit_store.verify_ingestion_chain(ENV, deep=True)
+    assert result["valid"] is True and result["verified_rows"] == 2
+
+
+def test_deep_verify_scopes_events_to_the_environment(schema):
+    """Two environments on the same Okta org archive the same event uuids;
+    one environment's copy must never stand in for (or double-count
+    against) the other's."""
+    for env in (ENV, ENV_B):
+        _sync(env, [_event("shared", _ts(2), event_type="user.authentication.auth_via_mfa")])
+    conn = audit_store._get_connection()
+    conn.execute("UPDATE events SET raw_json = '{\"edited\":true}' WHERE environment_id = ? AND uuid = 'shared'", (ENV_B,))
+    conn.commit()
+    a = audit_store.verify_ingestion_chain(ENV, deep=True)
+    b = audit_store.verify_ingestion_chain(ENV_B, deep=True)
+    assert a["valid"] is True and a["verified_rows"] == 1
+    assert b["valid"] is False and "does not match its sealed hash" in b["reason"]
+
+
+def test_orphan_listing_includes_leftover_chain_rows(schema):
+    conn = audit_store._get_connection()
+    conn.execute("INSERT INTO chain_heads VALUES (?, 1, 'h', 'x')", (ENV_B,))
+    conn.execute("INSERT INTO manifest_entries VALUES (?, 999, 'u', 's')", (ENV,))
+    conn.commit()
+    assert {a["environment_id"] for a in audit_store.list_orphaned_archives()} >= {ENV, ENV_B}
+
+
+def test_chain_v2_tolerates_a_pruned_non_curated_row(schema):
     _sync(ENV, [_event("noise", _ts(3), event_type="example.noise"),
                 _event("kept", _ts(3), event_type="user.authentication.auth_via_mfa")])
     conn = audit_store._get_connection()
@@ -481,6 +740,7 @@ def test_orphaned_archives_are_listed_and_purged_only_once_the_environment_is_go
     # ...which an admin can then purge, with per-table counts.
     counts = audit_store.purge_environment_archive(env_id)
     assert counts["events"] == 1 and counts["ingestion_manifests"] == 1 and counts["sync_state"] == 1
+    assert counts["manifest_entries"] == 1 and counts["chain_heads"] == 1
     assert env_id not in {a["environment_id"] for a in audit_store.list_orphaned_archives()}
 
 
@@ -783,7 +1043,8 @@ def test_integrity_route_supports_deep_verification(live_server):
     shallow = requests.get(f"{base_url}/api/environments/dev/integrity", headers=_headers(), timeout=5).json()
     deep = requests.get(f"{base_url}/api/environments/dev/integrity?deep=1", headers=_headers("00uADMIN", "true"), timeout=5).json()
     assert shallow["valid"] is True and shallow["deep"] is False
-    assert deep["valid"] is True and deep["deep"] is True and deep["deep_applicable"] is False  # v1 rows: nothing sealed to re-read
+    # 5.40.4: the sync above wrote a v2 (content-sealed) manifest, so deep verify re-reads it.
+    assert deep["valid"] is True and deep["deep"] is True and deep["deep_applicable"] is True
 
 
 def test_report_routes_return_400_for_a_malformed_window(live_server):

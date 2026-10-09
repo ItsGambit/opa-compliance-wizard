@@ -659,6 +659,54 @@ def _migration_006_evidence_chain_v2_and_sync_attempts(conn):
     conn.execute("DROP INDEX IF EXISTS idx_events_env_type")
 
 
+def _migration_007_manifest_entries_and_chain_heads(conn):
+    """5.40.4, evidence chain v2 goes live (DATA-04 follow-up from that
+    release's own review). Two tables, both IF NOT EXISTS:
+
+    - manifest_entries: one row per curated event a v2 manifest sealed
+      (environment_id, manifest_id, uuid, sha256 of raw_json). 5.40.2's
+      dormant design kept these as a single entries_json cell, which a
+      90-day first backfill of a mid-size tenant (~1M curated rows) would
+      have made a ~95 MB value built and parsed in one piece; rows can be
+      written with executemany and re-read with a cursor instead.
+    - chain_heads: the newest link per environment, written in the same
+      transaction as each manifest (and backfilled here from each existing
+      chain's last row), so removing manifests from the END of the chain
+      (which leaves nothing behind to disagree) no longer verifies as
+      valid, and the next sync links to the recorded head rather than the
+      surviving row, so it cannot paper over the gap. Like the chain itself this is unkeyed: it
+      catches an edit that doesn't also rewrite this row, not a writer
+      who recomputes everything (see verify_ingestion_chain)."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS manifest_entries (
+               environment_id TEXT NOT NULL,
+               manifest_id INTEGER NOT NULL,
+               uuid TEXT NOT NULL,
+               sha TEXT NOT NULL,
+               PRIMARY KEY (manifest_id, uuid)
+           )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_manifest_entries_env ON manifest_entries (environment_id)")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS chain_heads (
+               environment_id TEXT PRIMARY KEY,
+               manifest_id INTEGER NOT NULL,
+               head_hash TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+           )"""
+    )
+    # Record today's head for every existing chain, so an upgraded archive
+    # (all v1, or v2 rows from a hand-enabled 5.40.2/5.40.3) is checked
+    # for a cut-short tail from the upgrade onward instead of reporting
+    # "head missing". INSERT OR IGNORE keeps a re-run harmless.
+    conn.execute(
+        """INSERT OR IGNORE INTO chain_heads (environment_id, manifest_id, head_hash, updated_at)
+           SELECT m.environment_id, m.id, COALESCE(m.entry_hash, m.batch_hash), m.created_at
+           FROM ingestion_manifests m
+           JOIN (SELECT MAX(id) AS id FROM ingestion_manifests GROUP BY environment_id) last ON last.id = m.id"""
+    )
+
+
 MIGRATIONS = {
     1: _migration_001_unified_schema,
     2: _migration_002_ingestion_manifests,
@@ -666,6 +714,7 @@ MIGRATIONS = {
     4: _migration_004_drop_preserve_logs_locally,
     5: _migration_005_service_account_report_indexes,
     6: _migration_006_evidence_chain_v2_and_sync_attempts,
+    7: _migration_007_manifest_entries_and_chain_heads,
 }
 
 # DATA-08: migration 4 needs ALTER TABLE ... DROP COLUMN (SQLite 3.35.0,
@@ -1083,6 +1132,37 @@ def _manifest_entry_hash(prev_hash, environment_id, source, since, until, row_co
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
 
 
+def _recorded_head_is_stale(conn, environment_id, recorded):
+    """True when the recorded head's own manifest is still there, with the
+    same link hash, and rows were appended after it -- what code older
+    than 5.40.4 (which never updates chain_heads) leaves behind if it ran
+    a sync after 5.40.4 had started once. Those rows are checked by the
+    chain walk like any others, so linking past them weakens nothing.
+    A tail that was REMOVED takes the recorded row with it (or leaves the
+    head pointing past the last row), so it is never mistaken for this."""
+    row = conn.execute(
+        "SELECT batch_hash, entry_hash FROM ingestion_manifests WHERE id = ? AND environment_id = ?",
+        (recorded["manifest_id"], environment_id),
+    ).fetchone()
+    if row is None or (row["entry_hash"] or row["batch_hash"]) != recorded["head_hash"]:
+        return False
+    return conn.execute(
+        "SELECT 1 FROM ingestion_manifests WHERE environment_id = ? AND id > ? LIMIT 1",
+        (environment_id, recorded["manifest_id"]),
+    ).fetchone() is not None
+
+
+def _sha256_of_lines(lines):
+    """sha256 of "\n".join(lines), fed line by line so a 1M-line batch
+    never materialises the joined string."""
+    h = hashlib.sha256()
+    for i, line in enumerate(lines):
+        if i:
+            h.update(b"\n")
+        h.update(line.encode("utf-8"))
+    return h.hexdigest()
+
+
 def _manifest_content_hash(entries):
     """sha256 over `uuid:sha256(raw_json)` for every CURATED row in the
     batch, sorted by uuid. Curated rows are the ones the archive promises
@@ -1090,8 +1170,7 @@ def _manifest_content_hash(entries):
     deep verification can be expected to re-read; a non-curated row that
     retention has legitimately removed must not make the chain look
     tampered with."""
-    lines = sorted(f"{uuid}:{sha}" for uuid, is_curated, sha in entries if is_curated)
-    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+    return _sha256_of_lines(sorted(f"{uuid}:{sha}" for uuid, is_curated, sha in entries if is_curated))
 
 
 def _record_ingestion_manifest(conn, environment_id, source, since, until, new_entries):
@@ -1117,11 +1196,15 @@ def _record_ingestion_manifest(conn, environment_id, source, since, until, new_e
         content_hash) -- the real link. prev_manifest_hash now carries
         the previous row's entry_hash (or its batch_hash for a pre-v2
         row), so the v1->v2 boundary is explicit rather than a re-seal;
-      - entries_json: [[uuid, sha], ...] for the CURATED rows only (the
-        ones content_hash covers and a deep verify re-reads) -- the
-        non-curated rows are counted in row_count but not listed, since a
-        90-day backfill in scope "all" can be ~1M rows and listing every
-        one would make a single manifest row tens of MB.
+      - its sealed entries: (uuid, sha) for the CURATED rows only (the
+        ones content_hash covers and a deep verify re-reads), one
+        manifest_entries row each (migration 007; 5.40.2's dormant
+        format put them in a single entries_json cell, which the verifier
+        still reads if present). Non-curated rows are counted in
+        row_count but not listed.
+    Every manifest (v1 or v2) also updates chain_heads in the same
+    transaction, so a chain cut short at the end is detectable (see
+    verify_ingestion_chain).
     batch_hash (sorted-uuids hash, every row) is kept so pre-v2 rows and
     tools that read it keep working.
 
@@ -1129,37 +1212,66 @@ def _record_ingestion_manifest(conn, environment_id, source, since, until, new_e
     flag is off). Every manifest -- success, failure or import -- is also
     anchored OUTSIDE the database as an `evidence_chain.sealed` entry in
     audit_log.jsonl (environment_id, source, row_count, head), so a
-    truncated chain tail is visible by comparing the stored head against
-    the last logged one; the anchor must never be able to break an
-    ingestion, so a logging failure is swallowed. Caller must hold conn;
+    head written by someone who also rewrote chain_heads can still be
+    compared against the last logged one; the anchor must never be able
+    to break an ingestion, so a logging failure is swallowed.
+
+    The new row links to the RECORDED head (chain_heads) when there is
+    one, not to whatever row happens to be last: otherwise the first sync
+    after manifests were removed from the end would chain onto the
+    surviving row, overwrite the head, and make the gap verify as valid
+    again. The read and the write are one BEGIN IMMEDIATE transaction, so
+    two processes cannot fork the chain either. Caller must hold conn;
     commits on its own, after the row-insert transaction it covers."""
     entries = [tuple(e) for e in new_entries]
-    uuids = sorted(uuid for uuid, _c, _s in entries)
-    batch_hash = hashlib.sha256("\n".join(uuids).encode()).hexdigest()
+    batch_hash = _sha256_of_lines(sorted(uuid for uuid, _c, _s in entries))
     content_hash = _manifest_content_hash(entries)
     created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     with _db_lock:
         try:
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+            recorded = conn.execute(
+                "SELECT manifest_id, head_hash FROM chain_heads WHERE environment_id = ?", (environment_id,)
+            ).fetchone()
             prev = conn.execute(
                 "SELECT batch_hash, entry_hash FROM ingestion_manifests WHERE environment_id = ? ORDER BY id DESC LIMIT 1",
                 (environment_id,),
             ).fetchone()
-            prev_hash = (prev["entry_hash"] or prev["batch_hash"]) if prev else None
+            last_hash = (prev["entry_hash"] or prev["batch_hash"]) if prev else None
+            if recorded is None or _recorded_head_is_stale(conn, environment_id, recorded):
+                prev_hash = last_hash
+            else:
+                prev_hash = recorded["head_hash"]
             if EVIDENCE_CHAIN_V2:
                 entry_hash = _manifest_entry_hash(
                     prev_hash, environment_id, source, since, until, len(entries), created_at, batch_hash, content_hash
                 )
-                curated_entries = sorted([u, s] for u, c, s in entries if c)
-                v2_fields = (content_hash, entry_hash, json.dumps(curated_entries, separators=(",", ":")))
+                v2_fields = (content_hash, entry_hash, None)  # entries go to manifest_entries (migration 007)
             else:
                 entry_hash = batch_hash  # v1 head: the next row chains to batch_hash, exactly as before
                 v2_fields = (None, None, None)
-            conn.execute(
+            cur = conn.execute(
                 """INSERT INTO ingestion_manifests
                    (environment_id, source, since, until, row_count, batch_hash, prev_manifest_hash, created_at,
                     content_hash, entry_hash, entries_json)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (environment_id, source, since, until, len(entries), batch_hash, prev_hash, created_at, *v2_fields),
+            )
+            manifest_id = cur.lastrowid
+            if EVIDENCE_CHAIN_V2:
+                conn.executemany(
+                    "INSERT INTO manifest_entries (environment_id, manifest_id, uuid, sha) VALUES (?, ?, ?, ?)",
+                    ((environment_id, manifest_id, u, s) for u, c, s in entries if c),
+                )
+            # The head is recorded in both modes, so a v1 row written with
+            # the flag off still keeps chain_heads current (the chain is
+            # reported as downgraded either way; it must not ALSO look cut short).
+            conn.execute(
+                """INSERT INTO chain_heads (environment_id, manifest_id, head_hash, updated_at) VALUES (?, ?, ?, ?)
+                   ON CONFLICT(environment_id) DO UPDATE SET
+                       manifest_id = excluded.manifest_id, head_hash = excluded.head_hash, updated_at = excluded.updated_at""",
+                (environment_id, manifest_id, entry_hash, created_at),
             )
             conn.commit()
         except Exception:
@@ -1176,16 +1288,15 @@ def _record_ingestion_manifest(conn, environment_id, source, since, until, new_e
     return entry_hash
 
 
-# DATA-04: the v2 chain is implemented and tested but NOT yet the format
-# new manifests are written in. Changing what the Phase 6 evidence chain
-# seals is a change to the tool's evidence-integrity guarantee -- a
-# maintainer decision, not a reviewer's -- so it ships dormant: with this
-# False, _record_ingestion_manifest writes exactly the v1 rows it always
-# did (verify_ingestion_chain already understands both). Flip to True to
-# start sealing content from the next ingestion onward; no migration or
-# re-seal of history is needed (the first v2 row chains to the last v1
-# row's batch_hash).
-EVIDENCE_CHAIN_V2 = False
+# DATA-04: new manifests are written in the v2 format (enabled 5.40.4,
+# maintainer decision 2026-10-08). Each v2 row seals the content of every
+# curated event it ingested plus every manifest field, so the chain is
+# tamper evidence from the first v2 row onward. Rows written before then
+# stay v1 (a uuid-only continuity check) and are never re-sealed: the
+# first v2 row chains to the last v1 row's batch_hash, and
+# verify_ingestion_chain reports how many legacy rows precede it. Setting
+# this back to False is a downgrade the verifier flags as a broken chain.
+EVIDENCE_CHAIN_V2 = True
 
 
 def verify_ingestion_chain(environment_id, deep=False):
@@ -1195,7 +1306,8 @@ def verify_ingestion_chain(environment_id, deep=False):
     (entry_hash, or batch_hash for a pre-v2 row); every v2 row's
     entry_hash must recompute from its stored fields; and with
     deep=True every v2 row's curated events are re-read from `events`,
-    re-hashed and compared against entries_json and content_hash -- so a
+    re-hashed and compared against its sealed entries (manifest_entries)
+    and content_hash -- so a
     deleted or edited curated event, an edited manifest field, a deleted
     manifest, or a re-ordered chain all surface here. A non-curated row
     missing from `events` is NOT a failure (retention pruning is
@@ -1210,19 +1322,57 @@ def verify_ingestion_chain(environment_id, deep=False):
     "head_hash", "legacy_manifests", "deep", "deep_applicable",
     "verified_rows", "unverifiable_rows"}. deep_applicable is False when
     no manifest carries v2 fields (nothing content-sealed to re-read --
-    the case while EVIDENCE_CHAIN_V2 is off), so a caller never mistakes
-    "verified 0 rows" for "all rows verified". broken_at is the id of
-    the first bad row, or None. Zero manifests is a valid, intact chain
-    of nothing. What this cannot see: a tail truncated AFTER the last row
-    (nothing follows it to disagree) -- compare head_hash against the
-    last `evidence_chain.sealed` entry in audit_log.jsonl for that."""
-    conn = _get_connection()
+    an archive whose manifests all predate 5.40.4), so a caller never
+    mistakes "verified 0 rows" for "all rows verified". broken_at is the
+    id of the first bad row, or None (or the recorded head's manifest id
+    when the chain was cut short). Zero manifests with no recorded head
+    is a valid, intact chain of nothing.
+
+    The END of the chain is checked against chain_heads (migration 007),
+    written with every manifest since 5.40.4 and backfilled at upgrade:
+    if manifests were removed from the
+    tail -- including every v2 manifest, which would otherwise make the
+    archive look like an all-legacy pre-5.40.4 one -- the computed head
+    no longer matches the recorded one; the writer links new rows to the
+    recorded head, so a later sync leaves the gap visible as a
+    prev_manifest_hash mismatch instead of healing it. All reads happen
+    in one read transaction, so a sync committing mid-check cannot make
+    the head look "removed". Rows that older code appended after the
+    recorded head (a code-only rollback; it never updates chain_heads)
+    are walked and checked like any others and reported as
+    `head_stale: true`, not as tampering.
+
+    Threat model, stated plainly: the hashes are unkeyed, so this detects
+    edits made by someone who does not also recompute the chain (and
+    chain_heads) after them -- a careless or partial edit, a restore of
+    the wrong backup, a tool that rewrote rows. Someone with write access
+    who recomputes every hash can forge a valid chain; the out-of-band
+    check for that is comparing head_hash with the last
+    `evidence_chain.sealed` entry in audit_log.jsonl. Rewriting or
+    deleting the chain_heads row needs no hashing at all, so the tail
+    check is only as strong as that row. Event content is only re-read
+    with deep=True, and only for curated events."""
+    conn = _get_connection()  # this thread's own connection: no _db_lock, so a long deep check never blocks a sync
+    own_txn = not conn.in_transaction
+    if own_txn:
+        conn.execute("BEGIN")  # one WAL read snapshot for every read below
+    try:
+        return _verify_ingestion_chain_snapshot(conn, environment_id, deep)
+    finally:
+        if own_txn:
+            conn.rollback()
+
+
+def _verify_ingestion_chain_snapshot(conn, environment_id, deep):
     rows = conn.execute(
         """SELECT id, environment_id, source, since, until, row_count, batch_hash, prev_manifest_hash,
-                  created_at, content_hash, entry_hash, entries_json
+                  created_at, content_hash, entry_hash
            FROM ingestion_manifests WHERE environment_id = ? ORDER BY id ASC""",
         (environment_id,),
     ).fetchall()
+    recorded_head = conn.execute(
+        "SELECT manifest_id, head_hash FROM chain_heads WHERE environment_id = ?", (environment_id,)
+    ).fetchone()
     result = {
         "valid": True, "manifest_count": len(rows), "broken_at": None, "reason": None, "head_hash": None,
         "legacy_manifests": 0, "deep": bool(deep), "deep_applicable": False, "verified_rows": 0, "unverifiable_rows": 0,
@@ -1252,31 +1402,82 @@ def verify_ingestion_chain(environment_id, deep=False):
         if recomputed != row["entry_hash"]:
             return _broken(row, "entry_hash does not match the manifest's stored fields")
         if deep:
-            try:
-                entries = [tuple(e) for e in json.loads(row["entries_json"] or "[]")]
-            except (ValueError, TypeError):
-                return _broken(row, "entries_json is unreadable")
-            if len(entries) > row["row_count"]:
-                return _broken(row, "entries_json lists more rows than row_count")
-            # entries_json holds the curated rows only, so the content hash
-            # recomputes from it directly; non-curated rows are the
-            # difference between row_count and len(entries) and were
+            legacy_json = conn.execute(
+                "SELECT entries_json FROM ingestion_manifests WHERE id = ?", (row["id"],)
+            ).fetchone()["entries_json"]
+            if legacy_json is not None:  # 5.40.2-format v2 row (flag forced on by hand before 5.40.4)
+                try:
+                    pairs = [tuple(e) for e in json.loads(legacy_json)]
+                except (ValueError, TypeError):
+                    return _broken(row, "entries_json is unreadable")
+                sealed = sorted(
+                    (f"{u}:{sha}", u, sha, _stored_raw(conn, environment_id, u)) for u, sha in pairs
+                )
+            else:
+                # Streamed in the content hash's own order: SQLite's default
+                # BINARY collation compares UTF-8 bytes, which orders the
+                # same as Python's code-point sort of the same strings.
+                sealed = (
+                    (r["line"], r["uuid"], r["sha"], r["raw_json"]) for r in conn.execute(
+                        """SELECT me.uuid || ':' || me.sha AS line, me.uuid, me.sha, e.raw_json
+                           FROM manifest_entries me
+                           LEFT JOIN events e ON e.environment_id = me.environment_id AND e.uuid = me.uuid
+                           WHERE me.manifest_id = ? ORDER BY line""",
+                        (row["id"],),
+                    )
+                )
+            h = hashlib.sha256()
+            count = 0
+            first_event_problem = None
+            for line, uuid, sha, raw_json in sealed:
+                if count:
+                    h.update(b"\n")
+                h.update(line.encode("utf-8"))
+                count += 1
+                if first_event_problem is None:
+                    if raw_json is None:
+                        first_event_problem = f"curated event {uuid} is missing from the archive"
+                    elif _content_sha256(raw_json) != sha:
+                        first_event_problem = f"event {uuid} content does not match its sealed hash"
+            if count > row["row_count"]:
+                return _broken(row, "the manifest lists more sealed rows than row_count")
+            # The sealed entries are the curated rows only, so the content
+            # hash recomputes from them directly; non-curated rows are the
+            # difference between row_count and the sealed count and were
             # never content-sealed (retention may legitimately prune them).
-            if _manifest_content_hash([(u, 1, s) for u, s in entries]) != row["content_hash"]:
-                return _broken(row, "content_hash does not match entries_json")
-            result["unverifiable_rows"] += row["row_count"] - len(entries)
-            for uuid, sha in entries:
-                stored = conn.execute(
-                    "SELECT raw_json FROM events WHERE environment_id = ? AND uuid = ?", (environment_id, uuid)
-                ).fetchone()
-                if stored is None:
-                    return _broken(row, f"curated event {uuid} is missing from the archive")
-                if _content_sha256(stored["raw_json"]) != sha:
-                    return _broken(row, f"event {uuid} content does not match its sealed hash")
-                result["verified_rows"] += 1
+            if h.hexdigest() != row["content_hash"]:
+                return _broken(row, "content_hash does not match the manifest's sealed entries")
+            if first_event_problem:
+                return _broken(row, first_event_problem)
+            result["unverifiable_rows"] += row["row_count"] - count
+            result["verified_rows"] += count
         expected_prev = row["entry_hash"]
     result["head_hash"] = expected_prev
+    result["head_stale"] = False
+    if (recorded_head is not None and recorded_head["head_hash"] != expected_prev
+            and _recorded_head_is_stale(conn, environment_id, recorded_head)):
+        # Rows appended after the recorded head by older code (a code-only
+        # rollback) -- the walk above already validated them. Not tampering;
+        # the next sync refreshes the head.
+        result["head_stale"] = True
+    elif recorded_head is not None and recorded_head["head_hash"] != expected_prev:
+        result.update({
+            "valid": False, "broken_at": recorded_head["manifest_id"],
+            "reason": "the chain ends before the recorded head -- manifests were removed from the end",
+        })
+    elif recorded_head is None and seen_v2:
+        result.update({
+            "valid": False, "broken_at": rows[-1]["id"],
+            "reason": "sealed (v2) manifests exist but the recorded chain head is missing",
+        })
     return result
+
+
+def _stored_raw(conn, environment_id, uuid):
+    found = conn.execute(
+        "SELECT raw_json FROM events WHERE environment_id = ? AND uuid = ?", (environment_id, uuid)
+    ).fetchone()
+    return found["raw_json"] if found else None
 
 
 class PendingActionError(Exception):
@@ -1862,7 +2063,7 @@ def prune_events(environment_id, retention_days=None, max_size_mb=None):
 
 def list_orphaned_archives():
     """DATA-12: environment_ids that still have archive rows (events,
-    sync_state or ingestion_manifests) but no app_environments row any
+    sync_state, ingestion_manifests or their chain tables) but no app_environments row any
     more -- the data a deleted environment leaves behind, which no route
     could address, prune, export or purge before. Returns one dict per
     orphan with what an admin needs to decide: event_count, bytes (raw
@@ -1875,7 +2076,9 @@ def list_orphaned_archives():
         r[0] for r in conn.execute(
             """SELECT DISTINCT environment_id FROM events
                UNION SELECT environment_id FROM sync_state
-               UNION SELECT environment_id FROM ingestion_manifests"""
+               UNION SELECT environment_id FROM ingestion_manifests
+               UNION SELECT environment_id FROM chain_heads
+               UNION SELECT environment_id FROM manifest_entries"""
         )
     } - {r[0] for r in conn.execute("SELECT environment_id FROM app_environments")}
     out = []
@@ -1897,8 +2100,8 @@ def list_orphaned_archives():
 
 def purge_environment_archive(environment_id):
     """DATA-12: removes every archive row for an environment that no
-    longer exists -- events, event_targets, sync_state and
-    ingestion_manifests -- in one transaction. Refuses (ValueError) while
+    longer exists -- events, event_targets, sync_state, ingestion_manifests
+    and their sealed entries / recorded head -- in one transaction. Refuses (ValueError) while
     an app_environments row still references the id: a live environment's
     evidence is deleted through delete_environment(purge_archive=True),
     never by addressing the archive directly. Returns the per-table
@@ -1910,7 +2113,7 @@ def purge_environment_archive(environment_id):
             if conn.execute("SELECT 1 FROM app_environments WHERE environment_id = ?", (environment_id,)).fetchone():
                 raise ValueError("That environment still exists; delete the environment itself to purge its archive.")
             counts = {}
-            for table in ("event_targets", "events", "sync_state", "ingestion_manifests"):
+            for table in ("event_targets", "events", "sync_state", "manifest_entries", "chain_heads", "ingestion_manifests"):
                 counts[table] = conn.execute(f"DELETE FROM {table} WHERE environment_id = ?", (environment_id,)).rowcount
             conn.commit()
         except Exception:

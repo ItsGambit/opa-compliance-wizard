@@ -2,6 +2,83 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.40.4 — **Evidence chain v2 is on: every new ingestion manifest now seals the content of the curated events it archived, and the end of the chain is recorded (DATA-04).**
+5.40.2 shipped the v2 chain dormant (`audit_store.EVIDENCE_CHAIN_V2 =
+False`) because changing what the Phase 6 chain seals is a maintainer
+decision; this release makes that decision and turns it on.
+- **What changes.** From the first sync or CSV import after upgrading,
+  each manifest stores `content_hash` (sha256 over every curated event's
+  raw JSON) and `entry_hash` (sha256 over the previous link and every
+  manifest field), and links to the previous `entry_hash`. For manifests
+  written from this release on, the integrity check (`GET
+  /api/environments/<name>/integrity`) reports as broken: an edited or
+  deleted manifest, a later row written without v2 fields ("downgrade"),
+  and -- with the admin-only `?deep=1` -- an edited or deleted curated
+  event. The review reproduced each of these against the v1 chain and got
+  "valid".
+- **The end of the chain is recorded (new migration 007).** `chain_heads`
+  holds each environment's newest link, written in the same transaction
+  as each manifest and backfilled at upgrade from every existing chain's
+  last row, so manifests removed from the end from the upgrade onward --
+  v1 or v2, including every sealed one -- show as a broken chain. A new manifest links to the
+  recorded head, not to whichever row is last, so the next sync keeps
+  such a gap visible instead of covering it. The manifest write (read of
+  the head, insert, sealed entries, head update) is one `BEGIN IMMEDIATE`
+  transaction, and the check reads everything from one snapshot, so a
+  sync running during a check is not reported as tampering. Rows that
+  older code appended after the recorded head (a code-only rollback,
+  which never updates `chain_heads`) are checked like any others and
+  reported as `head_stale: true` rather than as a cut-short chain; the
+  next sync links past them and refreshes the head.
+- **Sealed entries get their own table (migration 007).**
+  `manifest_entries` holds the `(uuid, sha256)` of each sealed curated
+  event, one row each, instead of 5.40.2's single `entries_json` cell (a
+  90-day first backfill of a mid-size tenant would have made that one
+  ~95 MB value). Deep verification streams them with the events in one
+  query and hashes as it goes, and the plain check no longer reads them;
+  a 5.40.2-format `entries_json` row is still verified. An archive purge
+  removes both new tables, and the orphaned-archive listing includes them.
+- **What it does not do -- read this before relying on it.** The hashes
+  are unkeyed. The chain detects changes made by someone who does not
+  also rewrite the chain to match: a careless or partial edit, a tool
+  that rewrote rows, restoring the wrong backup. It does not stop a
+  deliberate edit by someone with database write access: they can
+  recompute the hashes, and defeating the end-of-chain check needs no
+  hashing at all (rewrite or delete the `chain_heads` row along with the
+  manifests). The out-of-band check is comparing the result's
+  `head_hash` with the last `evidence_chain.sealed` entry in
+  `audit_log.jsonl`. Event content is checked only with `?deep=1`, and
+  only for curated events (the ones retention never prunes).
+- **History is not re-sealed.** Manifests written before this release
+  stay v1 rows (a continuity check over event ids, not tamper evidence);
+  the first v2 row chains to the last v1 row's `batch_hash`, and
+  `legacy_manifests` counts the v1 rows before that boundary. A deploy
+  from 5.40.1 or earlier runs migrations 006 and 007 in the same start.
+- **Not rollback-safe once a sync has run.** Rolling the code back to
+  5.40.3 or earlier after any 5.40.4 sync breaks the chain in two ways: 5.40.3's deep check
+  cannot read the sealed entries, so every 5.40.4 manifest with curated
+  rows fails at once, and its next sync writes an unsealed row after a
+  sealed one ("chain downgraded"). Restoring the pre-upgrade
+  `audit_store.db` backup avoids that, but also drops every event synced
+  since the upgrade; only events still inside Okta's 90-day System Log
+  window can be fetched again.
+- **Tests.** The tamper tests run on the shipped default; new cases for
+  sealed entries, a removed tail (staying broken after the next sync),
+  removing every manifest, a missing head, a sync committing during a
+  check, the transaction's atomicity, the row-count bound, the
+  5.40.2-format fallback, purge of the new tables, and upgrades from a
+  real pre-006 and pre-007 schema, a code-only rollback, prefix-sharing
+  uuids, and known-answer hashes that pin `batch_hash` to the v1 format;
+  the Phase 6 chaining and tampered-hash tests cover both formats. The
+  safeguards were mutation-checked; the cross-process `BEGIN IMMEDIATE`
+  is reasoned about, not covered by a multi-process test.
+- Known, not changed here (pre-existing): if writing sync state fails
+  after a successful sync's manifest has committed, the failure path
+  writes a second manifest for the same rows (the chain stays valid,
+  `row_count` is double-counted). Deep verification of a manifest with
+  about a million sealed rows takes tens of seconds inside one request.
+  Both are queued for the engine batch.
+
 5.40.3 — **Server routes and tests: an HTTP authorization matrix for every route, plus twelve findings from the 2026-10-05 external review (TEST-01/03/07/08/09, SRV-03/05/06, ENG2-16, ENG1-05, ENG1-06, UI-06).**
 Batch 2 of the review's remaining findings. Behaviour changes an operator
 or user can notice are listed first.

@@ -1272,16 +1272,18 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_json(200, job)
 
             if path.startswith("/api/environments/") and path.endswith("/integrity"):
-                # Phase 6: cheap, mechanical "has this environment's
-                # ingestion history been tampered with" check -- walks
-                # the hash-chained ingestion_manifests table, never
-                # touches `events` itself (see
-                # audit_store.verify_ingestion_chain's docstring).
+                # Phase 6 / DATA-04: walks the hash-chained
+                # ingestion_manifests table and checks its end against the
+                # recorded head; the admin-only ?deep=1 also re-reads every
+                # sealed curated event from `events` (see
+                # audit_store.verify_ingestion_chain's docstring for what
+                # this does and does not detect).
                 name = unquote(path[len("/api/environments/"):-len("/integrity")])
                 deep = (qs.get("deep") or ["0"])[0] in ("1", "true")  # DATA-04: also re-hash sealed curated events
                 if deep and not _can_admin(owner_key, self.headers):
-                    # Deep mode re-reads every sealed event (one SELECT per
-                    # row) inside the request -- an admin-only cost.
+                    # Deep mode re-reads every sealed event (one streamed
+                    # query per manifest) inside the request -- an
+                    # admin-only cost.
                     return self._send_json(403, {"error": "Admin access required for a deep integrity check."})
                 try:
                     result = engine.verify_environment_evidence_chain(name, owner=engine_owner, deep=deep)

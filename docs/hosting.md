@@ -282,12 +282,34 @@ sqlite3 /home/<app-user>/opa-compliance-wizard/audit_store.db ".backup '/backups
 copy). To restore: stop the service, move the current `audit_store.db`,
 `-wal` and `-shm` files aside, copy the backup into place, make sure it
 is owned by the app user with mode `0600`, start the service, then run
-`sqlite3 audit_store.db "PRAGMA integrity_check"` and open each
-environment's **Integrity** check in the dashboard (`GET
-/api/environments/<name>/integrity`; the admin-only `?deep=1` additionally
-re-hashes every content-sealed event, which only exists for manifests
-written with evidence chain v2 enabled -- the response's
-`deep_applicable` says whether there was anything to re-read). Set
+`sqlite3 audit_store.db "PRAGMA integrity_check"` and call each
+environment's integrity check (`GET /api/environments/<name>/integrity`;
+the admin-only `?deep=1` additionally re-hashes every sealed curated
+event). Evidence chain v2 is on by default since 5.40.4. For manifests
+written from then on, an edited or deleted manifest and (with `?deep=1`)
+an edited or deleted curated event show as a broken chain; for the whole
+chain, v1 and v2, manifests removed from the end after the upgrade show
+as broken, because
+each environment's newest link is recorded separately (`chain_heads`)
+and new manifests link to it. The hashes are unkeyed: this catches
+changes made without rewriting the chain to match, not a deliberate edit
+by someone with database write access (who can recompute the hashes, or
+simply rewrite the `chain_heads` row). For that, compare the result's
+`head_hash` with the last `evidence_chain.sealed` entry in
+`audit_log.jsonl`. Manifests written before 5.40.4 are legacy v1 rows --
+a continuity check over event ids only -- and are never re-sealed; the
+response's `legacy_manifests` counts them and `deep_applicable` says
+whether any sealed rows exist to re-read.
+
+**Rolling back past 5.40.4.** Once a 5.40.4+ sync has run, code from
+5.40.3 or earlier cannot read the sealed entries (its deep check fails on
+every new manifest) and its next sync writes an unsealed row after a
+sealed one (a "downgraded" chain). Take a backup before upgrading (as
+above) and restore it together with the old code if you roll back --
+knowing that this drops every event synced since the upgrade, and only
+events still inside Okta's 90-day System Log window can be fetched again.
+
+Set
 `OPA_AUDIT_DB_PATH=/var/lib/opa-compliance-wizard/audit_store.db` (or any
 path outside the code checkout) in the service's environment file to keep
 the archive out of the directory `deploy.sh` rsyncs over: create that
