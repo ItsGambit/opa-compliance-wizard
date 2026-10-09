@@ -68,7 +68,14 @@ export function FolderBuilder() {
       }
     } else if (previewResp) {
       for (const t of previewResp.tree) {
-        map.set(t.path, t.exists ? { label: 'exists', variant: 'exists' } : { label: 'will create', variant: 'new' })
+        if (t.exists) map.set(t.path, { label: 'exists', variant: 'exists' })
+        else if (t.name_in_use_at)
+          map.set(t.path, {
+            label: 'name in use',
+            variant: 'error',
+            errorMessage: `A folder with this name already exists at "${t.name_in_use_at}". OPA requires folder names to be unique per project, so creating it here will most likely be refused; it will not be merged with the existing one.`,
+          })
+        else map.set(t.path, { label: 'will create', variant: 'new' })
       }
     }
     return map

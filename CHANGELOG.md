@@ -2,6 +2,136 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.40.6 — **Sync and report engine: eighteen findings from the 2026-10-05 external review (ENG1-07..12, ENG2-02/03/05..13/15; ENG2-10 in part), one manifest per sync, and a deep integrity check that no longer runs inside one request.**
+Batch 4 of the review's remaining findings. The evidence chain is
+unchanged: same hash formats, same link rule, same `chain_heads`, same
+verifier results for existing data. No schema change, no migration.
+- **Operator action and deploy impact.**
+  - Nothing to do. `server/deploy.sh` now also leaves
+    `.audit_log.jsonl.lock` alone (a new lock file next to the audit log).
+  - Rollback to 5.40.5 is code-only and safe: nothing new is stored in
+    the database, and the lock file is ignored by older code.
+- **Noticeable changes.**
+  - **`GET /api/environments/<name>/integrity?deep=1` can answer `202`
+    (deep-verify decision).** The deep check now runs in the background,
+    one at a time per environment. The request waits up to 20 s and, if
+    the check is done, answers `200` exactly as before (plus
+    `checked_at`). Otherwise it answers `202 {"status": "running"}`; call
+    the same URL again until it answers `200` (or `500`: a failed check
+    is reported once, and the next call starts a new one). A finished
+    result is served for 2 minutes. Why: a deep check re-hashes every sealed curated event,
+    curated events are never pruned, so the cost grows with the archive
+    for ever (8-20 s per million); inside one request it would eventually
+    pass nginx's 60 s proxy timeout and every retry would start another
+    full pass. See `docs/hosting.md` for a polling example.
+  - **Folder Builder: a planned folder is matched only at its exact path
+    (ENG2-02).** If the project has `Dev/DB` and the CSV asks for
+    `Prod/DB/creds`, `Prod/DB` used to be marked "exists" with `Dev/DB`'s
+    id, and `creds` was created under `Dev/DB` (inheriting its policy
+    grants) while the results said `Prod/DB/creds`. Now the preview shows
+    **name in use** with the other location, nothing is ever created under
+    the wrong parent, and the create is attempted where the CSV says (OPA
+    refuses a name already used in the project, so that row ends as an
+    error and its sub-folders are skipped).
+  - **Assign access to an existing policy can answer `409` (ENG2-05).**
+    The policy is re-read right before it is written; if it changed in the
+    meantime (in the OPA console or by another wizard user), nothing is
+    written and you are asked to reload. Wizard writes to one policy are
+    serialised. The policy must belong to the resource group in the URL,
+    the folder must exist in the project (its name now comes from OPA),
+    privileges must be `true`/`false` (a non-UI client sending `"false"`
+    used to grant), and malformed group refs or MFA settings are a `400`
+    instead of a `500`. OPA offers no ETag for policies, so the window is
+    narrowed to one round trip, not closed: any rate-limit wait now happens
+    before the re-read, and the write goes out right after it (a `429` on
+    the write re-waits and re-reads).
+  - **Access Explorer loads even when the service key may not read some
+    sections (ENG2-07).** Gateways, connections, assignments,
+    relationships, enrolled clients and the per-project account lists come
+    back empty on `401`/`403`/`404`, and a banner names each incomplete
+    section. Resource groups, projects, users, groups, folders and
+    policies still fail the load.
+  - **Partial results say so (ENG2-09).** The live (pre-sync) Secrets
+    report and the "last accessed" lookup show a caveat when the System
+    Log walk hit its page limit.
+  - **A locked OS keychain is reported as such (ENG1-10)** — `503` with
+    "The OS credential store could not be read", instead of looking like
+    every environment had lost its secrets.
+  - **CLI (ENG2-13).** Credentials come from one source: all four from
+    the environment/`.env`, or all four from the dashboard's active
+    environment. A partial set in the environment stops with the missing
+    names. `--output` is never overwritten without the new `--force`, and
+    the file is opened before anything is created. A non-UTF-8 CSV ends
+    with a clear message.
+  - **CSV and names (ENG2-12).** `Path`, ` path ` and `PATH` headers are
+    accepted. Folder names `.` and `..` and names longer than 255
+    characters are rejected up front (OPA documents no limit; 255 is the
+    limit its spec gives other names). Names that differ only by case are
+    warned about.
+- **Fixed.**
+  - **A sync wrote a second manifest for the same rows** when the final
+    status write failed after the manifest committed (`row_count` counted
+    twice). Exactly one manifest is written per sync now, and the rows are
+    sealed even if writing the error status fails too.
+  - **Archive Secrets report (ENG2-03).** It read the whole environment's
+    secret/folder events capped at 100,000, then filtered to the project:
+    past that volume the oldest events (the creates) silently vanished.
+    It now filters to the project in SQL through the indexed
+    `event_targets` table, streams the rows, and has no cap. The live and
+    archive reports now share one implementation (pinned by a test that
+    feeds both the same events).
+  - **Environment save (ENG1-07).** Every check runs before anything is
+    stored: a rejected save no longer replaces the stored secret or leaves
+    an orphaned keychain entry. The lookup, the duplicate-name check and
+    the write are one transaction, so two concurrent local creates of one
+    name make one environment, and an admin rename onto an existing name
+    is a clean `400`.
+  - **Rate-limit waits are bounded (ENG1-08).** Each wait is clamped to
+    0-120 s (a negative or NaN `Retry-After` used to crash the call as a
+    `400`; `1e9` slept for ~31 years), an HTTP-date `Retry-After` is
+    honoured, and one call gives up with `429` after 10 minutes of waits.
+  - **HTTP client (ENG1-09).** A credential only ever goes to the
+    configured origin: a pagination link naming another host is requested
+    as a path on the configured origin, with a WARN (the OPA client used to
+    send its bearer token to any host a `Link` header named); host case and default ports are
+    normalised, so an org URL saved with capitals no longer breaks page 2;
+    a repeating link is an error, not an endless loop. POSTs are no longer
+    retried after a 5xx or an ambiguous network error (duplicate Okta
+    groups); GET/PUT/DELETE still are. Timeouts, resets and non-JSON
+    responses become normal API errors (`502`) instead of tracebacks or
+    `400`s. A `401 Missing capability` no longer triggers a token refresh.
+    An unexpected list response is logged by shape, not by content.
+  - **App audit log (ENG1-11).** Created owner-only (`0600`), and an
+    existing wider file (local mode used the process umask) is narrowed to
+    `0600` on its next write; every writer takes a cross-process lock
+    (waited for at most 5 s, then the in-process lock for a minute; the MFA
+    refresh, which rewrites the file, answers `409` instead of rewriting
+    without it -- it could otherwise lose another process's line); a failed append no longer turns a
+    completed action into a `500` (it is logged to the journal instead);
+    the Audit Log page reads from the end of the file instead of parsing
+    all of it.
+  - **`.env` loader (ENG1-12).** A UTF-8 BOM, a UTF-16 file (PowerShell's
+    `>`) and `export KEY=value` lines work; an unreadable file is skipped
+    with a warning instead of crashing at import.
+  - **Folder execute keeps its record (ENG2-06).** A network failure
+    mid-run used to lose every result already recorded (no results file,
+    no `folders.execute` audit entry). That row is now an error, the rest
+    are reported as not attempted, and the response and the
+    `folders.execute` audit entry are always produced (if the results file
+    itself can't be written, `output_file` is `null` and the journal says
+    why).
+  - **Access Explorer bootstrap (ENG2-08).** Per-user group lookups run on
+    four workers (the rest stays sequential).
+  - **Null fields (ENG2-11).** A policy with `"rules": null`, a rule with
+    null privileges, a folder without a name and similar API shapes no
+    longer crash the policy picker, the reports or the access model.
+  - **Results CSV (ENG2-15).** Cells starting with `=`, `+`, `-`, `@`, tab
+    or CR get a leading `'`, so a spreadsheet does not evaluate them.
+  - **Relationship policies (ENG2-10, additive).** Each relationship-derived
+    resource now also carries the principal of the assignment that granted
+    it. How the view should pair them is an open decision (it needs one
+    live check of OPA's semantics).
+
 5.40.5 — **Login gate, nginx template and second-site generator: nine findings from the 2026-10-05 external review (GATE-06/07/08/09/10/12/13/14/15), plus the MFA log lookup now reports Okta failures as failures.**
 Batch 3 of the review's remaining findings. Nothing changes for a normal
 sign-in. GATE-05 (session revocation) and GATE-11 (systemd sandboxing)

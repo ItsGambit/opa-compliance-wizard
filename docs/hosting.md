@@ -333,6 +333,24 @@ a continuity check over event ids only -- and are never re-sealed; the
 response's `legacy_manifests` counts them and `deep_applicable` says
 whether any sealed rows exist to re-read.
 
+**A deep check on a large archive (5.40.6+).** `?deep=1` re-reads every
+sealed curated event, and curated events are never pruned, so its cost
+grows with the archive (roughly 8-20 s per million sealed events). It runs
+in the background, one at a time per environment. The request waits up to
+20 s: a check that finishes in time is answered with `200` and the result,
+as before. A longer one answers `202 {"status": "running", ...}`; call the
+same URL again (every ~10 s) until it answers `200` -- or `500` if the
+check failed (reported once; the next call starts a new check). The finished result
+carries `checked_at` and is served to repeat calls for 2 minutes; after
+that the next call starts a fresh check. For example (`$BASE` and
+`$AUTH` stand for however you already call the API):
+
+```bash
+until code=$(curl -s -o result.json -w '%{http_code}' -H "$AUTH" \
+      "$BASE/api/environments/<name>/integrity?deep=1") && [ "$code" != 202 ]; do sleep 10; done
+cat result.json
+```
+
 **Rolling back past 5.40.4.** Once a 5.40.4+ sync has run, code from
 5.40.3 or earlier cannot read the sealed entries (its deep check fails on
 every new manifest) and its next sync writes an unsealed row after a
@@ -376,7 +394,14 @@ environment into being visible to every other logged-in user via the
 `POST /api/environments/{name}/share`). Every write action (environment
 changes, folder/resource-group/policy/group creates and deletes, sync
 starts, admin overrides) is appended to `audit_log.jsonl`, attributed to
-the real logged-in identity. Running the CLI or `launch.py` directly (no
+the real logged-in identity. The file is created owner-only (`0600`; an
+older, wider file is narrowed on its next write), and
+every process that writes it takes a lock on `.audit_log.jsonl.lock`
+next to it (5.40.6). If an entry cannot be written (disk full, read-only
+file), the action it describes has already happened, so it is not turned
+into an error: the journal gets an `Audit log append FAILED` line with the
+action, the actor's id and the time. The file has no rotation and no
+tamper evidence of its own; keep it in your backups. Running the CLI or `launch.py` directly (no
 login gate in front of them at all) is entirely unaffected by any of
 this -- there's exactly one shared, unscoped environment list, matching
 this tool's original single-user design.

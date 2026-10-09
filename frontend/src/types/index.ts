@@ -272,6 +272,9 @@ export interface PreviewTreeItem {
   depth: number
   exists: boolean
   folder_id: string
+  /** A folder with the same name already exists at this other path in the
+   * project (never adopted as this path -- OPA decides on the create). */
+  name_in_use_at?: string | null
 }
 
 export interface InvalidName {
@@ -282,6 +285,8 @@ export interface InvalidName {
 export interface PreviewResponse {
   tree: PreviewTreeItem[]
   collisions: Record<string, string[]>
+  /** Groups of planned paths whose names differ only by letter case. */
+  case_variants?: string[][]
   invalid_names: InvalidName[]
 }
 
@@ -297,7 +302,8 @@ export interface ExecuteResultRow {
 export interface ExecuteResponse {
   results: ExecuteResultRow[]
   collisions: Record<string, string[]>
-  output_file: string
+  /** null when the results file could not be written (the run itself completed). */
+  output_file: string | null
 }
 
 export interface ApiErrorBody {
@@ -676,6 +682,14 @@ export interface AccessModel {
   relationships: AccessRelationship[]
   clients: AccessClient[]
   devices: AccessDevice[]
+  /** Sections the service key may not read (shown empty, not "none"). */
+  warnings?: AccessModelWarning[]
+}
+
+export interface AccessModelWarning {
+  section: string
+  status: number | string
+  message: string
 }
 
 // ── Access Explorer: AD account-discovery configuration ──────────────────
@@ -727,6 +741,9 @@ export interface ResourceAccessInfo {
    * means genuinely not accessed (or not within the last 90 days). */
   supported: boolean
   events: ResourceAccessEvent[]
+  /** False when the System Log lookup hit its page cap -- "no access" may
+   * then just mean "not within what was read". */
+  complete?: boolean
 }
 
 // ── Folder Builder: policy assignment ────────────────────────────────────
@@ -940,4 +957,7 @@ export interface SecretsAccessReport {
   /** Earliest event timestamp actually available in whichever source
    * produced this report -- null if no history exists at all. */
   oldest_captured_at: string | null
+  /** False when the live System Log walk hit its page cap (the oldest
+   * events, e.g. creates, are missing). Absent on older servers. */
+  complete?: boolean
 }

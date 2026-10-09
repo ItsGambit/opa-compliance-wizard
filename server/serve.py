@@ -426,7 +426,7 @@ def _job_error_message(exc):
     DATA-03 "unusable watermark" message) is the user's own, actionable
     information and is kept; anything else is replaced by a generic message
     with the job's correlation id, and the detail is logged."""
-    if isinstance(exc, (engine.OpaApiError, engine.OktaApiError, ValueError)) and not isinstance(
+    if isinstance(exc, (engine.OpaApiError, engine.OktaApiError, ValueError, engine.CredentialStoreUnavailable)) and not isinstance(
         exc, (UnicodeError, json.JSONDecodeError)  # these quote fragments of the input they choked on
     ):
         return str(exc)
@@ -451,6 +451,100 @@ def _run_access_job(storage_name, job_client, job_okta_client, correlation_id=No
         with _access_jobs_lock:
             _access_jobs[storage_name]["status"] = "error"
             _access_jobs[storage_name]["error"] = _job_error_message(exc)
+
+
+# ENG2-05: wizard writes to one security policy are serialised (see the
+# policy route). Keyed by (environment_id, policy_id); the dict only ever
+# holds one small lock per policy the wizard has written to.
+POLICY_WRITE_ATTEMPTS = 3  # a 429 on the policy PUT: wait, re-read, re-compare, retry
+_policy_write_locks_guard = threading.Lock()
+_policy_write_locks = {}
+
+
+def _policy_write_lock(environment_id, policy_id):
+    with _policy_write_locks_guard:
+        return _policy_write_locks.setdefault((environment_id, policy_id), threading.Lock())
+
+
+# Deep evidence-chain verification (5.40.6). A deep check re-reads and
+# re-hashes every sealed curated event, and curated rows are never pruned,
+# so its cost grows with the archive for ever (~8-20 s per million sealed
+# rows measured for 5.40.4). Run inside one request it would eventually
+# outlive nginx's 60 s proxy_read_timeout -- a 504 for the caller while the
+# thread keeps working, and every retry stacking another CPU-bound pass.
+# So: one verify per environment at a time, in a background thread. A
+# request waits up to DEEP_VERIFY_WAIT_SECS for it; a check that finishes in
+# time is answered exactly as before (200 + the verifier's result). A
+# longer one answers 202 {"status": "running"}, and the caller polls the
+# same URL; a finished result stays available to polls for
+# DEEP_VERIFY_RESULT_TTL_SECS (with checked_at), after which the next
+# request starts a fresh check. A FAILED check is handed to the next
+# request once (within DEEP_VERIFY_ERROR_TTL_SECS) as a 500 -- so a poller
+# always learns about it and stops -- and the request after that retries.
+# The verifier itself is unchanged.
+DEEP_VERIFY_WAIT_SECS = 20
+DEEP_VERIFY_RESULT_TTL_SECS = 120
+DEEP_VERIFY_ERROR_TTL_SECS = 30
+_deep_verify_lock = threading.Lock()
+_deep_verify_jobs = {}  # environment_id -> {"status", "started_at", "checked_at", "finished_mono", "result", "error", "event"}
+
+
+def _utc_now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _run_deep_verify(environment_id, job, correlation_id):
+    engine.CORRELATION_ID.set(correlation_id)
+    import audit_store
+    try:
+        result, error = audit_store.verify_ingestion_chain(environment_id, deep=True), None
+    except Exception as exc:
+        result, error = None, _job_error_message(exc)
+    with _deep_verify_lock:
+        job.update({
+            "status": "error" if error else "done", "result": result, "error": error,
+            "checked_at": _utc_now_iso(), "finished_mono": time.monotonic(),
+        })
+    job["event"].set()
+
+
+def _deep_verify(environment_id, wait_secs=None):
+    """Returns (http_status, body) for GET .../integrity?deep=1 -- see the
+    comment above DEEP_VERIFY_WAIT_SECS."""
+    wait_secs = DEEP_VERIFY_WAIT_SECS if wait_secs is None else wait_secs
+    with _deep_verify_lock:
+        job = _deep_verify_jobs.get(environment_id)
+        age = None if job is None or job["finished_mono"] is None else time.monotonic() - job["finished_mono"]
+        fresh = job is not None and (
+            (job["status"] == "done" and age < DEEP_VERIFY_RESULT_TTL_SECS)
+            # A failure not yet seen by anyone (it finished after the
+            # request that started it stopped waiting) is reported once.
+            or (job["status"] == "error" and not job.get("error_delivered") and age < DEEP_VERIFY_ERROR_TTL_SECS)
+        )
+        if job is None or (job["status"] != "running" and not fresh):
+            job = {
+                "status": "running", "started_at": _utc_now_iso(), "checked_at": None, "finished_mono": None,
+                "result": None, "error": None, "event": threading.Event(),
+            }
+            _deep_verify_jobs[environment_id] = job
+            try:
+                threading.Thread(
+                    target=_run_deep_verify, args=(environment_id, job, engine.CORRELATION_ID.get()),
+                    daemon=True, name=f"deep-verify-{environment_id[:8]}",
+                ).start()
+            except BaseException:
+                # Never leave a "running" job no thread will ever finish.
+                _deep_verify_jobs.pop(environment_id, None)
+                raise
+    job["event"].wait(wait_secs)
+    with _deep_verify_lock:
+        if job["status"] == "running":
+            return 202, {"status": "running", "started_at": job["started_at"],
+                         "poll_after_seconds": 10, "deep": True}
+        if job["status"] == "error":
+            job["error_delivered"] = True
+            return 500, {"error": job["error"], "checked_at": job["checked_at"]}
+        return 200, {**job["result"], "checked_at": job["checked_at"]}
 
 
 # Compliance-reporting daily sync job -- one job per environment (not a
@@ -643,7 +737,10 @@ def _start_sync_job(env_id, env_name, ingestion_scope, owner=engine.LOCAL_OWNER_
 
     try:
         creds = engine.get_environment_credentials(env_name, owner=owner)
-    except KeyError as exc:
+    except (KeyError, engine.CredentialStoreUnavailable) as exc:
+        # ENG1-10: a locked keychain is a refused attempt like any other
+        # (recorded, so the scheduler backs off) -- never an exception that
+        # escapes the scheduler tick and skips every other environment.
         return _refuse(str(exc))
     if not creds.get("okta_url") or not creds.get("okta_api_token"):
         return _refuse("No Okta URL/API token configured for this environment.")
@@ -861,13 +958,18 @@ def _row_dict(path, folder_id, status, error_message):
     return {"path": "/".join(path), "folder_id": folder_id, "status": status, "error_message": error_message}
 
 
-def _plan_dict(ordered_paths, existing, collisions):
+def _plan_dict(ordered_paths, existing, collisions, name_in_use=None, case_variants=None):
+    name_in_use = name_in_use or {}
     return {
         "tree": [
-            {"path": "/".join(p), "depth": len(p) - 1, "exists": p in existing, "folder_id": existing.get(p, "")}
+            {"path": "/".join(p), "depth": len(p) - 1, "exists": p in existing, "folder_id": existing.get(p, ""),
+             # ENG2-02: a same-named folder elsewhere in the project (never
+             # adopted; OPA decides on the create) -- None when there is none.
+             "name_in_use_at": name_in_use.get(p)}
             for p in ordered_paths
         ],
         "collisions": {name: ["/".join(p) for p in paths] for name, paths in collisions.items()},
+        "case_variants": [["/".join(p) for p in paths] for paths in (case_variants or {}).values()],
     }
 
 
@@ -948,15 +1050,18 @@ def _run_pipeline(active_client, rows, resource_group_id, project_id):
     (a snapshot the caller took at the start of its request) rather than
     reading the module-level `client` global itself -- see the note on
     request-scoped client snapshots above do_GET."""
+    if not isinstance(rows, list):
+        raise ValueError("rows must be a list")
     ordered_paths, descriptions = engine.parse_rows(rows, warn=False)
     invalid_names = [
         {"path": "/".join(p), "name": p[-1]}
         for p in ordered_paths
-        if not engine.NAME_PATTERN.match(p[-1])
+        if not engine.is_valid_folder_name(p[-1])
     ]
     collisions = engine.detect_name_collisions(ordered_paths)
-    existing = engine.resolve_existing_folders(active_client, resource_group_id, project_id, ordered_paths)
-    return ordered_paths, descriptions, existing, collisions, invalid_names
+    case_variants = engine.detect_case_variant_names(ordered_paths)
+    existing, name_in_use = engine.resolve_existing_folders(active_client, resource_group_id, project_id, ordered_paths)
+    return ordered_paths, descriptions, existing, collisions, invalid_names, name_in_use, case_variants
 
 
 def _validate_ids(**ids):
@@ -1296,11 +1401,19 @@ class Handler(SimpleHTTPRequestHandler):
                 deep = (qs.get("deep") or ["0"])[0] in ("1", "true")  # DATA-04: also re-hash sealed curated events
                 if deep and not _can_admin(owner_key, self.headers):
                     # Deep mode re-reads every sealed event (one streamed
-                    # query per manifest) inside the request -- an
-                    # admin-only cost.
+                    # query per manifest) -- an admin-only cost.
                     return self._send_json(403, {"error": "Admin access required for a deep integrity check."})
+                if deep:
+                    # Bounded per request, single-flight per environment --
+                    # see DEEP_VERIFY_WAIT_SECS. Visibility is resolved here,
+                    # before any job (or a cached result) is touched.
+                    meta = engine.list_environments_for(engine_owner).get(name)
+                    if meta is None:
+                        return self._send_json(404, {"error": f"No saved environment named '{name}'"})
+                    status, body = _deep_verify(meta["environment_id"])
+                    return self._send_json(status, body)
                 try:
-                    result = engine.verify_environment_evidence_chain(name, owner=engine_owner, deep=deep)
+                    result = engine.verify_environment_evidence_chain(name, owner=engine_owner, deep=False)
                 except KeyError as exc:
                     return self._send_json(404, {"error": str(exc)})
                 return self._send_json(200, result)
@@ -1652,6 +1765,8 @@ class Handler(SimpleHTTPRequestHandler):
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to view access control settings."})
                 return self._send_json(200, engine.get_access_control_config())
+        except engine.CredentialStoreUnavailable as exc:
+            return self._send_json(503, {"error": str(exc)})
         except ValueError as exc:
             return self._send_json(400, {"error": str(exc)})
         except (engine.OpaApiError, engine.OktaApiError) as exc:
@@ -1811,7 +1926,7 @@ class Handler(SimpleHTTPRequestHandler):
                 try:
                     updated_count = engine.backfill_mfa_log_events(_lookup_mfa_log_event)
                 except engine.MfaBackfillBusy as exc:
-                    return self._send_json(409, {"error": f"{exc} Try again in a moment.", "reason": "busy"})
+                    return self._send_json(409, {"error": str(exc), "reason": "busy"})
                 return self._send_json(200, {"updated_count": updated_count})
 
             if path == "/api/environments":
@@ -2074,12 +2189,36 @@ class Handler(SimpleHTTPRequestHandler):
                 _validate_ids(resource_group_id=rg_id, project_id=proj_id, folder_id=folder_id)
 
                 mode = payload.get("mode")
-                folder_name = payload.get("folder_name", "")
-                rule_name = payload.get("rule_name") or f"{folder_name}-access"
-                privileges = payload.get("privileges") or {}
-                mfa = payload.get("mfa")
-                group_refs = payload.get("group_refs") or []
-                workload_role_refs = payload.get("workload_role_refs") or []
+                if mode not in ("new", "existing"):
+                    return self._send_json(400, {"error": "mode must be 'new' or 'existing'"})
+                # ENG2-05: every browser-supplied part is checked before any
+                # OPA call -- privileges must be real booleans ("false" used
+                # to grant), refs need ids, mfa has exactly its two fields.
+                privileges = engine.validate_secret_privilege_flags(payload.get("privileges"))
+                mfa = engine.validate_mfa_condition(payload.get("mfa"))
+                group_refs = engine.validate_principal_refs(payload.get("group_refs"), "group_refs")
+                workload_role_refs = engine.validate_principal_refs(payload.get("workload_role_refs"), "workload_role_refs")
+                rule_name = payload.get("rule_name")
+                if rule_name is not None and not isinstance(rule_name, str):
+                    return self._send_json(400, {"error": "rule_name must be a string"})
+                policy_id = payload.get("policy_id")
+                if mode == "existing":
+                    if not policy_id:
+                        return self._send_json(400, {"error": "policy_id is required to attach to an existing policy"})
+                    engine.validate_resource_id(policy_id, "policy_id")
+                # The folder must really be in this project, and its name
+                # (written into the rule's selector) comes from OPA, not from
+                # the request.
+                try:
+                    folder = local_client.get_folder(rg_id, proj_id, folder_id)
+                except engine.OpaApiError as exc:
+                    if exc.status in (400, 404):
+                        return self._send_json(400, {"error": "That folder was not found in this project."})
+                    raise
+                folder_name = (folder or {}).get("name") if isinstance(folder, dict) else None
+                if not isinstance(folder_name, str) or not folder_name:
+                    return self._send_json(502, {"error": "OPA returned the folder without a name; try again."})
+                rule_name = (rule_name or "").strip() or f"{folder_name}-access"
 
                 if mode == "new":
                     name = (payload.get("name") or "").strip()
@@ -2102,30 +2241,59 @@ class Handler(SimpleHTTPRequestHandler):
                     })
                     return self._send_json(201, {"policy": engine.summarize_security_policy(created)})
 
-                if mode == "existing":
-                    policy_id = payload.get("policy_id")
-                    if not policy_id:
-                        return self._send_json(400, {"error": "policy_id is required to attach to an existing policy"})
-                    engine.validate_resource_id(policy_id, "policy_id")
+                # ENG2-05 (external review, 2026-10-05): PUT replaces the whole
+                # policy and OPA offers no ETag/If-Match for it (checked
+                # against the OPA OpenAPI spec), so this was an unconditional
+                # read-modify-write: a change made in the OPA console (a group
+                # REMOVED from principals) or by another wizard request
+                # between the GET and the PUT was silently undone. Now wizard
+                # writes to one policy are serialised, and the policy is
+                # re-read right before the PUT -- if it changed, nothing is
+                # written and the admin is asked to reload (409). That narrows
+                # the window to one round trip; it cannot close it.
+                with _policy_write_lock(_local_env_id, policy_id):
                     current = local_client.get_security_policy(policy_id)
-                    current["principals"] = engine.merge_principals(current.get("principals"), group_refs, workload_role_refs)
+                    if not isinstance(current, dict):
+                        return self._send_json(502, {"error": "OPA returned an unreadable policy; try again."})
+                    if (current.get("resource_group") or {}).get("id") != rg_id:
+                        return self._send_json(400, {"error": "That policy does not belong to this resource group."})
+                    before = engine.policy_fingerprint(current)
+                    working = json.loads(json.dumps(current))
+                    working["principals"] = engine.merge_principals(working.get("principals"), group_refs, workload_role_refs)
                     # UI-01: a rule whose selector already names more than
                     # just this one folder can't be safely replaced from
                     # this single-folder form -- refuse rather than
                     # silently dropping the other folders' access.
                     try:
-                        engine.upsert_folder_rule_in_policy(current, folder_id, folder_name, rule_name, privileges, mfa=mfa)
+                        engine.upsert_folder_rule_in_policy(working, folder_id, folder_name, rule_name, privileges, mfa=mfa)
                     except engine.MultiTargetRuleError as exc:
                         return self._send_json(409, {"error": str(exc)})
-                    local_client.update_security_policy(policy_id, current)
+                    # The re-read and the PUT go out back to back: any
+                    # rate-limit wait happens BEFORE the re-read, and the
+                    # PUT itself never waits (a 429 on it re-waits and
+                    # re-reads here, a few times at most). Otherwise a
+                    # minute-long wait between the compare and the write
+                    # would reopen the window this check exists to close.
+                    for attempt in range(POLICY_WRITE_ATTEMPTS):
+                        local_client.wait_for_rate_limit()
+                        latest = local_client.get_security_policy(policy_id)
+                        if engine.policy_fingerprint(latest) != before:
+                            return self._send_json(409, {
+                                "error": "This policy was changed in OPA while your change was being prepared. "
+                                         "Nothing was saved -- reload the policy and try again.",
+                            })
+                        try:
+                            local_client.update_security_policy(policy_id, working, rate_limit_wait=False)
+                            break
+                        except engine.OpaApiError as exc:
+                            if exc.status != 429 or attempt == POLICY_WRITE_ATTEMPTS - 1:
+                                raise
                     updated = local_client.get_security_policy(policy_id)
-                    self._log_audit_event(actor_email, actor_sub, "policy.update", {
-                        "env_name": _local_env_name, "resource_group_id": rg_id, "folder_id": folder_id,
-                        "policy_id": policy_id,
-                    })
-                    return self._send_json(200, {"policy": engine.summarize_security_policy(updated)})
-
-                return self._send_json(400, {"error": "mode must be 'new' or 'existing'"})
+                self._log_audit_event(actor_email, actor_sub, "policy.update", {
+                    "env_name": _local_env_name, "resource_group_id": rg_id, "folder_id": folder_id,
+                    "policy_id": policy_id,
+                })
+                return self._send_json(200, {"policy": engine.summarize_security_policy(updated)})
 
             if path == "/api/groups":
                 if not _require_client(self._send_json, local_client):
@@ -2243,10 +2411,10 @@ class Handler(SimpleHTTPRequestHandler):
                 if not rg_id or not proj_id:
                     return self._send_json(400, {"error": "resource_group_id and project_id are required"})
                 _validate_ids(resource_group_id=rg_id, project_id=proj_id)
-                ordered_paths, _descriptions, existing, collisions, invalid_names = _run_pipeline(
+                ordered_paths, _descriptions, existing, collisions, invalid_names, name_in_use, case_variants = _run_pipeline(
                     local_client, payload.get("rows") or [], rg_id, proj_id
                 )
-                result = _plan_dict(ordered_paths, existing, collisions)
+                result = _plan_dict(ordered_paths, existing, collisions, name_in_use, case_variants)
                 result["invalid_names"] = invalid_names
                 return self._send_json(200, result)
 
@@ -2258,7 +2426,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if not rg_id or not proj_id:
                     return self._send_json(400, {"error": "resource_group_id and project_id are required"})
                 _validate_ids(resource_group_id=rg_id, project_id=proj_id)
-                ordered_paths, descriptions, existing, collisions, invalid_names = _run_pipeline(
+                ordered_paths, descriptions, existing, collisions, invalid_names, _name_in_use, _case = _run_pipeline(
                     local_client, payload.get("rows") or [], rg_id, proj_id
                 )
                 if invalid_names:
@@ -2267,16 +2435,26 @@ class Handler(SimpleHTTPRequestHandler):
                     )
                 results = engine.execute_plan(local_client, rg_id, proj_id, ordered_paths, descriptions, existing)
                 output_path = PROJECT_ROOT / f"folders_result_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
-                engine.write_results_csv(output_path, results)
-                engine.log("INFO", f"Execute complete: results written to {output_path.name}")
+                # ENG2-06: folders now exist -- a failure to write the results
+                # file must not also lose the audit entry and the response.
+                try:
+                    engine.write_results_csv(output_path, results)
+                    output_file = output_path.name
+                    engine.log("INFO", f"Execute complete: results written to {output_file}")
+                except OSError as exc:
+                    output_file = None
+                    engine.log("ERROR", f"Execute complete, but the results file could not be written "
+                                        f"({type(exc).__name__}: {exc.strerror or exc}).")
                 self._log_audit_event(actor_email, actor_sub, "folders.execute", {
                     "env_name": _local_env_name, "resource_group_id": rg_id, "project_id": proj_id,
-                    "output_file": output_path.name, "folder_count": len(results),
+                    "output_file": output_file, "folder_count": len(results),
+                    "created": sum(1 for r in results if r[2] == "created"),
+                    "errors": sum(1 for r in results if r[2] == "error"),
                 })
                 return self._send_json(200, {
                     "results": [_row_dict(*r) for r in results],
                     "collisions": {name: ["/".join(p) for p in paths] for name, paths in collisions.items()},
-                    "output_file": output_path.name,
+                    "output_file": output_file,
                 })
 
             if path.startswith("/api/access/users/") and path.endswith("/resource_access"):
@@ -2304,6 +2482,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self._send_json(404, {"error": "not found"})
         except _RequestAborted:
             return
+        except engine.CredentialStoreUnavailable as exc:
+            return self._send_json(503, {"error": str(exc)})
         except ValueError as exc:
             return self._send_json(400, {"error": str(exc)})
         except (engine.OpaApiError, engine.OktaApiError) as exc:
@@ -2444,6 +2624,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_json(200, {"removed": True, "group_id": group_id, "user_name": user_name})
 
             return self._send_json(404, {"error": "not found"})
+        except engine.CredentialStoreUnavailable as exc:
+            return self._send_json(503, {"error": str(exc)})
         except ValueError as exc:
             return self._send_json(400, {"error": str(exc)})
         # (no blanket KeyError -> 404 here any more: the routes catch the
@@ -2478,6 +2660,12 @@ def _try_activate_saved_environment(owner_key):
         if creds is None:
             return
         activate_environment(owner_key, None, environment_id=creds["environment_id"])
+    except engine.CredentialStoreUnavailable as exc:
+        # ENG1-10: a locked keychain is temporary -- let this owner's next
+        # request try again instead of staying un-activated until restart.
+        with _sessions_lock:
+            _seen_owners.discard(owner_key)
+        engine.log("WARN", f"Could not auto-activate the saved environment for owner '{owner_key}': {exc}")
     except Exception as exc:
         engine.log("WARN", f"Could not auto-activate the saved environment for owner '{owner_key}': {exc}")
 

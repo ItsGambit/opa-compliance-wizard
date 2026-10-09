@@ -181,6 +181,12 @@ export function SecretsAccessDashboard() {
                 : <>Based on the last {report.since_days} days of Okta System Log history (Okta's retention limit) — a secret
                   with no history shown may simply be older than this window, not necessarily untouched.</>}
             </p>
+            {report.complete === false && (
+              <p className="text-xs text-warn">
+                Incomplete: this project has more log events in the window than one lookup reads, so the oldest
+                ones (including some creates) are missing. Run a compliance sync to report from the full archive.
+              </p>
+            )}
           </div>
 
           <div className="card p-3 flex flex-col gap-2">

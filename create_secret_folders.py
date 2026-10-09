@@ -33,12 +33,11 @@
 #                  (.../secret_folders/{id}/items) that this script wasn't
 #                  using before. fetch_all_folders() walks it recursively to
 #                  see the whole tree; existing-folder detection
-#                  (resolve_existing_folders) still matches by NAME ONLY,
-#                  project-wide, which is safe given fact #1 (names are
-#                  unique per project anyway) but means the script cannot
-#                  verify a matched folder sits where the CSV intends; it
-#                  can only confirm a folder with that name exists somewhere
-#                  in the project.
+#                  (resolve_existing_folders) matches by FULL PATH since
+#                  5.40.6 (ENG2-02): a folder with the same name somewhere
+#                  else in the project is shown as "name in use" and is
+#                  never adopted as a parent -- the create is attempted at
+#                  the planned location and OPA's answer is reported.
 #
 #               3. Folder names may only contain letters, digits, hyphens,
 #                  underscores, and periods -- NO SPACES or other characters.
@@ -59,16 +58,20 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.40.5
+# Version     : 5.40.6
 # =============================================================================
 
 import argparse
+import contextlib
 import contextvars
 import csv
 import email.utils
+import http.client
 import json
+import math
 import os
 import re
+import socket
 import sys
 import tempfile
 import threading
@@ -78,10 +81,29 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.40.5"
+SCRIPT_VERSION = "5.40.6"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+# ENG2-12: OPA's spec documents no pattern or length for a secret-folder
+# name (SecretFolderCreateRequest.name is a bare string); 255 is the limit
+# the same spec gives its other names, used here so an over-long name
+# fails before the run instead of mid-way. "." and ".." pass the character
+# rule but are path syntax, not names.
+FOLDER_NAME_MAX_LEN = 255
+
+
+def is_valid_folder_name(name):
+    """The one folder-name rule, shared by the CLI (validate_names), the
+    dashboard (serve.py's _run_pipeline) and mirrored in
+    frontend/src/utils/validate.ts."""
+    return (
+        isinstance(name, str)
+        and 0 < len(name) <= FOLDER_NAME_MAX_LEN
+        and name not in (".", "..")
+        and NAME_PATTERN.fullmatch(name) is not None
+    )
 
 # ---------------------------------------------------------------------------
 # Live-verified API constants
@@ -420,15 +442,46 @@ def _load_dotenv():
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     if not os.path.isfile(env_path):
         return
-    with open(env_path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, raw_value = line.partition("=")
-            key = key.strip()
-            value = _parse_dotenv_value(raw_value)
-            os.environ.setdefault(key, value)
+    for key, value in _parse_dotenv_text(_read_dotenv_text(env_path)):
+        os.environ.setdefault(key, value)
+
+
+def _read_dotenv_text(env_path):
+    """ENG1-12 (external review, 2026-10-05): the file used to be opened as
+    plain utf-8, so a UTF-8 BOM (Notepad) silently renamed the first key
+    and a UTF-16 file (PowerShell 5's `>` redirection) raised
+    UnicodeDecodeError at IMPORT time, taking the CLI and the server down
+    with a traceback. Now: a UTF-16 BOM is decoded as UTF-16, a UTF-8 BOM
+    is dropped, and a file that still isn't text is skipped with a warning
+    on stderr (log() isn't defined yet at import time) instead of
+    crashing. Every key is still loaded, not only OPA_* -- users behind a
+    proxy rely on HTTPS_PROXY / SSL_CERT_FILE here, which urllib reads."""
+    with open(env_path, "rb") as f:
+        raw = f.read()
+    try:
+        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+            return raw.decode("utf-16")
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        sys.stderr.write(f"WARNING: ignoring {env_path}: it is not UTF-8 or UTF-16 text.\n")
+        return ""
+
+
+def _parse_dotenv_text(text):
+    """Yields (key, value) for each KEY=VALUE line; blank lines and # comments
+    are skipped, and a leading `export ` (shell syntax, ENG1-12) is
+    dropped rather than becoming part of the key."""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, raw_value = line.partition("=")
+        key = key.strip()
+        if key.startswith("export ") or key.startswith("export\t"):
+            key = key[len("export"):].strip()
+        if not key:
+            continue
+        yield key, _parse_dotenv_value(raw_value)
 
 
 _load_dotenv()
@@ -898,11 +951,26 @@ def keyring_set(storage_name, field, value):
     keyring.set_password(_keyring_service(storage_name), field, value)
 
 
+class CredentialStoreUnavailable(RuntimeError):
+    """ENG1-10 (external review, 2026-10-05): the OS credential store could
+    not be READ (locked keychain, Secret Service / D-Bus down, no backend).
+    Distinct from "no such secret" (keyring returns None for that): every
+    backend failure used to be swallowed into None, so a locked keyring
+    looked like every environment had lost its secrets ("Missing required
+    field: key_secret", has_okta_token false, an empty secret sent to the
+    token endpoint) and invited users to re-enter credentials. Routes
+    answer 503; the legacy-store migration stops instead of guessing."""
+
+
 def _keyring_get_raw(service, field):
     try:
         return keyring.get_password(service, field)
-    except Exception:
-        return None
+    except Exception as exc:
+        # The class only: a backend's message can echo the service name.
+        raise CredentialStoreUnavailable(
+            f"The OS credential store could not be read ({type(exc).__name__}). Unlock or start it "
+            "(e.g. the login keychain or the Secret Service / gnome-keyring) and try again."
+        ) from exc
 
 
 def keyring_get(storage_name, field):
@@ -951,6 +1019,145 @@ def keyring_delete(storage_name, field):
 
 
 
+def _undo_keyring_writes(written):
+    """Best-effort rollback of upsert_environment's keychain writes (see
+    ENG1-07 there). `written` maps (environment_id, field) -> the value
+    stored before the write, or None if there was none."""
+    for (env_id, field), previous in written.items():
+        try:
+            if previous is None:
+                keyring_delete(env_id, field)
+            else:
+                keyring_set(env_id, field, previous)
+        except Exception as exc:
+            log("ERROR", f"Could not undo a credential write for environment {env_id} ({field}): {type(exc).__name__}")
+
+
+def _resolve_environment_target(conn, name, owner, is_admin, environment_id):
+    """(target_id or None, target_owner, existing row or None) -- which
+    environment an upsert edits: by id for an admin override (ENG1-01),
+    otherwise the caller's own (owner, name)."""
+    if is_admin and environment_id:
+        row = conn.execute("SELECT * FROM app_environments WHERE environment_id = ?", (environment_id,)).fetchone()
+        if row is not None:
+            return row["environment_id"], row["owner_id"], row
+        return None, owner, None
+    target_id, _meta = _find_own_environment_sql(conn, owner, name)
+    if target_id is None:
+        return None, owner, None
+    row = conn.execute("SELECT * FROM app_environments WHERE environment_id = ?", (target_id,)).fetchone()
+    return target_id, owner, row
+
+
+_ENVIRONMENT_ROW_COLUMNS = (
+    "owner_id", "display_name", "base_domain", "team_name", "key_id", "okta_url", "shared", "updated_at",
+)
+
+
+def _write_environment_row(conn, name, fields, owner, is_admin, environment_id, expected_target, has_stored_secret,
+                           secret_values):
+    """Inside upsert_environment's BEGIN IMMEDIATE (holding _db_lock): the
+    lookup, the checks and the row write -- no keychain call happens here.
+    Returns (target_id, is_create, previous_row) for the caller's undo."""
+    target_id, target_owner, row = _resolve_environment_target(conn, name, owner, is_admin, environment_id)
+    existing_meta = _row_to_environment_meta(row) if row is not None else None
+    if existing_meta is not None and existing_meta.get("owner") != owner and not is_admin:
+        raise PermissionError(f"Environment '{name}' is not owned by this user.")
+
+    # A create (no existing environment matched) mints a brand-new random
+    # id -- NEVER derived from (owner, name), so it carries no information
+    # about either.
+    is_create = target_id is None
+    if is_create:
+        target_id = str(uuid.uuid4())
+    meta = dict(existing_meta or {})
+    for field in ENVIRONMENT_METADATA_FIELDS:
+        if field in fields:
+            meta[field] = (fields.get(field) or "").strip()
+    meta["owner"] = target_owner
+    meta["name"] = name
+    meta.setdefault("shared", False)
+
+    missing = [f for f in ("base_domain", "team_name", "key_id") if not meta.get(f)]
+    if missing:
+        raise ValueError(f"Missing required field(s): {', '.join(missing)}")
+    if not secret_values["key_secret"]:
+        # "Already stored" was read before the lock (keychain calls never
+        # run under it) for the environment resolved then; if a concurrent
+        # write changed which environment this resolves to, that answer
+        # doesn't apply.
+        if is_create or target_id != expected_target or not has_stored_secret:
+            raise ValueError("Missing required field: key_secret")
+    # SECURITY FIX (external review, 2026-10-05, ENG1-02): base_domain/
+    # okta_url become OpaClient/OktaClient's base_url verbatim (f"https://
+    # {base_domain}", org_url.rstrip("/")) -- validated here, at the one
+    # place every save (CLI, API, admin override) goes through, so a value
+    # with a path/query/userinfo (e.g. "real-tenant.okta.com@attacker.
+    # example.com") can't steer requests elsewhere even without a redirect.
+    validate_base_domain(meta["base_domain"])
+    validate_okta_url(meta.get("okta_url"))
+
+    # (owner, display_name) must stay unique -- also for owner NULL (local
+    # mode), which the table's UNIQUE constraint does not cover -- whenever
+    # this write would CREATE that pair: a create, or an admin renaming
+    # someone's environment onto a name they already use. Editing an
+    # environment under its own unchanged name is never refused, even on
+    # an install where the old race already left a duplicate.
+    if is_create or (row is not None and row["display_name"] != name):
+        clash = conn.execute(
+            "SELECT 1 FROM app_environments WHERE owner_id IS ? AND display_name = ? AND environment_id != ?",
+            (target_owner, name, target_id),
+        ).fetchone()
+        if clash:
+            raise ValueError(f"An environment named '{name}' already exists for this owner.")
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    conn.execute(
+        """INSERT INTO app_environments
+           (environment_id, owner_id, display_name, base_domain, team_name, key_id, okta_url,
+            shared, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(environment_id) DO UPDATE SET
+               owner_id=excluded.owner_id, display_name=excluded.display_name,
+               base_domain=excluded.base_domain, team_name=excluded.team_name,
+               key_id=excluded.key_id, okta_url=excluded.okta_url,
+               shared=excluded.shared, updated_at=excluded.updated_at""",
+        (target_id, meta.get("owner"), name, meta.get("base_domain", ""), meta.get("team_name", ""),
+         meta.get("key_id", ""), meta.get("okta_url", ""), int(bool(meta.get("shared"))),
+         now, now),
+    )
+    previous = {col: row[col] for col in _ENVIRONMENT_ROW_COLUMNS} if row is not None else None
+    written = dict(zip(_ENVIRONMENT_ROW_COLUMNS, (
+        meta.get("owner"), name, meta.get("base_domain", ""), meta.get("team_name", ""), meta.get("key_id", ""),
+        meta.get("okta_url", ""), int(bool(meta.get("shared"))), now,
+    )))
+    return target_id, is_create, previous, written
+
+
+def _undo_environment_row(conn, target_id, is_create, previous, written):
+    """Puts the app_environments row back after the keychain half of an
+    upsert failed: removed on a create, previous values on an update --
+    only if every column is still exactly what this upsert wrote
+    (`written`), so a write that committed in between (even within the
+    same second) is never reverted."""
+    import audit_store
+    unchanged = " AND ".join(f"{col} IS ?" for col in _ENVIRONMENT_ROW_COLUMNS)
+    still_ours = tuple(written[col] for col in _ENVIRONMENT_ROW_COLUMNS)
+    with audit_store._db_lock:
+        try:
+            if is_create:
+                conn.execute(f"DELETE FROM app_environments WHERE environment_id = ? AND {unchanged}",
+                             (target_id, *still_ours))
+            else:
+                assignments = ", ".join(f"{col} = ?" for col in _ENVIRONMENT_ROW_COLUMNS)
+                conn.execute(f"UPDATE app_environments SET {assignments} WHERE environment_id = ? AND {unchanged}",
+                             (*(previous[col] for col in _ENVIRONMENT_ROW_COLUMNS), target_id, *still_ours))
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            log("ERROR", f"Could not undo the environment row for {target_id}: {type(exc).__name__}")
+
+
 def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, environment_id=None):
     """Saves non-secret metadata to app_environments and secret fields to
     the OS keychain. Blank secret fields on an update leave the previously
@@ -996,90 +1203,70 @@ def upsert_environment(name, fields, owner=LOCAL_OWNER_KEY, is_admin=False, envi
     if not name or not name.strip():
         raise ValueError("Environment name is required (e.g. dev, uat, prod).")
     name = name.strip()
+    secret_values = {f: (fields.get(f) or "").strip() for f in ENVIRONMENT_SECRET_FIELDS}
     import audit_store
     conn = audit_store._get_connection()
 
-    # Resolve which environment_id/owner this update actually targets. A
-    # normal (non-admin) call always targets the CALLING owner's own copy
-    # by (owner, name) -- see _find_own_environment_sql -- correct even if
-    # no such environment exists yet (a create, handled below). An admin
-    # override editing an EXISTING environment must target whichever
-    # owner's copy actually already exists -- environment_id disambiguates
-    # this directly, and is REQUIRED for that case now (see ENG1-01 above);
-    # with no id, even an admin call resolves to the caller's own (owner,
-    # name), same as the non-admin path.
-    target_owner = owner
-    target_id = None
-    existing_meta = None
-    if is_admin and environment_id:
-        row = conn.execute("SELECT * FROM app_environments WHERE environment_id = ?", (environment_id,)).fetchone()
-        if row is not None:
-            target_owner = row["owner_id"]
-            target_id = row["environment_id"]
-            existing_meta = _row_to_environment_meta(row)
-    else:
-        target_id, existing_meta = _find_own_environment_sql(conn, owner, name)
+    # ENG1-07 (external review, 2026-10-05): every check now runs BEFORE
+    # anything is stored, and nothing is left half-written. Before: secrets
+    # were written to the keychain first, so a request that then failed
+    # validation (blank domain, missing key_id) had already replaced the
+    # stored key_secret -- or, on a create, left a keychain entry under a
+    # UUID no row references; the lookup ran outside the lock, so two
+    # concurrent local creates (owner_id NULL, which UNIQUE(owner_id,
+    # display_name) does not dedupe) made two rows; and an admin rename
+    # onto an existing name raised a bare IntegrityError after the secrets
+    # were written. Now, in three steps:
+    #   1. outside every lock: whether a key_secret is already stored (the
+    #      only keychain READ the checks need);
+    #   2. BEGIN IMMEDIATE (this process's _db_lock AND SQLite's write
+    #      lock, so another process can't interleave): lookup, permission,
+    #      validation, duplicate-name check and the row write -- no
+    #      keychain call, so a slow or prompting keychain never holds up
+    #      every other database writer;
+    #   3. after the commit: the keychain writes. If one fails, the
+    #      keychain is put back (deleted on a create, previous value
+    #      restored on an update) and so is the row, unless another write
+    #      changed it meanwhile. Known narrow window: between the commit
+    #      and the keychain write a reader can see the new metadata with
+    #      the old (or, on a create, no) secret, and two concurrent edits
+    #      of one environment's secret can undo each other's keychain
+    #      value on failure -- the price of never holding the database
+    #      lock across a keychain call.
+    has_stored_secret = False
+    expected_target = None
+    if not secret_values["key_secret"]:
+        with audit_store._db_lock:
+            outer_transaction = conn.in_transaction
+            expected_target, _owner, _row = _resolve_environment_target(conn, name, owner, is_admin, environment_id)
+            if conn.in_transaction and not outer_transaction:
+                conn.rollback()  # only a read this call started; nothing was written
+        if expected_target is not None:
+            has_stored_secret = bool(keyring_get(expected_target, "key_secret"))
 
-    if existing_meta is not None and existing_meta.get("owner") != owner and not is_admin:
-        raise PermissionError(f"Environment '{name}' is not owned by this user.")
-
-    # A create (no existing environment matched) mints a brand-new random
-    # id -- NEVER derived from (owner, name), unlike the old
-    # environment_storage_name scheme, so it carries no information about
-    # either.
-    is_create = target_id is None
-    if is_create:
-        target_id = str(uuid.uuid4())
-
-    meta = dict(existing_meta or {})
-    for field in ENVIRONMENT_METADATA_FIELDS:
-        if field in fields:
-            meta[field] = (fields.get(field) or "").strip()
-    meta["owner"] = target_owner
-    meta["name"] = name
-    meta.setdefault("shared", False)
-
-    for field in ENVIRONMENT_SECRET_FIELDS:
-        value = (fields.get(field) or "").strip()
-        if value:
-            keyring_set(target_id, field, value)
-        # blank + already exists -> leave the previously stored secret alone
-
-    missing = [f for f in ("base_domain", "team_name", "key_id") if not meta.get(f)]
-    if missing:
-        raise ValueError(f"Missing required field(s): {', '.join(missing)}")
-    if not keyring_get(target_id, "key_secret"):
-        raise ValueError("Missing required field: key_secret")
-    # SECURITY FIX (external review, 2026-10-05, ENG1-02): base_domain/
-    # okta_url become OpaClient/OktaClient's base_url verbatim (f"https://
-    # {base_domain}", org_url.rstrip("/")) with no validation at all --
-    # confirmed exploitable in combination with _SAFE_OPENER's redirect
-    # guard above being the LAST line of defense, not the only one: a
-    # value containing a path/query/userinfo could still steer requests
-    # somewhere unintended even without needing a redirect at all (e.g.
-    # "real-tenant.okta.com@attacker.example.com" is a valid URL
-    # authority with an unexpected host). Validated here, at the one
-    # place every save (CLI, API, admin override) goes through.
-    validate_base_domain(meta["base_domain"])
-    validate_okta_url(meta.get("okta_url"))
-
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     with audit_store._db_lock:
-        conn.execute(
-            """INSERT INTO app_environments
-               (environment_id, owner_id, display_name, base_domain, team_name, key_id, okta_url,
-                shared, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(environment_id) DO UPDATE SET
-                   owner_id=excluded.owner_id, display_name=excluded.display_name,
-                   base_domain=excluded.base_domain, team_name=excluded.team_name,
-                   key_id=excluded.key_id, okta_url=excluded.okta_url,
-                   shared=excluded.shared, updated_at=excluded.updated_at""",
-            (target_id, meta.get("owner"), name, meta.get("base_domain", ""), meta.get("team_name", ""),
-             meta.get("key_id", ""), meta.get("okta_url", ""), int(bool(meta.get("shared"))),
-             now, now),
-        )
-        conn.commit()
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        try:
+            target_id, is_create, previous_row, written_row = _write_environment_row(
+                conn, name, fields, owner, is_admin, environment_id, expected_target, has_stored_secret,
+                secret_values,
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
+    written = {}  # (environment_id, field) -> value stored before this call (None = there was none)
+    try:
+        for field, value in secret_values.items():
+            if value:  # blank + already exists -> leave the previously stored secret alone
+                written[(target_id, field)] = None if is_create else keyring_get(target_id, field)
+                keyring_set(target_id, field, value)
+    except BaseException:
+        _undo_keyring_writes(written)
+        _undo_environment_row(conn, target_id, is_create, previous_row, written_row)
+        raise
     return name, target_id
 
 
@@ -1484,6 +1671,112 @@ def _audit_log_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit_log.jsonl")
 
 
+def _audit_log_lock_path(path):
+    return os.path.join(os.path.dirname(path) or ".", "." + os.path.basename(path) + ".lock")
+
+
+_audit_os_lock_down_until = 0.0  # monotonic; see _audit_log_exclusive
+AUDIT_LOG_LOCK_RETRY_AFTER_SECS = 60
+
+
+@contextlib.contextmanager
+def _audit_log_exclusive(path, require_os_lock=False):
+    """ENG1-11 (external review, 2026-10-05): _audit_log_lock is per
+    process, but the log is shared by every process that runs this code
+    (a second server instance, the CLI, a test run against a real
+    checkout). Appends are O_APPEND and small, but the MFA backfill
+    REWRITES the file (write-temp-then-replace), so another process
+    appending during that rewrite would lose its line. This takes the
+    thread lock and an exclusive OS lock on a SIDECAR file (the log itself
+    is replaced by the rewrite, so a lock on its inode would not exclude
+    anyone who opened the new one). If the OS lock can't be taken (e.g. a
+    read-only directory) it continues with the thread lock alone and says
+    so -- an audit write must not fail because of its own lock. The OS lock
+    is waited for at most AUDIT_LOG_LOCK_WAIT_SECS: a stopped or hung
+    process holding it must not freeze every audited request here. After
+    a failure the OS lock is not tried again for
+    AUDIT_LOG_LOCK_RETRY_AFTER_SECS (one WARN, not one 5 s wait per
+    request). require_os_lock=True (the MFA backfill's whole-file REWRITE,
+    the one operation the OS lock really protects) raises
+    MfaBackfillBusy instead of falling back."""
+    global _audit_os_lock_down_until
+    with _audit_log_lock:
+        fd = None
+        if not require_os_lock and time.monotonic() < _audit_os_lock_down_until:
+            pass  # known unavailable right now: in-process lock only
+        else:
+            try:
+                fd = os.open(_audit_log_lock_path(path), os.O_RDWR | os.O_CREAT, 0o600)
+                if not _lock_fd(fd, AUDIT_LOG_LOCK_WAIT_SECS):
+                    raise TimeoutError("held by another process")
+                _audit_os_lock_down_until = 0.0
+            except OSError as exc:
+                if fd is not None:
+                    os.close(fd)
+                fd = None
+                if require_os_lock:
+                    if isinstance(exc, TimeoutError):
+                        raise MfaBackfillBusy("The audit log is locked by another process. Try again in a moment.") from exc
+                    # Not "busy": retrying won't help (e.g. a lock file owned
+                    # by another user, or a read-only directory).
+                    raise MfaBackfillBusy(
+                        f"The audit log's lock file {os.path.basename(_audit_log_lock_path(path))} can't be used "
+                        f"({type(exc).__name__}); check its owner and permissions."
+                    ) from exc
+                _audit_os_lock_down_until = time.monotonic() + AUDIT_LOG_LOCK_RETRY_AFTER_SECS
+                log("WARN", f"Audit log: cross-process lock unavailable ({type(exc).__name__}); using the "
+                            f"in-process lock only for the next {AUDIT_LOG_LOCK_RETRY_AFTER_SECS} s.")
+        try:
+            yield
+        finally:
+            if fd is not None:
+                try:
+                    _unlock_fd(fd)
+                except OSError:
+                    pass  # closing the descriptor releases it anyway
+                os.close(fd)
+
+
+AUDIT_LOG_LOCK_WAIT_SECS = 5
+
+
+def _lock_fd(fd, wait_secs):
+    """Exclusive, non-blocking attempts until wait_secs pass. True if taken."""
+    try:
+        import fcntl
+    except ImportError:  # Windows
+        import msvcrt
+
+        def attempt():
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        def attempt():
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    deadline = time.monotonic() + wait_secs
+    while True:
+        try:
+            attempt()
+            return True
+        except OSError as exc:
+            if not isinstance(exc, (BlockingIOError, PermissionError)) and getattr(exc, "errno", None) not in (11, 13, 35, 36):
+                raise
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+
+def _unlock_fd(fd):
+    try:
+        import fcntl
+    except ImportError:  # Windows
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        return
+    fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 def log_audit_event(actor_email, actor_sub, action, details=None, client_ip=None, user_agent=None):
     """client_ip/user_agent are new as of 2026-09-30 (Okta's own System
     Log always captures both; this log never did) -- optional so every
@@ -1491,7 +1784,17 @@ def log_audit_event(actor_email, actor_sub, action, details=None, client_ip=None
     them. Older entries in audit_log.jsonl predate these fields entirely
     (not backfilled -- there's no real data to backfill, since neither
     was ever captured) and simply won't have the keys; read_audit_log's
-    callers should treat a missing key the same as an explicit None."""
+    callers should treat a missing key the same as an explicit None.
+
+    ENG1-11 (external review, 2026-10-05): the file is created 0600 (it
+    holds e-mails, IPs and user agents; local mode used to get the
+    process umask, usually 0644), appends hold the cross-process lock
+    (_audit_log_exclusive), and an append that fails (disk full,
+    read-only file) no longer raises: every caller logs AFTER its action
+    has already happened, so raising turned a completed action into a 500
+    with no record anywhere. The failure is logged to stderr/the journal
+    with the action, actor sub and time (not the e-mail/IP/agent), and
+    the entry is still returned."""
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "actor_email": actor_email,
@@ -1501,35 +1804,87 @@ def log_audit_event(actor_email, actor_sub, action, details=None, client_ip=None
         "client_ip": client_ip,
         "user_agent": user_agent,
     }
-    line = json.dumps(entry, separators=(",", ":"))
-    with _audit_log_lock:
-        with open(_audit_log_path(), "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+    data = (json.dumps(entry, separators=(",", ":")) + "\n").encode("utf-8")
+    path = _audit_log_path()
+    try:
+        with _audit_log_exclusive(path):
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
+            try:
+                _tighten_to_owner_only(fd)
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+            finally:
+                os.close(fd)
+    except OSError as exc:
+        log("ERROR", f"Audit log append FAILED ({type(exc).__name__}: {exc.strerror}); the action itself completed. "
+                     f"Unrecorded entry: action={action} actor_sub={actor_sub} at={entry['timestamp']}")
     return entry
+
+
+def _tighten_to_owner_only(fd):
+    """An audit log created by an older version (local mode: the process
+    umask, usually 0644) is narrowed to 0600 on its next write. POSIX only;
+    best effort (a file owned by someone else is left as it is)."""
+    if not hasattr(os, "fchmod"):
+        return
+    try:
+        mode = os.fstat(fd).st_mode & 0o777
+        if mode & 0o077:
+            os.fchmod(fd, mode & 0o700)
+    except OSError:
+        pass
+
+
+def _audit_log_lines_newest_first(path, block_size=64 * 1024):
+    """Yields the file's lines (bytes, without the newline) from the END,
+    reading backwards in blocks -- so a page near the top of the log costs
+    O(offset + limit) lines, not a parse of the whole file (ENG1-11)."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        position = f.tell()
+        pending = b""
+        while position > 0:
+            step = min(block_size, position)
+            position -= step
+            f.seek(position)
+            pending = f.read(step) + pending
+            lines = pending.split(b"\n")
+            pending = lines[0]  # may be the tail of a line that started in an earlier block
+            for line in reversed(lines[1:]):
+                yield line
+        if pending:
+            yield pending
 
 
 def read_audit_log(limit=200, offset=0):
     """Returns the most recent `limit` entries (most-recent-first), skipping
-    `offset` from the top. Reads the whole file -- audit_log.jsonl is a
-    plain-text, human-scale operational log for a small team's tool, not a
-    high-volume dataset needing an index."""
+    `offset` from the top. Reads the file from the end and stops once the
+    page is full (ENG1-11) -- same entries, same order and the same
+    skipping of blank, unparseable and non-object lines as the old
+    whole-file read."""
     path = _audit_log_path()
-    if not os.path.isfile(path):
+    if not os.path.isfile(path) or limit <= 0:
         return []
     entries = []
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(entry, dict):  # ENG1-05: a valid-JSON non-object line is not an entry
-                entries.append(entry)
-    entries.reverse()
-    return entries[offset:offset + limit]
+    skipped = 0
+    for raw in _audit_log_lines_newest_first(path):
+        line = raw.decode("utf-8", errors="replace").strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):  # ENG1-05: a valid-JSON non-object line is not an entry
+            continue
+        if skipped < offset:
+            skipped += 1
+            continue
+        entries.append(entry)
+        if len(entries) >= limit:
+            break
+    return entries
 
 
 # ENG1-05: an access_control.update entry gets at most this many
@@ -1618,7 +1973,7 @@ def backfill_mfa_log_events(lookup_fn, max_lookups=20, now=None):
 
     Returns the number of entries that gained corroboration."""
     if not _mfa_backfill_running.acquire(blocking=False):
-        raise MfaBackfillBusy("An MFA log refresh is already running.")
+        raise MfaBackfillBusy("An MFA log refresh is already running. Try again in a moment.")
     try:
         return _backfill_mfa_log_events_locked(lookup_fn, max_lookups, now)
     finally:
@@ -1632,7 +1987,7 @@ def _backfill_mfa_log_events_locked(lookup_fn, max_lookups, now):
     now = now or datetime.now(timezone.utc)
     cutoff = now - timedelta(days=MFA_BACKFILL_RETENTION_DAYS)
 
-    with _audit_log_lock:
+    with _audit_log_exclusive(path):
         lines = _read_audit_log_lines(path)
 
     candidates = []  # (original_line, entry)
@@ -1694,7 +2049,7 @@ def _backfill_mfa_log_events_locked(lookup_fn, max_lookups, now):
 
     if not replacements:
         return 0
-    with _audit_log_lock:
+    with _audit_log_exclusive(path, require_os_lock=True):
         current = _read_audit_log_lines(path)
         changed = False
         for i, line in enumerate(current):
@@ -1741,6 +2096,7 @@ RETRYABLE_STATUS_CODES = {500, 502, 503, 504}  # 429 is handled separately -- se
 # behavior in any meaningful way (a few extra requests' worth of headroom
 # out of the tenant's full window).
 RATE_LIMIT_MIN_REMAINING = 5
+USER_GROUP_WORKERS = 4  # ENG2-08: parallel list_user_groups calls; must stay <= RATE_LIMIT_MIN_REMAINING
 RATE_LIMIT_WAIT_BUFFER_SECS = 1
 _rate_limit_lock = threading.Lock()
 _rate_limit_state = {}  # host -> {"remaining": int, "reset": int}
@@ -1793,12 +2149,28 @@ def die(message):
 # ---------------------------------------------------------------------------
 # HTTP client
 # ---------------------------------------------------------------------------
+# Non-HTTP statuses an API error can carry (ENG1-09 / ENG2-06): the call
+# never got a usable HTTP answer. Every `except OpaApiError` /
+# `except OktaApiError` handles these like any other API failure, instead
+# of a raw URLError / TimeoutError / JSONDecodeError escaping as a 400/500.
+API_STATUS_NETWORK = "network"
+API_STATUS_INVALID_RESPONSE = "invalid_response"
+
+
+def _api_error_message(status, url, body):
+    if status == API_STATUS_NETWORK:
+        return f"Network error calling {url}: {body}"
+    if status == API_STATUS_INVALID_RESPONSE:
+        return f"Unusable response from {url}: {body}"
+    return f"HTTP {status} calling {url}: {body}"
+
+
 class OpaApiError(Exception):
     def __init__(self, status, url, body):
         self.status = status
         self.url = url
         self.body = body
-        super().__init__(f"HTTP {status} calling {url}: {body}")
+        super().__init__(_api_error_message(status, url, body))
 
 
 class OktaApiError(Exception):
@@ -1806,7 +2178,11 @@ class OktaApiError(Exception):
         self.status = status
         self.url = url
         self.body = body
-        super().__init__(f"HTTP {status} calling {url}: {body}")
+        super().__init__(_api_error_message(status, url, body))
+
+
+def _is_network_error(exc):
+    return isinstance(exc, (OpaApiError, OktaApiError)) and exc.status == API_STATUS_NETWORK
 
 
 def _rate_limit_host(url):
@@ -1850,12 +2226,27 @@ def _record_rate_limit(url, headers):
     server_now = _server_time_from_headers(headers)
     if server_now is None:
         server_now = time.time()
-    reset_in_secs = reset - server_now
+    # ENG1-08: a reset far in the future (a broken proxy, a bogus header)
+    # used to park every later request to this host for that long.
+    reset_in_secs = _clamp_wait(reset - server_now)
     with _rate_limit_lock:
         _rate_limit_state[_rate_limit_host(url)] = {
             "remaining": remaining,
             "reset_monotonic": time.monotonic() + reset_in_secs,
         }
+
+
+def _note_rate_limited_until(url, seconds):
+    """Records "no requests to this host for `seconds`" (clamped) -- the
+    next _wait_if_rate_limited for it sleeps that long. Never shortens a
+    later deadline already recorded."""
+    deadline = time.monotonic() + _clamp_wait(seconds)
+    host = _rate_limit_host(url)
+    with _rate_limit_lock:
+        state = _rate_limit_state.get(host)
+        if state and state["remaining"] <= RATE_LIMIT_MIN_REMAINING and state["reset_monotonic"] > deadline:
+            return
+        _rate_limit_state[host] = {"remaining": 0, "reset_monotonic": deadline}
 
 
 def _wait_if_rate_limited(url):
@@ -1867,11 +2258,32 @@ def _wait_if_rate_limited(url):
         state = _rate_limit_state.get(_rate_limit_host(url))
     if not state or state["remaining"] > RATE_LIMIT_MIN_REMAINING:
         return
-    wait_secs = state["reset_monotonic"] - time.monotonic() + RATE_LIMIT_WAIT_BUFFER_SECS
-    if wait_secs > 0:
+    wait_secs = _clamp_wait(state["reset_monotonic"] - time.monotonic()) + RATE_LIMIT_WAIT_BUFFER_SECS
+    if wait_secs > RATE_LIMIT_WAIT_BUFFER_SECS:
         log("WARN", f"Rate limit nearly exhausted for {_rate_limit_host(url)} "
                      f"({state['remaining']} request(s) left) -- waiting {wait_secs:.0f}s for the window to reset...")
         time.sleep(wait_secs)
+        return wait_secs
+    return 0.0
+
+
+# ENG1-08 (external review, 2026-10-05): every rate-limit wait used to be
+# whatever the server (or a proxy, or -- before ENG1-02 -- any host a user
+# typed in) said: Retry-After 1e9 meant sleeping ~31 years, a negative or
+# NaN value made time.sleep raise ValueError (-> HTTP 400), and an
+# HTTP-date Retry-After was ignored. Okta's rate-limit windows are 60 s, so
+# no single wait needs to exceed RATE_LIMIT_MAX_WAIT_SECS, and one call
+# gives up (as a 429) once its waits add up to RATE_LIMIT_TOTAL_BUDGET_SECS
+# instead of holding a request thread or sync job for hours.
+RATE_LIMIT_MAX_WAIT_SECS = 120
+RATE_LIMIT_TOTAL_BUDGET_SECS = 600
+
+
+def _clamp_wait(seconds):
+    """A usable wait in [0, RATE_LIMIT_MAX_WAIT_SECS]; non-finite -> 0."""
+    if seconds is None or not math.isfinite(seconds):
+        return 0.0
+    return min(max(float(seconds), 0.0), float(RATE_LIMIT_MAX_WAIT_SECS))
 
 
 def _retry_after_secs(headers):
@@ -1882,19 +2294,26 @@ def _retry_after_secs(headers):
     rather than local wall time for the same clock-skew reasons as
     _record_rate_limit. Falls back to the fixed backoff only if none of
     Retry-After, x-ratelimit-reset, or Date are present."""
-    retry_after = headers.get("Retry-After")
-    if retry_after is not None:
+    server_now = _server_time_from_headers(headers)
+    if server_now is None:
+        server_now = time.time()
+    retry_after = (headers.get("Retry-After") or "").strip()
+    if retry_after:
+        seconds = None
         try:
-            return float(retry_after) + RATE_LIMIT_WAIT_BUFFER_SECS
+            seconds = float(retry_after)
         except ValueError:
-            pass
+            # RFC 9110 10.2.3: Retry-After may also be an HTTP-date.
+            try:
+                seconds = email.utils.parsedate_to_datetime(retry_after).timestamp() - server_now
+            except (TypeError, ValueError, IndexError, OverflowError):
+                seconds = None
+        if seconds is not None and math.isfinite(seconds) and seconds >= 0:
+            return _clamp_wait(seconds) + RATE_LIMIT_WAIT_BUFFER_SECS
     reset = headers.get("x-ratelimit-reset")
     if reset is not None:
         try:
-            server_now = _server_time_from_headers(headers)
-            if server_now is None:
-                server_now = time.time()
-            return max(0.0, int(reset) - server_now) + RATE_LIMIT_WAIT_BUFFER_SECS
+            return _clamp_wait(int(reset) - server_now) + RATE_LIMIT_WAIT_BUFFER_SECS
         except ValueError:
             pass
     return RETRY_BACKOFF_SECS * MAX_RETRIES
@@ -1924,6 +2343,80 @@ def _parse_next_link(headers):
         if rel == "next":
             return url
     return None
+
+
+def _origin(parts):
+    scheme = (parts.scheme or "").lower()
+    return scheme, (parts.hostname or "").lower(), parts.port or {"https": 443, "http": 80}.get(scheme)
+
+
+def _same_origin_path(base_url, link):
+    """ENG1-09 (external review, 2026-10-05): the path+query to request for
+    a pagination `next` link, or None if the link points anywhere other
+    than base_url's own origin. Shared by OpaClient._list,
+    OktaClient.list_devices and OktaClient.get_system_log. Before: the OPA
+    client sent its bearer token to whatever absolute URL a Link header
+    named (any host), and the Okta client stripped its base only on an
+    exact, case-sensitive prefix match -- so an org URL saved as
+    https://Your-Org.okta.com, or a link with an explicit :443, turned page 2
+    into base_url + "https://..." and every multi-page call failed.
+    Scheme and host compare case-insensitively, default ports normalised."""
+    if not link:
+        return None
+    if link.startswith("/") and not link.startswith("//"):
+        return link
+    try:
+        target = urllib.parse.urlsplit(link)
+        base = urllib.parse.urlsplit(base_url)
+        if target.scheme.lower() not in ("http", "https") or _origin(target) != _origin(base):
+            return None
+    except ValueError:  # e.g. a non-numeric port
+        return None
+    return (target.path or "/") + (f"?{target.query}" if target.query else "")
+
+
+_CROSS_ORIGIN_WARNED = "\0cross-origin-warned"  # marker kept in a walk's `seen` set (never a real path)
+MAX_LIST_PAGES = 10000  # runaway backstop for _list/list_devices; a real tenant is nowhere near this
+
+
+def _next_page_path(base_url, headers, seen, error_cls, what):
+    """The next page's path (always requested on base_url's own origin) for
+    a Link-paginated list, or None when there is none. Raises error_cls
+    (never silently truncates) when the link repeats a page already
+    fetched or the walk passes MAX_LIST_PAGES."""
+    link = _parse_next_link(headers)
+    if not link:
+        return None
+    path = _same_origin_path(base_url, link)
+    if path is None:
+        # A link naming another origin: the credential never goes there.
+        # Its path+query is requested on THIS client's own origin instead
+        # -- the OPA spec doesn't say which host its Link URLs carry (an
+        # alias of the same API would otherwise break every multi-page
+        # list), and the upstream that sent it is the one we already
+        # trust with our data. Logged, host only.
+        try:
+            target = urllib.parse.urlsplit(link)
+        except ValueError:
+            raise error_cls(API_STATUS_INVALID_RESPONSE, what, "unparseable pagination link") from None
+        path = (target.path or "/") + (f"?{target.query}" if target.query else "")
+        if not path.startswith("/") or path.startswith("//"):
+            raise error_cls(API_STATUS_INVALID_RESPONSE, what, "unusable pagination link")
+        # ...and only for the same collection the walk started on, so a
+        # hostile link can't steer page 2 to an unrelated endpoint.
+        if (target.path or "/").rstrip("/") != what.rstrip("/"):
+            raise error_cls(API_STATUS_INVALID_RESPONSE, what,
+                            "a pagination link to another origin points at a different collection")
+        if _CROSS_ORIGIN_WARNED not in seen:
+            seen.add(_CROSS_ORIGIN_WARNED)
+            log("WARN", f"{what}: pagination link names another origin ({target.netloc or '?'}); "
+                         "following its path on the configured origin only.")
+    if path in seen:
+        raise error_cls(API_STATUS_INVALID_RESPONSE, what, "pagination loop: the next-page link repeats a page")
+    if len(seen) > MAX_LIST_PAGES:
+        raise error_cls(API_STATUS_INVALID_RESPONSE, what, f"more than {MAX_LIST_PAGES} pages; stopping")
+    seen.add(path)
+    return path
 
 
 class _NoCrossHostRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -1964,7 +2457,18 @@ class _NoCrossHostRedirectHandler(urllib.request.HTTPRedirectHandler):
 _SAFE_OPENER = urllib.request.build_opener(_NoCrossHostRedirectHandler)
 
 
-def http_json_request(method, url, headers=None, body=None, error_cls=OpaApiError, return_headers=False):
+_IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
+
+
+def _is_connect_phase_error(reason):
+    """True for a network failure that certainly happened BEFORE the
+    request reached the server (name resolution, connection refused), so
+    even a POST can be retried without risking a duplicate."""
+    return isinstance(reason, (ConnectionRefusedError, socket.gaierror))
+
+
+def http_json_request(method, url, headers=None, body=None, error_cls=OpaApiError, return_headers=False,
+                      idempotent=None, rate_limit_wait=True):
     """Shared retrying HTTP-JSON helper used by both OpaClient and
     OktaClient, so the retry/backoff logic lives in exactly one place.
     Tracks x-ratelimit-* response headers per host and proactively waits
@@ -1978,12 +2482,38 @@ def http_json_request(method, url, headers=None, body=None, error_cls=OpaApiErro
     Uses _SAFE_OPENER (ENG1-02 above), not the module-level
     urllib.request.urlopen, so a redirect to a different host/scheme is
     refused instead of silently carrying this request's credentials
-    there."""
+    there.
+
+    ENG1-09 / ENG2-06 (external review, 2026-10-05):
+    - A 5xx, or a network failure that may have happened after the server
+      received the request (a timeout, a reset), is retried only for an
+      idempotent request (GET/HEAD/OPTIONS/PUT/DELETE, or a caller passing
+      idempotent=True, e.g. the token exchange). A POST used to be retried
+      too: a 502/504 from an intermediary after the upstream committed
+      created a duplicate (Okta group names are not unique). A
+      connect-phase failure (DNS, connection refused) is still retried for
+      every method -- nothing reached the server.
+    - Every failure now surfaces as error_cls: status "network" for a
+      transport failure (URLError after the retries, a timeout or reset
+      while reading, an HTTP protocol error) and "invalid_response" for a
+      2xx body that isn't JSON. They used to escape as URLError /
+      TimeoutError / JSONDecodeError -- a traceback in the CLI, an aborted
+      execute_plan, or (JSONDecodeError being a ValueError) a misleading
+      HTTP 400 from the dashboard.
+    - Rate-limit waits are clamped (see RATE_LIMIT_MAX_WAIT_SECS) and one
+      call gives up with a 429 once its waits pass
+      RATE_LIMIT_TOTAL_BUDGET_SECS.
+    - rate_limit_wait=False sends at once and raises a 429 instead of
+      waiting (no proactive wait, no 429 retry): for a write that must go
+      out right after the read it was checked against (ENG2-05); the
+      caller waits, re-reads and retries itself."""
     data = json.dumps(body).encode("utf-8") if body is not None else None
     headers = dict(headers or {})
     headers.setdefault("Accept", "application/json")
     if data is not None:
         headers["Content-Type"] = "application/json"
+    if idempotent is None:
+        idempotent = method.upper() in _IDEMPOTENT_METHODS
 
     # Two independent retry budgets: `error_attempt` for genuine failures
     # (5xx/network, capped low by MAX_RETRIES since repeated failure likely
@@ -1993,30 +2523,40 @@ def http_json_request(method, url, headers=None, body=None, error_cls=OpaApiErro
     # are no longer the same counter.
     error_attempt = 0
     rate_limit_attempt = 0
+    waited = 0.0
     while True:
-        _wait_if_rate_limited(url)
+        if rate_limit_wait:
+            waited += _wait_if_rate_limited(url) or 0.0
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with _SAFE_OPENER.open(req, timeout=REQUEST_TIMEOUT_SECS) as resp:
                 _record_rate_limit(url, resp.headers)
                 resp_headers = resp.headers
                 raw = resp.read()
-                parsed = json.loads(raw.decode("utf-8")) if raw else None
-                return (parsed, resp_headers) if return_headers else parsed
         except urllib.error.HTTPError as e:
             _record_rate_limit(url, e.headers)
-            raw_body = e.read().decode("utf-8", errors="replace")
+            try:
+                raw_body = e.read().decode("utf-8", errors="replace")
+            except (OSError, http.client.HTTPException):
+                raw_body = ""
             if e.code == 429:
                 rate_limit_attempt += 1
-                if rate_limit_attempt <= MAX_RATE_LIMIT_RETRIES:
-                    wait_secs = _retry_after_secs(e.headers)
+                wait_secs = _retry_after_secs(e.headers)
+                if (rate_limit_wait and rate_limit_attempt <= MAX_RATE_LIMIT_RETRIES
+                        and waited + wait_secs <= RATE_LIMIT_TOTAL_BUDGET_SECS):
                     log("WARN", f"{method} {url} -> HTTP 429 (rate limited); "
                                 f"waiting {wait_secs:.0f}s before retry "
                                 f"({rate_limit_attempt}/{MAX_RATE_LIMIT_RETRIES})...")
                     time.sleep(wait_secs)
+                    waited += wait_secs
                     continue
+                if not rate_limit_wait:
+                    # The caller waits itself (OpaClient.wait_for_rate_limit),
+                    # which only sees recorded state -- record this 429's own
+                    # wait, so a bare Retry-After is honoured too.
+                    _note_rate_limited_until(url, wait_secs - RATE_LIMIT_WAIT_BUFFER_SECS)
                 raise error_cls(e.code, url, raw_body) from None
-            if e.code in RETRYABLE_STATUS_CODES:
+            if e.code in RETRYABLE_STATUS_CODES and idempotent:
                 error_attempt += 1
                 if error_attempt <= MAX_RETRIES:
                     log("WARN", f"{method} {url} -> HTTP {e.code}, retrying ({error_attempt}/{MAX_RETRIES})...")
@@ -2024,12 +2564,29 @@ def http_json_request(method, url, headers=None, body=None, error_cls=OpaApiErro
                     continue
             raise error_cls(e.code, url, raw_body) from None
         except urllib.error.URLError as e:
-            error_attempt += 1
-            if error_attempt <= MAX_RETRIES:
-                log("WARN", f"{method} {url} -> network error ({e}), retrying ({error_attempt}/{MAX_RETRIES})...")
-                time.sleep(RETRY_BACKOFF_SECS * error_attempt)
-                continue
-            raise
+            if idempotent or _is_connect_phase_error(e.reason):
+                error_attempt += 1
+                if error_attempt <= MAX_RETRIES:
+                    log("WARN", f"{method} {url} -> network error ({e.reason!r}), retrying ({error_attempt}/{MAX_RETRIES})...")
+                    time.sleep(RETRY_BACKOFF_SECS * error_attempt)
+                    continue
+            raise error_cls(API_STATUS_NETWORK, url, f"{type(e.reason).__name__}: {e.reason}") from e
+        except (OSError, http.client.HTTPException) as e:
+            # Raised while READING the response (timeout, reset, truncated
+            # body) -- the request certainly reached the server.
+            if idempotent:
+                error_attempt += 1
+                if error_attempt <= MAX_RETRIES:
+                    log("WARN", f"{method} {url} -> {type(e).__name__} reading the response, retrying "
+                                f"({error_attempt}/{MAX_RETRIES})...")
+                    time.sleep(RETRY_BACKOFF_SECS * error_attempt)
+                    continue
+            raise error_cls(API_STATUS_NETWORK, url, f"{type(e).__name__} while reading the response") from e
+        try:
+            parsed = json.loads(raw.decode("utf-8")) if raw else None
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise error_cls(API_STATUS_INVALID_RESPONSE, url, "the response body is not JSON") from None
+        return (parsed, resp_headers) if return_headers else parsed
 
 
 # ENG2-16 (external review, 2026-10-05): resource identifiers reach the
@@ -2064,47 +2621,70 @@ class OpaClient:
         self.key_secret = key_secret
         self.bearer_token = None
         self._current_user = None  # see get_current_user()
+        # One token refresh at a time (ENG2-08 runs some reads on worker
+        # threads): a thread whose request was rejected refreshes only if
+        # nobody replaced the token it used in the meantime.
+        self._token_lock = threading.Lock()
         self._fetch_token()
 
     def _fetch_token(self):
         path = TOKEN_PATH.format(team=self.team_name)
         body = {"key_id": self.key_id, "key_secret": self.key_secret}
-        resp = self._raw_request("POST", path, body=body, authed=False)
+        # A token exchange creates nothing, so retrying it is always safe.
+        resp = self._raw_request("POST", path, body=body, authed=False, idempotent=True)
         token = (resp or {}).get("bearer_token")
         if not token:
-            raise OpaApiError("n/a", path, f"No 'bearer_token' in token response: {resp!r}")
+            raise OpaApiError(API_STATUS_INVALID_RESPONSE, path, "no 'bearer_token' in the token response")
         self.bearer_token = token
 
-    def request(self, method, path, body=None, return_headers=False, _retried_auth=False):
+    def request(self, method, path, body=None, return_headers=False, _retried_auth=False, rate_limit_wait=True):
+        token_used = self.bearer_token
         try:
-            return self._raw_request(method, path, body=body, authed=True, return_headers=return_headers)
+            return self._raw_request(method, path, body=body, authed=True, return_headers=return_headers,
+                                     rate_limit_wait=rate_limit_wait)
         except OpaApiError as e:
-            if e.status == 401 and not _retried_auth:
+            # ENG1-09: OPA also answers 401 for "Missing capability: ..."
+            # (a permission the service user lacks, confirmed live) -- a new
+            # token can't fix that, so don't spend a token exchange and a
+            # second request on it.
+            if e.status == 401 and not _retried_auth and "missing capability" not in str(e.body).lower():
                 log("WARN", "Bearer token rejected (401); refreshing and retrying once...")
-                self._fetch_token()
-                return self.request(method, path, body=body, return_headers=return_headers, _retried_auth=True)
+                with self._token_lock:
+                    if self.bearer_token == token_used:
+                        self._fetch_token()
+                return self.request(method, path, body=body, return_headers=return_headers, _retried_auth=True,
+                                    rate_limit_wait=rate_limit_wait)
             raise
 
-    def _raw_request(self, method, path, body=None, authed=True, return_headers=False):
-        url = path if path.startswith("http://") or path.startswith("https://") else self.base_url + path
+    def _raw_request(self, method, path, body=None, authed=True, return_headers=False, idempotent=None,
+                     rate_limit_wait=True):
+        # Always relative to base_url: absolute URLs (pagination links) are
+        # reduced to a same-origin path first -- see _next_page_path.
+        url = self.base_url + path
         headers = {"Authorization": f"Bearer {self.bearer_token}"} if authed else {}
         return http_json_request(method, url, headers=headers, body=body, error_cls=OpaApiError,
-                                  return_headers=return_headers)
+                                  return_headers=return_headers, idempotent=idempotent, rate_limit_wait=rate_limit_wait)
 
     def _list(self, path):
         """Fetches every page of a "list" envelope response, following the
         Link: rel="next" response header until exhausted -- no endpoint in
         this codebase ever wants only page 1, so pagination lives here
-        once rather than being opted into per call site."""
+        once rather than being opted into per call site. A next link is
+        only followed on this client's own origin, and a repeating link
+        or a runaway walk is an error, never a silent truncation (ENG1-09,
+        see _next_page_path)."""
         items = []
         next_path = path
+        seen = {path}
         while next_path:
             resp, headers = self.request("GET", next_path, return_headers=True)
             if isinstance(resp, dict) and isinstance(resp.get(LIST_ENVELOPE_KEY), list):
                 items.extend(resp[LIST_ENVELOPE_KEY])
             else:
-                log("WARN", f"Unexpected list response shape, treating as empty: {resp!r}")
-            next_path = _parse_next_link(headers)
+                # The shape only: the body can carry tenant data (ENG1-09).
+                log("WARN", f"Unexpected list response shape from {path.split('?')[0]} "
+                             f"({type(resp).__name__}), treating the page as empty.")
+            next_path = _next_page_path(self.base_url, headers, seen, OpaApiError, path.split("?")[0])
         return items
 
     def list_resource_groups(self):
@@ -2206,13 +2786,21 @@ class OpaClient:
         path = SECURITY_POLICY_PATH.format(team=self.team_name)
         return self.request("POST", path, body=policy_body)
 
-    def update_security_policy(self, security_policy_id, policy_body):
+    def update_security_policy(self, security_policy_id, policy_body, rate_limit_wait=True):
         """PUT is a full replace, not a patch -- confirmed live 2026-08-14
         (returns 204, no body). Callers must GET the current policy first
         and submit the complete modified object; see
-        upsert_folder_rule_in_policy for the one place that matters here."""
+        upsert_folder_rule_in_policy for the one place that matters here.
+        rate_limit_wait=False: sent at once, a 429 is raised rather than
+        waited out (see http_json_request; ENG2-05)."""
         path = SECURITY_POLICY_ITEM_PATH.format(team=self.team_name, security_policy_id=_path_id(security_policy_id))
-        return self.request("PUT", path, body=policy_body)
+        return self.request("PUT", path, body=policy_body, rate_limit_wait=rate_limit_wait)
+
+    def wait_for_rate_limit(self):
+        """Waits out this host's rate-limit window now, if it is nearly
+        used up -- so a read and the write checked against it can then go
+        out back to back (ENG2-05). Returns the seconds slept."""
+        return _wait_if_rate_limited(self.base_url + "/")
 
     def delete_security_policy(self, security_policy_id):
         path = SECURITY_POLICY_ITEM_PATH.format(team=self.team_name, security_policy_id=_path_id(security_policy_id))
@@ -2392,6 +2980,17 @@ class OpaClient:
             body[FIELD_PARENT_ID] = parent_id
         return self.request("POST", path, body=body)
 
+    def get_folder(self, resource_group_id, project_id, folder_id):
+        """GET .../secret_folders/{id} (RetrieveSecretFolder in the OPA spec;
+        SecretFolderResponse carries id and name, never a parent). Used by
+        the policy route (ENG2-05) to confirm a folder really is in the
+        project named in the URL and to take its name from OPA instead of
+        from the request."""
+        path = FOLDER_ITEM_PATH.format(
+            team=self.team_name, resource_group_id=_path_id(resource_group_id), project_id=_path_id(project_id), folder_id=_path_id(folder_id)
+        )
+        return self.request("GET", path)
+
     def delete_folder(self, resource_group_id, project_id, folder_id):
         """The API gives no cascade guarantee for a folder that still has
         children, and CreateSecretFolder's docs confirm nested creation is
@@ -2537,23 +3136,28 @@ class OktaClient:
         resolved elsewhere in this file."""
         devices = []
         next_path = "/api/v1/devices?limit=200"
+        seen = {next_path}
         while next_path:
             resp, headers = self.request("GET", next_path, return_headers=True)
-            devices.extend(resp or [])
-            next_path = _parse_next_link(headers)
-            if next_path and next_path.startswith(self.base_url):
-                next_path = next_path[len(self.base_url):]
+            devices.extend(d for d in (resp or []) if isinstance(d, dict))
+            next_path = _next_page_path(self.base_url, headers, seen, OktaApiError, "/api/v1/devices")
         for d in devices:
+            device_id = d.get("id")
+            if not device_id:  # ENG2-11: no id -> nothing to enrich, not a KeyError for the whole bootstrap
+                d["authenticator_enrollments"], d["users"] = [], []
+                continue
             try:
-                d["authenticator_enrollments"] = self.get_device_authenticator_enrollments(d["id"])
+                d["authenticator_enrollments"] = self.get_device_authenticator_enrollments(device_id)
             except OktaApiError:
                 d["authenticator_enrollments"] = []
             try:
-                associations = self.get_device_users(d["id"])
+                associations = self.get_device_users(device_id)
             except OktaApiError:
                 associations = []
             users = []
-            for assoc in associations:
+            for assoc in associations or []:
+                if not isinstance(assoc, dict):
+                    continue
                 profile = (assoc.get("user") or {}).get("profile") or {}
                 name = (
                     profile.get("email")
@@ -2613,15 +3217,16 @@ class OktaClient:
         query = urllib.parse.urlencode(params)
         events = []
         next_path = f"{SYSTEM_LOG_PATH}?{query}"
+        seen = {next_path}
         pages = 0
         while next_path and pages < max_pages:
             resp, headers = self.request("GET", next_path, return_headers=True)
             events.extend(resp or [])
-            next_path = _parse_next_link(headers)
-            # Link URLs from Okta are absolute (https://org...) -- request()
-            # always prefixes self.base_url, so strip it back down to a path.
-            if next_path and next_path.startswith(self.base_url):
-                next_path = next_path[len(self.base_url):]
+            # Link URLs from Okta are absolute (https://org...); only this
+            # org's own origin is followed, compared case-insensitively
+            # with default ports normalised (ENG1-09, _same_origin_path).
+            # A repeating link is an error here too, never a silent stop.
+            next_path = _next_page_path(self.base_url, headers, seen, OktaApiError, SYSTEM_LOG_PATH)
             pages += 1
         complete = not next_path
         if not complete:
@@ -2646,6 +3251,14 @@ def parse_rows(rows, warn=True):
     seen_paths = set()
 
     for row_num, row in enumerate(rows, start=1):
+        # ENG2-12: a JSON row whose path isn't a string used to raise
+        # AttributeError (-> 500); it's the caller's input, so a 400.
+        if not isinstance(row, dict):
+            raise ValueError(f"Row {row_num}: each row must be an object with a 'path'.")
+        if row.get("path") is not None and not isinstance(row.get("path"), str):
+            raise ValueError(f"Row {row_num}: 'path' must be a string.")
+        if row.get("description") is not None and not isinstance(row.get("description"), str):
+            raise ValueError(f"Row {row_num}: 'description' must be a string.")
         raw_path = (row.get("path") or "").strip()
         if not raw_path:
             if warn:
@@ -2674,12 +3287,23 @@ def parse_rows(rows, warn=True):
 
 def parse_csv(csv_path):
     """Reads a CSV file (columns: path, description) and delegates to
-    parse_rows for the actual tree-building logic."""
-    with open(csv_path, newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        if not reader.fieldnames or "path" not in [c.strip() for c in reader.fieldnames]:
-            die(f"CSV must have a 'path' column header. Found: {reader.fieldnames}")
-        rows = list(reader)
+    parse_rows for the actual tree-building logic.
+
+    ENG2-12 / ENG2-13: header names are matched trimmed and
+    case-insensitively (a spreadsheet's "Path " used to pass the header
+    check and then be ignored on every row, ending in a misleading "No
+    usable paths found"), and a file that isn't UTF-8 ends with a clear
+    message instead of a traceback."""
+    try:
+        with open(csv_path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames:
+                reader.fieldnames = [(c or "").strip().lower() for c in reader.fieldnames]
+            if not reader.fieldnames or "path" not in reader.fieldnames:
+                die(f"CSV must have a 'path' column header. Found: {reader.fieldnames}")
+            rows = list(reader)
+    except UnicodeDecodeError:
+        die(f"{csv_path} is not UTF-8 text. Save it as 'CSV UTF-8' and try again.")
     return parse_rows(rows)
 
 
@@ -2697,9 +3321,10 @@ def validate_names(ordered_paths):
     '-', '_', '.' (see module docstring fact #3). Check locally so a bad
     name fails fast with every offender listed, instead of a mid-run 400
     that aborts whatever hasn't been created yet."""
-    invalid = [path for path in ordered_paths if not NAME_PATTERN.match(path[-1])]
+    invalid = [path for path in ordered_paths if not is_valid_folder_name(path[-1])]
     if invalid:
-        log("ERROR", "These folder names contain characters OPA will reject (only A-Z a-z 0-9 . _ - are allowed):")
+        log("ERROR", "These folder names will be rejected (only A-Z a-z 0-9 . _ - are allowed, "
+                     f"at most {FOLDER_NAME_MAX_LEN} characters, and not '.' or '..'):")
         for path in invalid:
             log("ERROR", f"  '{path[-1]}' (from path '{'/'.join(path)}')")
         die("Fix the CSV and re-run.")
@@ -2713,6 +3338,17 @@ def detect_name_collisions(ordered_paths):
     for path in ordered_paths:
         name_to_paths.setdefault(path[-1], []).append(path)
     return {name: paths for name, paths in name_to_paths.items() if len(paths) > 1}
+
+
+def detect_case_variant_names(ordered_paths):
+    """ENG2-12: names that differ only by letter case (DB vs db). Whether
+    OPA treats them as the same name is not documented, so this is a
+    warning, not a block: {casefolded name: [paths]} for every name that
+    appears in more than one spelling."""
+    groups = {}
+    for path in ordered_paths:
+        groups.setdefault(path[-1].casefold(), []).append(path)
+    return {key: paths for key, paths in groups.items() if len({p[-1] for p in paths}) > 1}
 
 
 # ---------------------------------------------------------------------------
@@ -2782,10 +3418,16 @@ def full_path(resource, by_id):
     isn't duplicated between the two."""
     names = []
     current = resource
+    visited = set()
     while current is not None:
-        names.append(current["name"])
+        # ENG2-11: a folder stored with name None (the walk keeps
+        # folder.get(name)) used to raise TypeError in the join below.
+        names.append(current.get("name") or "?")
         parent_id = current.get("parent_id")
-        current = by_id.get(parent_id) if parent_id else None
+        if not parent_id or parent_id in visited:  # a parent cycle can't loop forever
+            break
+        visited.add(parent_id)
+        current = by_id.get(parent_id)
     return "/".join(reversed(names))
 
 
@@ -3054,23 +3696,92 @@ def merge_principals(principals, group_refs, workload_role_refs):
     """Dedups by id, adding any of group_refs/workload_role_refs
     ({"id","name"} dicts, already resolved by the caller) not already
     present. Principals apply to the WHOLE policy, not per-rule -- adding
-    a group here grants it every other rule already in the policy too."""
-    principals = principals or {}
-    user_groups = list(principals.get("user_groups") or [])
-    seen_group_ids = {g["id"] for g in user_groups}
-    for ref in group_refs or []:
-        if ref["id"] not in seen_group_ids:
-            user_groups.append(ref)
-            seen_group_ids.add(ref["id"])
+    a group here grants it every other rule already in the policy too.
 
-    workload_roles = list(principals.get("workload_roles") or [])
-    seen_role_ids = {r["id"] for r in workload_roles}
-    for ref in workload_role_refs or []:
-        if ref["id"] not in seen_role_ids:
-            workload_roles.append(ref)
-            seen_role_ids.add(ref["id"])
+    ENG2-05 (external review, 2026-10-05): returns a copy of `principals`
+    with only those two lists changed -- any other key the API returns
+    there is kept rather than dropped on the PUT (the spec documents only
+    user_groups and workload_roles today). Existing entries without an id
+    (ENG2-11) no longer raise KeyError."""
+    merged = dict(principals) if isinstance(principals, dict) else {}
+    for key, refs in (("user_groups", group_refs), ("workload_roles", workload_role_refs)):
+        current = list(merged.get(key) or [])
+        seen = {e.get("id") for e in current if isinstance(e, dict)}
+        for ref in refs or []:
+            if ref["id"] not in seen:
+                current.append(ref)
+                seen.add(ref["id"])
+        merged[key] = current
+    return merged
 
-    return {"user_groups": user_groups, "workload_roles": workload_roles}
+
+def validate_principal_refs(refs, label):
+    """ENG2-05: group/workload-role refs arrive from the browser and go to
+    OPA as sent. Each must be an object with a valid id; only id, name and
+    type are passed on. Raises ValueError (-> 400)."""
+    if refs is None:
+        return []
+    if not isinstance(refs, list):
+        raise ValueError(f"{label} must be a list")
+    out = []
+    for ref in refs:
+        if not isinstance(ref, dict):
+            raise ValueError(f"every entry of {label} must be an object with an id")
+        clean = {"id": validate_resource_id(ref.get("id"), f"{label} id")}
+        for key in ("name", "type"):
+            if ref.get(key) is not None:
+                if not isinstance(ref[key], str):
+                    raise ValueError(f"{label} {key} must be a string")
+                clean[key] = ref[key]
+        out.append(clean)
+    return out
+
+
+def validate_secret_privilege_flags(flags):
+    """ENG2-05: build_secret_privilege used bool(value), so a non-UI client
+    sending "false" (a non-empty string) GRANTED the privilege. Every known
+    field present must now be a real boolean. Unknown keys are ignored, as
+    before (they never reach OPA: only the 8 known fields are emitted)."""
+    if flags is None:
+        return {}
+    if not isinstance(flags, dict):
+        raise ValueError("privileges must be an object of {field: true|false}")
+    for field in SECRET_PRIVILEGE_FIELDS:
+        if field in flags and not isinstance(flags[field], bool):
+            raise ValueError(f"privileges.{field} must be true or false")
+    return flags
+
+
+def validate_mfa_condition(mfa):
+    """ENG2-05: build_mfa_condition(**mfa) raised TypeError (-> 500) on any
+    unexpected key. Returns None (no MFA) or a clean
+    {"reauth_seconds": int >= 0, "acr_values": non-empty str}."""
+    if not mfa:
+        return None
+    if not isinstance(mfa, dict) or set(mfa) != {"reauth_seconds", "acr_values"}:
+        raise ValueError("mfa must be null or {reauth_seconds, acr_values}")
+    seconds, acr = mfa["reauth_seconds"], mfa["acr_values"]
+    if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds < 0:
+        raise ValueError("mfa.reauth_seconds must be a whole number of seconds, 0 or more")
+    if not isinstance(acr, str) or not acr.strip():
+        raise ValueError("mfa.acr_values must be a non-empty string")
+    return {"reauth_seconds": seconds, "acr_values": acr.strip()}
+
+
+def policy_fingerprint(policy):
+    """A stable digest of a policy object as returned by GET, for the
+    ENG2-05 compare-before-PUT check. List order is ignored (every list,
+    at any depth, is compared as a sorted multiset): nothing documents
+    that two GETs of an unchanged policy return principals or rules in the
+    same order, and a false "changed" would block every assignment, while
+    a pure re-ordering changes nothing a PUT of the first copy would lose."""
+    def canonical(value):
+        if isinstance(value, dict):
+            return {k: canonical(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return sorted((canonical(v) for v in value), key=lambda v: json.dumps(v, sort_keys=True, default=str))
+        return value
+    return json.dumps(canonical(policy), sort_keys=True, separators=(",", ":"), default=str)
 
 
 def _summarize_rule_targets(rule):
@@ -3117,7 +3828,9 @@ def summarize_security_policy(policy):
         "active": policy.get("active", False),
         "type": policy.get("type"),
         "resource_group": policy.get("resource_group"),
-        "principals": policy.get("principals", {"user_groups": [], "workload_roles": []}),
+        "principals": policy.get("principals") or {"user_groups": [], "workload_roles": []},
+        # ENG2-11: a present-but-null "rules"/"privileges"/"conditions"
+        # (a relationship-only policy) used to raise TypeError -> 500.
         "rules": [
             {
                 "name": rule.get("name"),
@@ -3125,12 +3838,12 @@ def summarize_security_policy(policy):
                 "resource_type_label": RESOURCE_TYPE_LABELS.get(rule.get("resource_type"), rule.get("resource_type")),
                 "privileges": [
                     {"privilege_type": p.get("privilege_type"), "flags": _privilege_flags(p.get("privilege_value"))}
-                    for p in rule.get("privileges", [])
+                    for p in rule.get("privileges") or [] if isinstance(p, dict)
                 ],
-                "conditions": rule.get("conditions", []),
+                "conditions": rule.get("conditions") or [],
                 "targets": _summarize_rule_targets(rule),
             }
-            for rule in policy.get("rules", [])
+            for rule in policy.get("rules") or [] if isinstance(rule, dict)
         ],
     }
 
@@ -3203,7 +3916,8 @@ _RELATIONSHIP_ASSIGNMENT_ID_NAME_FIELDS = {
 }
 
 
-def _resolve_relationship_assignment_resources(resource_assignments, relationship_name=None, assignment_name=None):
+def _resolve_relationship_assignment_resources(resource_assignments, relationship_name=None, assignment_name=None,
+                                                principal=None):
     """Resolves one assignment's `resource_assignments` (confirmed live to
     vary in shape by which real resource kind was granted -- see
     _RELATIONSHIP_ASSIGNMENT_ID_NAME_FIELDS above) into the same
@@ -3220,7 +3934,7 @@ def _resolve_relationship_assignment_resources(resource_assignments, relationshi
     doesn't have them yet, e.g. the assignment-level `resolved_resources`
     attached directly in build_access_model, which has no single
     relationship in scope (one assignment can span several)."""
-    if not resource_assignments:
+    if not isinstance(resource_assignments, dict) or not resource_assignments:
         return []
     out = []
     for key, items in resource_assignments.items():
@@ -3228,7 +3942,9 @@ def _resolve_relationship_assignment_resources(resource_assignments, relationshi
         # secret_or_folder_assignments distinguishes secret vs. secret_folder
         # via the item's own "type" field (confirmed live) -- fall back to
         # the dict key itself for any kind with no such field.
-        for item in items or []:
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
             inner_kind = item.get("type") or key
             resolved = {
                 "kind": "resolved",
@@ -3241,6 +3957,14 @@ def _resolve_relationship_assignment_resources(resource_assignments, relationshi
                 resolved["relationship_name"] = relationship_name
             if assignment_name is not None:
                 resolved["assignment_name"] = assignment_name
+            if principal:
+                # ENG2-10 (additive, 5.40.6): the principal of the assignment
+                # that granted THIS resource, so a view can pair them instead
+                # of reading the policy's merged principal list as a
+                # cross-product. Whether OPA grants per assignment or across
+                # the shared relationship is still to be confirmed live.
+                resolved["principal_id"] = principal.get("id")
+                resolved["principal_name"] = principal.get("name")
             out.append(resolved)
     return out
 
@@ -3296,6 +4020,8 @@ def find_last_access_for_user(okta_client, actor_user_id, resources, limit_per_r
         {"resource_kind": ..., "supported": bool, "events": [
             {"published": ..., "request_id": ..., "outcome": ...}, ...
         ]}
+    Supported entries also carry "complete" (False when the System Log
+    walk hit its page cap, ENG2-09).
     `supported=False` (empty events, no query made) for any resource_kind
     not in RESOURCE_ACCESS_EVENT_TYPES -- see that constant's comment for
     why those are intentionally left unmapped rather than guessed."""
@@ -3315,10 +4041,11 @@ def find_last_access_for_user(okta_client, actor_user_id, resources, limit_per_r
 
         type_filter = " or ".join(f'eventType eq "{t}"' for t in mapping["event_types"])
         filter_expr = f'actor.id eq "{validate_resource_id(actor_user_id, "actor id")}" and ({type_filter})'
-        # No watermark to protect here (read-only lookup, nothing persisted)
-        # -- completeness only matters to sync_okta_events, see
-        # get_system_log's docstring.
-        events, _complete = okta_client.get_system_log(filter_expr=filter_expr, since=since, limit=1000)
+        # ENG2-09 (external review, 2026-10-05): nothing is persisted here,
+        # but the reader still needs to know when the walk hit the page cap
+        # -- the newest events are kept (DESCENDING), so a resource whose
+        # only events are past the cap shows "no access" when it wasn't.
+        events, complete = okta_client.get_system_log(filter_expr=filter_expr, since=since, limit=1000)
 
         wanted = set(resource_ids)
         buckets = {rid: [] for rid in resource_ids}
@@ -3333,7 +4060,8 @@ def find_last_access_for_user(okta_client, actor_user_id, resources, limit_per_r
                     })
 
         for rid in resource_ids:
-            results[rid] = {"resource_kind": resource_kind, "supported": True, "events": buckets[rid]}
+            results[rid] = {"resource_kind": resource_kind, "supported": True, "events": buckets[rid],
+                            "complete": bool(complete)}
 
     return results
 
@@ -3366,7 +4094,7 @@ def get_sync_schedule(name, owner=LOCAL_OWNER_KEY):
     _, meta = _find_own_environment_sql(conn, owner, name)
     if meta is None:
         raise KeyError(f"No saved environment named '{name}'")
-    stored = meta.get("sync_schedule", {})
+    stored = meta.get("sync_schedule") or {}
     merged = {**SYNC_SCHEDULE_DEFAULTS, **stored}
     # ENG2-04: a retention value saved before validation existed (0, a
     # negative number, a string) used to reach prune_events, where 0
@@ -3438,7 +4166,7 @@ def set_sync_schedule(name, config, owner=LOCAL_OWNER_KEY):
     target_id, meta = _find_own_environment_sql(conn, owner, name)
     if meta is None:
         raise KeyError(f"No saved environment named '{name}'")
-    merged = {**SYNC_SCHEDULE_DEFAULTS, **meta.get("sync_schedule", {}), **config}
+    merged = {**SYNC_SCHEDULE_DEFAULTS, **(meta.get("sync_schedule") or {}), **config}
     with audit_store._db_lock:
         conn.execute(
             """INSERT INTO sync_schedules
@@ -3481,7 +4209,9 @@ def build_secrets_access_report(client, okta_client, resource_group_id, project_
     evidence.
 
     Returns {"secrets": [...], "folders": [...], "since_days": since_days,
-    "local_retention_enabled": False, "oldest_captured_at": ...}.
+    "local_retention_enabled": False, "oldest_captured_at": ...,
+    "complete": bool} -- complete is False when the System Log walk was
+    cut short by its page cap (ENG2-09).
     Each row: {id, name, path, status, created, updated, deleted}
     (created/deleted are _audit_entry dicts -- {"by", "at", "request_id",
     "outcome", "outcome_reason"} -- or None; updated is a list of them,
@@ -3514,25 +4244,45 @@ def build_secrets_access_report(client, okta_client, resource_group_id, project_
     )
     since = (datetime.now(timezone.utc) - timedelta(days=since_days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     filter_expr = f'target.id eq "{validate_resource_id(project_id, "project_id")}" and ({type_filter})'
-    # No watermark to protect here (read-only report, nothing persisted) --
-    # completeness only matters to sync_okta_events, see get_system_log's
-    # docstring.
-    events, _complete = okta_client.get_system_log(filter_expr=filter_expr, since=since, limit=1000)
+    # ENG2-09 (external review, 2026-10-05): `complete` is False when the
+    # walk hit get_system_log's page cap. DESCENDING order means it is the
+    # OLDEST events (the creates) that are missing, so the report says so
+    # instead of presenting a truncated result as the whole window.
+    events, complete = okta_client.get_system_log(filter_expr=filter_expr, since=since, limit=1000)
     oldest_captured_at = min((e.get("published") for e in events if e.get("published")), default=None)
+    buckets = _bucket_secret_events(events, reveal_limit=reveal_limit)  # already DESCENDING
+    return {
+        "secrets": _secret_report_rows("secret", secrets_by_id, buckets, folders_by_id),
+        "folders": _secret_report_rows("secret_folder", folders_by_id, buckets, folders_by_id),
+        "since_days": since_days,
+        "local_retention_enabled": False,
+        "oldest_captured_at": oldest_captured_at,
+        "complete": bool(complete),
+    }
 
-    # Per resource_kind: {resource_id: {"name":..., "path":..., "created":None,
-    # "updated":[], "deleted":None, "reveals":[]}} -- path is filled from the
-    # log's own "Secret Path" target (a leading "/" stripped for
-    # consistency with the live walk's slash-joined convention), since a
-    # deleted resource's path can't be reconstructed any other way.
+
+def _bucket_secret_events(events, reveal_limit=None):
+    """Shared by both secrets reports (live and archive -- ENG2-14: the two
+    hand-copied loops had already diverged). `events` must be newest
+    first. Returns {"secret": {id: bucket}, "secret_folder": {id: bucket}};
+    a bucket is {"name", "path", "created", "updated", "deleted",
+    "reveals"}, entries shaped by _audit_entry, the create/delete rules
+    shared with the Service Accounts report (_record_create /
+    _record_delete: a delete only counts with a SUCCESS outcome, a create
+    prefers the successful attempt). Path comes from the log's own
+    "Secret Path" target (leading "/" stripped, matching the live walk's
+    convention), since a deleted resource's path can't be reconstructed
+    any other way. reveal_limit caps reveals per secret (None = no cap)."""
     buckets = {"secret": {}, "secret_folder": {}}
     target_type_for_kind = {"secret": "Secret", "secret_folder": "Secret Folder"}
     event_type_to_kind = {
         t: kind for kind, types in SECRETS_ACCESS_REPORT_EVENT_TYPES.items() for t in types
     }
-
-    for event in events:  # already DESCENDING (most-recent-first) per get_system_log's default
-        kind = event_type_to_kind.get(event.get("eventType"))
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_type = event.get("eventType")
+        kind = event_type_to_kind.get(event_type)
         if kind is None:
             continue
         target = _access_report_target(event, target_type_for_kind[kind])
@@ -3547,16 +4297,13 @@ def build_secrets_access_report(client, okta_client, resource_group_id, project_
             "deleted": None,
             "reveals": [],
         })
-        path_target = next((t for t in (event.get("target") or []) if t.get("type") == "Secret Path"), None)
+        path_target = next(
+            (t for t in (event.get("target") or []) if isinstance(t, dict) and t.get("type") == "Secret Path"), None
+        )
         if path_target and not bucket["path"]:
             bucket["path"] = (path_target.get("displayName") or "").lstrip("/")
 
-        # Entry shape, create/delete rules shared with the archive builder
-        # below and the Service Accounts report (v5.40.0): a delete only
-        # counts with a SUCCESS outcome and a create prefers the
-        # successful attempt -- see _audit_entry / _record_delete.
         entry = _audit_entry(event)
-        event_type = event.get("eventType")
         if event_type.endswith(".create"):
             _record_create(bucket, entry)
         elif event_type.endswith(".update"):
@@ -3564,54 +4311,47 @@ def build_secrets_access_report(client, okta_client, resource_group_id, project_
         elif event_type.endswith(".delete"):
             _record_delete(bucket, entry)
         elif event_type.endswith(".reveal"):
-            if len(bucket["reveals"]) < reveal_limit:
+            if reveal_limit is None or len(bucket["reveals"]) < reveal_limit:
                 bucket["reveals"].append(entry)
+    return buckets
 
-    def _build_rows(kind, live_by_id):
-        rows = []
-        seen_ids = set()
-        for rid, resource in live_by_id.items():
-            seen_ids.add(rid)
-            b = buckets[kind].get(rid, {})
-            # A secret's parent_id always points at a folder (never another
-            # secret), so path reconstruction walks folders_by_id regardless
-            # of which kind is being built.
-            rows.append({
-                "id": rid,
-                "name": resource.get("name", ""),
-                "path": full_path(resource, folders_by_id),
-                "status": "active",
-                "created": b.get("created"),
-                "updated": b.get("updated", []),
-                "deleted": b.get("deleted"),
-                **({"reveals": b.get("reveals", [])} if kind == "secret" else {}),
-            })
-        for rid, b in buckets[kind].items():
-            if rid in seen_ids:
-                continue
-            # Not in the live walk: "deleted" only with direct evidence
-            # (a real delete event in this bucket) -- otherwise "unknown"
-            # rather than assumed, per this report's honesty requirement.
-            status = "deleted" if b.get("deleted") else "unknown"
-            rows.append({
-                "id": rid,
-                "name": b.get("name", ""),
-                "path": b.get("path", ""),
-                "status": status,
-                "created": b.get("created"),
-                "updated": b.get("updated", []),
-                "deleted": b.get("deleted"),
-                **({"reveals": b.get("reveals", [])} if kind == "secret" else {}),
-            })
-        return rows
 
-    return {
-        "secrets": _build_rows("secret", secrets_by_id),
-        "folders": _build_rows("secret_folder", folders_by_id),
-        "since_days": since_days,
-        "local_retention_enabled": False,
-        "oldest_captured_at": oldest_captured_at,
-    }
+def _secret_report_rows(kind, live_by_id, buckets, folders_by_id):
+    """One report row per resource of `kind`: every resource in the live
+    walk ("active", even with no log history -- it may predate the
+    window), then every resource seen only in the log -- "deleted" only
+    with a real delete event in its bucket, otherwise "unknown", never
+    assumed. A secret's parent_id always points at a folder, so paths are
+    rebuilt from folders_by_id for both kinds."""
+    rows = []
+    seen_ids = set()
+    for rid, resource in live_by_id.items():
+        seen_ids.add(rid)
+        b = buckets[kind].get(rid, {})
+        rows.append({
+            "id": rid,
+            "name": resource.get("name") or "",
+            "path": full_path(resource, folders_by_id),
+            "status": "active",
+            "created": b.get("created"),
+            "updated": b.get("updated", []),
+            "deleted": b.get("deleted"),
+            **({"reveals": b.get("reveals", [])} if kind == "secret" else {}),
+        })
+    for rid, b in buckets[kind].items():
+        if rid in seen_ids:
+            continue
+        rows.append({
+            "id": rid,
+            "name": b.get("name", ""),
+            "path": b.get("path", ""),
+            "status": "deleted" if b.get("deleted") else "unknown",
+            "created": b.get("created"),
+            "updated": b.get("updated", []),
+            "deleted": b.get("deleted"),
+            **({"reveals": b.get("reveals", [])} if kind == "secret" else {}),
+        })
+    return rows
 
 
 def build_project_secrets_report_from_archive(client, environment_id, resource_group_id, project_id):
@@ -3623,16 +4363,14 @@ def build_project_secrets_report_from_archive(client, environment_id, resource_g
     this function does not itself call Okta at all, so it works even with
     no Okta API token configured, unlike the original.
 
-    Deliberately reuses the EXACT SAME bucketing/status logic as
-    build_secrets_access_report (the loop is copied rather than
-    abstracted -- that function's active/deleted/unknown honesty rules
-    took several iterations to get right, see this project's own
-    history; only the per-event entry/create/delete rules are shared
-    helpers, _audit_entry / _record_create / _record_delete, since
-    v5.40.0 so all three per-resource reports apply them identically).
-    Only the EVENT SOURCE differs: audit_store.query_events (all history
-    ever ingested, no 90-day/1000-row cap) instead of one bounded
-    okta_client.get_system_log call.
+    Uses the SAME bucketing and row/status logic as
+    build_secrets_access_report -- since 5.40.6 literally the same code
+    (_bucket_secret_events / _secret_report_rows; the two hand-copied
+    loops had already diverged, ENG2-14), pinned by a golden test that
+    feeds both paths the same events. Only the EVENT SOURCE differs:
+    audit_store.iter_events_targeting (all history ever ingested for this
+    project, no 90-day window and no row cap) instead of one bounded
+    okta_client.get_system_log call; and reveals are not capped here.
 
     Returns the exact same shape as build_secrets_access_report, with
     `local_retention_enabled` always True (the whole point of sourcing
@@ -3645,96 +4383,39 @@ def build_project_secrets_report_from_archive(client, environment_id, resource_g
     secrets_by_id = {s["id"]: s for s in secrets if s.get("id")}
 
     all_event_types = [t for types in SECRETS_ACCESS_REPORT_EVENT_TYPES.values() for t in types]
-    archived_rows = audit_store.query_events(environment_id, event_types=all_event_types, limit=100000)
-    # audit_store stores the raw Okta event dict under "raw" -- filter to
-    # this project client-side (confirmed live: a project-scoped event's
-    # target[] always includes the project itself as a co-target, same
-    # fact the original function's server-side `target.id eq` filter
-    # relies on -- just applied here instead of in the query, since the
-    # archive has no per-project index and doesn't need one at this
-    # realistic scale, see plan for the real row-count check behind this).
-    events = [
-        r["raw"] for r in archived_rows
-        if any(t.get("type") == "Project" and t.get("id") == project_id for t in (r["raw"].get("target") or []))
-    ]
-    events = sorted(events, key=lambda e: e.get("published") or "", reverse=True)
-    oldest_captured_at = min((e.get("published") for e in events if e.get("published")), default=None)
+    # ENG2-03 (external review, 2026-10-05): filtered to this project IN
+    # SQL (audit_store.iter_events_targeting, via the indexed event_targets
+    # table) and streamed, with no row cap -- the old environment-wide
+    # query_events(limit=100000) applied its cap BEFORE the project filter,
+    # silently dropping the oldest events (the creates) once the
+    # environment held more than 100k of these events. The Project-type
+    # check is the same one as before (a project-scoped event's target[]
+    # always includes the project itself, confirmed live), so exactly the
+    # same events qualify.
+    events = (
+        r["raw"] for r in audit_store.iter_events_targeting(environment_id, project_id, all_event_types)
+        if any(isinstance(t, dict) and t.get("type") == "Project" and t.get("id") == project_id
+               for t in (r["raw"].get("target") or []))
+    )
+    oldest = {"at": None}
 
-    buckets = {"secret": {}, "secret_folder": {}}
-    target_type_for_kind = {"secret": "Secret", "secret_folder": "Secret Folder"}
-    event_type_to_kind = {
-        t: kind for kind, types in SECRETS_ACCESS_REPORT_EVENT_TYPES.items() for t in types
-    }
+    def _track_oldest(stream):
+        for event in stream:
+            published = event.get("published")
+            if published and (oldest["at"] is None or published < oldest["at"]):
+                oldest["at"] = published
+            yield event
 
-    for event in events:  # already sorted DESCENDING (most-recent-first) above
-        kind = event_type_to_kind.get(event.get("eventType"))
-        if kind is None:
-            continue
-        target = _access_report_target(event, target_type_for_kind[kind])
-        if target is None or not target.get("id"):
-            continue
-        rid = target["id"]
-        bucket = buckets[kind].setdefault(rid, {
-            "name": target.get("displayName") or "",
-            "path": "",
-            "created": None,
-            "updated": [],
-            "deleted": None,
-            "reveals": [],
-        })
-        path_target = next((t for t in (event.get("target") or []) if t.get("type") == "Secret Path"), None)
-        if path_target and not bucket["path"]:
-            bucket["path"] = (path_target.get("displayName") or "").lstrip("/")
-
-        entry = _audit_entry(event)
-        event_type = event.get("eventType")
-        if event_type.endswith(".create"):
-            _record_create(bucket, entry)
-        elif event_type.endswith(".update"):
-            bucket["updated"].append(entry)
-        elif event_type.endswith(".delete"):
-            _record_delete(bucket, entry)
-        elif event_type.endswith(".reveal"):
-            bucket["reveals"].append(entry)
-
-    def _build_rows(kind, live_by_id):
-        rows = []
-        seen_ids = set()
-        for rid, resource in live_by_id.items():
-            seen_ids.add(rid)
-            b = buckets[kind].get(rid, {})
-            rows.append({
-                "id": rid,
-                "name": resource.get("name", ""),
-                "path": full_path(resource, folders_by_id),
-                "status": "active",
-                "created": b.get("created"),
-                "updated": b.get("updated", []),
-                "deleted": b.get("deleted"),
-                **({"reveals": b.get("reveals", [])} if kind == "secret" else {}),
-            })
-        for rid, b in buckets[kind].items():
-            if rid in seen_ids:
-                continue
-            status = "deleted" if b.get("deleted") else "unknown"
-            rows.append({
-                "id": rid,
-                "name": b.get("name", ""),
-                "path": b.get("path", ""),
-                "status": status,
-                "created": b.get("created"),
-                "updated": b.get("updated", []),
-                "deleted": b.get("deleted"),
-                **({"reveals": b.get("reveals", [])} if kind == "secret" else {}),
-            })
-        return rows
-
+    # Newest first (the query's ORDER BY). Reveals are not capped here --
+    # the archive shows every reveal it holds (a cap is an open decision).
+    buckets = _bucket_secret_events(_track_oldest(events), reveal_limit=None)
     return {
-        "secrets": _build_rows("secret", secrets_by_id),
-        "folders": _build_rows("secret_folder", folders_by_id),
+        "secrets": _secret_report_rows("secret", secrets_by_id, buckets, folders_by_id),
+        "folders": _secret_report_rows("secret_folder", folders_by_id, buckets, folders_by_id),
         "since_days": None,  # archive has no fixed window -- whole history ever ingested
         "local_retention_enabled": True,
-        "oldest_captured_at": oldest_captured_at,
+        "oldest_captured_at": oldest["at"],
+        "complete": True,  # nothing is capped; the archive holds what was ingested
     }
 
 
@@ -4218,13 +4899,35 @@ def build_access_model(client, okta_client=None, on_progress=None):
     # (confirmed live 2026-09-30 -- neither path takes a resource_group_id/
     # project_id), unlike servers/saas/okta/AD/database accounts below --
     # fetched once here rather than inside the per-project loop.
+    # ENG2-07 (external review, 2026-10-05): one list call the service key
+    # isn't allowed to make (401 "Missing capability", 403) or that doesn't
+    # exist on this tenant (404) used to abort the whole bootstrap after
+    # minutes of work. The tenant inventory lists below and the
+    # per-project account lists are optional: on those statuses they come
+    # back empty and a warning names the section, returned in the model so
+    # the UI says which parts are incomplete. Resource groups, projects,
+    # users, groups, folders and policies stay hard failures -- without
+    # them the model would be wrong, not just incomplete.
+    warnings = []
+
+    def _optional(label, fn, *args):
+        try:
+            return fn(*args)
+        except OpaApiError as exc:
+            if exc.status in (401, 403, 404):
+                warnings.append({"section": label, "status": exc.status,
+                                 "message": f"{label}: not available to this service key (HTTP {exc.status}); shown as empty."})
+                log("WARN", f"Access model: {label} unavailable (HTTP {exc.status}); continuing without it.")
+                return []
+            raise
+
     _report(on_progress, "workload_roles", "start")
-    workload_roles = client.list_workload_roles()
-    workload_connections = client.list_workload_connections()
-    gateways = client.list_gateways()
-    database_connections = client.list_database_connections()
-    saas_app_connections = client.list_saas_app_connections()
-    active_directory_connections = client.list_active_directory_connections()
+    workload_roles = _optional("workload roles", client.list_workload_roles)
+    workload_connections = _optional("workload connections", client.list_workload_connections)
+    gateways = _optional("gateways", client.list_gateways)
+    database_connections = _optional("database connections", client.list_database_connections)
+    saas_app_connections = _optional("SaaS app connections", client.list_saas_app_connections)
+    active_directory_connections = _optional("Active Directory connections", client.list_active_directory_connections)
     # Assignments/relationships are ALSO tenant-wide (confirmed live
     # 2026-09-30 -- no resource_group_id in the real response). NOT a
     # separate access-grant mechanism from security policies -- confirmed
@@ -4238,8 +4941,13 @@ def build_access_model(client, okta_client=None, on_progress=None):
     # detail must be fetched individually; real tenants have very few of
     # these (a curated admin config, not a high-cardinality resource), so
     # this doesn't scale badly even as the feature grows.
-    assignment_summaries = client.list_assignments()
-    assignments = [client.get_assignment(a["id"]) for a in assignment_summaries if a.get("id")]
+    assignment_summaries = _optional("assignments", client.list_assignments)
+    assignments = []
+    for summary in assignment_summaries:
+        if isinstance(summary, dict) and summary.get("id"):
+            label = f"assignment {summary.get('name') or summary['id']}"
+            detail = _optional(label, lambda assignment_id=summary["id"]: [client.get_assignment(assignment_id)])
+            assignments.extend(a for a in detail if isinstance(a, dict))
     # Resolved once here (reusing the SAME helper the policy-splice below
     # uses) so the Relationships tab can show real resource names/kinds
     # for an assignment directly, without re-deriving this resolution
@@ -4248,7 +4956,7 @@ def build_access_model(client, okta_client=None, on_progress=None):
         assignment["resolved_resources"] = _resolve_relationship_assignment_resources(
             assignment.get("resource_assignments")
         )
-    relationships = client.list_relationships()
+    relationships = _optional("relationships", client.list_relationships)
     # relationship id -> LIST of (assignment, its matching
     # relationship_assignment) pairs -- built once here, used by the
     # policy-resolution loop below. MUST be one-to-MANY: confirmed live
@@ -4275,7 +4983,7 @@ def build_access_model(client, okta_client=None, on_progress=None):
             f"{len(assignments)} assignment(s), {len(relationships)} relationship(s)")
 
     _report(on_progress, "clients", "start")
-    clients = client.list_clients()
+    clients = _optional("enrolled clients", client.list_clients)
     _report(on_progress, "clients", "done", f"{len(clients)} enrolled client(s)")
 
     _report(on_progress, "devices", "start")
@@ -4330,12 +5038,12 @@ def build_access_model(client, okta_client=None, on_progress=None):
                     indexes["secrets"][s["id"]] = proj_ref
             indexes["secret_folder_children"].update(_folder_descendant_secrets(folders, secrets))
 
-            for server in client.list_project_servers(rg["id"], project["id"]):
+            for server in _optional(f"servers in project {project.get('name')}", client.list_project_servers, rg["id"], project["id"]):
                 if server.get("id"):
                     indexes["servers"][server["id"]] = proj_ref
                 all_servers.append({**server, **proj_ref_named})
 
-            for acct in client.list_project_saas_app_accounts(rg["id"], project["id"]):
+            for acct in _optional(f"SaaS app accounts in project {project.get('name')}", client.list_project_saas_app_accounts, rg["id"], project["id"]):
                 key = acct.get("privileged_resource_id")
                 if key:
                     # access_tracking_id: confirmed live 2026-08-15 -- the
@@ -4350,7 +5058,7 @@ def build_access_model(client, okta_client=None, on_progress=None):
                     indexes["saas_accounts"][key] = {**proj_ref, "access_tracking_id": acct.get("id")}
                 all_saas_accounts.append({**acct, **proj_ref_named})
 
-            for acct in client.list_project_okta_ud_accounts(rg["id"], project["id"]):
+            for acct in _optional(f"Okta Universal Directory accounts in project {project.get('name')}", client.list_project_okta_ud_accounts, rg["id"], project["id"]):
                 key = acct.get("okta_user_id")
                 if key:
                     indexes["okta_accounts"][key] = {**proj_ref, "access_tracking_id": acct.get("id")}
@@ -4364,10 +5072,10 @@ def build_access_model(client, okta_client=None, on_progress=None):
             # text instead -- see _resolve_rule's active_directory/database
             # branches), so there's no matching `indexes[...]` entry to
             # populate here, only the full-object list for the Resources tab.
-            for acct in client.list_project_active_directory_accounts(rg["id"], project["id"]):
+            for acct in _optional(f"Active Directory accounts in project {project.get('name')}", client.list_project_active_directory_accounts, rg["id"], project["id"]):
                 all_active_directory_accounts.append({**acct, **proj_ref_named})
 
-            for acct in client.list_project_database_accounts(rg["id"], project["id"]):
+            for acct in _optional(f"database accounts in project {project.get('name')}", client.list_project_database_accounts, rg["id"], project["id"]):
                 all_database_accounts.append({**acct, **proj_ref_named})
 
             indexed_count += 1
@@ -4377,15 +5085,30 @@ def build_access_model(client, okta_client=None, on_progress=None):
 
     _report(on_progress, "user_groups", "start")
     users_with_groups = []
-    for i, user in enumerate(users):
-        user = dict(user)
+
+    def _user_groups(user):
         try:
-            user["groups"] = client.list_user_groups(user.get("name"))
+            return client.list_user_groups(user.get("name"))
         except OpaApiError as exc:
-            user["groups"] = []
             log("WARN", f"Could not fetch groups for user '{user.get('name')}': {exc}")
-        users_with_groups.append(user)
-        _report(on_progress, "user_groups", "progress", f"{i + 1}/{len(users)} users ({user.get('name')})")
+            return []
+
+    # ENG2-08 (external review, 2026-10-05): one call per user, independent
+    # of each other and already failure-tolerant -- the one part of the
+    # bootstrap that's safe to overlap. USER_GROUP_WORKERS stays at or under
+    # RATE_LIMIT_MIN_REMAINING, so the workers together can't overrun the
+    # headroom http_json_request keeps before its proactive wait; token
+    # refreshes are serialised in OpaClient.request. Results keep the users'
+    # order (and each worker runs in a copy of this thread's context, so log
+    # lines keep the job's correlation id). The rest of the walk stays
+    # sequential.
+    user_dicts = [dict(u) for u in users if isinstance(u, dict)]
+    with ThreadPoolExecutor(max_workers=USER_GROUP_WORKERS, thread_name_prefix="user-groups") as pool:
+        futures = [pool.submit(contextvars.copy_context().run, _user_groups, u) for u in user_dicts]
+        for i, (user, future) in enumerate(zip(user_dicts, futures)):
+            user["groups"] = future.result() or []
+            users_with_groups.append(user)
+            _report(on_progress, "user_groups", "progress", f"{i + 1}/{len(user_dicts)} users ({user.get('name')})")
     _report(on_progress, "user_groups", "done", f"{len(users)} user(s)")
 
     _report(on_progress, "policies", "start")
@@ -4418,7 +5141,8 @@ def build_access_model(client, okta_client=None, on_progress=None):
             # just the first/last match.
             matches = []
             for rel_ref in policy_relationships:
-                matches.extend(assignments_by_relationship_id.get(rel_ref.get("id"), []))
+                if isinstance(rel_ref, dict):
+                    matches.extend(assignments_by_relationship_id.get(rel_ref.get("id"), []))
             if matches:
                 seen_principal_ids = set()
                 effective_principals_list = []
@@ -4432,6 +5156,7 @@ def build_access_model(client, okta_client=None, on_progress=None):
                             assignment.get("resource_assignments"),
                             relationship_name=(ra.get("relationship") or {}).get("name"),
                             assignment_name=assignment.get("name"),
+                            principal=principal,
                         )
                     )
                 # Matches this codebase's existing principals shape
@@ -4442,7 +5167,9 @@ def build_access_model(client, okta_client=None, on_progress=None):
                 effective_principals = {"user_groups": effective_principals_list, "workload_roles": []}
 
         rules_out = []
-        for rule in policy.get("rules", []):
+        for rule in policy.get("rules") or []:  # ENG2-11: "rules": null (a relationship-only policy) is not a crash
+            if not isinstance(rule, dict):
+                continue
             resolutions = _resolve_rule(rule, indexes)
             # A relationship-based policy's rule has an EMPTY
             # resource_selector (confirmed live -- the real grant comes
@@ -4459,9 +5186,9 @@ def build_access_model(client, okta_client=None, on_progress=None):
                 "resource_type_label": RESOURCE_TYPE_LABELS.get(rule.get("resource_type"), rule.get("resource_type")),
                 "privileges": [
                     {"privilege_type": p.get("privilege_type"), "flags": _privilege_flags(p.get("privilege_value"))}
-                    for p in rule.get("privileges", [])
+                    for p in rule.get("privileges") or [] if isinstance(p, dict)
                 ],
-                "conditions": rule.get("conditions", []),
+                "conditions": rule.get("conditions") or [],
                 "resolutions": resolutions,
             })
         policies_out.append({
@@ -4471,13 +5198,13 @@ def build_access_model(client, okta_client=None, on_progress=None):
             "active": policy.get("active", False),
             "type": policy.get("type"),
             "resource_group": policy.get("resource_group"),
-            "principals": effective_principals if effective_principals is not None else policy.get("principals", {}),
+            "principals": effective_principals if effective_principals is not None else (policy.get("principals") or {}),
             "rules": rules_out,
             # Raw policy -> relationship link (already computed above as
             # policy_relationships, just also exposed here) -- lets the
             # Relationships tab answer "which policies use this
             # relationship" without re-deriving the match itself.
-            "relationship_ids": [r["id"] for r in policy_relationships if r.get("id")],
+            "relationship_ids": [r["id"] for r in policy_relationships if isinstance(r, dict) and r.get("id")],
         })
     _report(on_progress, "resolve", "done", f"{len(policies_out)} polic(ies) resolved")
 
@@ -4502,6 +5229,9 @@ def build_access_model(client, okta_client=None, on_progress=None):
         "relationships": relationships,
         "clients": clients,
         "devices": devices,
+        # ENG2-07: sections that came back empty because the service key
+        # may not read them -- the UI shows these instead of implying "none".
+        "warnings": warnings,
     }
 
 
@@ -4522,58 +5252,128 @@ def get_ad_connection_discovery_config(client, ad_connection_id):
 # ---------------------------------------------------------------------------
 # Existing-folder resolution
 # ---------------------------------------------------------------------------
-def resolve_existing_folders(client, resource_group_id, project_id, ordered_paths):
-    """Returns dict: path tuple -> folder_id, for folders that already exist.
+def _folder_path_tuple(folder, by_id):
+    """The folder's full path as a tuple of names, from its parent chain
+    (a name may in principle contain "/", so this never splits a joined
+    string). None if any name on the chain is missing or the chain loops."""
+    names = []
+    current = folder
+    visited = set()
+    while current is not None:
+        name = current.get(FIELD_NAME)
+        if not name:
+            return None
+        names.append(name)
+        parent_id = current.get("parent_id")
+        if not parent_id:
+            break
+        if parent_id in visited:
+            return None
+        visited.add(parent_id)
+        current = by_id.get(parent_id)
+        if current is None:
+            return None
+    return tuple(reversed(names))
 
-    Matches by NAME ONLY (project-wide), which is safe as long as fact #1
-    (per-project name uniqueness) holds in your tenant -- but the folders
-    themselves now come from fetch_all_folders() so nested existing folders
-    are found too, not just top-level ones (see module docstring fact #2).
-    """
+
+def resolve_existing_folders(client, resource_group_id, project_id, ordered_paths):
+    """Returns (existing, name_in_use): existing maps a planned path tuple
+    to the id of the folder that already exists AT THAT EXACT PATH;
+    name_in_use maps a planned path that doesn't exist yet to the path of
+    an existing folder elsewhere in the project with the same name
+    (compared case-insensitively), for the plan to show.
+
+    ENG2-02 (external review, 2026-10-05): this used to match by leaf name
+    only, project-wide. With Dev/DB in the project, a plan for
+    Prod/DB/creds marked Prod/DB as "[exists]" with Dev/DB's id, and
+    creds was created under Dev/DB -- inheriting Dev's policy grants --
+    while the results CSV recorded Prod/DB/creds as created. Now only an
+    exact path match is adopted. A same-named folder elsewhere is never
+    used as a parent: the create is attempted at the planned location and
+    OPA decides (fact #1 in the header says it refuses a name already used
+    anywhere in the project; if it doesn't, the folder lands where the CSV
+    says). Either way nothing is created under the wrong parent."""
     folders = fetch_all_folders(client, resource_group_id, project_id)
     log("INFO", f"Scanned {len(folders)} existing folder(s) in project (recursive, all depths).")
-    name_to_id = {}
+    by_id = {f.get(FIELD_ID): f for f in folders if f.get(FIELD_ID)}
+    path_to_id = {}
+    paths_by_name = {}
     for f in folders:
-        name = f.get(FIELD_NAME)
         fid = f.get(FIELD_ID)
-        if not name or not fid:
+        if not fid:
             continue
-        if name in name_to_id:
-            log("WARN", f"Tenant already has more than one folder named '{name}' in this project; using the first one found.")
+        path = _folder_path_tuple(f, by_id)
+        if path is None:
             continue
-        name_to_id[name] = fid
+        if path in path_to_id:
+            log("WARN", f"Tenant already has more than one folder at '{'/'.join(path)}'; using the first one found.")
+            continue
+        path_to_id[path] = fid
+        paths_by_name.setdefault(path[-1].casefold(), []).append(path)
 
-    existing = {}
+    existing = {path: path_to_id[path] for path in ordered_paths if path in path_to_id}
+    name_in_use = {}
     for path in ordered_paths:
-        fid = name_to_id.get(path[-1])
-        if fid:
-            existing[path] = fid
-    return existing
+        if path in existing:
+            continue
+        elsewhere = sorted(p for p in paths_by_name.get(path[-1].casefold(), []) if p != path)
+        if elsewhere:
+            name_in_use[path] = "/".join(elsewhere[0])
+    return existing, name_in_use
 
 
 # ---------------------------------------------------------------------------
 # Plan / execute
 # ---------------------------------------------------------------------------
-def print_plan(ordered_paths, existing, collisions):
+def print_plan(ordered_paths, existing, collisions, name_in_use=None, case_variants=None):
+    name_in_use = name_in_use or {}
     if collisions:
         log("WARN", "Name collisions detected -- OPA requires folder names to be unique per project:")
         for name, paths in collisions.items():
             where = ", ".join("/".join(p) for p in paths)
             log("WARN", f"  '{name}' is used at multiple positions: {where}")
         log("WARN", "Only the first folder created with each name will succeed; the rest will error with 409.")
+    if case_variants:
+        log("WARN", "Names that differ only by letter case (OPA may treat them as the same name):")
+        for _key, paths in case_variants.items():
+            log("WARN", f"  {', '.join('/'.join(p) for p in paths)}")
 
     log("INFO", "Planned folder tree:")
     for path in ordered_paths:
         indent = "  " * (len(path) - 1)
-        marker = "[exists]     " if path in existing else "[will create]"
-        log("INFO", f"  {indent}{marker} {path[-1]}  (full path: {'/'.join(path)})")
+        if path in existing:
+            marker = "[exists]     "
+        elif path in name_in_use:
+            marker = "[name in use]"
+        else:
+            marker = "[will create]"
+        suffix = f"  -- a folder with this name already exists at '{name_in_use[path]}'" if path in name_in_use else ""
+        log("INFO", f"  {indent}{marker} {path[-1]}  (full path: {'/'.join(path)}){suffix}")
+
+
+NOT_ATTEMPTED_AFTER_NETWORK_FAILURE = "Not attempted: an earlier network failure stopped the run (re-run to continue)."
 
 
 def execute_plan(client, resource_group_id, project_id, ordered_paths, descriptions, existing):
+    """Creates every planned folder that doesn't exist yet, parents first.
+    Always returns one result row per planned path.
+
+    ENG2-06 (external review, 2026-10-05): a network failure (now an
+    OpaApiError with status "network", see http_json_request) used to
+    escape as URLError/TimeoutError, losing every result already
+    recorded: no results CSV, no folders.execute audit entry, a traceback
+    in the CLI -- although folders had been created. Now that row is an
+    error, and every later row is reported as not attempted (a dead
+    network would only fail them one by one); a re-run picks up where it
+    stopped, since existing folders are detected."""
     results = []
     folder_ids = dict(existing)
+    network_failed = False
 
     for path in ordered_paths:
+        if network_failed and path not in folder_ids:
+            results.append((path, "", "error", NOT_ATTEMPTED_AFTER_NETWORK_FAILURE))
+            continue
         if path in folder_ids:
             results.append((path, folder_ids[path], "skipped_exists", ""))
             continue
@@ -4593,29 +5393,85 @@ def execute_plan(client, resource_group_id, project_id, ordered_paths, descripti
             )
             new_id = (created or {}).get(FIELD_ID, "")
             if not new_id:
-                raise OpaApiError("n/a", "create_folder", f"No '{FIELD_ID}' in response: {created!r}")
+                raise OpaApiError(API_STATUS_INVALID_RESPONSE, "create_folder", f"no '{FIELD_ID}' in the create response")
             folder_ids[path] = new_id
             results.append((path, new_id, "created", ""))
             log("SUCCESS", f"Created '{'/'.join(path)}' (id={new_id})")
         except OpaApiError as e:
             log("ERROR", f"Failed to create '{'/'.join(path)}': {e}")
             results.append((path, "", "error", str(e)))
+            if _is_network_error(e):
+                network_failed = True
 
     return results
 
 
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe_cell(value):
+    """ENG2-15 (external review, 2026-10-05): a cell a spreadsheet would
+    evaluate as a formula (a folder named "-A1" is a valid OPA name) gets
+    a leading single quote. Only for output-only files -- never applied to
+    a CSV this tool reads back."""
+    text = "" if value is None else str(value)
+    return "'" + text if text.startswith(_FORMULA_PREFIXES) else text
+
+
+def _write_results_rows(f, results):
+    writer = csv.writer(f)
+    writer.writerow(["path", "folder_id", "status", "error_message"])
+    for path, folder_id, status, error_message in results:
+        writer.writerow([_csv_safe_cell(v) for v in ("/".join(path), folder_id, status, error_message)])
+
+
 def write_results_csv(output_path, results):
     with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["path", "folder_id", "status", "error_message"])
-        for path, folder_id, status, error_message in results:
-            writer.writerow(["/".join(path), folder_id, status, error_message])
+        _write_results_rows(f, results)
     log("INFO", f"Results written to {output_path}")
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+_CLI_CREDENTIAL_VARS = (ENV_BASE_DOMAIN, ENV_TEAM_NAME, ENV_KEY_ID, ENV_KEY_SECRET)
+
+
+def _resolve_cli_credentials():
+    """ENG2-13 (external review, 2026-10-05): ONE source, all four values --
+    all from the environment (shell or .env), else all from the
+    dashboard's active environment. Mixing field by field let a leftover
+    OPA_TEAM_NAME (or a preview-org OPA_BASE_DOMAIN) combine with
+    production's key while the log said the dashboard environment was in
+    use. A partial set in the environment now stops with the names that
+    are missing."""
+    from_env = {name: os.environ.get(name, "").strip() for name in _CLI_CREDENTIAL_VARS}
+    supplied = [name for name, value in from_env.items() if value]
+    if supplied and len(supplied) < len(_CLI_CREDENTIAL_VARS):
+        missing = [name for name in _CLI_CREDENTIAL_VARS if not from_env[name]]
+        die(
+            f"Only some credentials are set in the environment/.env ({', '.join(supplied)}); missing: "
+            f"{', '.join(missing)}. Set all four, or unset them all to use the dashboard's active environment."
+        )
+    if supplied:
+        return tuple(from_env[name] for name in _CLI_CREDENTIAL_VARS)
+    try:
+        active = get_active_environment_credentials()
+    except CredentialStoreUnavailable as exc:
+        die(str(exc))
+    if not active:
+        die(
+            f"No credentials found. Set {', '.join(_CLI_CREDENTIAL_VARS)} as environment variables or in a "
+            "local .env file, or activate an environment in the dashboard."
+        )
+    values = tuple((active.get(field) or "").strip() for field in ("base_domain", "team_name", "key_id", "key_secret"))
+    missing = [name for name, value in zip(_CLI_CREDENTIAL_VARS, values) if not value]
+    if missing:
+        die(f"The dashboard's active environment ('{active.get('name')}') is missing: {', '.join(missing)}.")
+    log("INFO", f"Using credentials from the dashboard's active environment ('{active.get('name')}').")
+    return values
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Bulk-create Okta Privileged Access secret folders from a CSV of paths."
@@ -4631,37 +5487,15 @@ def main():
     parser.add_argument(
         "--output",
         default=None,
-        help="Output results CSV path (default: folders_result_<timestamp>.csv)",
+        help="Output results CSV path (default: folders_result_<timestamp>.csv). Must not exist unless --force.",
     )
+    parser.add_argument("--force", action="store_true", help="Allow --output to overwrite an existing file.")
     args = parser.parse_args()
 
     if not os.path.isfile(args.csv):
         die(f"CSV file not found: {args.csv}")
 
-    base_domain = os.environ.get(ENV_BASE_DOMAIN, "").strip()
-    team_name = os.environ.get(ENV_TEAM_NAME, "").strip()
-    key_id = os.environ.get(ENV_KEY_ID, "").strip()
-    key_secret = os.environ.get(ENV_KEY_SECRET, "").strip()
-
-    if not all([base_domain, team_name, key_id, key_secret]):
-        active = get_active_environment_credentials()
-        if active:
-            base_domain = base_domain or active.get("base_domain", "")
-            team_name = team_name or active.get("team_name", "")
-            key_id = key_id or active.get("key_id", "")
-            key_secret = key_secret or active.get("key_secret", "")
-            log("INFO", f"Using credentials from the dashboard's active environment ('{active.get('name')}').")
-
-    missing = [name for name, val in [
-        (ENV_BASE_DOMAIN, base_domain), (ENV_TEAM_NAME, team_name),
-        (ENV_KEY_ID, key_id), (ENV_KEY_SECRET, key_secret),
-    ] if not val]
-    if missing:
-        die(
-            f"Missing required credential(s): {', '.join(missing)}. "
-            "Set them as environment variables, in a local .env file, or activate an "
-            "environment in the dashboard."
-        )
+    base_domain, team_name, key_id, key_secret = _resolve_cli_credentials()
 
     log("INFO", f"OPA Secret Folder Bulk Creator v{SCRIPT_VERSION}")
     log("INFO", f"Mode: {'EXECUTE' if args.execute else 'DRY-RUN (no changes will be made)'}")
@@ -4672,23 +5506,34 @@ def main():
 
     validate_names(ordered_paths)
     collisions = detect_name_collisions(ordered_paths)
+    case_variants = detect_case_variant_names(ordered_paths)
 
     try:
         client = OpaClient(base_domain, team_name, key_id, key_secret)
-        existing = resolve_existing_folders(client, args.resource_group_id, args.project_id, ordered_paths)
-    except OpaApiError as e:
+        existing, name_in_use = resolve_existing_folders(client, args.resource_group_id, args.project_id, ordered_paths)
+    except OpaApiError as e:  # network failures are OpaApiError too since 5.40.6 (ENG2-06)
         die(f"Failed during setup/lookup: {e}")
 
-    print_plan(ordered_paths, existing, collisions)
+    print_plan(ordered_paths, existing, collisions, name_in_use, case_variants)
 
     if not args.execute:
         log("INFO", "Dry-run complete. Re-run with --execute to actually create the folders above.")
         return
 
-    results = execute_plan(client, args.resource_group_id, args.project_id, ordered_paths, descriptions, existing)
-
+    # ENG2-13: the results file is opened BEFORE anything is created -- a
+    # bad directory used to fail only after every folder existed, losing
+    # the record -- and an existing file is never overwritten silently.
     output_path = args.output or f"folders_result_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
-    write_results_csv(output_path, results)
+    try:
+        results_file = open(output_path, "w" if args.force else "x", newline="", encoding="utf-8")
+    except FileExistsError:
+        die(f"{output_path} already exists. Choose another --output, or add --force to overwrite it.")
+    except OSError as e:
+        die(f"Cannot write the results file {output_path}: {e.strerror}")
+    with results_file:
+        results = execute_plan(client, args.resource_group_id, args.project_id, ordered_paths, descriptions, existing)
+        _write_results_rows(results_file, results)
+    log("INFO", f"Results written to {output_path}")
 
     created = sum(1 for r in results if r[2] == "created")
     skipped = sum(1 for r in results if r[2] == "skipped_exists")

@@ -1754,7 +1754,10 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
     on a later chunk used to leave rows that no manifest covered and a
     sync_state stuck at "running" with no error. Any exception now
     records the manifest for every row already inserted, writes
-    last_sync_status="error" + last_sync_error, and re-raises.
+    last_sync_status="error" + last_sync_error, and re-raises. Exactly
+    one manifest is written per call (5.40.6): a failure after this
+    call's manifest committed (e.g. the final sync_state write) marks the
+    sync "error" but never seals the same rows a second time.
     last_sync_completed_at is written ONLY by a successful completion;
     last_sync_attempt_at records every start (the scheduler keys its
     retry back-off off the attempt, not the completion)."""
@@ -1802,16 +1805,34 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
     chunks = 0
     incomplete_chunks = 0
     all_new_entries = []  # Phase 6: accumulated across every day-chunk, sealed into ONE manifest row for this whole call
+    # Exactly one manifest per call (5.40.6): once this call's rows are
+    # sealed, nothing may seal them again. Before this, a failure AFTER the
+    # success manifest committed (the final _upsert_sync_state) fell into
+    # the except below, whose _fail wrote a second manifest for the same
+    # rows -- the chain stayed valid but row_count was counted twice.
+    sealed = {"head": None, "done": False}
+
+    def _seal(until):
+        if not sealed["done"]:
+            sealed["head"] = _record_ingestion_manifest(
+                conn, environment_id, "sync", original_since, until, all_new_entries
+            )
+            sealed["done"] = True  # only after the commit: a seal that raised rolled back and may be retried
+        return sealed["head"]
 
     def _fail(error_message, until):
-        _upsert_sync_state(conn, environment_id, last_sync_status="error", last_sync_error=error_message)
-        if on_progress:
-            on_progress("ingest", "error", error_message)
+        try:
+            _upsert_sync_state(conn, environment_id, last_sync_status="error", last_sync_error=error_message)
+            if on_progress:
+                on_progress("ingest", "error", error_message)
+        except Exception:
+            _seal(until)  # the rows still get sealed when the status write (or the callback) fails
+            raise
         # An interrupted sync still produced real inserted rows (across
         # however many chunks completed) -- those must be in the chain
         # too, same "nothing new is silently invisible" reasoning as a
-        # zero-new-rows batch.
-        return _record_ingestion_manifest(conn, environment_id, "sync", original_since, until, all_new_entries)
+        # zero-new-rows batch. A no-op if this call already sealed them.
+        return _seal(until)
 
     try:
         while cursor < safe_now_dt:
@@ -1862,9 +1883,7 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
 
         # Still inside the try: a failure sealing the manifest or writing
         # the final state must also end as "error", never a silent "running".
-        chain_head = _record_ingestion_manifest(
-            conn, environment_id, "sync", original_since, _iso_ms(safe_now_dt), all_new_entries
-        )
+        chain_head = _seal(_iso_ms(safe_now_dt))
         _upsert_sync_state(
             conn, environment_id,
             last_sync_completed_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
@@ -2186,6 +2205,34 @@ def _require_positive_limit(limit):
     recommendation. Raises ValueError; callers map that to an HTTP 400."""
     if not isinstance(limit, int) or limit < 1:
         raise ValueError(f"limit must be a positive integer, got {limit!r}")
+
+
+def iter_events_targeting(environment_id, target_id, event_types):
+    """Yields every archived event of `event_types` that names `target_id`
+    among its targets (any target, not only the primary resource),
+    newest first, one row at a time: {"uuid", "published", "raw"}.
+
+    ENG2-03 (external review, 2026-10-05): the archive-backed secrets
+    report used query_events(limit=100000) over the WHOLE environment and
+    filtered by project in Python -- the cap applied before the filter, so
+    past 100k secret/folder events the oldest (the creates) silently fell
+    off, and every request parsed up to 100k raw events. event_targets
+    holds one row per target of every stored event (written on insert,
+    backfilled at boot for older rows) and is indexed on (environment_id,
+    target_id), so the project filter runs in SQL and nothing is capped.
+    The caller still checks the target's type itself."""
+    if not event_types:
+        return
+    conn = _get_connection()
+    placeholders = ",".join("?" for _ in event_types)
+    sql = (
+        "SELECT uuid, published, raw_json FROM events WHERE environment_id = ? "
+        f"AND event_type IN ({placeholders}) "
+        "AND uuid IN (SELECT uuid FROM event_targets WHERE environment_id = ? AND target_id = ?) "
+        "ORDER BY published DESC"
+    )
+    for row in conn.execute(sql, (environment_id, *event_types, environment_id, target_id)):
+        yield {"uuid": row["uuid"], "published": row["published"], "raw": json.loads(row["raw_json"])}
 
 
 def query_events(environment_id, event_types=None, since=None, until=None, actor_id=None, resource_id=None, limit=1000,

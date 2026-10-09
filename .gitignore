@@ -9,6 +9,7 @@ ubuntuserver.txt
 # real operational data (who did what, when) specific to whichever
 # deployment produced it, not something to ship in the repo
 audit_log.jsonl
+.audit_log.jsonl.lock
 
 # Admin-configured announcement banner (see engine.get/set_banner_config) --
 # deployment-specific content (an org's own maintenance/incident notice),

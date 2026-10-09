@@ -141,7 +141,7 @@ export function FolderNodeRow({
 
       {nameInvalid && (
         <div className="text-[0.6875rem] text-loss" style={{ paddingLeft: `${parentPath.length * 1.5 + 0.25}rem` }}>
-          Only letters, digits, "." "_" "-" are allowed — no spaces.
+          Only letters, digits, "." "_" "-" are allowed (no spaces, at most 255 characters, not "." or "..").
         </div>
       )}
       {!nameInvalid && hasCollision && (

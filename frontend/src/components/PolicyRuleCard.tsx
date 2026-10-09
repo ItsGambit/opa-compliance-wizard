@@ -44,7 +44,9 @@ function ResourceAccessSummary({ info }: { info: ResourceAccessInfo }) {
     return <span className="text-text-faint italic">access tracking not available for this resource type</span>
   }
   if (info.events.length === 0) {
-    return <span className="text-text-faint">not accessed (or not within the last 90 days)</span>
+    return info.complete === false
+      ? <span className="text-warn">no access found in the events read — the lookup hit its page limit, so this is not a complete 90-day answer</span>
+      : <span className="text-text-faint">not accessed (or not within the last 90 days)</span>
   }
 
   const [latest, ...rest] = info.events

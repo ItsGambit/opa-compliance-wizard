@@ -78,6 +78,15 @@ export function AccessExplorer({ subTab }: Props) {
         </div>
       </div>
 
+      {(displayedModel.warnings?.length ?? 0) > 0 && (
+        <div className="card p-3 border-warn/40 text-xs text-warn flex flex-col gap-1" role="status">
+          <div className="font-medium">Some sections are incomplete — the service key may not read them, so they are shown empty:</div>
+          {displayedModel.warnings!.map((w, i) => (
+            <div key={`${i}:${w.section}`}>{w.message}</div>
+          ))}
+        </div>
+      )}
+
       {subTab === 'resource_groups' && <ResourceGroupsTab model={displayedModel} />}
       {subTab === 'projects' && <ProjectsTab model={displayedModel} />}
       {subTab === 'resources' && <ResourcesTab model={displayedModel} />}
