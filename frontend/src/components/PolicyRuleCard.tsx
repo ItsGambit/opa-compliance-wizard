@@ -12,15 +12,34 @@ interface Props {
   policyName?: string
   /** Only meaningful for resolved resolutions -- see UsersTab, the only
    * current caller that passes this. Omitted everywhere else (Projects/
-   * Policies/Groups tabs), since "last accessed by whom" only makes sense
-   * once a specific user is in scope. Keyed by resolution.id. */
-  accessInfoByResourceId?: Map<string, ResourceAccessInfo>
+   * Policies/Groups tabs) and for a service account (no Okta identity, so
+   * no System Log lookup), since "last accessed by whom" only makes sense
+   * once a specific human user is in scope. */
+  accessLookup?: AccessLookup
+}
+
+/** UI-12 (external review, 2026-10-05): the state of the per-user "last
+ * accessed" lookup, not just its results -- a failed or disabled lookup
+ * used to leave every row reading "loading…" forever. */
+export type AccessLookup =
+  | { status: 'loading' }
+  | { status: 'error'; message: string; onRetry: () => void; retrying?: boolean }
+  | { status: 'ready'; byId: Map<string, ResourceAccessInfo> }
+
+function AccessCell({ lookup, resourceId }: { lookup: AccessLookup; resourceId: string }) {
+  if (lookup.status === 'loading') return <span className="text-text-faint">loading…</span>
+  if (lookup.status === 'error') return <span className="text-warn">unavailable</span>
+  const info = lookup.byId.get(resourceId)
+  // A ready lookup that has no entry for this resource: the server did not
+  // report on it -- say so rather than spinning forever.
+  if (!info) return <span className="text-text-faint italic">no result returned for this resource</span>
+  return <ResourceAccessSummary info={info} />
 }
 
 // Resource kinds with a verified, working System Log mapping -- see
 // create_secret_folders.py's RESOURCE_ACCESS_EVENT_TYPES. Kept in sync
 // with UsersTab's TRACKABLE_KINDS (the only current caller that populates
-// accessInfoByResourceId for these kinds).
+// the access lookup for these kinds).
 const TRACKABLE_KINDS = new Set([
   'secret',
   'individual_server_account',
@@ -82,10 +101,10 @@ function ResourceAccessSummary({ info }: { info: ResourceAccessInfo }) {
 
 function FolderAccessSummary({
   childSecrets,
-  accessInfoByResourceId,
+  accessLookup,
 }: {
   childSecrets: { id: string; name: string }[]
-  accessInfoByResourceId: Map<string, ResourceAccessInfo>
+  accessLookup: AccessLookup
 }) {
   const [expanded, setExpanded] = useState(false)
   return (
@@ -101,11 +120,10 @@ function FolderAccessSummary({
       </button>
       {expanded &&
         childSecrets.map(secret => {
-          const info = accessInfoByResourceId.get(secret.id)
           return (
             <div key={secret.id} className="flex items-baseline gap-1.5 pl-3">
               <span className="text-text-dim shrink-0">{secret.name}:</span>
-              {info ? <ResourceAccessSummary info={info} /> : <span className="text-text-faint">loading…</span>}
+              <AccessCell lookup={accessLookup} resourceId={secret.id} />
             </div>
           )
         })}
@@ -113,7 +131,7 @@ function FolderAccessSummary({
   )
 }
 
-export function PolicyRuleCard({ rule, policyName, accessInfoByResourceId }: Props) {
+export function PolicyRuleCard({ rule, policyName, accessLookup }: Props) {
   // Narrowed to TRACKABLE_KINDS (not every resolved resource) because
   // that's all UsersTab ever queries access info for -- including anything
   // else here would show a permanent "loading…" for resource kinds nobody
@@ -169,23 +187,30 @@ export function PolicyRuleCard({ rule, policyName, accessInfoByResourceId }: Pro
         </div>
       </div>
 
-      {accessInfoByResourceId && (trackableTargets.length > 0 || trackableFolders.length > 0) && (
+      {accessLookup && (trackableTargets.length > 0 || trackableFolders.length > 0) && (
         <div className="flex flex-col gap-1">
           <span className="section-label">Last accessed (System Log, last 90 days)</span>
+          {accessLookup.status === 'error' && (
+            <div className="text-[0.6875rem] text-warn flex items-center gap-2" role="status">
+              Last-accessed lookup unavailable: {accessLookup.message}
+              <button type="button" className="btn-secondary !py-0 !px-1.5 text-[0.6875rem]" onClick={accessLookup.onRetry} disabled={accessLookup.retrying}>
+                {accessLookup.retrying ? 'Retrying…' : 'Retry'}
+              </button>
+            </div>
+          )}
           <div className="flex flex-col gap-1 text-[0.6875rem]">
             {trackableTargets.map((res, i) => {
-              const info = accessInfoByResourceId.get(res.access_tracking_id ?? res.id)
               return (
                 <div key={`s-${i}`} className="flex items-baseline gap-1.5">
                   <span className="text-text-dim shrink-0">{res.name}:</span>
-                  {info ? <ResourceAccessSummary info={info} /> : <span className="text-text-faint">loading…</span>}
+                  <AccessCell lookup={accessLookup} resourceId={res.access_tracking_id ?? res.id} />
                 </div>
               )
             })}
             {trackableFolders.map((res, i) => (
               <div key={`f-${i}`} className="flex items-baseline gap-1.5">
                 <span className="text-text-dim shrink-0">{res.name}:</span>
-                <FolderAccessSummary childSecrets={res.child_secrets!} accessInfoByResourceId={accessInfoByResourceId} />
+                <FolderAccessSummary childSecrets={res.child_secrets!} accessLookup={accessLookup} />
               </div>
             ))}
           </div>

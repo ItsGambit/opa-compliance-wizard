@@ -19,6 +19,11 @@ interface SelectProps {
   placeholder: string
   disabled?: boolean
   loading?: boolean
+  /** UI-19: point a visible <label htmlFor> at the trigger (Radix's
+   * documented pattern), or give it a name with ariaLabel when there is no
+   * visible label. */
+  id?: string
+  ariaLabel?: string
 }
 
 // Every dropdown in the app (Resource Groups, Projects, Groups, Policies,
@@ -30,7 +35,7 @@ interface SelectProps {
 // to search through.
 const SEARCH_THRESHOLD = 8
 
-export function Select({ value, onValueChange, options, placeholder, disabled, loading }: SelectProps) {
+export function Select({ value, onValueChange, options, placeholder, disabled, loading, id, ariaLabel }: SelectProps) {
   const [query, setQuery] = useState('')
   const filtered = useFuzzyFilter(options, query, ['label', 'value'])
 
@@ -44,6 +49,8 @@ export function Select({ value, onValueChange, options, placeholder, disabled, l
       }}
     >
       <RadixSelect.Trigger
+        id={id}
+        aria-label={ariaLabel}
         className="text-input inline-flex items-center justify-between gap-2 min-w-56 disabled:opacity-40 disabled:cursor-default"
       >
         <RadixSelect.Value placeholder={loading ? 'Loading…' : placeholder} />
@@ -55,10 +62,11 @@ export function Select({ value, onValueChange, options, placeholder, disabled, l
         <RadixSelect.Content className="dropdown z-50" position="popper" sideOffset={4}>
           {options.length >= SEARCH_THRESHOLD && (
             <div className="flex items-center gap-1.5 px-2 py-1.5 border-b border-border">
-              <Search size={12} className="text-text-faint shrink-0" />
+              <Search size={12} className="text-text-faint shrink-0" aria-hidden="true" />
               <input
                 type="text"
                 autoFocus
+                aria-label="Search options"
                 placeholder="Search…"
                 value={query}
                 onChange={e => setQuery(e.target.value)}

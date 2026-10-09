@@ -39,11 +39,45 @@ export interface Environment {
   // backend never reveals WHO another owner is, just whether it's yours.
   shared: boolean
   is_own: boolean
+  /** 5.40.7 (UI-07): true when this row's NAME resolves to this very row
+   * for the caller -- i.e. it is what activating, syncing or reporting by
+   * that name would act on. False for another owner's private row (admin
+   * view) and for a shared row hidden by the caller's own same-named
+   * environment. Older servers omit it (treated as is_own || shared). */
+  addressable?: boolean
 }
 
 export interface EnvironmentsResponse {
   environments: Environment[]
   active: string | null
+  /** 5.40.7 (UI-07): the active environment's id -- compare rows by this,
+   * never by name (an admin sees several owners' same-named rows). */
+  active_id?: string | null
+}
+
+/** One archive left behind by a deleted environment (DATA-12). */
+export interface OrphanedArchive {
+  environment_id: string
+  event_count: number
+  bytes: number
+  oldest_published: string | null
+  newest_published: string | null
+  manifest_count: number
+}
+
+/** GET /api/environments/{name}/integrity (see audit_store.verify_ingestion_chain). */
+export interface IntegrityResult {
+  valid: boolean
+  manifest_count: number
+  broken_at: number | string | null
+  reason: string | null
+  head_hash?: string | null
+  legacy_manifests?: number
+  deep?: boolean
+  deep_applicable?: boolean
+  verified_rows?: number
+  unverifiable_rows?: number
+  checked_at?: string | null
 }
 
 export interface SyncStepEvent {
@@ -70,6 +104,8 @@ export interface SyncState {
 
 export interface SyncStatusResponse {
   status: 'idle' | 'running' | 'done' | 'error'
+  /** "csv_import" while a CSV import holds the ingest slot (not a sync). */
+  kind?: string
   steps: SyncStepEvent[]
   error: string | null
   result?: {
@@ -309,7 +345,11 @@ export interface ExecuteResponse {
 export interface ApiErrorBody {
   error: string
   invalid_names?: InvalidName[]
+  /** 502 "Saved, but could not connect": the record WAS written (FE-11). */
   saved?: boolean
+  /** Machine-readable cause on some refusals (e.g. step-up "expired",
+   * "already_consumed"; audit-log backfill "busy"). */
+  reason?: string
 }
 
 // ── Access Explorer ──────────────────────────────────────────────────────

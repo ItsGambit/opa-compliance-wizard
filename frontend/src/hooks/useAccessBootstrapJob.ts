@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { fetchAccessBootstrapResult, fetchAccessBootstrapStatus, startAccessBootstrap } from '../api/client'
-import type { BootstrapStepEvent } from '../api/client'
+import type { BootstrapStatusResponse, BootstrapStepEvent } from '../api/client'
 import type { AccessModel } from '../types'
-
-const POLL_INTERVAL_MS = 1000
+import { JOB_LOST_MESSAGE, startPollLoop } from './pollLoop'
 
 export type JobPhase = 'idle' | 'starting' | 'running' | 'done' | 'error'
 
@@ -17,72 +16,71 @@ interface JobState {
 
 const INITIAL_STATE: JobState = { phase: 'idle', stepDefs: [], events: [], error: null, result: null }
 
-/** Drives the background bootstrap job: POST /start, poll /status every
- * second, fetch /result once done. Exposes enough for a UI to show real
- * step-by-step progress (not just a spinner) and a Retry that restarts
- * cleanly from scratch — simplest correct recovery, given steps build on
- * each other so resuming mid-way isn't worth the complexity. */
+const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err))
+
+/** Drives the background bootstrap job: POST /start, poll /status, fetch
+ * /result once (see startPollLoop). Exposes enough for a UI to show real
+ * step-by-step progress and a Retry that restarts cleanly from scratch.
+ *
+ * FE-04 / UI-10 (external review, 2026-10-05): polls never overlap (the
+ * result download used to be started again on every tick while the
+ * previous one was still in flight); nothing runs after unmount; "idle"
+ * while running means the server lost the job (restart, or the active
+ * environment changed) and ends in an error instead of polling forever;
+ * and a job that was already running still shows its step list (the
+ * server now returns `steps` with already_running). */
 export function useAccessBootstrapJob() {
   const [state, setState] = useState<JobState>(INITIAL_STATE)
-  const pollHandle = useRef<number | null>(null)
+  const generation = useRef(0)
+  const cancelPoll = useRef<(() => void) | null>(null)
 
   const stopPolling = useCallback(() => {
-    if (pollHandle.current !== null) {
-      window.clearInterval(pollHandle.current)
-      pollHandle.current = null
-    }
+    cancelPoll.current?.()
+    cancelPoll.current = null
   }, [])
-
-  const poll = useCallback(() => {
-    fetchAccessBootstrapStatus()
-      .then(status => {
-        setState(s => ({ ...s, events: status.steps, error: status.error }))
-        if (status.status === 'done') {
-          // FIX (external review, 2026-09-30): stopPolling() used to run
-          // BEFORE this fetch, so a transient failure fetching the result
-          // (the job itself succeeded, but e.g. a network blip on this
-          // one follow-up request) left polling permanently stopped with
-          // no automatic retry -- the only recovery was the user manually
-          // clicking Retry, which restarts the whole bootstrap from
-          // scratch rather than just re-fetching an already-finished
-          // result. Stop polling only once the result fetch itself has
-          // actually resolved (success OR failure), not preemptively.
-          return fetchAccessBootstrapResult()
-            .then(result => {
-              stopPolling()
-              setState(s => ({ ...s, phase: 'done', result }))
-            })
-            .catch(err => {
-              stopPolling()
-              setState(s => ({ ...s, phase: 'error', error: err instanceof Error ? err.message : String(err) }))
-            })
-        }
-        if (status.status === 'error') {
-          stopPolling()
-          setState(s => ({ ...s, phase: 'error' }))
-        }
-      })
-      .catch(err => {
-        stopPolling()
-        setState(s => ({ ...s, phase: 'error', error: err instanceof Error ? err.message : String(err) }))
-      })
-  }, [stopPolling])
 
   const start = useCallback(() => {
     stopPolling()
-    setState({ phase: 'starting', stepDefs: [], events: [], error: null, result: null })
+    generation.current += 1
+    const gen = generation.current
+    setState({ ...INITIAL_STATE, phase: 'starting' })
     startAccessBootstrap()
       .then(resp => {
+        if (gen !== generation.current) return
         setState(s => ({ ...s, phase: 'running', stepDefs: resp.steps ?? [] }))
-        pollHandle.current = window.setInterval(poll, POLL_INTERVAL_MS)
-        poll()
+        cancelPoll.current = startPollLoop<BootstrapStatusResponse>({
+          fetchStatus: fetchAccessBootstrapStatus,
+          onStatus: async status => {
+            if (gen !== generation.current) return 'stop'
+            setState(s => ({ ...s, events: status.steps, error: status.error }))
+            if (status.status === 'running') return 'continue'
+            if (status.status === 'done') {
+              // One result download, awaited before anything else happens.
+              const result = await fetchAccessBootstrapResult()
+              if (gen === generation.current) setState(s => ({ ...s, phase: 'done', result }))
+            } else if (status.status === 'error') {
+              setState(s => ({ ...s, phase: 'error' }))
+            } else {
+              setState(s => ({ ...s, phase: 'error', error: JOB_LOST_MESSAGE }))
+            }
+            return 'stop'
+          },
+          onFatal: message => {
+            if (gen !== generation.current) return
+            setState(s => ({ ...s, phase: 'error', error: message }))
+          },
+        })
       })
       .catch(err => {
-        setState(s => ({ ...s, phase: 'error', error: err instanceof Error ? err.message : String(err) }))
+        if (gen !== generation.current) return
+        setState(s => ({ ...s, phase: 'error', error: errorText(err) }))
       })
-  }, [poll, stopPolling])
+  }, [stopPolling])
 
-  useEffect(() => stopPolling, [stopPolling])
+  useEffect(() => () => {
+    generation.current += 1
+    stopPolling()
+  }, [stopPolling])
 
   return { ...state, start }
 }

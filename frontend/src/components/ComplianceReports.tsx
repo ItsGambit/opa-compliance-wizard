@@ -1,4 +1,5 @@
-import { AlertTriangle, FileClock, KeyRound, Shield, Users } from 'lucide-react'
+import { useMutation } from '@tanstack/react-query'
+import { AlertTriangle, Download, FileClock, KeyRound, Shield, Users } from 'lucide-react'
 import { useEnvironments, useReportDefs, useSyncStatus } from '../api/hooks'
 import type { ComplianceControl, ComplianceReportDef } from '../types'
 import { ComplianceReportDetail } from './ComplianceReportDetail'
@@ -6,6 +7,8 @@ import { complianceReportExportSections } from '../utils/exportSections'
 import { exportSections } from '../utils/export'
 import { runReport } from '../api/client'
 import { toast } from '../hooks/useToast'
+import { ErrorNotice } from './ErrorNotice'
+import { exportAllReports } from '../utils/reportExports'
 
 // UI-03/DATA-07 (external review, 2026-10-05): both export paths below
 // call runReport with no `from`/`to` and no `limit`, so a tenant with
@@ -51,6 +54,17 @@ const REPORT_ICON: Record<string, typeof Shield> = {
 
 function ReportCard({ def, environment, onClick }: { def: ComplianceReportDef; environment: string | undefined; onClick: () => void }) {
   const Icon = REPORT_ICON[def.key] ?? Shield
+  // UI-14 (external review, 2026-10-05): a pending state (no duplicate
+  // downloads from impatient clicks) and an error toast (a failed export
+  // used to be a silent unhandled rejection).
+  const exportMutation = useMutation({
+    mutationFn: () => runReport(def.key, environment),
+    onSuccess: resp => {
+      warnIfTruncated(def.label, resp.truncated, resp.total, resp.rows.length)
+      exportSections(complianceReportExportSections(def.label, resp.rows), 'csv', `opa-report-${def.key}`)
+    },
+    onError: (err: Error) => toast({ title: `Could not export "${def.label}"`, description: err.message, variant: 'error' }),
+  })
 
   return (
     <div className="relative group">
@@ -59,7 +73,7 @@ function ReportCard({ def, environment, onClick }: { def: ComplianceReportDef; e
         onClick={onClick}
         className="card p-3.5 flex items-start gap-3 w-full text-left hover:border-accent hover:bg-accent-dim transition-colors"
       >
-        <div className="w-8 h-8 rounded-lg bg-accent-dim text-accent flex items-center justify-center shrink-0">
+        <div className="w-8 h-8 rounded-lg bg-accent-dim text-accent flex items-center justify-center shrink-0" aria-hidden="true">
           <Icon size={16} />
         </div>
         <div className="flex-1 min-w-0">
@@ -68,23 +82,26 @@ function ReportCard({ def, environment, onClick }: { def: ComplianceReportDef; e
         </div>
         <div className="text-right shrink-0">
           <div className="text-lg font-bold text-text">{def.count ?? '—'}</div>
-          <div className="text-[0.625rem] text-text-faint">events</div>
+          {/* UI-14: this count covers the whole archive; the report itself
+              opens on the last 90 days, so the two numbers can differ. */}
+          <div className="text-[0.625rem] text-text-faint">events, all time</div>
         </div>
       </button>
       <button
         type="button"
-        title="Export CSV"
+        title={`Export "${def.label}" (all time) as CSV`}
+        aria-label={`Export ${def.label} as CSV`}
+        disabled={exportMutation.isPending}
         className="absolute top-2 right-2 w-6 h-6 rounded-md border border-border bg-bg-card text-text-faint
-          opacity-0 group-hover:opacity-100 hover:text-accent hover:border-accent transition-opacity flex items-center justify-center"
-        onClick={async e => {
+          opacity-0 group-hover:opacity-100 focus-visible:opacity-100 disabled:opacity-100 hover:text-accent hover:border-accent transition-opacity flex items-center justify-center"
+        onClick={e => {
           e.stopPropagation()
-          const resp = await runReport(def.key, environment)
-          warnIfTruncated(def.label, resp.truncated, resp.total, resp.rows.length)
-          const sections = complianceReportExportSections(def.label, resp.rows)
-          exportSections(sections, 'csv', `opa-report-${def.key}`)
+          exportMutation.mutate()
         }}
       >
-        ⬇
+        {exportMutation.isPending
+          ? <span className="inline-block w-3 h-3 rounded-full border-2 border-accent border-t-transparent animate-spin" aria-hidden="true" />
+          : <Download size={12} aria-hidden="true" />}
       </button>
     </div>
   )
@@ -102,11 +119,30 @@ interface Props {
 export function ComplianceReports({ selectedReport, onSelectReport }: Props) {
   const { data: environments } = useEnvironments()
   const activeEnv = environments?.active ?? undefined  // null (no active env) -> undefined, which the hooks treat as "disabled"
-  const { data: reports } = useReportDefs(activeEnv)
+  const { data: reports, isError: reportsError, error: reportsErrorValue, refetch: refetchReports, isFetching: reportsFetching } = useReportDefs(activeEnv)
   // Phase 10: point-in-time, non-polling read (see useSyncStatus's own
   // doc comment) -- this page just needs to know "is the data behind
   // these reports currently degraded," not live sync progress.
   const { data: syncStatus } = useSyncStatus(activeEnv)
+
+  const exportAllMutation = useMutation({
+    mutationFn: () => exportAllReports(reports ?? [], activeEnv),
+    onSuccess: ({ sections, failed }) => {
+      // A file named "all reports" must contain all of them: if any report
+      // failed, nothing is downloaded (as before) -- but the failures are
+      // now named instead of being a silent unhandled rejection (UI-14).
+      if (failed.length > 0) {
+        toast({
+          title: 'Export failed — nothing was downloaded',
+          description: `Could not load ${failed.length} of ${sections.length + failed.length} reports: ${failed.map(f => `${f.def.label} (${f.error})`).join('; ')}. Try again, or export reports one at a time from their cards.`,
+          variant: 'error',
+        })
+        return
+      }
+      for (const { def, resp } of sections) warnIfTruncated(def.label, resp.truncated, resp.total, resp.rows.length)
+      exportSections(sections.map(({ section }) => section), 'csv', 'opa-compliance-reports-all')
+    },
+  })
 
   if (selectedReport && reports) {
     const def = reports.find(r => r.key === selectedReport)
@@ -146,25 +182,18 @@ export function ComplianceReports({ selectedReport, onSelectReport }: Props) {
         <button
           type="button"
           className="btn-secondary text-xs"
-          onClick={async () => {
-            if (!reports) return
-            const sections = await Promise.all(
-              reports.map(async def => {
-                const resp = await runReport(def.key, activeEnv)
-                warnIfTruncated(def.label, resp.truncated, resp.total, resp.rows.length)
-                return { title: def.label, rows: resp.rows.map(r => ({
-                  User: r.user, Action: r.action, Timestamp: r.timestamp, 'Affected Resource': r.resource, Outcome: r.outcome,
-                })) }
-              })
-            )
-            exportSections(sections, 'csv', 'opa-compliance-reports-all')
-          }}
+          disabled={!reports || reports.length === 0 || exportAllMutation.isPending}
+          onClick={() => exportAllMutation.mutate()}
         >
-          ⬇ Export all (CSV)
+          <Download size={12} aria-hidden="true" /> {exportAllMutation.isPending ? 'Exporting…' : 'Export all (CSV)'}
         </button>
       </div>
 
-      {!reports && <div className="text-sm text-text-faint">Loading reports…</div>}
+      {/* UI-04: a failed list used to read "Loading reports…" forever. */}
+      {reportsError && (
+        <ErrorNotice title="Could not load the reports" error={reportsErrorValue} onRetry={() => refetchReports()} retrying={reportsFetching} />
+      )}
+      {!reports && !reportsError && <div className="text-sm text-text-faint">Loading reports…</div>}
 
       {grouped.map(({ control, reports: controlReports }) => (
         <div key={control} className="flex flex-col gap-2">

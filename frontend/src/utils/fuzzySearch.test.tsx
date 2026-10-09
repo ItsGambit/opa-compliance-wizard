@@ -98,3 +98,25 @@ describe('HighlightedText', () => {
     expect(marks[1].textContent).toBe('world')
   })
 })
+
+describe('HighlightedText robustness (FE-12)', () => {
+  it('renders exactly the text for overlapping and out-of-range ranges', () => {
+    const text = 'abcdefgh'
+    const { container } = render(<HighlightedText text={text} indices={[[0, 4], [2, 6], [5, 99], [-3, 1], [40, 50]]} />)
+    expect(container.textContent).toBe(text)
+  })
+
+  it('never duplicates characters when ranges arrive unsorted and nested', () => {
+    const { container } = render(<HighlightedText text="hello world" indices={[[6, 10], [0, 10], [2, 3]]} />)
+    expect(container.textContent).toBe('hello world')
+  })
+})
+
+describe('useFuzzyFilter keys (FE-12)', () => {
+  it('rebuilds the index when the key list changes', () => {
+    const { result, rerender } = renderHook(({ keys }) => useFuzzyFilter(ITEMS, 'example.com', keys), { initialProps: { keys: ['name'] } })
+    expect(result.current).toHaveLength(0)
+    rerender({ keys: ['name', 'email'] })
+    expect(result.current.map(r => r.item.name)).toContain('Bob Smith')
+  })
+})

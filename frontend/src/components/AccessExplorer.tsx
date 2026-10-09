@@ -1,7 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { RefreshCw } from 'lucide-react'
-import { useAccessBootstrapJob } from '../hooks/useAccessBootstrapJob'
-import type { AccessModel } from '../types'
+import { useAccessModel } from '../hooks/useAccessModel'
 import { BootstrapProgressPanel } from './BootstrapProgressPanel'
 import { GroupsTab } from './GroupsTab'
 import { PoliciesTab } from './PoliciesTab'
@@ -14,7 +13,7 @@ import { ExportButtons } from './ExportButtons'
 import { accessModelExportSections } from '../utils/exportSections'
 
 // Exported so App.tsx / SideNav can render these as sidebar sub-nav items
-// (this used to be an internal TabBar rendered inside this component --
+// (this used to be an internal tab bar rendered inside this component --
 // moved to the sidebar per the Okta-console-style redesign, see the
 // "splendid-floating-moth" plan).
 export const ACCESS_SUB_TABS = [
@@ -32,26 +31,20 @@ interface Props {
 }
 
 export function AccessExplorer({ subTab }: Props) {
-  const job = useAccessBootstrapJob()
-  const startedOnce = useRef(false)
-  // The last successfully loaded model stays visible during a refresh
-  // (job.result briefly clears while the new job runs) so a Refresh
-  // doesn't blank the screen while its own progress panel shows at the
-  // bottom.
-  const [displayedModel, setDisplayedModel] = useState<AccessModel | null>(null)
+  // UI-10: model + job live in AccessModelProvider (survives page switches).
+  const { job, model: displayedModel, ensureLoaded, refresh, updateModel } = useAccessModel()
 
-  useEffect(() => {
-    if (!startedOnce.current) {
-      startedOnce.current = true
-      job.start()
-    }
-  }, [job])
+  useEffect(() => { ensureLoaded() }, [ensureLoaded])
 
-  useEffect(() => {
-    if (job.phase === 'done' && job.result) setDisplayedModel(job.result)
-  }, [job.phase, job.result])
-
-  const isRefreshing = displayedModel !== null && job.phase !== 'done'
+  // A refresh is in progress only while the job is actually starting or
+  // running -- a FAILED refresh used to keep "Refreshing…" (and a disabled
+  // button) on screen until the bottom panel's Retry was found.
+  const isRefreshing = displayedModel !== null && (job.phase === 'starting' || job.phase === 'running')
+  const refreshFailed = displayedModel !== null && job.phase === 'error'
+  // The failed-refresh panel can be dismissed (the previous data stays);
+  // any new job phase brings it back.
+  const [dismissedFailure, setDismissedFailure] = useState(false)
+  useEffect(() => { setDismissedFailure(false) }, [job.phase])
 
   if (!displayedModel) {
     return (
@@ -60,7 +53,7 @@ export function AccessExplorer({ subTab }: Props) {
         stepDefs={job.stepDefs}
         events={job.events}
         error={job.error}
-        onRetry={job.start}
+        onRetry={refresh}
         variant="fullpage"
       />
     )
@@ -71,7 +64,7 @@ export function AccessExplorer({ subTab }: Props) {
       <div className="flex items-center justify-end">
         <div className="flex items-center gap-2">
           <ExportButtons sections={accessModelExportSections(displayedModel)} filenameBase="opa-access-explorer-all" />
-          <button type="button" className="btn-secondary shrink-0" onClick={job.start} disabled={isRefreshing}>
+          <button type="button" className="btn-secondary shrink-0" onClick={refresh} disabled={isRefreshing}>
             <RefreshCw size={13} className={isRefreshing ? 'animate-spin' : ''} />
             {isRefreshing ? 'Refreshing…' : 'Refresh'}
           </button>
@@ -96,28 +89,23 @@ export function AccessExplorer({ subTab }: Props) {
         <UsersTab
           model={displayedModel}
           onUserGroupRemoved={(userId, groupId) =>
-            setDisplayedModel(prev =>
-              prev
-                ? {
-                    ...prev,
-                    users: prev.users.map(u =>
-                      u.id === userId ? { ...u, groups: u.groups.filter(g => g.id !== groupId) } : u
-                    ),
-                  }
-                : prev
-            )
+            updateModel(prev => ({
+              ...prev,
+              users: prev.users.map(u => (u.id === userId ? { ...u, groups: u.groups.filter(g => g.id !== groupId) } : u)),
+            }))
           }
         />
       )}
       {subTab === 'groups' && <GroupsTab model={displayedModel} />}
 
-      {isRefreshing && (
+      {(isRefreshing || (refreshFailed && !dismissedFailure)) && (
         <BootstrapProgressPanel
           phase={job.phase}
           stepDefs={job.stepDefs}
           events={job.events}
           error={job.error}
-          onRetry={job.start}
+          onRetry={refresh}
+          onDismiss={() => setDismissedFailure(true)}
           variant="bottom"
         />
       )}

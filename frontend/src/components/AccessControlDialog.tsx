@@ -1,24 +1,18 @@
 import { useEffect, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
+import { DialogCloseButton } from './DialogCloseButton'
 import { useMutation } from '@tanstack/react-query'
-import { ShieldCheck, X } from 'lucide-react'
 import { toast } from '../hooks/useToast'
 import { useAccessControl } from '../api/hooks'
 import { prepareAccessControl } from '../api/client'
 import type { AccessControlConfig } from '../types'
 
 interface Props {
-  // Both optional -- omit for the self-contained trigger button (falls back
-  // to internal state, unchanged behavior). Pass both when opened remotely
-  // (e.g. SideNav's admin-only nav/utility row).
-  open?: boolean
-  onOpenChange?: (open: boolean) => void
+  open: boolean
+  onOpenChange: (open: boolean) => void
 }
 
-export function AccessControlDialog({ open: openProp, onOpenChange }: Props = {}) {
-  const [openState, setOpenState] = useState(false)
-  const open = openProp ?? openState
-  const setOpen = onOpenChange ?? setOpenState
+export function AccessControlDialog({ open, onOpenChange: setOpen }: Props) {
   const { data: config } = useAccessControl(open)
 
   const [adminGroupId, setAdminGroupId] = useState('')
@@ -71,23 +65,12 @@ export function AccessControlDialog({ open: openProp, onOpenChange }: Props = {}
 
   return (
     <Dialog.Root open={open} onOpenChange={setOpen}>
-      {openProp === undefined && (
-        <Dialog.Trigger asChild>
-          <button type="button" className="btn-secondary !px-2" title="Access control">
-            <ShieldCheck size={14} />
-          </button>
-        </Dialog.Trigger>
-      )}
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
-        <Dialog.Content className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[28rem] p-5">
+        <Dialog.Content aria-describedby={undefined} className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[28rem] p-5">
           <div className="flex items-center justify-between mb-3">
             <Dialog.Title className="text-sm font-semibold text-text">Access control</Dialog.Title>
-            <Dialog.Close asChild>
-              <button type="button" className="text-text-faint hover:text-text-dim">
-                <X size={16} />
-              </button>
-            </Dialog.Close>
+            <DialogCloseButton />
           </div>
 
           <p className="text-xs text-text-faint mb-4">
@@ -98,8 +81,9 @@ export function AccessControlDialog({ open: openProp, onOpenChange }: Props = {}
 
           <div className="flex flex-col gap-3">
             <div className="field">
-              <label className="section-label block mb-1">Admin Group ID</label>
+              <label htmlFor="access-control-admin-group" className="section-label block mb-1">Admin Group ID</label>
               <input
+                id="access-control-admin-group"
                 className="text-input w-full"
                 value={adminGroupId}
                 onChange={e => setAdminGroupId(e.target.value)}
@@ -108,8 +92,9 @@ export function AccessControlDialog({ open: openProp, onOpenChange }: Props = {}
             </div>
 
             <div className="field">
-              <label className="section-label block mb-1">User Group ID</label>
+              <label htmlFor="access-control-user-group" className="section-label block mb-1">User Group ID</label>
               <input
+                id="access-control-user-group"
                 className="text-input w-full"
                 value={userGroupId}
                 onChange={e => setUserGroupId(e.target.value)}

@@ -116,7 +116,7 @@ export function SecretsAccessDashboard() {
         <div className="flex flex-wrap items-end gap-4">
           <div className="flex flex-col gap-1">
             <span className="section-label">Resource group</span>
-            <Select
+            <Select ariaLabel="Resource group"
               value={rgId}
               onValueChange={handleRgChange}
               placeholder="Select a resource group"
@@ -125,7 +125,7 @@ export function SecretsAccessDashboard() {
           </div>
           <div className="flex flex-col gap-1">
             <span className="section-label">Project</span>
-            <Select
+            <Select ariaLabel="Project"
               value={projectId}
               onValueChange={setProjectId}
               disabled={!rgId}

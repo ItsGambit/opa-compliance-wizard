@@ -23,6 +23,7 @@ interface Props {
   accessByPath: Map<string, FolderAccessEntry[]>
   resourceGroupId: string | undefined
   projectId: string | undefined
+  projectName?: string
   onAddChild: (parentId: string) => void
   onDelete: (id: string) => void
   onUpdate: (id: string, patch: Partial<Pick<FolderNode, 'name' | 'description'>>) => void
@@ -38,6 +39,7 @@ export function FolderNodeRow({
   accessByPath,
   resourceGroupId,
   projectId,
+  projectName,
   onAddChild,
   onDelete,
   onUpdate,
@@ -58,6 +60,7 @@ export function FolderNodeRow({
       toast({ title: `Deleted "${node.name}" from OPA`, variant: 'default' })
       setConfirmingDelete(false)
       queryClient.invalidateQueries({ queryKey: ['security_policies', resourceGroupId] })
+      queryClient.invalidateQueries({ queryKey: ['secrets_access_report'] })
       onDelete(node.id)
     },
     onError: (err: Error) => {
@@ -79,12 +82,15 @@ export function FolderNodeRow({
     <div className="flex flex-col">
       <div className="flex items-center gap-2 py-1" style={{ paddingLeft: `${parentPath.length * 1.5}rem` }}>
         <input
+          aria-label={parentPath.length ? `Folder name (in ${parentPath.join('/')})` : 'Folder name'}
+          aria-invalid={nameInvalid || undefined}
           value={node.name}
           onChange={e => onUpdate(node.id, { name: e.target.value })}
           placeholder="folder-name"
           className={`text-input w-40 ${nameInvalid ? 'border-loss' : hasCollision ? 'border-warn' : ''}`}
         />
         <input
+          aria-label={`Description for ${node.name || 'this folder'}`}
           value={node.description}
           onChange={e => onUpdate(node.id, { description: e.target.value })}
           placeholder="description (optional)"
@@ -100,17 +106,19 @@ export function FolderNodeRow({
           type="button"
           onClick={() => onAddChild(node.id)}
           title="Add subfolder"
+          aria-label={`Add subfolder under ${node.name || 'this folder'}`}
           className="btn-secondary !px-1.5 !py-1"
         >
-          <Plus size={13} />
+          <Plus size={13} aria-hidden="true" />
         </button>
         <button
           type="button"
           onClick={handleDeleteClick}
           title={folderId ? 'Delete from OPA' : 'Remove'}
+          aria-label={folderId ? `Delete ${node.name} from OPA` : `Remove ${node.name || 'this folder'}`}
           className="btn-secondary !px-1.5 !py-1 hover:!text-loss"
         >
-          <Trash2 size={13} />
+          <Trash2 size={13} aria-hidden="true" />
         </button>
       </div>
 
@@ -119,7 +127,7 @@ export function FolderNodeRow({
           className="flex items-center gap-2 text-xs text-loss py-1"
           style={{ paddingLeft: `${parentPath.length * 1.5 + 0.25}rem` }}
         >
-          Delete "{node.name}" from OPA? This can't be undone.
+          Delete "{node.name}" from OPA{projectName ? <> (project <strong>{projectName}</strong>)</> : null}? This can't be undone.
           <button
             type="button"
             className="btn-danger !py-0.5 !px-2"
@@ -166,6 +174,7 @@ export function FolderNodeRow({
           accessByPath={accessByPath}
           resourceGroupId={resourceGroupId}
           projectId={projectId}
+          projectName={projectName}
           onAddChild={onAddChild}
           onDelete={onDelete}
           onUpdate={onUpdate}

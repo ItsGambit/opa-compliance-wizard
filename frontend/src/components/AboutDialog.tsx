@@ -1,39 +1,21 @@
-import { useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
-import { Info, X } from 'lucide-react'
+import { DialogCloseButton } from './DialogCloseButton'
 
 interface Props {
-  // Both optional -- omit for the self-contained trigger button (falls back
-  // to internal state, unchanged behavior). Pass both when opened remotely
-  // (e.g. SideNav's utility row).
-  open?: boolean
-  onOpenChange?: (open: boolean) => void
+  open: boolean
+  onOpenChange: (open: boolean) => void
 }
 
-export function AboutDialog({ open: openProp, onOpenChange }: Props = {}) {
-  const [openState, setOpenState] = useState(false)
-  const open = openProp ?? openState
-  const setOpen = onOpenChange ?? setOpenState
+export function AboutDialog({ open, onOpenChange: setOpen }: Props) {
 
   return (
     <Dialog.Root open={open} onOpenChange={setOpen}>
-      {openProp === undefined && (
-        <Dialog.Trigger asChild>
-          <button type="button" className="btn-secondary !px-2" title="About / disclaimer">
-            <Info size={14} />
-          </button>
-        </Dialog.Trigger>
-      )}
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
-        <Dialog.Content className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[26rem] p-5">
+        <Dialog.Content aria-describedby={undefined} className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[26rem] p-5">
           <div className="flex items-center justify-between mb-3">
             <Dialog.Title className="text-sm font-semibold text-text">About OPA Compliance Wizard</Dialog.Title>
-            <Dialog.Close asChild>
-              <button type="button" className="text-text-faint hover:text-text-dim">
-                <X size={16} />
-              </button>
-            </Dialog.Close>
+            <DialogCloseButton />
           </div>
 
           <div className="flex flex-col gap-3 text-xs text-text-dim leading-relaxed">

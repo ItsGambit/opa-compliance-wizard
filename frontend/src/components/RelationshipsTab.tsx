@@ -125,6 +125,7 @@ export function RelationshipsTab({ model }: Props) {
                   <span className="text-xs text-text-faint">No assignments reference this relationship.</span>
                 )}
                 <Select
+                  ariaLabel="Assignment"
                   value={assignmentId}
                   onValueChange={setAssignmentId}
                   placeholder="Select an assignment"

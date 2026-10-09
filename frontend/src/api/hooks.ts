@@ -26,6 +26,12 @@ export function useEnvironments() {
   return useQuery({
     queryKey: ['environments'],
     queryFn: fetchEnvironments,
+    // The server session (and so the active environment) is per user, not
+    // per tab: another tab's Activate changes it here too. Refetching this
+    // cheap list on focus is what lets App notice and reset the tenant
+    // scope (UI-05) -- an exception to the app-wide no-focus-refetch rule.
+    refetchOnWindowFocus: true,
+    staleTime: 0,
   })
 }
 
@@ -33,6 +39,8 @@ export function useBanner() {
   return useQuery({
     queryKey: ['banner'],
     queryFn: fetchBanner,
+    refetchOnWindowFocus: true,
+    staleTime: 0,
     // Refetch on focus/reconnect (not staleTime: Infinity like
     // useWhoami/useVersion above) -- unlike identity/version, a banner is
     // meant to change while the page is already open (an admin flips it
@@ -44,6 +52,8 @@ export function useAccessControl(enabled: boolean) {
   return useQuery({
     queryKey: ['access_control'],
     queryFn: fetchAccessControl,
+    // Always fresh when the dialog opens: another admin may have changed it.
+    staleTime: 0,
     // Only ever opened by an admin from the dialog -- gated by `enabled`
     // (React Query's own conditional-fetch flag) so a non-admin's browser
     // never even attempts this admin-only request in the background.
@@ -201,11 +211,21 @@ export function useReportDefs(environment: string | undefined, from?: string, to
   })
 }
 
-export function useReport(reportKey: string | undefined, environment: string | undefined, from?: string, to?: string) {
+/** `enabled` false (e.g. an invalid date range) runs nothing. While a new
+ * range loads, the previous rows stay on screen (UI-04; isPlaceholderData
+ * tells the caller they are the old range's). */
+export function useReport(reportKey: string | undefined, environment: string | undefined, from?: string, to?: string, enabled = true) {
   return useQuery({
     queryKey: ['report', reportKey, environment, from, to],
     queryFn: () => runReport(reportKey!, environment, from, to),
-    enabled: !!reportKey && !!environment,
+    enabled: enabled && !!reportKey && !!environment,
+    // Only across a date-range change of the SAME report and environment --
+    // never another report's rows under this report's title.
+    // Never while disabled (an invalid range): TanStack applies
+    // placeholderData to a disabled pending query too, which would label
+    // the old rows "loading" forever.
+    placeholderData: (prev, prevQuery) =>
+      enabled && prevQuery && prevQuery.queryKey[1] === reportKey && prevQuery.queryKey[2] === environment ? prev : undefined,
   })
 }
 
@@ -218,12 +238,19 @@ export function useResourceHistory(
   environment: string | undefined,
   from?: string,
   to?: string,
-  resourceName?: string
+  resourceName?: string,
+  enabled = true
 ) {
   return useQuery({
     queryKey: ['resource_history', resourceId, environment, from, to, resourceName],
     queryFn: () => fetchResourceHistory(resourceId!, environment, from, to, resourceName),
-    enabled: !!resourceId && !!environment,
+    enabled: enabled && !!resourceId && !!environment,
+    // Same resource only: never show another resource's history under
+    // this one's name while it loads.
+    placeholderData: (prev, prevQuery) =>
+      enabled && prevQuery && prevQuery.queryKey[1] === resourceId && prevQuery.queryKey[2] === environment && prevQuery.queryKey[5] === resourceName
+        ? prev
+        : undefined,
   })
 }
 

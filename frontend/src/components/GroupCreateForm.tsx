@@ -20,12 +20,14 @@ export function GroupCreateForm({ mutation, onCancel, label = 'New group (create
     <div className="card p-3 flex flex-col gap-2">
       <span className="section-label">{label}</span>
       <input
+        aria-label="Group name"
         value={name}
         onChange={e => setName(e.target.value)}
         placeholder="group name"
         className="text-input"
       />
       <input
+        aria-label="Group description"
         value={description}
         onChange={e => setDescription(e.target.value)}
         placeholder="description (optional)"

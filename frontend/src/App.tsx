@@ -1,24 +1,28 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useEnvironments, useWhoami } from './api/hooks'
-import { saveAccessControl } from './api/client'
+import { isSessionExpiredError, saveAccessControl } from './api/client'
 import { useHashRoute } from './hooks/useHashRoute'
 import { toast } from './hooks/useToast'
 import { AboutDialog } from './components/AboutDialog'
 import { AccessControlDialog } from './components/AccessControlDialog'
 import { AccessExplorer, ACCESS_SUB_TABS } from './components/AccessExplorer'
+import { AccessModelProvider } from './components/AccessModelProvider'
 import { AnnouncementBanner } from './components/AnnouncementBanner'
 import { AuditLogPage } from './components/AuditLogPage'
 import { BannerSettingsDialog } from './components/BannerSettingsDialog'
 import { ComplianceReports } from './components/ComplianceReports'
 import { EnvironmentManagerDialog } from './components/EnvironmentManagerDialog'
+import { EnvironmentScope } from './components/EnvironmentScope'
 import { EnvironmentSetup } from './components/EnvironmentSetup'
 import { Footer } from './components/Footer'
 import { FolderBuilder } from './components/FolderBuilder'
+import { OrphanedArchivesDialog } from './components/OrphanedArchivesDialog'
 import { SecretsAccessDashboard } from './components/SecretsAccessDashboard'
 import { ServiceAccountsDashboard } from './components/ServiceAccountsDashboard'
 import { REPORTS_SUB_TABS, SideNav } from './components/SideNav'
 import { UserMenu } from './components/UserMenu'
+import { environmentScopeKey } from './utils/environmentRows'
 import { canAdminFrom } from './utils/whoami'
 
 // Every navigable view is a hash route (see utils/route.ts) so the browser
@@ -40,6 +44,7 @@ export default function App() {
   const [bannerOpen, setBannerOpen] = useState(false)
   const [accessControlOpen, setAccessControlOpen] = useState(false)
   const [aboutOpen, setAboutOpen] = useState(false)
+  const [orphansOpen, setOrphansOpen] = useState(false)
   const { data: environments, isLoading: environmentsLoading } = useEnvironments()
   const { data: whoami } = useWhoami()
   // UI-06: the Audit Log and banner settings follow what the server will
@@ -47,6 +52,11 @@ export default function App() {
   const canAdmin = canAdminFrom(whoami)
   const isConfigured = !!environments?.active
   const queryClient = useQueryClient()
+
+  // UI-05: the content below is scoped to the active tenant (see
+  // EnvironmentScope) -- its id plus the connection fields, so a
+  // "Save & Reconnect" to a different team/org also resets it.
+  const scopeKey = environmentScopeKey(environments)
 
   // Completes the Access Control save flow after the browser comes back
   // from Okta's step-up (fresh MFA) redirect -- see
@@ -73,7 +83,21 @@ export default function App() {
       })
       queryClient.invalidateQueries({ queryKey: ['access_control'] })
     },
-    onError: (err: Error) => toast({ title: 'Could not save access control settings', description: err.message, variant: 'error' }),
+    onError: (err: Error & { body?: { reason?: string } }) => {
+      // FE-11: say what to do, not just what broke -- the step-up proof
+      // lasts two minutes and is single-use.
+      const expired: boolean = isSessionExpiredError(err as unknown)
+      const reason = err.body?.reason
+      toast({
+        title: 'Could not save access control settings',
+        description: expired || reason === 'expired'
+          ? 'The step-up sign-in expired before the save finished. Open Access control and save again.'
+          : reason === 'already_consumed' || reason === 'not_found'
+            ? 'This change was already applied or abandoned. Open Access control to check the current settings.'
+            : err.message,
+        variant: 'error',
+      })
+    },
   })
 
   useEffect(() => {
@@ -127,8 +151,11 @@ export default function App() {
           onOpenBanner={() => setBannerOpen(true)}
           onOpenAccessControl={() => setAccessControlOpen(true)}
           onOpenAbout={() => setAboutOpen(true)}
+          onOpenOrphanedArchives={() => setOrphansOpen(true)}
         />
 
+        <EnvironmentScope scopeKey={scopeKey}>
+        <AccessModelProvider>
         <main className="flex-1 overflow-y-auto px-8 py-6 flex flex-col gap-5">
           <header className="flex items-start justify-between">
             <div>
@@ -174,6 +201,8 @@ export default function App() {
 
           <Footer />
         </main>
+        </AccessModelProvider>
+        </EnvironmentScope>
       </div>
 
       <EnvironmentManagerDialog
@@ -182,6 +211,7 @@ export default function App() {
         onOpenChange={setEnvironmentsOpen}
         isAdmin={whoami?.is_admin}
       />
+      {canAdmin && <OrphanedArchivesDialog open={orphansOpen} onOpenChange={setOrphansOpen} />}
       <BannerSettingsDialog open={bannerOpen} onOpenChange={setBannerOpen} />
       <AccessControlDialog open={accessControlOpen} onOpenChange={setAccessControlOpen} />
       <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />

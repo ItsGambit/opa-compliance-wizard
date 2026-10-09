@@ -41,18 +41,21 @@ interface Props {
   events: BootstrapStepEvent[]
   error: string | null
   onRetry: () => void
+  /** Bottom variant only: hides a failed-refresh panel (data stays). */
+  onDismiss?: () => void
   /** "fullpage" replaces the whole tab content (first load). "bottom" is a
    * compact panel meant to sit at the bottom of the screen while the
    * previous result stays visible underneath (refresh). */
   variant: 'fullpage' | 'bottom'
 }
 
-export function BootstrapProgressPanel({ phase, stepDefs, events, error, onRetry, variant }: Props) {
+export function BootstrapProgressPanel({ phase, stepDefs, events, error, onRetry, onDismiss, variant }: Props) {
   const steps = deriveSteps(stepDefs, events, phase)
 
   const body = (
-    <div className="flex flex-col gap-2">
+    <div className="flex flex-col gap-2" role="status" aria-live="polite">
       {phase === 'starting' && <p className="text-sm text-text-dim">Starting…</p>}
+      {phase === 'running' && steps.length === 0 && <p className="text-sm text-text-dim">Working…</p>}
       {steps.map(step => (
         <div key={step.key} className="flex items-center gap-2 text-sm">
           <StepIcon status={step.status} />
@@ -66,6 +69,11 @@ export function BootstrapProgressPanel({ phase, stepDefs, events, error, onRetry
           <button type="button" className="btn-secondary shrink-0" onClick={onRetry}>
             Retry
           </button>
+          {onDismiss && variant === 'bottom' && (
+            <button type="button" className="btn-secondary shrink-0" onClick={onDismiss}>
+              Dismiss
+            </button>
+          )}
         </div>
       )}
     </div>

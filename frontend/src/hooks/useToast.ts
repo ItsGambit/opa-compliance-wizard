@@ -5,13 +5,22 @@ export interface ToastMessage {
   title: string
   description?: string
   variant?: 'default' | 'success' | 'error'
+  /** Override how long it stays (ms) -- e.g. a warning that asks for a manual step. */
+  duration?: number
 }
 
 type Listener = (msg: ToastMessage) => void
 const listeners: Set<Listener> = new Set()
 
+// UI-15 (external review, 2026-10-05): ids were Date.now(), so two toasts
+// in the same millisecond (e.g. "group created" + "service account not
+// added") shared one id -- duplicate React keys, and dismissing one removed
+// both. A module counter is unique for the page's lifetime.
+let nextToastId = 0
+
 export function toast(msg: Omit<ToastMessage, 'id'>) {
-  const message: ToastMessage = { ...msg, id: String(Date.now()) }
+  nextToastId += 1
+  const message: ToastMessage = { ...msg, id: `toast-${nextToastId}` }
   listeners.forEach(l => l(message))
 }
 

@@ -15,7 +15,9 @@ import type {
   ExecuteResponse,
   FolderSecurityPolicy,
   IngestionScope,
+  IntegrityResult,
   NamedRef,
+  OrphanedArchive,
   OpaGroup,
   PreviewResponse,
   Project,
@@ -30,21 +32,98 @@ import type {
   WorkloadRole,
 } from '../types'
 
-async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+/** Thrown for any non-2xx answer from the API. `status` lets callers (and
+ * the QueryClient's retry policy, see queryClient.ts) tell a request that
+ * can never succeed (4xx) from one worth retrying (5xx). */
+export class ApiError extends Error {
+  status: number
+  body?: ApiErrorBody
+  constructor(message: string, status: number, body?: ApiErrorBody) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.body = body
+  }
+}
+
+/** FE-05 (external review, 2026-10-05): the hosted login gate answers an
+ * expired session with 401 -> nginx's error_page -> a redirect to Okta.
+ * fetch() used to follow that cross-origin redirect and die as an opaque
+ * "Failed to fetch". Requests now use redirect: 'manual', which hands back
+ * a filtered response of type "opaqueredirect" (status 0, MDN
+ * Response.type) instead -- and serve.py never redirects an /api call
+ * itself, so that response (or a plain 401) can only mean the gate wants a
+ * fresh login. */
+export class SessionExpiredError extends Error {
+  constructor(message = 'Your session has expired. Sign in again to continue.') {
+    super(message)
+    this.name = 'SessionExpiredError'
+  }
+}
+
+type SessionExpiredListener = () => void
+const sessionExpiredListeners = new Set<SessionExpiredListener>()
+
+/** Subscribes to "the login gate refused a request" -- SessionExpiredDialog
+ * listens and offers a fresh sign-in once, however many requests failed. */
+export function onSessionExpired(listener: SessionExpiredListener): () => void {
+  sessionExpiredListeners.add(listener)
+  return () => { sessionExpiredListeners.delete(listener) }
+}
+
+export function isSessionExpiredError(err: unknown): err is SessionExpiredError {
+  return err instanceof SessionExpiredError
+}
+
+type SessionRestoredListener = () => void
+const sessionRestoredListeners = new Set<SessionRestoredListener>()
+
+/** Fired when the user says they have signed in again (SessionExpiredDialog's
+ * Continue) -- lets progress hooks re-attach to a job whose polling the
+ * expiry stopped. */
+export function onSessionRestored(listener: SessionRestoredListener): () => void {
+  sessionRestoredListeners.add(listener)
+  return () => { sessionRestoredListeners.delete(listener) }
+}
+
+export function notifySessionRestored(): void {
+  sessionRestoredListeners.forEach(l => l())
+}
+
+interface ApiFetchOptions {
+  /** false: report a gate redirect to the caller only (no global "session
+   * expired" prompt) -- for the step-up save, where the redirect means the
+   * two-minute step-up proof lapsed, not the session. */
+  notifySessionExpired?: boolean
+}
+
+async function apiFetch<T>(path: string, init?: RequestInit, { notifySessionExpired = true }: ApiFetchOptions = {}): Promise<T> {
+  // Content-Type only when there is a body to describe (FE-15).
+  const headers: Record<string, string> = init?.body != null ? { 'Content-Type': 'application/json' } : {}
   const res = await fetch(path, {
     ...init,
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
+    redirect: 'manual',
+    headers: { ...headers, ...(init?.headers as Record<string, string> | undefined) },
   })
-  if (!res.ok) {
-    let body: ApiErrorBody | null = null
+  let body: ApiErrorBody | null = null
+  if (!res.ok && res.type !== 'opaqueredirect') {
     try {
       body = await res.json()
     } catch {
       // ignore — fall through to generic message
     }
-    const err = new Error(body?.error || `Request failed with status ${res.status}`) as Error & { body?: ApiErrorBody }
-    err.body = body ?? undefined
+  }
+  // The gate's answer is a redirect (nginx turns its 401 into /login). A
+  // bare 401 with no JSON error is treated the same; serve.py's own 401
+  // (a proxy-secret misconfiguration) carries a JSON error and is shown as
+  // that error -- signing in again can't fix it.
+  if (res.type === 'opaqueredirect' || (res.status === 401 && !body?.error)) {
+    const err = new SessionExpiredError()
+    if (notifySessionExpired) sessionExpiredListeners.forEach(l => l())
     throw err
+  }
+  if (!res.ok) {
+    throw new ApiError(body?.error || `Request failed with status ${res.status}`, res.status, body ?? undefined)
   }
   return res.json() as Promise<T>
 }
@@ -95,7 +174,9 @@ export function prepareAccessControl(config: AccessControlConfig): Promise<{ act
 // saved_at (Phase 10) so App.tsx can confirm the save was approved via a
 // validated step-up transaction, not just show a generic "saved" toast.
 export function saveAccessControl(): Promise<AccessControlSaveResponse> {
-  return apiFetch('/api/access_control/save', { method: 'POST' })
+  // A redirect here means the step-up proof lapsed (nginx's /verify_stepup
+  // gate), not the session: App.tsx says so; no global sign-in prompt.
+  return apiFetch('/api/access_control/save', { method: 'POST' }, { notifySessionExpired: false })
 }
 
 // activated=false (5.40.3): an admin edited ANOTHER owner's environment --
@@ -105,8 +186,14 @@ export function saveEnvironment(values: EnvironmentFormValues): Promise<{ activa
   return apiFetch('/api/environments', { method: 'POST', body: JSON.stringify(values) })
 }
 
-export function activateEnvironment(name: string): Promise<{ activated: boolean; active: string }> {
-  return apiFetch(`/api/environments/${encodeURIComponent(name)}/activate`, { method: 'POST' })
+/** `id` (5.40.7, UI-07): the row the user clicked. The server refuses
+ * (409) if `name` no longer resolves to that environment for this user, so
+ * a stale list can never activate a different, same-named tenant. */
+export function activateEnvironment(name: string, id?: string): Promise<{ activated: boolean; active: string; active_id?: string }> {
+  return apiFetch(`/api/environments/${encodeURIComponent(name)}/activate`, {
+    method: 'POST',
+    body: JSON.stringify(id ? { id } : {}),
+  })
 }
 
 // `id` (the real owner-namespaced storage key, see Environment.id) is only
@@ -203,9 +290,8 @@ export function deleteFolder(
   )
 }
 
-export function fetchGroups(contains?: string): Promise<{ groups: OpaGroup[] }> {
-  const qs = contains ? `?contains=${encodeURIComponent(contains)}` : ''
-  return apiFetch(`/api/groups${qs}`)
+export function fetchGroups(): Promise<{ groups: OpaGroup[] }> {
+  return apiFetch('/api/groups')
 }
 
 export function createGroup(name: string, description: string): Promise<CreateGroupResponse> {
@@ -288,9 +374,8 @@ export function fetchResourceGroupSecurityPolicies(resourceGroupId: string): Pro
   return apiFetch(`/api/resource_groups/${encodeURIComponent(resourceGroupId)}/security_policies`)
 }
 
-export function fetchWorkloadRoles(contains?: string): Promise<{ workload_roles: WorkloadRole[] }> {
-  const qs = contains ? `?contains=${encodeURIComponent(contains)}` : ''
-  return apiFetch(`/api/workload_roles${qs}`)
+export function fetchWorkloadRoles(): Promise<{ workload_roles: WorkloadRole[] }> {
+  return apiFetch('/api/workload_roles')
 }
 
 export interface AssignFolderPolicyPayload {
@@ -426,4 +511,29 @@ export function fetchAuditLog(limit?: number, offset?: number): Promise<{ entrie
 // so a delayed corroboration shows up without a separate action.
 export function backfillMfaLogEvents(): Promise<{ updated_count: number }> {
   return apiFetch('/api/audit_log/backfill_mfa', { method: 'POST' })
+}
+
+// ── Orphaned archives (admin-only, DATA-12; UI 5.40.7) ───────────────────
+
+/** Archives a deleted environment left behind. Admin-only on the server
+ * (local mode exempt), same rule as the audit log. */
+export function fetchOrphanedArchives(): Promise<{ archives: OrphanedArchive[] }> {
+  return apiFetch('/api/archives/orphaned')
+}
+
+/** Irreversibly deletes every archive row for one orphaned environment_id.
+ * The server refuses (409) while that environment still exists or a sync
+ * is running, and audit-logs the per-table counts. */
+export function purgeOrphanedArchive(environmentId: string): Promise<{ purged: string } & Record<string, number | string>> {
+  return apiFetch(`/api/archives/${encodeURIComponent(environmentId)}`, { method: 'DELETE' })
+}
+
+// ── Evidence chain (FE-15: was reachable only by URL) ────────────────────
+
+/** Basic check (any user who can see the environment) or, with deep=true,
+ * the admin-only re-hash of every sealed event. Deep answers 202
+ * {status: "running"} while the background check is still going -- call
+ * again until it answers 200 (hooks/useIntegrityCheck does). */
+export function fetchIntegrity(name: string, deep = false): Promise<IntegrityResult | { status: 'running' }> {
+  return apiFetch(`/api/environments/${encodeURIComponent(name)}/integrity${deep ? '?deep=1' : ''}`)
 }

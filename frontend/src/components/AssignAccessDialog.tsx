@@ -1,15 +1,17 @@
 import { useEffect, useMemo, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { useMutation } from '@tanstack/react-query'
-import { AlertTriangle, Plus, X } from 'lucide-react'
+import { AlertTriangle, Plus } from 'lucide-react'
 import { assignFolderPolicy } from '../api/client'
 import { useGroups, useResourceGroupSecurityPolicies, useWorkloadRoles } from '../api/hooks'
 import { useCreateGroup } from '../hooks/useCreateGroup'
 import { toast } from '../hooks/useToast'
 import type { ApiErrorBody, FolderAccessEntry, FolderSecurityPolicy, NamedRef } from '../types'
+import { DialogCloseButton } from './DialogCloseButton'
 import { GroupCreateForm } from './GroupCreateForm'
 import { Select } from './Select'
 import { ServiceAccountGroupStatus } from './ServiceAccountGroupStatus'
+import { computeBlastRadius, describeBlastRadius } from '../utils/blastRadius'
 
 const PRIVILEGE_GROUPS: { label: string; fields: { key: string; label: string }[] }[] = [
   { label: 'Access', fields: [{ key: 'list', label: 'List contents' }] },
@@ -95,7 +97,8 @@ export function AssignAccessDialog({ open, onOpenChange, resourceGroupId, projec
   const { data: policies } = useResourceGroupSecurityPolicies(resourceGroupId, open)
   const { data: allGroups } = useGroups(open)
   const { data: workloadRoles } = useWorkloadRoles(open)
-  const groups = (allGroups ?? []).filter(g => g.name !== 'everyone')
+  // Memoised (UI-20): rebuilt on every render it defeated every memo below.
+  const groups = useMemo(() => (allGroups ?? []).filter(g => g.name !== 'everyone'), [allGroups])
 
   const selectedPolicy = policies?.find(p => p.id === policyId)
   const existingEntryForSelectedPolicy = existingAccess?.find(e => e.policyId === policyId)
@@ -129,13 +132,15 @@ export function AssignAccessDialog({ open, onOpenChange, resourceGroupId, projec
   const toggleGroup = (id: string) =>
     setGroupIds(prev => {
       const next = new Set(prev)
-      next.has(id) ? next.delete(id) : next.add(id)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
       return next
     })
   const toggleWorkloadRole = (id: string) =>
     setWorkloadRoleIds(prev => {
       const next = new Set(prev)
-      next.has(id) ? next.delete(id) : next.add(id)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
       return next
     })
   const togglePrivilege = (key: string) => setPrivileges(prev => ({ ...prev, [key]: !prev[key] }))
@@ -148,19 +153,10 @@ export function AssignAccessDialog({ open, onOpenChange, resourceGroupId, projec
   // Blast-radius warning: principals apply to the WHOLE policy, so adding
   // a group/role that isn't already a principal grants it every other
   // rule already in that policy too — not just this folder.
-  const blastRadius = useMemo(() => {
-    if (mode !== 'existing' || !selectedPolicy) return null
-    const existingGroupIds = new Set(selectedPolicy.principals.user_groups.map(g => g.id))
-    const existingRoleIds = new Set(selectedPolicy.principals.workload_roles.map(r => r.id))
-    const newGroups = [...groupIds].filter(id => !existingGroupIds.has(id))
-    const newRoles = [...workloadRoleIds].filter(id => !existingRoleIds.has(id))
-    if (newGroups.length === 0 && newRoles.length === 0) return null
-    const otherRules = selectedPolicy.rules.filter(
-      r => !r.targets.some(t => t.kind === 'resolved' && t.id === folderId)
-    )
-    if (otherRules.length === 0) return null
-    return { newGroupNames: groups.filter(g => newGroups.includes(g.id)).map(g => g.name), otherRuleCount: otherRules.length }
-  }, [mode, selectedPolicy, groupIds, workloadRoleIds, folderId, groups])
+  const blastRadius = useMemo(
+    () => (mode === 'existing' ? computeBlastRadius(selectedPolicy, groupIds, workloadRoleIds, folderId, groups, workloadRoles ?? []) : null),
+    [mode, selectedPolicy, groupIds, workloadRoleIds, folderId, groups, workloadRoles],
+  )
 
   const mutation = useMutation({
     mutationFn: () => {
@@ -202,14 +198,10 @@ export function AssignAccessDialog({ open, onOpenChange, resourceGroupId, projec
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
-        <Dialog.Content className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[34rem] max-h-[85vh] overflow-y-auto p-5">
+        <Dialog.Content aria-describedby={undefined} className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[34rem] max-h-[85vh] overflow-y-auto p-5">
           <div className="flex items-center justify-between mb-3">
             <Dialog.Title className="text-sm font-semibold text-text">Assign access — {folderName}</Dialog.Title>
-            <Dialog.Close asChild>
-              <button type="button" className="text-text-faint hover:text-text-dim">
-                <X size={16} />
-              </button>
-            </Dialog.Close>
+            <DialogCloseButton />
           </div>
 
           <div className="flex flex-col gap-4">
@@ -227,7 +219,7 @@ export function AssignAccessDialog({ open, onOpenChange, resourceGroupId, projec
             {mode === 'existing' ? (
               <div className="flex flex-col gap-1">
                 <span className="section-label">Policy (scoped to this resource group)</span>
-                <Select
+                <Select ariaLabel="Policy"
                   value={policyId}
                   onValueChange={setPolicyId}
                   placeholder="Select a policy"
@@ -277,11 +269,11 @@ export function AssignAccessDialog({ open, onOpenChange, resourceGroupId, projec
               <>
                 <div className="flex flex-col gap-1">
                   <span className="section-label">Name</span>
-                  <input value={name} onChange={e => setName(e.target.value)} className="text-input" placeholder="Policy name" />
+                  <input aria-label="Name" value={name} onChange={e => setName(e.target.value)} className="text-input" placeholder="Policy name" />
                 </div>
                 <div className="flex flex-col gap-1">
                   <span className="section-label">Description (optional)</span>
-                  <input value={description} onChange={e => setDescription(e.target.value)} className="text-input" />
+                  <input aria-label="Description" value={description} onChange={e => setDescription(e.target.value)} className="text-input" />
                 </div>
               </>
             )}
@@ -324,13 +316,7 @@ export function AssignAccessDialog({ open, onOpenChange, resourceGroupId, projec
             {blastRadius && (
               <div className="flex items-start gap-2 text-xs text-warn bg-warn/10 border border-warn/40 rounded-md p-2">
                 <AlertTriangle size={14} className="shrink-0 mt-0.5" />
-                <span>
-                  {blastRadius.newGroupNames.join(', ')} {blastRadius.newGroupNames.length === 1 ? 'is' : 'are'} not
-                  currently a principal on this policy. Adding {blastRadius.newGroupNames.length === 1 ? 'it' : 'them'}{' '}
-                  will also grant access to {blastRadius.otherRuleCount} other rule
-                  {blastRadius.otherRuleCount === 1 ? '' : 's'} already in this policy — principals apply policy-wide,
-                  not per-rule.
-                </span>
+                <span>{describeBlastRadius(blastRadius)}</span>
               </div>
             )}
 
@@ -361,6 +347,7 @@ export function AssignAccessDialog({ open, onOpenChange, resourceGroupId, projec
                   <div className="flex flex-col gap-1">
                     <span className="text-xs text-text-faint">Re-auth every (seconds, 0 = once per session)</span>
                     <input
+                      aria-label="Re-auth every (seconds, 0 = once per session)"
                       type="number"
                       min={0}
                       value={mfaReauthSeconds}
@@ -370,7 +357,7 @@ export function AssignAccessDialog({ open, onOpenChange, resourceGroupId, projec
                   </div>
                   <div className="flex flex-col gap-1">
                     <span className="text-xs text-text-faint">ACR values</span>
-                    <input value={mfaAcrValues} onChange={e => setMfaAcrValues(e.target.value)} className="text-input" />
+                    <input aria-label="ACR values" value={mfaAcrValues} onChange={e => setMfaAcrValues(e.target.value)} className="text-input" />
                   </div>
                 </div>
               )}

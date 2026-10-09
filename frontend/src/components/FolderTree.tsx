@@ -12,6 +12,8 @@ interface Props {
   accessByPath: Map<string, FolderAccessEntry[]>
   resourceGroupId: string | undefined
   projectId: string | undefined
+  /** Named in the "Delete from OPA" confirmation (UI-17). */
+  projectName?: string
   onAssignAccess: (path: string, folderId: string, folderName: string) => void
 }
 
@@ -24,6 +26,7 @@ export function FolderTree({
   accessByPath,
   resourceGroupId,
   projectId,
+  projectName,
   onAssignAccess,
 }: Props) {
   const handleAddRoot = () => onChange(addChild(nodes, null, newNode()))
@@ -48,6 +51,7 @@ export function FolderTree({
           accessByPath={accessByPath}
           resourceGroupId={resourceGroupId}
           projectId={projectId}
+          projectName={projectName}
           onAddChild={handleAddChild}
           onDelete={handleDelete}
           onUpdate={handleUpdate}
@@ -55,7 +59,7 @@ export function FolderTree({
         />
       ))}
       <button type="button" onClick={handleAddRoot} className="btn-secondary self-start mt-2">
-        <Plus size={13} /> Add root folder
+        <Plus size={13} aria-hidden="true" /> Add root folder
       </button>
     </div>
   )

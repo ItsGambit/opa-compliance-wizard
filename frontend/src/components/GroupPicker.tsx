@@ -28,7 +28,7 @@ export function GroupPicker({ value, onChange }: Props) {
     <div className="flex flex-col gap-1">
       <span className="section-label">Group (required — grants access to the new resource group)</span>
       <div className="flex gap-2 items-center">
-        <Select
+        <Select ariaLabel="Group"
           value={value}
           onValueChange={onChange}
           loading={isLoading}

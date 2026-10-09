@@ -2,6 +2,135 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.40.7 — **Frontend: twenty-four findings from the 2026-10-05 external review (UI-04/05/07/10..22, FE-04/05/07/09/11..13/15), plus an admin screen for archives left behind by deleted environments.**
+Batch 5 of the review's remaining findings. No report content or export
+format changed: every compliance report and export shows and writes the
+same rows, columns and timestamp format as before (the review's UI-08
+export-timestamp change and the CSV byte-order mark are open decisions,
+not shipped). Server changes are additive.
+- **Operator action and deploy impact.**
+  - Nothing to do. Rollback to 5.40.6 is code-only and safe: nothing new
+    is stored, and the new response fields are ignored by older pages.
+  - After the deploy, open browser tabs keep running the old page until
+    they are reloaded.
+- **Noticeable changes.**
+  - **Expired sessions (FE-05).** In hosted mode, when the login gate
+    refuses a request, one "Your session has expired" prompt appears
+    instead of a stream of "Failed to fetch" errors. "Sign in in a new
+    tab" keeps the current page (and an unsaved Folder Builder tree);
+    "Continue" then retries. API calls no longer follow redirects
+    (`redirect: 'manual'`); the app never redirects an `/api` call
+    itself, so a redirect there (or a bare `401`) means the gate wants a
+    login. A `401` that carries the server's own JSON error (a proxy-secret
+    misconfiguration) is shown as that error instead. A failed Access
+    Control save after step-up says the step-up expired and to save again,
+    without the session prompt. After signing in again, "Continue" retries
+    only what failed and picks a running sync's progress back up.
+  - **Switching environment clears the old one (UI-05).** Every cached
+    view, selection, progress poll and Access Explorer model from the
+    previous environment is dropped -- before anything re-renders -- when
+    the active environment changes, when the active environment is
+    reconnected to a different OPA team or Okta org, and when another tab
+    switches it (the environment list is the one query that still
+    refetches on window focus).
+  - **Environments dialog acts on the row you click (UI-07, UI-16).** The
+    "active" badge is matched by id (an admin no longer sees several
+    owners' same-named rows all marked active). Activate is offered only
+    on rows that activating by name would actually reach; the server
+    refuses (`409`) if the name now points somewhere else, and otherwise
+    activates (and stores as active) exactly the row that was clicked. Sync settings
+    and the footer's "Sync now" are offered only on your own environments
+    (on a shared one they always failed). Sharing an environment asks
+    first; a fresh form never shows the last attempt's error; "Saved, but
+    could not connect" closes the form and shows the saved row.
+  - **Access Explorer keeps its data between pages (UI-10).** Leaving and
+    coming back no longer re-runs the full tenant scan. A failed refresh
+    re-enables Refresh (it used to stay "Refreshing…") and keeps the
+    previous data on screen.
+  - **Failures are no longer shown as "no events" (UI-04).** A failed
+    report, resource history or report list shows the error with Retry.
+    Changing the date range keeps the previous rows visible (labelled)
+    while the new range loads, and export waits for the new rows.
+  - **Date ranges (UI-18).** The pickers say they are UTC days, From after
+    To is refused, an untouched To follows today, and the Timestamp column
+    names the viewer's time zone. An outcome filter that no longer matches
+    anything is cleared.
+  - **Reports home (UI-14).** Card counts say "events, all time" (the
+    report opens on 90 days). Per-card and "Export all" exports show
+    progress, can't be double-clicked and report failures; "Export all"
+    still writes nothing unless every report loaded (a file named "all"
+    is never partial), and now names the reports that failed.
+  - **Audit Log (UI-13).** "Load more" appends instead of reloading the
+    whole list, and each older page is checked against the last entry
+    shown (new activity in between reloads the list rather than showing a
+    duplicate or skipping one); same-second entries no longer collide;
+    Refresh runs one MFA backfill at a time; the search says it covers the
+    loaded entries.
+  - **Folder Builder (UI-17, UI-21, FE-11, FE-13).** Changing the resource
+    group or project drops the folder ids loaded from the previous one
+    ("Delete from OPA" / "Assign access" used to send them to the new
+    project). Loading a CSV over an edited tree and saving over an
+    existing file both ask first; a CSV without a `path` column is refused
+    with a message; Save, Preview and Create wait until every folder has a
+    valid name that is unique among its siblings.
+  - **Users tab (UI-12).** "Last accessed" no longer says "loading…"
+    forever: not shown at all for a service account, "unavailable" with
+    Retry when the lookup failed.
+  - **Evidence-chain check in the app (FE-15).** Environments → sync
+    settings → Evidence chain → Verify (Deep check for admins and local
+    runs; it polls the `202` itself).
+  - **Orphaned archives (DATA-12 UI).** Admins (and a local run's
+    operator) get an "Orphaned archives" screen listing archives whose
+    environment was deleted, with event count, size, date range and
+    manifest count, and can purge one after typing the first 8 characters
+    of its id.
+  - **Smaller fixes.** A dismissed announcement no longer hides later ones
+    (UI-11); two toasts at once no longer share an id, and error toasts
+    stay 8 s (UI-15); the assign-access warning names new workload roles
+    too (UI-20); CSV export quotes a bare carriage return and Markdown
+    export escapes newlines, pipes and backslashes so tables stay intact
+    (FE-09); search highlights can't duplicate text (FE-12).
+  - **Accessibility (UI-19).** Every form field has a label tied to it,
+    every icon-only button has a name, resource rows open from the
+    keyboard, the per-card export button is visible on keyboard focus,
+    `<select>` gets the focus ring, the active nav item is marked.
+- **Requests and retries (FE-04, FE-07).** Queries no longer refetch on
+  window focus (the banner still does) and retry only network errors and
+  5xx, at most twice. Progress polling never overlaps, stops on unmount
+  and environment change, survives one failed read, and treats a job the
+  server no longer knows about (restart) as an error instead of polling
+  forever; a sync already running (scheduled, another tab) is shown (a
+  CSV import holding the slot is not mistaken for one). Views that a
+  write changes are refreshed by that write (policy assignment, folder
+  create/delete -> Secrets Access report; removing a user from a group ->
+  groups and "last accessed").
+- **Server (additive).**
+  - `GET /api/environments` adds `active_id` and, per row, `addressable`.
+  - `POST /api/environments/<name>/activate` accepts an optional `{"id"}`:
+    `409` when the name resolves to a different environment, `400` for a
+    non-string id; otherwise that id is activated and stored as the active
+    pointer (the audit entry records it). Without `id`, unchanged.
+  - `POST /api/access/bootstrap/start` returns `steps` with
+    `already_running` too.
+  - A sync now claims its slot before the worker thread starts, so two
+    starts can't both run and the first status poll never sees the
+    previous run's "done"; a start that fails unexpectedly releases it.
+- **Removed dead code (UI-22, FE-15).** `TabBar.tsx`, the unused
+  self-contained dialog triggers, the unused `contains` parameters and
+  `findNode`; `Content-Type` is sent only with a body; the `run_time`
+  comment now says UTC.
+- **Tests.** Python: `tests/test_review_batch5_routes.py` (10). Frontend:
+  vitest grows from 58 to 191 (polling loop, both job hooks, fetch
+  wrapper, query defaults, environment rows/dialog, reports, audit log,
+  CSV bar, folder builder, orphaned archives, export escaping, tree
+  utilities, accessibility labels). Smoke-tested in headless Chromium
+  against `server/serve.py` in local mode with fake data. Three rounds
+  of adversarial review: round 1 found that the first cut of the
+  environment-switch reset ran after remounted views had already read
+  the old tenant's cache (fixed: the reset now runs before anything
+  re-renders), plus six medium and six minor issues; rounds 2-3 found
+  only minor ones. All are fixed.
+
 5.40.6 — **Sync and report engine: eighteen findings from the 2026-10-05 external review (ENG1-07..12, ENG2-02/03/05..13/15; ENG2-10 in part), one manifest per sync, and a deep integrity check that no longer runs inside one request.**
 Batch 4 of the review's remaining findings. The evidence chain is
 unchanged: same hash formats, same link rule, same `chain_heads`, same

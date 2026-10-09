@@ -27,7 +27,7 @@ export function FolderAccessBadge({ entries, disabled, onClick }: Props) {
       className="flex items-center gap-1 text-[0.6875rem] text-text-faint hover:text-text-dim transition-colors whitespace-nowrap"
       title="Assign access"
     >
-      <Lock size={11} />
+      <Lock size={11} aria-hidden="true" />
       {label}
     </button>
   )

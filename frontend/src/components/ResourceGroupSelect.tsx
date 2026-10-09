@@ -47,8 +47,9 @@ export function ResourceGroupSelect({ value, onChange }: Props) {
     return (
       <div className="card p-3 flex flex-col gap-2 min-w-72">
         <span className="section-label">New resource group</span>
-        <input value={name} onChange={e => setName(e.target.value)} placeholder="resource group name" className="text-input" />
+        <input aria-label="New resource group name" value={name} onChange={e => setName(e.target.value)} placeholder="resource group name" className="text-input" />
         <input
+          aria-label="New resource group description"
           value={description}
           onChange={e => setDescription(e.target.value)}
           placeholder="description (optional)"
@@ -75,7 +76,7 @@ export function ResourceGroupSelect({ value, onChange }: Props) {
   return (
     <div className="flex flex-col gap-1">
       <span className="section-label">Resource Group</span>
-      <Select
+      <Select ariaLabel="Resource Group"
         value={value}
         onValueChange={handleSelect}
         loading={isLoading}

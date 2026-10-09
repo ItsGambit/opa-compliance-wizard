@@ -43,7 +43,7 @@ export function ProjectSelect({ resourceGroupId, value, onChange }: Props) {
     return (
       <div className="card p-3 flex flex-col gap-2 min-w-72">
         <span className="section-label">New project</span>
-        <input value={name} onChange={e => setName(e.target.value)} placeholder="project name" className="text-input" />
+        <input aria-label="New project" value={name} onChange={e => setName(e.target.value)} placeholder="project name" className="text-input" />
         <div className="flex gap-2">
           <button
             type="button"
@@ -64,7 +64,7 @@ export function ProjectSelect({ resourceGroupId, value, onChange }: Props) {
   return (
     <div className="flex flex-col gap-1">
       <span className="section-label">Project</span>
-      <Select
+      <Select ariaLabel="Project"
         value={value}
         onValueChange={handleSelect}
         loading={isLoading}

@@ -61,7 +61,7 @@ export function ResourceGroupsTab({ model }: Props) {
       <div className="card p-3 flex items-end justify-between gap-4">
         <div className="flex flex-col gap-1">
           <span className="section-label">Resource group</span>
-          <Select
+          <Select ariaLabel="Resource group"
             value={rgId}
             onValueChange={setRgId}
             placeholder="Select a resource group"

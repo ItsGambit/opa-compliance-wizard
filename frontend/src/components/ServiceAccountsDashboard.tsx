@@ -218,15 +218,15 @@ export function ServiceAccountsDashboard() {
         <div className="flex flex-wrap items-end gap-4">
           <div className="flex flex-col gap-1">
             <span className="section-label">Type</span>
-            <Select value={filters.kind} onValueChange={v => setFilter('kind', v as typeof ALL | ServiceAccountKind)} placeholder="Type" options={KIND_OPTIONS} />
+            <Select ariaLabel="Type" value={filters.kind} onValueChange={v => setFilter('kind', v as typeof ALL | ServiceAccountKind)} placeholder="Type" options={KIND_OPTIONS} />
           </div>
           <div className="flex flex-col gap-1">
             <span className="section-label">Status</span>
-            <Select value={filters.status} onValueChange={v => setFilter('status', v as typeof ALL | SecretsAccessStatus)} placeholder="Status" options={STATUS_OPTIONS} />
+            <Select ariaLabel="Status" value={filters.status} onValueChange={v => setFilter('status', v as typeof ALL | SecretsAccessStatus)} placeholder="Status" options={STATUS_OPTIONS} />
           </div>
           <div className="flex flex-col gap-1">
             <span className="section-label">Resource group</span>
-            <Select
+            <Select ariaLabel="Resource group"
               value={filters.resourceGroupId}
               onValueChange={v => setFilter('resourceGroupId', v)}
               placeholder="Resource group"
@@ -236,7 +236,7 @@ export function ServiceAccountsDashboard() {
           </div>
           <div className="flex flex-col gap-1">
             <span className="section-label">Project</span>
-            <Select
+            <Select ariaLabel="Project"
               value={filters.projectId}
               onValueChange={v => setFilter('projectId', v)}
               placeholder="Project"
@@ -247,9 +247,10 @@ export function ServiceAccountsDashboard() {
           <div className="flex flex-col gap-1">
             <span className="section-label">Search</span>
             <div className="relative">
-              <Search size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-text-faint" />
+              <Search size={13} aria-hidden="true" className="absolute left-2 top-1/2 -translate-y-1/2 text-text-faint" />
               <input
                 type="text"
+                aria-label="Search service accounts"
                 value={query}
                 onChange={e => setSearch(e.target.value)}
                 placeholder="Name, username, app, project…"

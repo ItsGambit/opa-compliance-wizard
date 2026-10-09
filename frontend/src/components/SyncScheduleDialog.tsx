@@ -1,13 +1,17 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { useQueryClient } from '@tanstack/react-query'
-import { CalendarClock, Cloud, FileText, Play, X } from 'lucide-react'
+import { CalendarClock, Cloud, FileText, Play, ShieldCheck } from 'lucide-react'
 import { importSyncCsv, resetSyncWatermark, saveSyncSchedule } from '../api/client'
-import { useCsvFiles } from '../api/hooks'
+import { useCsvFiles, useWhoami } from '../api/hooks'
+import { useIntegrityCheck } from '../hooks/useIntegrityCheck'
 import { useSyncJob } from '../hooks/useSyncJob'
 import { toast } from '../hooks/useToast'
 import type { Environment, IngestionScope, SyncSchedule } from '../types'
 import { getSyncProgressPercent } from '../utils/syncProgress'
+import { canAdminFrom } from '../utils/whoami'
+import { DialogCloseButton } from './DialogCloseButton'
+import { IntegrityResultView } from './IntegrityResultView'
 import { Select } from './Select'
 
 interface Props {
@@ -40,17 +44,45 @@ function formatLocalEquivalent(utcHHMM: string): string {
  * saving, matching the reviewed mockup exactly. */
 export function SyncScheduleDialog({ env }: Props) {
   const [open, setOpen] = useState(false)
+  // The content (and with it the sync-status request and any polling)
+  // mounts only while this dialog is open -- the Environments list used to
+  // fire one /sync/status request per row as soon as it rendered (UI-07).
+  return (
+    <Dialog.Root open={open} onOpenChange={setOpen}>
+      <Dialog.Trigger asChild>
+        <button type="button" className="btn-secondary !p-1.5" title="Compliance sync settings" aria-label={`Compliance sync settings for ${env.name}`}>
+          <CalendarClock size={12} aria-hidden="true" />
+        </button>
+      </Dialog.Trigger>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
+        <Dialog.Content
+          aria-describedby={undefined}
+          className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[30rem] max-h-[85vh] overflow-y-auto p-5"
+        >
+          <SyncScheduleContent env={env} />
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  )
+}
+
+function SyncScheduleContent({ env }: Props) {
   const [firstRunPrompt, setFirstRunPrompt] = useState(false)
   const [firstRunChoice, setFirstRunChoice] = useState<FirstRunChoice>('backfill')
   // Bare filename, not a full path -- the backend's import_csv route
   // confines csv_path to a bare basename resolved inside PROJECT_ROOT
-  // (same _safe_csv_path pattern /api/csv already uses), so this now
-  // reuses that same file list/picker instead of a free-text path field.
+  // (same _safe_csv_path pattern /api/csv already uses), so this reuses
+  // that same file list/picker instead of a free-text path field.
   const [csvFile, setCsvFile] = useState<string | undefined>(undefined)
   const { data: csvFiles } = useCsvFiles()
+  const { data: whoami } = useWhoami()
   const queryClient = useQueryClient()
   const job = useSyncJob(env.name)
+  const integrity = useIntegrityCheck(env.name)
 
+  // Initialised from the saved schedule each time the dialog opens (this
+  // component mounts with it).
   const [enabled, setEnabled] = useState(env.sync_schedule.enabled)
   const [runTime, setRunTime] = useState(env.sync_schedule.run_time)
   const [ingestionScope, setIngestionScope] = useState<IngestionScope>(env.sync_schedule.ingestion_scope)
@@ -61,20 +93,6 @@ export function SyncScheduleDialog({ env }: Props) {
     env.sync_schedule.retention_max_size_mb != null ? String(env.sync_schedule.retention_max_size_mb) : ''
   )
   const [saving, setSaving] = useState(false)
-
-  useEffect(() => {
-    if (open) {
-      setEnabled(env.sync_schedule.enabled)
-      setRunTime(env.sync_schedule.run_time)
-      setIngestionScope(env.sync_schedule.ingestion_scope)
-      setRetentionDays(env.sync_schedule.retention_days != null ? String(env.sync_schedule.retention_days) : '')
-      setRetentionMaxSizeMb(
-        env.sync_schedule.retention_max_size_mb != null ? String(env.sync_schedule.retention_max_size_mb) : ''
-      )
-      job.refreshStatus()
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, env.sync_schedule])
 
   // UI-09 / ENG2-04 (external review, 2026-10-05): validate here with the
   // same rules the server enforces (create_secret_folders.py's
@@ -174,22 +192,10 @@ export function SyncScheduleDialog({ env }: Props) {
   const syncProgressPercent = getSyncProgressPercent(job.status?.steps ?? [])
 
   return (
-    <Dialog.Root open={open} onOpenChange={setOpen}>
-      <Dialog.Trigger asChild>
-        <button type="button" className="btn-secondary !p-1.5" title="Compliance sync settings">
-          <CalendarClock size={12} />
-        </button>
-      </Dialog.Trigger>
-      <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
-        <Dialog.Content className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[30rem] max-h-[85vh] overflow-y-auto p-5">
+    <>
           <div className="flex items-center justify-between mb-3">
             <Dialog.Title className="text-sm font-semibold text-text">Compliance sync — {env.name}</Dialog.Title>
-            <Dialog.Close asChild>
-              <button type="button" className="text-text-faint hover:text-text-dim">
-                <X size={16} />
-              </button>
-            </Dialog.Close>
+            <DialogCloseButton />
           </div>
 
           {!firstRunPrompt ? (
@@ -200,8 +206,8 @@ export function SyncScheduleDialog({ env }: Props) {
                   Enable daily sync
                 </label>
 
-                <div className="field">
-                  <label className="section-label block mb-1">What to ingest</label>
+                <fieldset className="field">
+                  <legend className="section-label block mb-1">What to ingest</legend>
                   <div className="flex flex-col gap-2">
                     <label className="card p-2.5 flex items-start gap-2 cursor-pointer">
                       <input type="radio" checked={ingestionScope === 'curated'} onChange={() => setIngestionScope('curated')} className="mt-0.5" />
@@ -218,12 +224,12 @@ export function SyncScheduleDialog({ env }: Props) {
                       </div>
                     </label>
                   </div>
-                </div>
+                </fieldset>
 
                 <div className="grid grid-cols-3 gap-2">
                   <div className="field">
-                    <label className="section-label block mb-1">Run time (UTC)</label>
-                    <input type="time" className="text-input w-full" value={runTime} onChange={e => setRunTime(e.target.value)} />
+                    <label htmlFor={`${env.id}-run-time`} className="section-label block mb-1">Run time (UTC)</label>
+                    <input id={`${env.id}-run-time`} type="time" className="text-input w-full" value={runTime} onChange={e => setRunTime(e.target.value)} />
                     {/* Directly addresses a real mix-up: the "(UTC)" label
                         alone was easy to miss on a native time picker,
                         confirmed live when a 14:00 UTC schedule was
@@ -236,15 +242,17 @@ export function SyncScheduleDialog({ env }: Props) {
                     </p>
                   </div>
                   <div className="field">
-                    <label className="section-label block mb-1">Retention (days)</label>
+                    <label htmlFor={`${env.id}-retention-days`} className="section-label block mb-1">Retention (days)</label>
                     <input
+                      id={`${env.id}-retention-days`}
                       type="number" min="1" step="1" placeholder="Forever" className="text-input w-full"
                       value={retentionDays} onChange={e => setRetentionDays(e.target.value)}
                     />
                   </div>
                   <div className="field">
-                    <label className="section-label block mb-1">Max size (MB)</label>
+                    <label htmlFor={`${env.id}-retention-mb`} className="section-label block mb-1">Max size (MB)</label>
                     <input
+                      id={`${env.id}-retention-mb`}
                       type="number" min="1" step="1" placeholder="No limit" className="text-input w-full"
                       value={retentionMaxSizeMb} onChange={e => setRetentionMaxSizeMb(e.target.value)}
                     />
@@ -333,8 +341,40 @@ export function SyncScheduleDialog({ env }: Props) {
                   disabled={isRunning || !env.name}
                   onClick={() => job.start(ingestionScope)}
                 >
-                  <Play size={12} /> {isRunning ? 'Syncing…' : 'Sync now'}
+                  <Play size={12} aria-hidden="true" /> {isRunning ? 'Syncing…' : 'Sync now'}
                 </button>
+
+                {/* FE-15: the evidence-chain check, reachable from the UI. */}
+                <div className="card p-2.5 flex flex-col gap-2">
+                  <div className="text-xs font-medium text-text flex items-center gap-1.5">
+                    <ShieldCheck size={13} aria-hidden="true" /> Evidence chain
+                  </div>
+                  <p className="text-[0.6875rem] text-text-dim">
+                    Checks that this archive's ingestion records still link up end to end.
+                    {canAdminFrom(whoami) && ' The deep check also re-reads every sealed event and can take a while on a large archive.'}
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      className="btn-secondary text-xs"
+                      disabled={integrity.state.phase === 'checking'}
+                      onClick={() => integrity.run(false)}
+                    >
+                      {integrity.state.phase === 'checking' && !integrity.state.deep ? 'Checking…' : 'Verify'}
+                    </button>
+                    {canAdminFrom(whoami) && (
+                      <button
+                        type="button"
+                        className="btn-secondary text-xs"
+                        disabled={integrity.state.phase === 'checking'}
+                        onClick={() => integrity.run(true)}
+                      >
+                        {integrity.state.phase === 'checking' && integrity.state.deep ? 'Deep check running…' : 'Deep check'}
+                      </button>
+                    )}
+                  </div>
+                  <IntegrityResultView state={integrity.state} />
+                </div>
               </div>
 
               <div className="flex justify-end gap-2 mt-5">
@@ -382,6 +422,7 @@ export function SyncScheduleDialog({ env }: Props) {
                       <Select
                         value={csvFile}
                         onValueChange={setCsvFile}
+                        ariaLabel="System Log CSV file to import"
                         placeholder="Choose a .csv file from the project folder"
                         options={(csvFiles ?? []).map(f => ({ value: f, label: f }))}
                       />
@@ -410,8 +451,6 @@ export function SyncScheduleDialog({ env }: Props) {
               </div>
             </>
           )}
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
+    </>
   )
 }

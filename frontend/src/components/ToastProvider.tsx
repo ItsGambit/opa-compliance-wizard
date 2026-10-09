@@ -2,11 +2,17 @@ import * as Toast from '@radix-ui/react-toast'
 import { X } from 'lucide-react'
 import { useToastMessages, type ToastMessage } from '../hooks/useToast'
 
+/** Success/info toasts stay 3.5 s; errors and warnings carry text the user
+ * may need to read (or act on), so they stay 8 s (UI-15). Hovering or
+ * focusing a toast pauses its timer (Radix Toast). */
+export const TOAST_DURATION_MS = 3500
+export const ERROR_TOAST_DURATION_MS = 8000
+
 export function ToastProvider() {
   const { messages, dismiss } = useToastMessages()
 
   return (
-    <Toast.Provider swipeDirection="right" duration={3500}>
+    <Toast.Provider swipeDirection="right" duration={TOAST_DURATION_MS}>
       {messages.map(m => (
         <ToastItem key={m.id} message={m} onDismiss={() => dismiss(m.id)} />
       ))}
@@ -22,6 +28,7 @@ function ToastItem({ message: m, onDismiss }: { message: ToastMessage; onDismiss
   return (
     <Toast.Root
       open
+      duration={m.duration ?? (m.variant === 'error' ? ERROR_TOAST_DURATION_MS : undefined)}
       onOpenChange={open => { if (!open) onDismiss() }}
       className={`bg-bg-elevated border ${borderColor} rounded-lg shadow-xl px-4 py-3 flex items-start gap-3
         data-[state=open]:animate-[slide-in-from-right_0.2s_ease-out]
@@ -34,8 +41,8 @@ function ToastItem({ message: m, onDismiss }: { message: ToastMessage; onDismiss
         )}
       </div>
       <Toast.Close asChild>
-        <button className="text-text-faint hover:text-text-dim transition-colors shrink-0 mt-0.5">
-          <X size={13} />
+        <button type="button" aria-label="Dismiss notification" className="text-text-faint hover:text-text-dim transition-colors shrink-0 mt-0.5">
+          <X size={13} aria-hidden="true" />
         </button>
       </Toast.Close>
     </Toast.Root>

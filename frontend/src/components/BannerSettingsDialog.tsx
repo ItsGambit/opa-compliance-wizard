@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
+import { DialogCloseButton } from './DialogCloseButton'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { Megaphone, X } from 'lucide-react'
 import { saveBanner } from '../api/client'
 import { useBanner } from '../api/hooks'
 import { toast } from '../hooks/useToast'
@@ -14,17 +14,11 @@ const VARIANTS: { value: BannerVariant; label: string }[] = [
 ]
 
 interface Props {
-  // Both optional -- omit for the self-contained trigger button (falls back
-  // to internal state, unchanged behavior). Pass both when opened remotely
-  // (e.g. SideNav's utility row).
-  open?: boolean
-  onOpenChange?: (open: boolean) => void
+  open: boolean
+  onOpenChange: (open: boolean) => void
 }
 
-export function BannerSettingsDialog({ open: openProp, onOpenChange }: Props = {}) {
-  const [openState, setOpenState] = useState(false)
-  const open = openProp ?? openState
-  const setOpen = onOpenChange ?? setOpenState
+export function BannerSettingsDialog({ open, onOpenChange: setOpen }: Props) {
   const { data: banner } = useBanner()
   const queryClient = useQueryClient()
 
@@ -36,8 +30,16 @@ export function BannerSettingsDialog({ open: openProp, onOpenChange }: Props = {
   // Re-seed the form from the server every time the dialog opens, so a
   // second admin's more recent edit isn't silently clobbered by whatever
   // this browser happened to have open before.
+  // Once per opening: the banner query also refetches on window focus, and
+  // re-seeding on every refetch would wipe an edit in progress.
+  const seeded = useRef(false)
   useEffect(() => {
-    if (open && banner) {
+    if (!open) {
+      seeded.current = false
+      return
+    }
+    if (banner && !seeded.current) {
+      seeded.current = true
       setEnabled(banner.enabled)
       setMessage(banner.message)
       setVariant(banner.variant)
@@ -57,23 +59,12 @@ export function BannerSettingsDialog({ open: openProp, onOpenChange }: Props = {
 
   return (
     <Dialog.Root open={open} onOpenChange={setOpen}>
-      {openProp === undefined && (
-        <Dialog.Trigger asChild>
-          <button type="button" className="btn-secondary !px-2" title="Announcement banner">
-            <Megaphone size={14} />
-          </button>
-        </Dialog.Trigger>
-      )}
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
-        <Dialog.Content className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[28rem] p-5">
+        <Dialog.Content aria-describedby={undefined} className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[28rem] p-5">
           <div className="flex items-center justify-between mb-3">
             <Dialog.Title className="text-sm font-semibold text-text">Announcement banner</Dialog.Title>
-            <Dialog.Close asChild>
-              <button type="button" className="text-text-faint hover:text-text-dim">
-                <X size={16} />
-              </button>
-            </Dialog.Close>
+            <DialogCloseButton />
           </div>
 
           <p className="text-xs text-text-faint mb-4">
@@ -93,8 +84,9 @@ export function BannerSettingsDialog({ open: openProp, onOpenChange }: Props = {
             </label>
 
             <div className="field">
-              <label className="section-label block mb-1">Message</label>
+              <label htmlFor="banner-message" className="section-label block mb-1">Message</label>
               <textarea
+                id="banner-message"
                 className="text-input w-full min-h-20 resize-y"
                 value={message}
                 onChange={e => setMessage(e.target.value)}
@@ -103,8 +95,9 @@ export function BannerSettingsDialog({ open: openProp, onOpenChange }: Props = {
             </div>
 
             <div className="field">
-              <label className="section-label block mb-1">Style</label>
+              <label htmlFor="banner-style" className="section-label block mb-1">Style</label>
               <select
+                id="banner-style"
                 className="text-input w-full"
                 value={variant}
                 onChange={e => setVariant(e.target.value as BannerVariant)}

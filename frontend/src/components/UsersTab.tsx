@@ -7,7 +7,7 @@ import type { ExportSection } from '../utils/export'
 import { grantRows } from '../utils/exportSections'
 import { policiesUsingGroup, rulesGrantedToGroupIds } from '../utils/policy'
 import { ExportButtons } from './ExportButtons'
-import { PolicyRuleCard } from './PolicyRuleCard'
+import { PolicyRuleCard, type AccessLookup } from './PolicyRuleCard'
 import { Select } from './Select'
 
 interface Props {
@@ -60,9 +60,10 @@ function GroupAccessChip({
           type="button"
           className="text-text-faint hover:text-loss"
           title={`Remove '${userName}' from '${group.name}'`}
+          aria-label={`Remove ${userName} from ${group.name}`}
           onClick={() => setConfirming(true)}
         >
-          <X size={11} />
+          <X size={11} aria-hidden="true" />
         </button>
       </div>
       {confirming && (
@@ -156,14 +157,20 @@ export function UsersTab({ model, onUserGroupRemoved }: Props) {
   // email, so the System Log actor lookup behind this can never resolve --
   // skip firing a request known to fail rather than surface an error for
   // something that was never going to work.
-  const { data: accessResults } = useUserResourceAccess(user?.id, trackedResources, !isServiceAccount)
-  const accessInfoByResourceId = useMemo(() => {
-    const map = new Map<string, ResourceAccessInfo>()
-    if (accessResults) {
-      for (const [resourceId, info] of Object.entries(accessResults)) map.set(resourceId, info)
+  const accessQuery = useUserResourceAccess(user?.id, trackedResources, !isServiceAccount)
+  const { data: accessResults, isError: accessIsError, error: accessError, refetch: refetchAccess, isFetching: accessFetching } = accessQuery
+  // UI-12: undefined for a service account (no lookup runs, so no
+  // "Last accessed" section -- it used to show "loading…" forever right
+  // under the note saying tracking doesn't apply), and an explicit error
+  // state when the lookup failed.
+  const accessLookup = useMemo<AccessLookup | undefined>(() => {
+    if (isServiceAccount) return undefined
+    if (accessIsError) {
+      return { status: 'error', message: accessError instanceof Error ? accessError.message : String(accessError), onRetry: () => { void refetchAccess() }, retrying: accessFetching }
     }
-    return map
-  }, [accessResults])
+    if (!accessResults) return { status: 'loading' }
+    return { status: 'ready', byId: new Map<string, ResourceAccessInfo>(Object.entries(accessResults)) }
+  }, [isServiceAccount, accessIsError, accessError, refetchAccess, accessFetching, accessResults])
 
   const exportSectionsForUser: ExportSection[] = useMemo(() => {
     if (!user) return []
@@ -186,7 +193,7 @@ export function UsersTab({ model, onUserGroupRemoved }: Props) {
     <div className="flex flex-col gap-4">
       <div className="card p-3 flex flex-col gap-1">
         <span className="section-label">User</span>
-        <Select
+        <Select ariaLabel="User"
           value={userId}
           onValueChange={setUserId}
           placeholder="Select a user"
@@ -257,7 +264,7 @@ export function UsersTab({ model, onUserGroupRemoved }: Props) {
                   <PolicyRuleCard
                     rule={rule}
                     policyName={policy.name}
-                    accessInfoByResourceId={accessInfoByResourceId}
+                    accessLookup={accessLookup}
                   />
                 </div>
               )

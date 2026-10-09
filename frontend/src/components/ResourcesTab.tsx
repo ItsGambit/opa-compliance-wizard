@@ -303,12 +303,14 @@ function ResourceTable({
   query,
   selectedId,
   onSelect,
+  kindIsAdConnection = false,
 }: {
   headers: string[]
   rows: ResourceRow[]
   query: string
   selectedId: string | null
   onSelect: (row: ResourceRow) => void
+  kindIsAdConnection?: boolean
 }) {
   const results = useFuzzyFilter(rows, query, ['label', 'cells'])
 
@@ -343,17 +345,34 @@ function ResourceTable({
                   row.id === selectedId ? 'bg-accent-dim/40' : ''
                 }`}
               >
-                {row.cells.map((cell, j) => (
-                  <td key={j} className="px-3 py-2 text-text-dim whitespace-nowrap">
-                    {cell === '' || cell == null ? (
-                      <span className="text-text-faint">—</span>
-                    ) : j === 0 ? (
-                      <HighlightedText text={String(cell)} indices={labelMatch?.indices} />
-                    ) : (
-                      cell
-                    )}
-                  </td>
-                ))}
+                {row.cells.map((cell, j) => {
+                  const content = cell === '' || cell == null ? (
+                    <span className="text-text-faint">—</span>
+                  ) : j === 0 ? (
+                    <HighlightedText text={String(cell)} indices={labelMatch?.indices} />
+                  ) : (
+                    cell
+                  )
+                  return (
+                    <td key={j} className="px-3 py-2 text-text-dim whitespace-nowrap">
+                      {/* UI-19: the row's click target is also a real button
+                          in its first cell, so the drill-down is reachable
+                          (and announced) from the keyboard. The row's own
+                          onClick stays for the mouse. */}
+                      {j === 0 && clickable ? (
+                        <button
+                          type="button"
+                          className="text-left text-text-dim hover:text-text underline-offset-2 hover:underline"
+                          aria-pressed={row.id === selectedId}
+                          aria-label={`${kindIsAdConnection ? 'Show discovery configuration for' : 'Show access history for'} ${row.label}`}
+                          onClick={e => { e.stopPropagation(); onSelect(row) }}
+                        >
+                          {content}
+                        </button>
+                      ) : content}
+                    </td>
+                  )
+                })}
               </tr>
             )
           })}
@@ -386,9 +405,11 @@ export function ResourcesTab({ model }: Props) {
   // about for its original, still-primary use.
   const [selectedAdConnection, setSelectedAdConnection] = useState<{ id: string; label: string } | null>(null)
 
-  // Changing kind (or the search query narrowing away the selected row)
-  // clears whichever panel is open -- it was scoped to a resource that may
-  // no longer even be visible.
+  // Changing kind clears whichever panel is open -- it was scoped to a
+  // resource of the previous kind. (A search that filters the selected row
+  // out of the table deliberately leaves its panel open: the panel is
+  // still about a real resource, and closing it on every keystroke would
+  // lose the user's place. UI-22: this comment used to claim otherwise.)
   useEffect(() => {
     setSelected(null)
     setSelectedAdConnection(null)
@@ -425,14 +446,15 @@ export function ResourcesTab({ model }: Props) {
         <div className="flex flex-wrap items-end gap-3">
           <div className="flex flex-col gap-1">
             <span className="section-label">Resource kind</span>
-            <Select value={kind} onValueChange={setKind} placeholder="Select a resource kind" options={RESOURCE_KINDS} />
+            <Select ariaLabel="Resource kind" value={kind} onValueChange={setKind} placeholder="Select a resource kind" options={RESOURCE_KINDS} />
           </div>
           <div className="flex flex-col gap-1">
             <span className="section-label">Search</span>
             <div className="flex items-center gap-1.5 text-input min-w-56">
-              <Search size={13} className="text-text-faint shrink-0" />
+              <Search size={13} className="text-text-faint shrink-0" aria-hidden="true" />
               <input
                 type="text"
+                aria-label={`Search ${kindLabel.toLowerCase()}`}
                 placeholder={`Search ${kindLabel.toLowerCase()}…`}
                 value={query}
                 onChange={e => setQuery(e.target.value)}
@@ -453,6 +475,7 @@ export function ResourcesTab({ model }: Props) {
         rows={rows}
         query={query}
         selectedId={kind === 'active_directory_connections' ? selectedAdConnection?.id ?? null : selected?.id ?? null}
+        kindIsAdConnection={kind === 'active_directory_connections'}
         onSelect={row => {
           if (!row.id) return
           if (kind === 'active_directory_connections') {

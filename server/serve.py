@@ -716,6 +716,13 @@ def _start_sync_job(env_id, env_name, ingestion_scope, owner=engine.LOCAL_OWNER_
             if trigger == "scheduled":
                 engine.log_audit_event(actor_email, actor_sub, "sync.scheduled_skipped", {"name": env_name, "reason": "already running"}, client_ip=client_ip, user_agent=user_agent)
             return False
+        # FE-04 (external review, 2026-10-05): claim the slot HERE, under the
+        # same lock as the check. It used to be set only inside the worker
+        # thread, so two starts in that window could both pass the check
+        # (two syncs writing one archive), and the UI's first status poll
+        # could still read the PREVIOUS run's "done" and report completion
+        # before this run began. _refuse below and the worker overwrite it.
+        _sync_jobs[storage_name] = {"status": "running", "steps": [], "error": None}
     action_prefix = "sync.scheduled" if trigger == "scheduled" else "sync.manual"
     def _refuse(error_msg):
         # DATA-05: a credential failure is an attempt too -- recorded in
@@ -735,6 +742,24 @@ def _start_sync_job(env_id, env_name, ingestion_scope, owner=engine.LOCAL_OWNER_
         engine.log_audit_event(actor_email, actor_sub, f"{action_prefix}_failed", {"name": env_name, "error": error_msg}, client_ip=client_ip, user_agent=user_agent)
         return False
 
+    try:
+        return _launch_claimed_sync(
+            env_id, env_name, ingestion_scope, owner, trigger, actor_email, actor_sub, client_ip, user_agent,
+            minutes_late, correlation_id, action_prefix, _refuse,
+        )
+    except BaseException as exc:
+        # The slot was claimed above: never leave it "running" with no
+        # worker behind it (every later start would be refused as busy).
+        with _sync_jobs_lock:
+            if _sync_jobs.get(storage_name, {}).get("status") == "running" and not _sync_jobs[storage_name]["steps"]:
+                _sync_jobs[storage_name] = {"status": "error", "steps": [], "error": f"Could not start the sync: {exc}"}
+        raise
+
+
+def _launch_claimed_sync(env_id, env_name, ingestion_scope, owner, trigger, actor_email, actor_sub, client_ip,
+                         user_agent, minutes_late, correlation_id, action_prefix, _refuse):
+    """Second half of _start_sync_job, run once the slot is claimed:
+    resolve credentials (refusing cleanly) and start the worker thread."""
     try:
         creds = engine.get_environment_credentials(env_name, owner=owner)
     except (KeyError, engine.CredentialStoreUnavailable) as exc:
@@ -1365,9 +1390,18 @@ class Handler(SimpleHTTPRequestHandler):
                         for environment_id, meta in engine.list_all_environments().items()
                     ]
                 else:
-                    visible = engine.list_environments_for(engine_owner)
-                    envs = [_public_entry(m["environment_id"], n, m, engine_owner) for n, m in visible.items()]
-                return self._send_json(200, {"environments": envs, "active": local_env_name})
+                    envs = [_public_entry(m["environment_id"], n, m, engine_owner) for n, m in engine.list_environments_for(engine_owner).items()]
+                # UI-07 (external review, 2026-10-05), additive: every
+                # name-keyed route (activate, sync, reports) acts on whatever
+                # the NAME resolves to for this caller -- `addressable` says
+                # whether that is this very row, and `active_id` lets the UI
+                # mark the active row by id. Admins see other owners' rows
+                # (and shared rows their own same-named environment hides);
+                # those are not addressable by name.
+                resolves_to = {n: m["environment_id"] for n, m in engine.list_environments_for(engine_owner).items()}
+                for entry in envs:
+                    entry["addressable"] = resolves_to.get(entry["name"]) == entry["id"]
+                return self._send_json(200, {"environments": envs, "active": local_env_name, "active_id": local_env_id})
 
             if path == "/api/banner":
                 # No client/auth requirement -- this has to render even
@@ -1978,13 +2012,50 @@ class Handler(SimpleHTTPRequestHandler):
 
             if path.startswith("/api/environments/") and path.endswith("/activate"):
                 name = unquote(path[len("/api/environments/"):-len("/activate")])
+                expected_id = payload.get("id")
+                if expected_id is not None:
+                    # UI-07: the UI sends the id of the row that was clicked.
+                    # Activation is by name; refuse rather than activate a
+                    # different environment the name resolves to now (a
+                    # rename, a new same-named environment of the caller's
+                    # own, or an unshare since the list was loaded).
+                    if not isinstance(expected_id, str):
+                        return self._send_json(400, {"error": "id must be a string"})
+                    meta = engine.list_environments_for(engine_owner).get(name)
+                    if meta is None:
+                        return self._send_json(404, {"error": f"No saved environment named '{name}' visible to this user."})
+                    if meta["environment_id"] != expected_id:
+                        return self._send_json(409, {"error": f"'{name}' now refers to a different environment for you; reload the list and try again."})
                 try:
-                    activate_environment(owner_key, name)
+                    if expected_id is not None:
+                        # Activate exactly the checked id (visibility
+                        # re-checked by id), and store the pointer as that
+                        # id -- resolving the name a second time could land
+                        # elsewhere after a rename/share in between. If the
+                        # pointer write is refused (unshared in that gap),
+                        # the caller's previous session is put back.
+                        with _sessions_lock:
+                            previous_session = _sessions.get(owner_key)
+                        activate_environment(owner_key, None, environment_id=expected_id)
+                        try:
+                            engine.set_active_environment_id(engine_owner, expected_id)
+                        except KeyError:
+                            with _sessions_lock:
+                                if previous_session is None:
+                                    _sessions.pop(owner_key, None)
+                                else:
+                                    _sessions[owner_key] = previous_session
+                            raise
+                    else:
+                        activate_environment(owner_key, name)
                 except KeyError as exc:
                     return self._send_json(404, {"error": str(exc)})
                 except engine.OpaApiError as exc:
                     return self._send_json(502, {"error": str(exc)})
-                self._log_audit_event(actor_email, actor_sub, "environment.activate", {"name": name})
+                details = {"name": name}
+                if expected_id is not None:
+                    details["environment_id"] = expected_id
+                self._log_audit_event(actor_email, actor_sub, "environment.activate", details)
                 return self._send_json(200, {"activated": True, "active": name})
 
             if path.startswith("/api/environments/") and path.endswith("/share"):
@@ -2135,7 +2206,9 @@ class Handler(SimpleHTTPRequestHandler):
                     return
                 with _access_jobs_lock:
                     if _access_jobs.get(_local_env_id, {}).get("status") == "running":
-                        return self._send_json(200, {"started": False, "already_running": True})
+                        # UI-10: the step list too, so a page that attaches to
+                        # a job already running can still show its progress.
+                        return self._send_json(200, {"started": False, "already_running": True, "steps": engine.ACCESS_MODEL_STEPS})
                     _access_jobs[_local_env_id] = {"status": "running", "steps": [], "error": None, "result": None}
                 threading.Thread(
                     target=_run_access_job, args=(_local_env_id, local_client, local_okta_client),

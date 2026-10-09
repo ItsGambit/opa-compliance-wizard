@@ -20,9 +20,11 @@ interface Props {
 function PolicyLastModified({ policyId }: { policyId: string }) {
   const { data: environments } = useEnvironments()
   const activeEnv = environments?.active ?? undefined  // null (no active env) -> undefined, which the hooks treat as "disabled"
-  const { data, isLoading } = useResourceHistory(policyId, activeEnv)
+  const { data, isLoading, isError } = useResourceHistory(policyId, activeEnv)
   const latest = data?.rows.find(r => r.event_type === 'pam.security_policy.create' || r.event_type === 'pam.security_policy.update')
   if (isLoading) return null
+  // UI-04: a failed lookup says so instead of looking like "never modified".
+  if (isError) return <span className="text-xs text-warn">Last modified: could not load the history</span>
   if (!latest) return null
   return (
     <span className="text-xs text-text-faint">

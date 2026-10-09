@@ -1,12 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useInfiniteQuery } from '@tanstack/react-query'
 import { RefreshCw, Search } from 'lucide-react'
 import { backfillMfaLogEvents, fetchAuditLog } from '../api/client'
 import { toast } from '../hooks/useToast'
+import { AuditLogShiftedError, fetchAuditPage, nextAuditPageParam, type AuditPageParam } from '../utils/auditPaging'
 import { cellValue, formatDateTime, labelize } from '../utils/format'
 import { HighlightedText, useFuzzyFilter } from '../utils/fuzzySearch'
-
-const PAGE_SIZE = 50
 
 /** Every write action across every environment and user, admin-only, for
  * compliance visibility -- a full page (was a modal popup, AuditLogDialog)
@@ -18,14 +17,44 @@ const PAGE_SIZE = 50
  * log_audit_event) -- shown as "—" on any entry written before that
  * change, since neither was ever captured for those. */
 export function AuditLogPage() {
-  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
   const [query, setQuery] = useState('')
+  // UI-13: Refresh first runs the MFA backfill (Okta lookups) -- guarded
+  // by its own flag so repeated clicks can't queue several of them.
+  const [refreshing, setRefreshing] = useState(false)
 
-  const { data, isLoading, isFetching, isError, error, refetch } = useQuery({
-    queryKey: ['audit_log', visibleCount],
-    queryFn: () => fetchAuditLog(visibleCount, 0),
+  // UI-13 (external review, 2026-10-05): "Load more" used to change the
+  // query key (limit 50 -> 100 -> ...), so the whole list blanked to
+  // "Loading…" and re-downloaded every earlier entry. Pages of PAGE_SIZE by
+  // offset instead (the API supports it); a refetch re-reads every loaded
+  // page in order (TanStack infinite-query behaviour).
+  // Each older page must line up with the last entry shown (see
+  // utils/auditPaging): if new activity shifted the log, the list is
+  // refetched from the newest entry instead of showing duplicates/gaps.
+  const { data, isLoading, isFetching, isFetchingNextPage, isError, error, refetch, fetchNextPage, hasNextPage } = useInfiniteQuery({
+    queryKey: ['audit_log'],
+    queryFn: ({ pageParam }) => fetchAuditPage(pageParam, fetchAuditLog),
+    initialPageParam: { offset: 0, anchor: null } as AuditPageParam,
+    getNextPageParam: nextAuditPageParam,
+    refetchOnReconnect: false,
   })
-  const entries = data?.entries ?? []
+
+  // A shift (new activity while paging) is answered by one reload from
+  // the newest entry; the toast says what actually happened.
+  const reloadAfterShift = async () => {
+    const reloaded = await refetch()
+    if (reloaded.error) {
+      toast({ title: 'Could not reload the audit log', description: reloaded.error.message, variant: 'error' })
+      return false
+    }
+    toast({ title: 'The audit log changed while loading', description: 'New activity arrived, so the list was reloaded from the newest entry. Use "Load more" again to go further back.', variant: 'default' })
+    return true
+  }
+
+  const loadMore = async () => {
+    const result = await fetchNextPage()
+    if (result.error instanceof AuditLogShiftedError) await reloadAfterShift()
+  }
+  const entries = useMemo(() => (data?.pages ?? []).flatMap(p => p.entries), [data])
 
   // A failed fetch (network blip, expired session, a 403 if admin status
   // lapsed mid-session) previously left the page showing whatever it last
@@ -34,7 +63,7 @@ export function AuditLogPage() {
   // which is indistinguishable from "the button doesn't do anything."
   // Surface it the same way every mutation in this app already does.
   useEffect(() => {
-    if (isError) {
+    if (isError && !(error instanceof AuditLogShiftedError)) {
       toast({ title: 'Could not refresh audit log', description: (error as Error)?.message, variant: 'error' })
     }
   }, [isError, error])
@@ -56,6 +85,16 @@ export function AuditLogPage() {
   // here is swallowed, not surfaced as an error -- it's a best-effort
   // enhancement to the refresh, not the refresh's own success/failure.
   const handleRefresh = async () => {
+    if (refreshing) return
+    setRefreshing(true)
+    try {
+      await doRefresh()
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
+  const doRefresh = async () => {
     const previousTopTimestamp = entries[0]?.timestamp
     const previousTopAction = entries[0]?.action
     let backfillBusy = false
@@ -65,8 +104,13 @@ export function AuditLogPage() {
       return null
     })
     const result = await refetch()
-    if (result.error) return // isError effect above already handles this
-    const freshEntries = result.data?.entries ?? []
+    if (result.error) {
+      // Activity landed between the pages of this refresh: reload once
+      // more and say so; any other error is reported by the effect above.
+      if (result.error instanceof AuditLogShiftedError) await reloadAfterShift()
+      return
+    }
+    const freshEntries = result.data?.pages[0]?.entries ?? []
     const isNew = freshEntries[0] && (freshEntries[0].timestamp !== previousTopTimestamp || freshEntries[0].action !== previousTopAction)
     const backfillNote = backfill && backfill.updated_count > 0
       ? ` Found Okta MFA corroboration for ${backfill.updated_count} earlier ${backfill.updated_count === 1 ? 'entry' : 'entries'}.`
@@ -85,7 +129,7 @@ export function AuditLogPage() {
   // other list/table in this app already uses, per the standing
   // "implement globally, not per-view" rule.
   const searchableEntries = useMemo(
-    () => entries.map(entry => ({ ...entry, _detailsText: Object.values(entry.details ?? {}).map(v => cellValue(v)).join(' ') })),
+    () => entries.map((entry, position) => ({ ...entry, _position: position, _detailsText: Object.values(entry.details ?? {}).map(v => cellValue(v)).join(' ') })),
     [entries]
   )
   const results = useFuzzyFilter(searchableEntries, query, ['action', 'actor_email', 'actor_sub', 'client_ip', 'user_agent', '_detailsText'])
@@ -94,21 +138,30 @@ export function AuditLogPage() {
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-1.5 text-input min-w-72">
-          <Search size={13} className="text-text-faint shrink-0" />
+          <Search size={13} className="text-text-faint shrink-0" aria-hidden="true" />
           <input
             type="text"
+            aria-label="Search the loaded audit log entries"
             placeholder="Search action, actor, IP, details…"
             value={query}
             onChange={e => setQuery(e.target.value)}
             className="flex-1 bg-transparent outline-none placeholder:text-text-faint"
           />
         </div>
-        <button type="button" className="btn-secondary text-xs" onClick={handleRefresh} disabled={isFetching}>
-          <RefreshCw size={12} className={isFetching ? 'animate-spin' : ''} /> Refresh
+        <button type="button" className="btn-secondary text-xs" onClick={handleRefresh} disabled={isFetching || refreshing}>
+          <RefreshCw size={12} aria-hidden="true" className={isFetching || refreshing ? 'animate-spin' : ''} /> Refresh
         </button>
       </div>
 
-      {isError && (
+      {/* UI-13: the search runs over what is loaded, and says so. */}
+      {query.trim() && entries.length > 0 && (
+        <div className="text-[0.6875rem] text-text-dim" role="status">
+          Searching the {entries.length.toLocaleString()} most recent entries loaded
+          {hasNextPage ? ' — use "Load more" below to search further back.' : ' (the whole log).'}
+        </div>
+      )}
+
+      {isError && !(error instanceof AuditLogShiftedError) && (
         <div className="card p-3 text-sm text-loss">
           Could not load the audit log: {(error as Error)?.message ?? 'unknown error'}. What's shown
           below (if anything) may be stale — click Refresh to try again.
@@ -145,7 +198,10 @@ export function AuditLogPage() {
             const deployTextColor = isDeployFailure ? 'text-loss' : 'text-accent'
             return (
               <div
-                key={`${entry.timestamp}-${entry.action}`}
+                // UI-13: timestamp+action collided for entries written in the
+                // same second; the entry's position in the loaded log is
+                // unique (and stable across Load more, which only appends).
+                key={`${entry._position}-${entry.timestamp}-${entry.action}`}
                 className={`card p-3 text-xs ${isDeployEvent ? `border-l-2 ${deployBorderColor}` : ''}`}
               >
                 <div className="flex items-center justify-between gap-2 mb-1.5">
@@ -171,14 +227,14 @@ export function AuditLogPage() {
         </div>
       )}
 
-      {entries.length >= visibleCount && (
+      {hasNextPage && (
         <button
           type="button"
           className="btn-secondary self-center text-xs"
           disabled={isFetching}
-          onClick={() => setVisibleCount(c => c + PAGE_SIZE)}
+          onClick={() => { void loadMore() }}
         >
-          Load more
+          {isFetchingNextPage ? 'Loading…' : 'Load more'}
         </button>
       )}
     </div>

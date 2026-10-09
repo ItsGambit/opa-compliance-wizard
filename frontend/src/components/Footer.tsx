@@ -1,11 +1,11 @@
 import { useEffect, useRef } from 'react'
-import { useQueryClient } from '@tanstack/react-query'
 import { RefreshCw } from 'lucide-react'
 import { useEnvironments, useSyncStatus, useVersion } from '../api/hooks'
 import { useSyncJob } from '../hooks/useSyncJob'
 import { toast } from '../hooks/useToast'
 import { formatDateTime } from '../utils/format'
 import { getSyncProgressPercent } from '../utils/syncProgress'
+import { activeRow, canManageSync } from '../utils/environmentRows'
 
 // This project split out of the ItsGambit/Okta monorepo into its own
 // standalone repo 2026-09-30 -- these were left pointing at the old
@@ -23,7 +23,11 @@ export function Footer() {
   const { data: environments } = useEnvironments()
   const activeEnv = environments?.active ?? undefined  // null (no active env) -> undefined, which the hooks treat as "disabled"
   const { data: syncStatus } = useSyncStatus(activeEnv)
-  const queryClient = useQueryClient()
+  // UI-07: "Sync now" is the environment owner's action on the server (it
+  // reads the owner's own schedule); for an environment shared with this
+  // user it always failed with "No saved environment named …".
+  const active = activeRow(environments)
+  const canSync = !active || canManageSync(active)
 
   // ONE global sync trigger, not a Refresh button on every report/
   // resource-history view -- every one of those reads the SAME shared
@@ -41,28 +45,15 @@ export function Footer() {
   // back to the same small fixed value that dialog uses (8%) before the
   // first "fetch" step has landed, rather than showing a stuck 0%.
   const syncProgressPercent = getSyncProgressPercent(syncJob.status?.steps ?? [])
+  // Archive-backed views refresh inside useSyncJob when a sync finishes
+  // (shared with the sync settings dialog); only the failure toast is here.
   const prevSyncPhase = useRef(syncJob.phase)
   useEffect(() => {
-    if (prevSyncPhase.current !== 'done' && syncJob.phase === 'done') {
-      // Broad prefix invalidation, not a specific refetch() -- this
-      // updates EVERY currently-mounted report/history view (and this
-      // Footer's own "Last Okta import" line) regardless of which one, if
-      // any, is on screen right now.
-      queryClient.invalidateQueries({ queryKey: ['report'] })
-      queryClient.invalidateQueries({ queryKey: ['report_defs'] })
-      queryClient.invalidateQueries({ queryKey: ['resource_history'] })
-      // Both per-resource dashboards read the same archive once an
-      // environment has synced -- a fresh sync must refresh them too
-      // (secrets_access_report was missing here before 5.40.0).
-      queryClient.invalidateQueries({ queryKey: ['secrets_access_report'] })
-      queryClient.invalidateQueries({ queryKey: ['service_accounts_report'] })
-      queryClient.invalidateQueries({ queryKey: ['sync_status'] })
-    }
     if (syncJob.phase === 'error' && prevSyncPhase.current !== 'error') {
       toast({ title: 'Sync failed', description: syncJob.error ?? undefined, variant: 'error' })
     }
     prevSyncPhase.current = syncJob.phase
-  }, [syncJob.phase, syncJob.error, queryClient])
+  }, [syncJob.phase, syncJob.error])
 
   return (
     <footer className="max-w-4xl mx-auto w-full mt-4 pt-3 border-t border-border text-xs text-text-faint flex flex-wrap items-center justify-center gap-3">
@@ -83,15 +74,25 @@ export function Footer() {
           <button
             type="button"
             onClick={() => syncJob.start()}
-            disabled={isSyncing}
-            title="Pull the latest events from live Okta for every report and resource history"
+            disabled={isSyncing || !canSync}
+            title={canSync
+              ? 'Pull the latest events from live Okta for every report and resource history'
+              : `Only the owner of '${activeEnv}' can run its sync. Reports show what its owner's syncs have archived.`}
             className="inline-flex items-center gap-1 hover:text-text-dim disabled:opacity-60"
           >
-            <RefreshCw size={11} className={isSyncing ? 'animate-spin' : ''} />
+            <RefreshCw size={11} aria-hidden="true" className={isSyncing ? 'animate-spin' : ''} />
             {isSyncing ? 'Syncing…' : 'Sync now'}
           </button>
           {isSyncing && (
-            <span className="h-1 w-16 rounded-full bg-bg-hover overflow-hidden" title={syncProgressPercent !== null ? `${syncProgressPercent}%` : undefined}>
+            <span
+              className="h-1 w-16 rounded-full bg-bg-hover overflow-hidden"
+              role="progressbar"
+              aria-label="Sync progress"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={syncProgressPercent ?? undefined}
+              title={syncProgressPercent !== null ? `${syncProgressPercent}%` : undefined}
+            >
               <span
                 className="h-full block rounded-full bg-accent transition-[width] duration-300"
                 style={{ width: `${syncProgressPercent ?? 8}%` }}

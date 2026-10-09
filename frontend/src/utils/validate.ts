@@ -2,7 +2,7 @@
 // digits, "." "_" "-" only, at most FOLDER_NAME_MAX_LEN characters, and
 // not "." or ".." -- validated client-side for instant feedback before the
 // user ever clicks Preview/Create. The server re-checks every name.
-export const NAME_PATTERN = /^[A-Za-z0-9._-]+$/
+const NAME_PATTERN = /^[A-Za-z0-9._-]+$/
 export const FOLDER_NAME_MAX_LEN = 255
 
 export function isValidName(name: string): boolean {

@@ -33,7 +33,12 @@ export function LoadExistingStructureButton({ resourceGroupId, projectId, hasUns
   const doLoad = () =>
     loadMutation.mutate(
       { resourceGroupId: resourceGroupId!, projectId: projectId! },
-      { onError: (err: Error) => toast({ title: 'Could not load existing structure', description: err.message, variant: 'error' }) }
+      {
+        onError: (err: Error) => {
+          setConfirming(false)
+          toast({ title: 'Could not load existing structure', description: err.message, variant: 'error' })
+        },
+      }
     )
 
   const handleClick = () => {
@@ -48,10 +53,10 @@ export function LoadExistingStructureButton({ resourceGroupId, projectId, hasUns
     return (
       <div className="flex items-center gap-2 text-xs text-warn">
         Replace the current tree with what's already in this project?
-        <button type="button" className="btn-primary !py-0.5 !px-2" onClick={doLoad}>
-          Yes, load it
+        <button type="button" className="btn-primary !py-0.5 !px-2" onClick={doLoad} disabled={loadMutation.isPending}>
+          {loadMutation.isPending ? 'Loading…' : 'Yes, load it'}
         </button>
-        <button type="button" className="btn-secondary !py-0.5 !px-2" onClick={() => setConfirming(false)}>
+        <button type="button" className="btn-secondary !py-0.5 !px-2" onClick={() => setConfirming(false)} disabled={loadMutation.isPending}>
           Cancel
         </button>
       </div>
@@ -60,7 +65,7 @@ export function LoadExistingStructureButton({ resourceGroupId, projectId, hasUns
 
   return (
     <button type="button" className="btn-secondary" disabled={disabled} onClick={handleClick}>
-      <Download size={13} /> {loadMutation.isPending ? 'Loading…' : 'Load Current Structure'}
+      <Download size={13} aria-hidden="true" /> {loadMutation.isPending ? 'Loading…' : 'Load Current Structure'}
     </button>
   )
 }

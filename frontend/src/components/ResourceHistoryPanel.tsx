@@ -1,6 +1,8 @@
 import { useMemo, useState } from 'react'
 import { useEnvironments, useResourceHistory } from '../api/hooks'
+import { useReportDateRange } from '../hooks/useReportDateRange'
 import { complianceReportExportSections } from '../utils/exportSections'
+import { DateRangeFields } from './DateRangeFields'
 import { ExportButtons } from './ExportButtons'
 import { ReportRowsTable } from './ReportRowsTable'
 
@@ -34,10 +36,7 @@ export function ResourceHistoryPanel({
 }) {
   const { data: environments } = useEnvironments()
   const activeEnv = environments?.active ?? undefined  // null (no active env) -> undefined, which the hooks treat as "disabled"
-  const today = new Date().toISOString().slice(0, 10)
-  const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
-  const [from, setFrom] = useState(ninetyDaysAgo)
-  const [to, setTo] = useState(today)
+  const dateRange = useReportDateRange()
 
   // No per-view Refresh here -- every resource's history reads the SAME
   // shared audit_store.db archive as every ordinary report, so pulling
@@ -45,7 +44,9 @@ export function ResourceHistoryPanel({
   // something duplicated per screen. This query auto-refetches when that
   // global sync completes, via queryClient.invalidateQueries on the
   // ['resource_history'] key prefix (see Footer.tsx).
-  const { data, isLoading } = useResourceHistory(resourceId, activeEnv, from, to, matchByName ? resourceLabel : undefined)
+  const { data, isLoading, isError, error, refetch, isFetching, isPlaceholderData } = useResourceHistory(
+    resourceId, activeEnv, dateRange.range?.from, dateRange.range?.to, matchByName ? resourceLabel : undefined, !!dateRange.range,
+  )
   // FIX (external review, 2026-09-30): `data?.rows ?? []` creates a brand
   // new [] literal on every render while data is still loading --
   // useFuzzyFilter callers downstream (see e.g. ResourceRowList) rebuild
@@ -63,6 +64,7 @@ export function ResourceHistoryPanel({
           <ExportButtons
             sections={complianceReportExportSections(`History: ${resourceLabel}`, filteredRows)}
             filenameBase={`opa-resource-history-${resourceLabel}`}
+            disabledReason={isPlaceholderData ? 'Loading the new date range…' : isError ? 'The history did not load' : undefined}
           />
           <button type="button" className="btn-secondary text-xs" onClick={onClose}>
             Close
@@ -70,21 +72,16 @@ export function ResourceHistoryPanel({
         </div>
       </div>
 
-      <div className="card p-3 flex items-end gap-3">
-        <div className="field">
-          <label className="section-label block mb-1">From</label>
-          <input type="date" className="text-input" value={from} onChange={e => setFrom(e.target.value)} />
-        </div>
-        <div className="field">
-          <label className="section-label block mb-1">To</label>
-          <input type="date" className="text-input" value={to} onChange={e => setTo(e.target.value)} />
-        </div>
-      </div>
+      <DateRangeFields range={dateRange} idPrefix={`history-${resourceId}`} />
 
       <ReportRowsTable
         rows={rows}
         isLoading={isLoading}
-        emptyMessage="No compliance-report activity found for this resource in this date range."
+        error={isError ? error : null}
+        onRetry={() => refetch()}
+        retrying={isFetching}
+        stale={isPlaceholderData}
+        emptyMessage={dateRange.error ? 'Fix the date range to see events.' : 'No compliance-report activity found for this resource in this date range.'}
         onFilteredRowsChange={setFilteredRows}
         total={data?.total}
         truncated={data?.truncated}

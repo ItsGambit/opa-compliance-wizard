@@ -30,7 +30,7 @@ export function useCreateGroup(onCreated: (group: OpaGroup) => void) {
         if (resp.service_account_added) {
           queryClient.invalidateQueries({ queryKey: ['service_account'] })
         } else if (resp.service_account_warning) {
-          toast({ title: 'Service account not added automatically', description: resp.service_account_warning, variant: 'default' })
+          toast({ title: 'Service account not added automatically', description: resp.service_account_warning, variant: 'default', duration: 8000 })
         }
         onCreated(resp.group)
       } else {

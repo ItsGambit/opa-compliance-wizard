@@ -1,11 +1,11 @@
 import { useState } from 'react'
-import { useMutation } from '@tanstack/react-query'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import * as AlertDialog from '@radix-ui/react-alert-dialog'
 import { Eye, FolderPlus } from 'lucide-react'
 import { execute, preview } from '../api/client'
 import { toast } from '../hooks/useToast'
 import type { ExecuteResponse, FolderNode, PreviewResponse, Project, ResourceGroup } from '../types'
-import { countNodes, flattenTree } from '../utils/tree'
+import { countNodes, flattenTree, treeProblems } from '../utils/tree'
 
 interface Props {
   nodes: FolderNode[]
@@ -17,7 +17,12 @@ interface Props {
 
 export function ActionBar({ nodes, resourceGroup, project, onPreviewResult, onExecuteResult }: Props) {
   const [confirmOpen, setConfirmOpen] = useState(false)
-  const ready = !!resourceGroup && !!project && nodes.length > 0
+  const queryClient = useQueryClient()
+  // FE-13: an empty/invalid/duplicate name would plan a different tree
+  // than the one on screen ("a//b" drops a level), so it blocks both.
+  const problems = treeProblems(nodes)
+  const ready = !!resourceGroup && !!project && nodes.length > 0 && problems.length === 0
+  const blockedReason = problems.length > 0 ? `Fix the folder names first: ${problems.join(' ')}` : undefined
 
   const previewMutation = useMutation({
     mutationFn: () => preview(resourceGroup!.id, project!.id, flattenTree(nodes)),
@@ -32,6 +37,7 @@ export function ActionBar({ nodes, resourceGroup, project, onPreviewResult, onEx
     mutationFn: () => execute(resourceGroup!.id, project!.id, flattenTree(nodes)),
     onSuccess: (resp) => {
       onExecuteResult(resp)
+      queryClient.invalidateQueries({ queryKey: ['secrets_access_report'] })
       const created = resp.results.filter(r => r.status === 'created').length
       const errors = resp.results.filter(r => r.status === 'error').length
       toast({
@@ -50,15 +56,16 @@ export function ActionBar({ nodes, resourceGroup, project, onPreviewResult, onEx
         type="button"
         className="btn-secondary"
         disabled={!ready || previewMutation.isPending}
+        title={blockedReason}
         onClick={() => previewMutation.mutate()}
       >
-        <Eye size={13} /> {previewMutation.isPending ? 'Previewing…' : 'Preview (dry-run)'}
+        <Eye size={13} aria-hidden="true" /> {previewMutation.isPending ? 'Previewing…' : 'Preview (dry-run)'}
       </button>
 
       <AlertDialog.Root open={confirmOpen} onOpenChange={setConfirmOpen}>
         <AlertDialog.Trigger asChild>
-          <button type="button" className="btn-primary" disabled={!ready}>
-            <FolderPlus size={13} /> Create Folders
+          <button type="button" className="btn-primary" disabled={!ready} title={blockedReason}>
+            <FolderPlus size={13} aria-hidden="true" /> Create Folders
           </button>
         </AlertDialog.Trigger>
         <AlertDialog.Portal>

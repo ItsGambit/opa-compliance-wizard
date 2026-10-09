@@ -39,7 +39,7 @@ export function GroupsTab({ model }: Props) {
     <div className="flex flex-col gap-4">
       <div className="card p-3 flex flex-col gap-1">
         <span className="section-label">Group</span>
-        <Select
+        <Select ariaLabel="Group"
           value={groupId}
           onValueChange={setGroupId}
           placeholder="Select a group"

@@ -18,9 +18,19 @@ function neutralizeFormula(value: string): string {
   return /^[=+\-@\t\r]/.test(value) ? `'${value}` : value
 }
 
-function csvEscape(value: string): string {
+// FE-09: a bare CR ends a record in RFC 4180 parsers and Excel just like
+// LF does, so it must be quoted too (the old pattern only checked LF).
+export function csvEscape(value: string): string {
   value = neutralizeFormula(value)
-  return /[",\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value
+  return /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value
+}
+
+/** FE-09: a Markdown table cell is one line, and `|` / `\` are syntax. A
+ * newline in a value (descriptions, outcome reasons, JSON) used to break
+ * the table, and a trailing backslash escaped the cell delimiter. Escape
+ * backslashes first, then pipes; line breaks become <br>. */
+export function markdownCell(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/\|/g, '\\|').replace(/\r\n|\r|\n/g, '<br>')
 }
 
 /** Multiple sections in one CSV file, separated by a blank line, each
@@ -46,11 +56,11 @@ export function toMarkdown(sections: ExportSection[]): string {
     .map(section => {
       const columns = Object.keys(section.rows[0])
       const lines = [
-        `## ${section.title}`,
+        `## ${section.title.replace(/\r\n|\r|\n/g, ' ')}`,
         '',
-        `| ${columns.join(' | ')} |`,
+        `| ${columns.map(markdownCell).join(' | ')} |`,
         `| ${columns.map(() => '---').join(' | ')} |`,
-        ...section.rows.map(row => `| ${columns.map(c => (row[c] ?? '').replace(/\|/g, '\\|')).join(' | ')} |`),
+        ...section.rows.map(row => `| ${columns.map(c => markdownCell(row[c] ?? '')).join(' | ')} |`),
       ]
       return lines.join('\n')
     })
@@ -66,7 +76,9 @@ export function downloadTextFile(filename: string, content: string, mimeType: st
   document.body.appendChild(a)
   a.click()
   document.body.removeChild(a)
-  URL.revokeObjectURL(url)
+  // Revoked on the next tick, not synchronously: Safari can cancel a
+  // download whose object URL is revoked inside the click (FE-09).
+  setTimeout(() => URL.revokeObjectURL(url), 0)
 }
 
 export function exportSections(sections: ExportSection[], format: 'csv' | 'md', filenameBase: string): void {

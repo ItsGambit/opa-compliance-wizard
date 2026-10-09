@@ -333,6 +333,20 @@ a continuity check over event ids only -- and are never re-sealed; the
 response's `legacy_manifests` counts them and `deep_applicable` says
 whether any sealed rows exist to re-read.
 
+Since 5.40.7 the same check is in the app too: **Environments → the
+calendar icon on your environment → Evidence chain → Verify** (the
+**Deep check** button is shown to admins, and to the operator of a local
+run; it keeps asking while the server answers `202`).
+
+**Archives left by deleted environments (5.40.7+).** Deleting an
+environment without purging its archive leaves those events in
+`audit_store.db` with no environment to show them. Admins (and a local
+run's operator) see them under **Orphaned archives** in the sidebar and
+can purge one after typing the first 8 characters of its id; the server
+refuses while the environment still exists or a sync is running, and the
+purge is written to the audit log with per-table counts. Purging is
+permanent -- take a backup first (above) if you might need the evidence.
+
 **A deep check on a large archive (5.40.6+).** `?deep=1` re-reads every
 sealed curated event, and curated events are never pruned, so its cost
 grows with the archive (roughly 8-20 s per million sealed events). It runs

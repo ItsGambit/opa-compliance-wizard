@@ -1,4 +1,5 @@
 import type { Environment } from '../types'
+import { isAddressable } from './environmentRows'
 
 /** Environments the caller can actually activate: their own, plus ones shared with them.
  *
@@ -11,7 +12,10 @@ import type { Environment } from '../types'
 export function usableEnvironments(environments: Environment[] | undefined): Environment[] {
   const byName = new Map<string, Environment>()
   for (const env of environments ?? []) {
-    if (!env.is_own && !env.shared) continue
+    // 5.40.7: the server's own answer (addressable) when it gives one --
+    // exactly the rows a by-name activation (and a saved-session restore)
+    // will accept.
+    if (!isAddressable(env)) continue
     const existing = byName.get(env.name)
     if (!existing || (env.is_own && !existing.is_own)) byName.set(env.name, env)
   }

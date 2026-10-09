@@ -58,7 +58,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.40.6
+# Version     : 5.40.7
 # =============================================================================
 
 import argparse
@@ -84,7 +84,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.40.6"
+SCRIPT_VERSION = "5.40.7"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 # ENG2-12: OPA's spec documents no pattern or length for a secret-folder
 # name (SecretFolderCreateRequest.name is a bare string); 255 is the limit
@@ -805,6 +805,28 @@ def set_active_environment(owner, name):
     if meta is None:
         raise KeyError(f"No saved environment named '{name}' owned by this user.")
     environment_id = meta["environment_id"]
+    with audit_store._db_lock:
+        conn.execute(
+            "INSERT OR REPLACE INTO active_environments (owner_key, environment_id) VALUES (?, ?)",
+            (_owner_storage_key(owner), environment_id),
+        )
+        conn.commit()
+
+
+def set_active_environment_id(owner, environment_id):
+    """Stores the active pointer as exactly this environment_id (5.40.7,
+    UI-07) -- for an activation that was already resolved and checked by
+    id, so a rename or share between the check and the write can't make
+    the pointer name a different environment. Same visibility rule as
+    get_environment_credentials_by_id: own, or shared. Raises KeyError."""
+    import audit_store
+    conn = audit_store._get_connection()
+    row = conn.execute(
+        "SELECT 1 FROM app_environments WHERE environment_id = ? AND (owner_id IS ? OR shared = 1)",
+        (environment_id, owner),
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"No saved environment with id '{environment_id}' visible to this user")
     with audit_store._db_lock:
         conn.execute(
             "INSERT OR REPLACE INTO active_environments (owner_key, environment_id) VALUES (?, ?)",
@@ -4077,7 +4099,7 @@ def _access_report_target(event, target_type):
 
 SYNC_SCHEDULE_DEFAULTS = {
     "enabled": False,
-    "run_time": "02:00",  # 24h local HH:MM
+    "run_time": "02:00",  # 24h HH:MM in UTC (the scheduler and the UI both treat it as UTC)
     "ingestion_scope": "curated",  # "curated" or "all" -- see audit_store.py
     "retention_days": None,  # None = no time-based prune
     "retention_max_size_mb": None,  # None = no size-based prune

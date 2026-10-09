@@ -22,6 +22,9 @@ export interface FuzzyMatch {
  * reasonably type into, not just the primary display label, so e.g.
  * searching a user by email still works. */
 export function useFuzzyFilter<T>(items: T[], query: string, keys: string[]): { item: T; matches: FuzzyMatch['matches'] }[] {
+  // FE-12: the index is rebuilt when the key LIST changes (by value, so a
+  // new array literal with the same keys each render costs nothing).
+  const keysSignature = keys.join('\u0000')
   const fuse = useMemo(
     () =>
       new Fuse(items, {
@@ -30,12 +33,9 @@ export function useFuzzyFilter<T>(items: T[], query: string, keys: string[]): { 
         threshold: 0.4, // Fuse's own tuned default range for "typo tolerant but not noisy" -- 0 is exact-only, 1 matches almost anything
         ignoreLocation: true, // a match anywhere in the string counts, not just near Fuse's default 0-index window (a UUID/hostname match happens anywhere)
       }),
-    // Fuse's own index is rebuilt whenever the underlying item list changes --
-    // `keys` is expected to be a stable literal array per call site, not
-    // included here to avoid rebuilding the index every render off a new
-    // array reference with the same contents.
+    // keysSignature stands in for `keys` (same contents => same index).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [items]
+    [items, keysSignature]
   )
 
   return useMemo(() => {
@@ -59,10 +59,17 @@ export function HighlightedText({ text, indices }: { text: string; indices?: [nu
   const sorted = [...indices].sort((a, b) => a[0] - b[0])
   const parts: JSX.Element[] = []
   let cursor = 0
-  sorted.forEach(([start, end], i) => {
+  sorted.forEach(([rawStart, rawEnd], i) => {
+    // FE-12: never trust the ranges to be in bounds or disjoint -- an
+    // overlapping range used to print characters twice and move the
+    // cursor backwards. Clamp to the text and to what is already printed;
+    // the rendered text is always exactly `text`.
+    const start = Math.max(rawStart, cursor, 0)
+    const end = Math.min(rawEnd, text.length - 1)
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return
     if (start > cursor) parts.push(<span key={`plain-${i}`}>{text.slice(cursor, start)}</span>)
     parts.push(
-      <mark key={`hit-${i}`} className="bg-accent-dim text-accent rounded-[2px] px-0">
+      <mark key={`hit-${i}`} className="bg-accent-dim text-text rounded-[2px] px-0">
         {text.slice(start, end + 1)}
       </mark>
     )

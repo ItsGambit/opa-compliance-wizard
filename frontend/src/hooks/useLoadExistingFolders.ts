@@ -1,7 +1,7 @@
 import { useMutation } from '@tanstack/react-query'
 import { fetchExistingFolders } from '../api/client'
 import type { FolderNode } from '../types'
-import { treeFromRows } from '../utils/tree'
+import { normalizePath, treeFromRows } from '../utils/tree'
 
 /** Shared fetch+convert logic for loading a project's existing (flat) folder
  * list into the tree editor. OPA exposes no parent/child linkage on read, so
@@ -16,9 +16,18 @@ export function useLoadExistingFolders(onLoad: (nodes: FolderNode[], folderIdByP
     mutationFn: (vars: { resourceGroupId: string; projectId: string }) =>
       fetchExistingFolders(vars.resourceGroupId, vars.projectId),
     onSuccess: (data) => {
-      const folderIdByPath = new Map(
-        data.rows.filter(r => r.folder_id).map(r => [r.path, r.folder_id as string])
-      )
+      // Keyed by the same normalised path the tree is built from (FE-13).
+      // Two folders on one path would make "Delete"/"Assign access"
+      // ambiguous, so such a path gets no id at all.
+      const folderIdByPath = new Map<string, string>()
+      const duplicated = new Set<string>()
+      for (const r of data.rows) {
+        if (!r.folder_id || typeof r.path !== 'string') continue
+        const key = normalizePath(r.path)
+        if (folderIdByPath.has(key)) duplicated.add(key)
+        folderIdByPath.set(key, r.folder_id)
+      }
+      for (const key of duplicated) folderIdByPath.delete(key)
       onLoad(treeFromRows(data.rows), folderIdByPath)
     },
   })

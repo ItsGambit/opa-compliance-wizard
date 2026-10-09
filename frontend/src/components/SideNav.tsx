@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import {
+  Archive,
   ClipboardCheck,
   FolderTree,
   Info,
@@ -102,6 +103,8 @@ interface Props {
   onOpenBanner: () => void
   onOpenAccessControl: () => void
   onOpenAbout: () => void
+  /** Admin-only (canAdmin): archives left behind by deleted environments. */
+  onOpenOrphanedArchives?: () => void
 }
 
 const TOP_LEVEL_ICON: Record<string, typeof FolderTree> = {
@@ -142,6 +145,8 @@ function NavItem({
         type="button"
         onClick={onClick}
         title={label}
+        aria-label={label}
+        aria-current={active ? 'page' : undefined}
         className={`w-9 h-9 mx-auto flex items-center justify-center rounded-md transition-colors ${
           active ? 'bg-accent text-white' : 'text-text-faint hover:bg-bg-hover hover:text-text-dim'
         }`}
@@ -154,6 +159,7 @@ function NavItem({
     <button
       type="button"
       onClick={onClick}
+      aria-current={active ? 'page' : undefined}
       className={`w-full flex items-center gap-2.5 px-2.5 py-2 rounded-md text-sm text-left transition-colors ${
         active ? 'bg-accent-dim text-accent font-medium' : 'text-text-dim hover:bg-bg-hover'
       }`}
@@ -188,6 +194,7 @@ function UtilityPill({
         type="button"
         onClick={onClick}
         title={label}
+        aria-label={label}
         className="w-9 h-9 mx-auto flex items-center justify-center rounded-full text-text-dim
           bg-[color-mix(in_srgb,var(--color-text)_6%,transparent)]
           hover:bg-[color-mix(in_srgb,var(--color-text)_10%,transparent)] transition-colors"
@@ -224,6 +231,7 @@ export function SideNav({
   onOpenBanner,
   onOpenAccessControl,
   onOpenAbout,
+  onOpenOrphanedArchives,
 }: Props) {
   const { theme, toggle } = useTheme()
 
@@ -261,6 +269,7 @@ export function SideNav({
           onClick={() => setDrawerOpen(o => !o)}
           className="w-8 h-8 flex items-center justify-center rounded-md text-text-faint hover:bg-bg-hover hover:text-text-dim"
           title="Toggle menu"
+          aria-label="Toggle menu"
         >
           <Menu size={16} />
         </button>
@@ -282,6 +291,7 @@ export function SideNav({
             type="button"
             onClick={() => setCollapsedPref(c => !c)}
             title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
             className="hidden md:flex w-7 h-7 shrink-0 items-center justify-center rounded-md text-text-faint hover:bg-bg-hover hover:text-text-dim"
           >
             {collapsed ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}
@@ -374,6 +384,9 @@ export function SideNav({
               matters. */}
           {canAdmin && (
             <UtilityPill label="Announcement banner" icon={Megaphone} onClick={() => { onOpenBanner(); closeDrawer() }} collapsed={collapsed} />
+          )}
+          {canAdmin && onOpenOrphanedArchives && (
+            <UtilityPill label="Orphaned archives" icon={Archive} onClick={() => { onOpenOrphanedArchives(); closeDrawer() }} collapsed={collapsed} />
           )}
           <UtilityPill label="About" icon={Info} onClick={() => { onOpenAbout(); closeDrawer() }} collapsed={collapsed} />
           <UtilityPill

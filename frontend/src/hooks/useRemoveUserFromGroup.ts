@@ -20,6 +20,8 @@ export function useRemoveUserFromGroup(onRemoved: (groupId: string) => void) {
     mutationFn: (vars: { groupId: string; userName: string }) => removeUserFromGroup(vars.groupId, vars.userName),
     onSuccess: (resp) => {
       queryClient.invalidateQueries({ queryKey: ['service_account'] })
+      queryClient.invalidateQueries({ queryKey: ['groups'] })
+      queryClient.invalidateQueries({ queryKey: ['user_resource_access'] })
       toast({ title: 'Access removed', variant: 'success' })
       onRemoved(resp.group_id)
     },

@@ -1,8 +1,10 @@
 import { useMemo, useState } from 'react'
 import { ArrowLeft } from 'lucide-react'
 import { useReport } from '../api/hooks'
+import { useReportDateRange } from '../hooks/useReportDateRange'
 import type { ComplianceReportDef, ComplianceReportRow } from '../types'
 import { complianceReportExportSections } from '../utils/exportSections'
+import { DateRangeFields } from './DateRangeFields'
 import { ExportButtons } from './ExportButtons'
 import { ReportRowsTable } from './ReportRowsTable'
 
@@ -15,10 +17,7 @@ interface Props {
 const CONTROL_LABEL: Record<string, string> = { CC6: 'CC6', CC7: 'CC7', CC8: 'CC8' }
 
 export function ComplianceReportDetail({ def, environment, onBack }: Props) {
-  const today = new Date().toISOString().slice(0, 10)
-  const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
-  const [from, setFrom] = useState(ninetyDaysAgo)
-  const [to, setTo] = useState(today)
+  const dateRange = useReportDateRange()
 
   // No per-view Refresh here -- every report reads the SAME shared
   // audit_store.db archive, so pulling fresh Okta data is one global
@@ -26,7 +25,9 @@ export function ComplianceReportDetail({ def, environment, onBack }: Props) {
   // screen. This query auto-refetches when that global sync completes,
   // via queryClient.invalidateQueries on the ['report'] key prefix (see
   // Footer.tsx).
-  const { data, isLoading } = useReport(def.key, environment, from, to)
+  const { data, isLoading, isError, error, refetch, isFetching, isPlaceholderData } = useReport(
+    def.key, environment, dateRange.range?.from, dateRange.range?.to, !!dateRange.range,
+  )
   // FIX (external review, 2026-09-30): see the identical note in
   // ResourcesTab.tsx -- `data?.rows ?? []` without useMemo creates a new
   // array reference on every render while loading, defeating
@@ -46,7 +47,9 @@ export function ComplianceReportDetail({ def, environment, onBack }: Props) {
         <button type="button" className="btn-secondary text-xs" onClick={onBack}>
           <ArrowLeft size={12} /> Back to reports
         </button>
-        <ExportButtons sections={complianceReportExportSections(def.label, filteredRows)} filenameBase={`opa-report-${def.key}`} />
+        <ExportButtons sections={complianceReportExportSections(def.label, filteredRows)} filenameBase={`opa-report-${def.key}`}
+          disabledReason={isPlaceholderData ? 'Loading the new date range…' : isError ? 'The report did not load' : undefined}
+        />
       </div>
 
       <div>
@@ -59,21 +62,16 @@ export function ComplianceReportDetail({ def, environment, onBack }: Props) {
         <p className="text-xs text-text-faint mt-1">{def.description}</p>
       </div>
 
-      <div className="card p-3 flex items-end gap-3">
-        <div className="field">
-          <label className="section-label block mb-1">From</label>
-          <input type="date" className="text-input" value={from} onChange={e => setFrom(e.target.value)} />
-        </div>
-        <div className="field">
-          <label className="section-label block mb-1">To</label>
-          <input type="date" className="text-input" value={to} onChange={e => setTo(e.target.value)} />
-        </div>
-      </div>
+      <DateRangeFields range={dateRange} idPrefix={`report-${def.key}`} />
 
       <ReportRowsTable
         rows={rows}
         isLoading={isLoading}
-        emptyMessage="No events found in this date range."
+        error={isError ? error : null}
+        onRetry={() => refetch()}
+        retrying={isFetching}
+        stale={isPlaceholderData}
+        emptyMessage={dateRange.error ? 'Fix the date range to see events.' : 'No events found in this date range.'}
         onFilteredRowsChange={setFilteredRows}
         total={data?.total}
         truncated={data?.truncated}

@@ -1,4 +1,5 @@
 import type { CsvRow, FolderNode } from '../types'
+import { isValidName } from './validate'
 
 // crypto.randomUUID() needs a secure context (https, or localhost -- which
 // this app always runs on), so this fallback is essentially unreachable in
@@ -28,12 +29,26 @@ export function flattenTree(nodes: FolderNode[], parentPath: string[] = []): Csv
   return rows
 }
 
-/** Inverse of flattenTree: builds a nested tree from flat '/'-delimited rows. */
+/** The one path normalisation both directions use: segments trimmed, empty
+ * segments dropped ("a//b " -> "a/b"). FE-13: the folder-id map was keyed
+ * by the server's raw path while the tree was built from trimmed segments,
+ * so a path with stray spaces lost its OPA id. */
+export function normalizePath(path: string): string {
+  return path.split('/').map(s => s.trim()).filter(Boolean).join('/')
+}
+
+/** Inverse of flattenTree for any tree that passes treeProblems (non-empty,
+ * valid, sibling-unique names): builds a nested tree from flat
+ * '/'-delimited rows. Rows without a string `path` (a CSV that is not a
+ * folder template, e.g. an Okta System Log export) are skipped instead of
+ * throwing (FE-11). The last row that names a folder sets its
+ * description, even to empty (FE-13). */
 export function treeFromRows(rows: CsvRow[]): FolderNode[] {
   const root: FolderNode[] = []
 
   for (const row of rows) {
-    const segments = row.path.split('/').map(s => s.trim()).filter(Boolean)
+    if (typeof row?.path !== 'string') continue
+    const segments = normalizePath(row.path).split('/').filter(Boolean)
     if (segments.length === 0) continue
 
     let level = root
@@ -45,23 +60,14 @@ export function treeFromRows(rows: CsvRow[]): FolderNode[] {
         existing = newNode(segment)
         level.push(existing)
       }
-      if (depth === segments.length - 1 && row.description) {
-        existing.description = row.description
+      if (depth === segments.length - 1) {
+        existing.description = typeof row.description === 'string' ? row.description : ''
       }
       level = existing.children
     })
   }
 
   return root
-}
-
-export function findNode(nodes: FolderNode[], id: string): FolderNode | null {
-  for (const node of nodes) {
-    if (node.id === id) return node
-    const found = findNode(node.children, id)
-    if (found) return found
-  }
-  return null
 }
 
 export function addChild(nodes: FolderNode[], parentId: string | null, child: FolderNode): FolderNode[] {
@@ -87,4 +93,29 @@ export function updateNode(nodes: FolderNode[], id: string, patch: Partial<Pick<
 
 export function countNodes(nodes: FolderNode[]): number {
   return nodes.reduce((sum, n) => sum + 1 + countNodes(n.children), 0)
+}
+
+/** True when every row has a string `path` -- i.e. the file is a folder
+ * template (path,description), not some other CSV in the project folder. */
+export function looksLikeFolderTemplate(rows: unknown[]): boolean {
+  return rows.every(r => typeof r === 'object' && r !== null && typeof (r as { path?: unknown }).path === 'string')
+}
+
+/** Why the tree can't be saved / previewed as-is (FE-13): an empty name
+ * flattens to "a//b" and silently re-parents its children on reload, and
+ * two same-named siblings flatten to one path and merge. Empty when fine. */
+export function treeProblems(nodes: FolderNode[]): string[] {
+  const problems = new Set<string>()
+  const walk = (level: FolderNode[]) => {
+    const seen = new Set<string>()
+    for (const node of level) {
+      if (!node.name.trim()) problems.add('Every folder needs a name.')
+      else if (!isValidName(node.name)) problems.add(`"${node.name}" is not a valid folder name.`)
+      if (seen.has(node.name)) problems.add(`"${node.name}" appears twice under the same parent.`)
+      seen.add(node.name)
+      walk(node.children)
+    }
+  }
+  walk(nodes)
+  return [...problems]
 }

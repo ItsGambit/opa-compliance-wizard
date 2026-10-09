@@ -7,6 +7,17 @@ import { HighlightedText, useFuzzyFilter } from '../utils/fuzzySearch'
 // The resource_type_detail -> label map lives in utils/resourceTypeLabels.ts
 // (5.40.0) so the CSV export shows the same labels as this table.
 import { resourceTypeLabel } from '../utils/resourceTypeLabels'
+import { ErrorNotice } from './ErrorNotice'
+
+/** The viewer's zone, for the Timestamp header (UI-18: the date pickers are
+ * UTC days; the times in the table are local). */
+function localZoneLabel(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'local time'
+  } catch {
+    return 'local time'
+  }
+}
 
 // Email + Okta resource ID, shown together under the resource's display
 // name -- a display name alone isn't a unique identifier (two real users/
@@ -65,6 +76,13 @@ interface Props {
    * (or pass truncated=false) when the caller has no such concept. */
   total?: number
   truncated?: boolean
+  /** UI-04: a failed load. Rendered as an error with Retry -- never as the
+   * empty message, which would read as "nothing happened". */
+  error?: unknown
+  onRetry?: () => void
+  retrying?: boolean
+  /** The rows shown are the previous date range's while the new one loads. */
+  stale?: boolean
 }
 
 /** The filterable report-rows table -- extracted out of
@@ -76,7 +94,7 @@ interface Props {
  * Outcome dropdown, same as before this extraction) -- callers only see
  * the rendered table plus, optionally, the filtered rows via
  * onFilteredRowsChange. */
-export function ReportRowsTable({ rows, isLoading, emptyMessage, onFilteredRowsChange, total, truncated }: Props) {
+export function ReportRowsTable({ rows, isLoading, emptyMessage, onFilteredRowsChange, total, truncated, error, onRetry, retrying, stale }: Props) {
   const [userFilter, setUserFilter] = useState('')
   const [actionFilter, setActionFilter] = useState('')
   const [resourceFilter, setResourceFilter] = useState('')
@@ -86,6 +104,12 @@ export function ReportRowsTable({ rows, isLoading, emptyMessage, onFilteredRowsC
     () => [...new Set(rows.map(r => r.outcome).filter(Boolean))].sort(),
     [rows]
   )
+
+  // UI-18: an outcome that the new rows no longer contain used to stay
+  // selected and keep filtering, under a dropdown that showed "All".
+  useEffect(() => {
+    if (outcomeFilter && !outcomeOptions.includes(outcomeFilter)) setOutcomeFilter('')
+  }, [outcomeFilter, outcomeOptions])
 
   // Three independent fuzzy passes over the FULL row set (not progressively
   // narrowed) -- each column's filter is its own question ("does this row's
@@ -131,8 +155,17 @@ export function ReportRowsTable({ rows, isLoading, emptyMessage, onFilteredRowsC
     setOutcomeFilter('')
   }
 
+  if (error) {
+    return <ErrorNotice title="Could not load these events" error={error} onRetry={onRetry} retrying={retrying} />
+  }
+
   return (
-    <div className="card p-0 overflow-x-auto">
+    <div className="card p-0 overflow-x-auto" aria-busy={stale || isLoading ? true : undefined}>
+      {stale && (
+        <div className="px-3 py-2 text-[0.6875rem] text-text-dim border-b border-border" role="status">
+          Loading the new date range — the rows below are from the previous range.
+        </div>
+      )}
       {truncated && !isLoading && (
         <div className="px-3 py-2 text-[0.6875rem] text-warn bg-warn/10 border-b border-border">
           Showing the newest {rows.length.toLocaleString()} of {(total ?? rows.length).toLocaleString()} events in
@@ -149,7 +182,10 @@ export function ReportRowsTable({ rows, isLoading, emptyMessage, onFilteredRowsC
             <tr className="border-b border-border">
               <th className="text-left font-semibold text-text-faint uppercase text-[0.625rem] tracking-wide px-3 py-2">User</th>
               <th className="text-left font-semibold text-text-faint uppercase text-[0.625rem] tracking-wide px-3 py-2">Action</th>
-              <th className="text-left font-semibold text-text-faint uppercase text-[0.625rem] tracking-wide px-3 py-2">Timestamp</th>
+              <th className="text-left font-semibold text-text-faint uppercase text-[0.625rem] tracking-wide px-3 py-2">
+                Timestamp
+                <span className="block normal-case font-normal tracking-normal">{localZoneLabel()}</span>
+              </th>
               <th className="text-left font-semibold text-text-faint uppercase text-[0.625rem] tracking-wide px-3 py-2">Affected Resource</th>
               <th className="text-left font-semibold text-text-faint uppercase text-[0.625rem] tracking-wide px-3 py-2">
                 <div className="flex items-center justify-between gap-2">
@@ -159,9 +195,10 @@ export function ReportRowsTable({ rows, isLoading, emptyMessage, onFilteredRowsC
                       type="button"
                       onClick={clearFilters}
                       title="Clear all filters"
+                      aria-label="Clear all filters"
                       className="text-text-faint hover:text-text-dim normal-case font-normal"
                     >
-                      <X size={11} />
+                      <X size={11} aria-hidden="true" />
                     </button>
                   )}
                 </div>
@@ -170,25 +207,26 @@ export function ReportRowsTable({ rows, isLoading, emptyMessage, onFilteredRowsC
             <tr className="border-b border-border bg-bg-hover/50">
               <th className="px-3 py-1.5">
                 <input
-                  type="text" placeholder="Filter…" value={userFilter} onChange={e => setUserFilter(e.target.value)}
+                  type="text" placeholder="Filter…" aria-label="Filter by user" value={userFilter} onChange={e => setUserFilter(e.target.value)}
                   className="text-input w-full !py-1 text-[0.6875rem] font-normal normal-case"
                 />
               </th>
               <th className="px-3 py-1.5">
                 <input
-                  type="text" placeholder="Filter…" value={actionFilter} onChange={e => setActionFilter(e.target.value)}
+                  type="text" placeholder="Filter…" aria-label="Filter by action" value={actionFilter} onChange={e => setActionFilter(e.target.value)}
                   className="text-input w-full !py-1 text-[0.6875rem] font-normal normal-case"
                 />
               </th>
               <th className="px-3 py-1.5" />
               <th className="px-3 py-1.5">
                 <input
-                  type="text" placeholder="Filter…" value={resourceFilter} onChange={e => setResourceFilter(e.target.value)}
+                  type="text" placeholder="Filter…" aria-label="Filter by affected resource" value={resourceFilter} onChange={e => setResourceFilter(e.target.value)}
                   className="text-input w-full !py-1 text-[0.6875rem] font-normal normal-case"
                 />
               </th>
               <th className="px-3 py-1.5">
                 <select
+                  aria-label="Filter by outcome"
                   value={outcomeFilter} onChange={e => setOutcomeFilter(e.target.value)}
                   className="text-input w-full !py-1 text-[0.6875rem] font-normal normal-case"
                 >

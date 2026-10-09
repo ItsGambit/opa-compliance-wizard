@@ -1,7 +1,8 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { activateEnvironment, fetchEnvironments, saveEnvironment } from '../api/client'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useEnvironments } from '../api/hooks'
+import { activateEnvironment, saveEnvironment, type ApiError } from '../api/client'
 import { toast } from '../hooks/useToast'
-import type { ApiErrorBody, EnvironmentFormValues } from '../types'
+import type { EnvironmentFormValues } from '../types'
 import { usableEnvironments } from '../utils/usableEnvironments'
 import { EnvironmentForm } from './EnvironmentForm'
 
@@ -14,15 +15,20 @@ export function EnvironmentSetup() {
       toast({ title: `Connected to '${data.active}'`, variant: 'success' })
       queryClient.invalidateQueries({ queryKey: ['environments'] })
     },
-    onError: (err: Error) => toast({ title: 'Could not connect', description: err.message, variant: 'error' }),
+    onError: (err: ApiError) => {
+      // FE-11: a 502 with saved:true means the environment WAS stored --
+      // refresh so it shows up under "Available environments".
+      if (err.body?.saved) queryClient.invalidateQueries({ queryKey: ['environments'] })
+      toast({ title: err.body?.saved ? 'Saved, but could not connect' : 'Could not connect', description: err.message, variant: 'error' })
+    },
   })
 
   // A new identity (e.g. signing in through a second Okta org's gate) has no active environment yet, but
   // may already have environments shared with it: offer those here instead of only "add a new one".
-  const { data: environments } = useQuery({ queryKey: ['environments'], queryFn: fetchEnvironments })
+  const { data: environments } = useEnvironments()
   const usable = usableEnvironments(environments?.environments)
   const activateMutation = useMutation({
-    mutationFn: (name: string) => activateEnvironment(name),
+    mutationFn: (env: { name: string; id: string }) => activateEnvironment(env.name, env.id),
     onSuccess: (data) => {
       toast({ title: `Connected to '${data.active}'`, variant: 'success' })
       queryClient.invalidateQueries({ queryKey: ['environments'] })
@@ -30,7 +36,7 @@ export function EnvironmentSetup() {
     onError: (err: Error) => toast({ title: 'Could not connect', description: err.message, variant: 'error' }),
   })
 
-  const apiError = (mutation.error as (Error & { body?: ApiErrorBody }) | null)?.body?.error
+  const apiError = (mutation.error as ApiError | null)?.body?.saved ? undefined : (mutation.error as ApiError | null)?.body?.error
 
   return (
     <div className="max-w-md mx-auto px-6 py-16 flex flex-col gap-5">
@@ -58,7 +64,7 @@ export function EnvironmentSetup() {
                 type="button"
                 className="btn-primary !py-1 !px-2 text-xs shrink-0"
                 disabled={activateMutation.isPending}
-                onClick={() => activateMutation.mutate(env.name)}
+                onClick={() => activateMutation.mutate(env)}
               >
                 Use this environment
               </button>

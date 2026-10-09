@@ -44,8 +44,15 @@ export function FolderBuilder() {
     clearResults()
     setLoadedFolderIds(folderIdByPath)
   }
-  const handleResourceGroupChange = (id: string) => { setResourceGroupId(id); setProjectId(undefined); clearResults() }
-  const handleProjectChange = (id: string) => { setProjectId(id); clearResults() }
+  // UI-17 (external review, 2026-10-05): folder ids belong to the project
+  // they were loaded from. Changing the resource group or project used to
+  // keep them, so "Delete from OPA" / "Assign access" sent project A's
+  // folder ids against project B. The tree itself stays (it may be meant
+  // for the new project too); its rows simply lose those OPA links.
+  const handleResourceGroupChange = (id: string) => {
+    setResourceGroupId(id); setProjectId(undefined); clearResults(); setLoadedFolderIds(new Map()); setAssigning(null)
+  }
+  const handleProjectChange = (id: string) => { setProjectId(id); clearResults(); setLoadedFolderIds(new Map()); setAssigning(null) }
 
   const folderIdByPath = useMemo(() => {
     const map = new Map(loadedFolderIds)
@@ -96,6 +103,9 @@ export function FolderBuilder() {
 
   const handleAccessSaved = () => {
     queryClient.invalidateQueries({ queryKey: ['security_policies', resourceGroupId] })
+    // Who can reach which secret changed (finding from batch 5's review:
+    // with a 30 s staleTime nothing else would refresh the dashboard).
+    queryClient.invalidateQueries({ queryKey: ['secrets_access_report'] })
   }
 
   return (
@@ -122,6 +132,7 @@ export function FolderBuilder() {
         accessByPath={accessByPath}
         resourceGroupId={resourceGroupId}
         projectId={projectId}
+        projectName={project?.name}
         onAssignAccess={handleAssignAccess}
       />
 
