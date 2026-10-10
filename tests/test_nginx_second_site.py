@@ -251,3 +251,84 @@ def test_quoted_regex_location_is_seen_and_refused():
             "  location / { proxy_pass http://127.0.0.1:8766; } }")
     with pytest.raises(ValueError, match="shadow"):
         build(text, 8768, "127.0.0.1:8080", "opa.example.com", "x")
+
+
+# ---------------------------------------------------------------------------
+# SP-5 (5.43.0): the shared-environment permissions (read and write) and the
+# orphaned-archive list/purge are whole-backend admin settings like Access
+# control -- unreachable from an additional gate's hostname, same mechanism
+# as GATE-04 above. Deleting an environment WITH its archive
+# (?purge_archive=1) is the same purge, refused by a server-level check (a
+# location can't match a query string).
+# ---------------------------------------------------------------------------
+from server.nginx_second_site import SECOND_SITE_DENIED_PREFIXES  # noqa: E402
+
+
+@pytest.mark.parametrize("prefix", ["/api/shared_permissions", "/api/archives"])
+def test_shared_permissions_and_archive_purge_are_denied_entirely(site, prefix):
+    assert prefix in SECOND_SITE_DENIED_PREFIXES
+    assert re.search(rf"location {re.escape(prefix)} \{{\s*return 403;\s*\}}", site)
+    # Nothing else in the site can win over the deny for these routes.
+    assert [p for p, _ in _location_blocks(site) if prefix.rsplit("/", 1)[-1] in p] == [prefix]
+
+
+def test_access_control_deny_is_still_there_with_the_new_ones(site):
+    assert SECOND_SITE_DENIED_PREFIXES == ("/api/access_control", "/api/shared_permissions", "/api/archives")
+    for prefix in SECOND_SITE_DENIED_PREFIXES:
+        assert site.count(f"location {prefix} {{") == 1
+
+
+def test_delete_with_archive_purge_is_denied_at_server_level(site):
+    structure = _structure(site)
+    # The RAW request line, not nginx's normalised $uri (serve.py routes on
+    # the raw path), and no path condition at all.
+    assert 'set $opa_second_site_delete "$request_method $request_uri";' in site
+    assert '$uri' not in site.split("set $opa_second_site_delete", 1)[1].split("}", 1)[0]
+    assert re.search(r'if \(\$opa_second_site_delete ~\* "\^DELETE \[\^\?\]\*\\\?\.\*\(purge\|%\)"\) \{\s*return 403;\s*\}',
+                     site)
+    # Server level (not inside a location): it runs before any location is chosen.
+    for _path, blk in _location_blocks(site):
+        assert "opa_second_site_delete" not in blk
+    assert structure.count("if (") == 1
+
+
+@pytest.mark.parametrize("prefix,shadow", [
+    ("/api/shared_permissions", "location ~ ^/api/shared_permissions$"),
+    ("/api/shared_permissions", "location /api/shared_permissions/x"),
+    ("/api/archives", 'location ~ "^/api/archives/"'),
+    ("/api/archives", "location = /api/archives/orphaned"),
+])
+def test_a_main_site_location_that_could_shadow_a_new_deny_is_refused(prefix, shadow):
+    text = ("server { listen 443 ssl; server_name m.example.com;\n"
+            f"  {shadow} {{ proxy_pass http://127.0.0.1:8766; }}\n"
+            "  location / { proxy_pass http://127.0.0.1:8766; } }")
+    with pytest.raises(ValueError, match=f"{re.escape(prefix)}.*shadow"):
+        build(text, 8768, "127.0.0.1:8080", "opa.example.com", "x")
+
+
+def test_build_refuses_when_a_deny_block_is_missing(monkeypatch):
+    import server.nginx_second_site as nss
+
+    monkeypatch.setattr(nss, "_ACCESS_CONTROL_BLOCK", nss._ACCESS_CONTROL_BLOCK.replace(
+        "    location /api/archives {\n        return 403;\n    }\n", ""))
+    with pytest.raises(ValueError, match="/api/archives deny block was not inserted"):
+        build(MAIN, 8768, "127.0.0.1:8080", "opa.example.com", "x")
+    monkeypatch.undo()
+    monkeypatch.setattr(nss, "_ACCESS_CONTROL_BLOCK", nss._ACCESS_CONTROL_BLOCK.split("    set $opa_second_site_delete")[0])
+    with pytest.raises(ValueError, match="purge-on-delete"):
+        build(MAIN, 8768, "127.0.0.1:8080", "opa.example.com", "x")
+
+
+def test_the_issuer_header_is_forwarded_like_the_other_identity_headers(site):
+    """5.43.0: the additional gate names its own org's issuer; the site
+    carries it to the backend exactly as the main site does."""
+    https_block = [b for b in server_blocks(MAIN) if re.search(r"listen\s+443", b)][0]
+    assert "auth_request_set $auth_issuer   $upstream_http_x_auth_issuer;" in site
+    for _path, blk in _location_blocks(site):
+        if "X-Auth-Sub $auth_sub" in blk:
+            assert "proxy_set_header X-Auth-Issuer $auth_issuer;" in blk, _path
+            if "auth_request_set" in blk:
+                assert "auth_request_set $auth_issuer" in blk, _path
+    assert https_block.count("X-Auth-Issuer $auth_issuer") == 3 and site.count("X-Auth-Issuer $auth_issuer") == 2
+    # ... each with the marker that tells serve.py the issuer was overwritten here.
+    assert site.count("proxy_set_header X-Nginx-Issuer-Forwarded $nginx_proxy_secret;") == 2

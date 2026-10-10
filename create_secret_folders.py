@@ -58,7 +58,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.42.0
+# Version     : 5.43.0
 # =============================================================================
 
 import argparse
@@ -84,7 +84,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.42.0"
+SCRIPT_VERSION = "5.43.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 # ENG2-12: OPA's spec documents no pattern or length for a secret-folder
 # name (SecretFolderCreateRequest.name is a bare string); 255 is the limit
@@ -4301,18 +4301,21 @@ def _write_sync_schedule(conn, target_id, meta, config):
 # shared user may then do with it is an admin's. An owner is never limited
 # by any of this. Each capability resolves per environment: an override for
 # that environment (allow/deny), else the global default (allow/deny), else
-# the built-in default below. The built-in defaults are exactly what a
-# shared user could do before 5.42.0, so an upgrade changes nothing until an
-# admin changes a setting. "inherit" is never stored: it is the absence of a
+# the built-in default below. In 5.42.0 the built-in defaults were exactly
+# what a shared user could do before; since 5.43.0 writing to the owner's
+# OPA team / Okta org (tenant_write) and importing a CSV into the owner's
+# archive (import_csv) are denied unless an admin allows them (globally or
+# per environment) -- the owner decided to share, not to let others act
+# with their credentials. "inherit" is never stored: it is the absence of a
 # row (migration 008's two tables).
 SHARED_CAPABILITIES = (
     {"key": "view_archive", "label": "View archived reports", "builtin": "allow",
      "description": "Compliance reports, resource history, sync status and the basic evidence-chain check, read from this app's archive."},
     {"key": "live_read", "label": "Live read queries", "builtin": "allow",
      "description": "Reads from the owner's OPA team and Okta org with the owner's credentials: Access Explorer, Folder Builder lists and preview, the Secrets and Service Accounts dashboards."},
-    {"key": "tenant_write", "label": "Write to the OPA tenant / Okta org", "builtin": "allow",
+    {"key": "tenant_write", "label": "Write to the OPA tenant / Okta org", "builtin": "deny",
      "description": "Creates and changes things with the owner's credentials: resource groups, projects, folders, security policies, group membership, and new Okta groups with Group Push."},
-    {"key": "import_csv", "label": "Import a CSV into the archive", "builtin": "allow",
+    {"key": "import_csv", "label": "Import a CSV into the archive", "builtin": "deny",
      "description": "Adds System Log events from a CSV file in the project folder to this environment's compliance archive."},
     {"key": "reset_watermark", "label": "Reset the sync watermark", "builtin": "allow",
      "description": "Makes the next sync backfill the full 90-day window."},
@@ -4362,19 +4365,130 @@ def get_shared_permission_overrides(environment_id):
     }
 
 
-def effective_shared_permissions(environment_id, defaults=None):
-    """{capability: {"value": allow|deny, "source": "override"|"default"|"built_in"}}
-    for a shared (non-owner) user of this environment. `defaults` lets a
-    caller listing many environments read the global defaults once."""
+# Per-user exceptions (5.43.0, migration 009). A user is the pair (issuer,
+# subject): the Okta issuer of the login gate that authenticated them and
+# their `sub` there. A `sub` alone is only unique within one Okta org (OpenID
+# Connect Core 1.0, section 5.7: "The sub (subject) and iss (issuer) Claims,
+# used together, are the only Claims that an RP can rely upon as a stable
+# identifier for the End-User"), and an additional login gate
+# (setup-second-gate.sh) can front a different org on the same backend.
+# Issuer shapes are exactly what server/gate_config.okta_endpoints builds.
+SHARED_GRANT_ISSUER_PATTERN = re.compile(r"https://[A-Za-z0-9.-]{1,253}(?::[0-9]{1,5})?(?:/oauth2/[A-Za-z0-9]{1,64})?")
+SHARED_GRANT_SUBJECT_PATTERN = re.compile(r"[A-Za-z0-9]{1,64}")  # auth_gate.py's _OKTA_SUB_PATTERN
+
+
+def valid_grant_identity(issuer, subject):
+    """True when (issuer, subject) can name a gate-authenticated user."""
+    return (isinstance(issuer, str) and isinstance(subject, str)
+            and bool(SHARED_GRANT_ISSUER_PATTERN.fullmatch(issuer))
+            and bool(SHARED_GRANT_SUBJECT_PATTERN.fullmatch(subject)))
+
+
+def get_shared_permission_grants(environment_id):
+    """[{"issuer", "subject", "email", "capability", "value"}] -- this
+    environment's per-user exceptions, with the e-mail last seen for each
+    user (None when the backend has never seen them)."""
+    import audit_store
+    conn = audit_store._get_connection()
+    rows = conn.execute(
+        """SELECT g.issuer, g.subject, g.capability, g.value, k.email
+           FROM shared_permission_grants g
+           LEFT JOIN known_identities k ON k.issuer = g.issuer AND k.subject = g.subject
+           WHERE g.environment_id = ? ORDER BY g.issuer, g.subject, g.capability""",
+        (environment_id,),
+    )
+    return [{"issuer": r["issuer"], "subject": r["subject"], "email": r["email"],
+             "capability": r["capability"], "value": r["value"]}
+            for r in rows
+            if r["capability"] in SHARED_CAPABILITY_KEYS and r["value"] in SHARED_PERMISSION_VALUES]
+
+
+def _caller_grants(environment_id, caller_issuer, caller_subject):
+    """{capability: allow|deny} granted to exactly this caller, or {} when the
+    caller has no verified issuer (local mode, or a login gate / nginx site
+    older than 5.43.0) -- a grant never matches on the subject alone."""
+    if not valid_grant_identity(caller_issuer, caller_subject):
+        return {}
+    import audit_store
+    conn = audit_store._get_connection()
+    return {
+        row["capability"]: row["value"]
+        for row in conn.execute(
+            """SELECT capability, value FROM shared_permission_grants
+               WHERE environment_id = ? AND issuer = ? AND subject = ?""",
+            (environment_id, caller_issuer, caller_subject),
+        )
+        if row["capability"] in SHARED_CAPABILITY_KEYS and row["value"] in SHARED_PERMISSION_VALUES
+    }
+
+
+def effective_shared_permissions(environment_id, defaults=None, caller_issuer=None, caller_subject=None):
+    """{capability: {"value": allow|deny, "source": "user"|"override"|"default"|"built_in"}}
+    for a shared (non-owner) user of this environment: a grant to this
+    exact user (caller_issuer + caller_subject, 5.43.0), else the
+    environment's override, else the global default, else the built-in
+    default. Without a caller identity it is what any shared user gets.
+    `defaults` lets a caller listing many environments read the global
+    defaults once."""
     defaults = defaults if defaults is not None else get_shared_permission_defaults()
     overrides = get_shared_permission_overrides(environment_id)
+    grants = _caller_grants(environment_id, caller_issuer, caller_subject)
     out = {}
     for key in SHARED_CAPABILITY_KEYS:
-        if key in overrides:
+        if key in grants:
+            out[key] = {"value": grants[key], "source": "user"}
+        elif key in overrides:
             out[key] = {"value": overrides[key], "source": "override"}
         else:
             out[key] = {"value": defaults[key]["value"], "source": defaults[key]["source"]}
     return out
+
+
+KNOWN_IDENTITY_RETENTION_DAYS = 400
+
+
+def record_known_identity(issuer, subject, email):
+    """Remembers that a login gate vouched for (issuer, subject) with this
+    e-mail (5.43.0), so an admin can pick the user for a per-user exception.
+    serve.py calls it the first time each (issuer, subject, e-mail) reaches
+    a backend process on a given UTC day, so last_seen_at is "last
+    recorded" (at most daily), not every request. Rows nobody has been recorded under
+    for KNOWN_IDENTITY_RETENTION_DAYS and that no exception names are
+    dropped here (the e-mails are personal data with no other use).
+    Silently ignores an identity that isn't gate-shaped. Returns True when a
+    row was written."""
+    if not valid_grant_identity(issuer, subject):
+        return False
+    email = email if isinstance(email, str) and 0 < len(email) <= 320 else None
+    import audit_store
+    conn = audit_store._get_connection()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    with audit_store._db_lock:
+        conn.execute(
+            """INSERT INTO known_identities (issuer, subject, email, first_seen_at, last_seen_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(issuer, subject) DO UPDATE SET
+                   email = COALESCE(excluded.email, known_identities.email),
+                   last_seen_at = excluded.last_seen_at""",
+            (issuer, subject, email, now, now),
+        )
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=KNOWN_IDENTITY_RETENTION_DAYS)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        conn.execute(
+            """DELETE FROM known_identities WHERE last_seen_at < ? AND NOT EXISTS (
+                   SELECT 1 FROM shared_permission_grants g
+                   WHERE g.issuer = known_identities.issuer AND g.subject = known_identities.subject)""",
+            (cutoff,),
+        )
+        conn.commit()
+    return True
+
+
+def list_known_identities():
+    """[{"issuer", "subject", "email", "last_seen_at"}], most recent first."""
+    import audit_store
+    conn = audit_store._get_connection()
+    return [dict(r) for r in conn.execute(
+        "SELECT issuer, subject, email, last_seen_at FROM known_identities ORDER BY last_seen_at DESC, email")]
 
 
 def environment_owner(environment_id):
@@ -4385,21 +4499,26 @@ def environment_owner(environment_id):
     return (False, None) if row is None else (True, row["owner_id"])
 
 
-def shared_capability_allowed(environment_id, caller_owner, capability):
+def shared_capability_allowed(environment_id, caller_owner, capability, caller_issuer=None):
     """THE shared-environment permission check (5.42.0). True when
     `caller_owner` (engine-layer owner: an Okta sub, or LOCAL_OWNER_KEY)
     owns the environment -- owners are never limited -- or when the
-    capability resolves to "allow" for it (override, else global default,
-    else built-in). An unknown environment id is False (callers resolve
-    visibility before asking; this never grants anything on a row that
-    isn't there). An unknown capability is a programming error (ValueError)."""
+    capability resolves to "allow" for it: a grant to this exact user
+    (caller_issuer + caller_owner, 5.43.0; never matched without a verified
+    issuer), else the environment's override, else the global default, else
+    the built-in default. An unknown environment id is False (callers
+    resolve visibility before asking; this never grants anything on a row
+    that isn't there). An unknown capability is a programming error
+    (ValueError)."""
     _validate_shared_capability(capability)
     exists, owner = environment_owner(environment_id)
     if not exists:
         return False
     if owner == caller_owner:
         return True
-    return effective_shared_permissions(environment_id)[capability]["value"] == "allow"
+    return effective_shared_permissions(
+        environment_id, caller_issuer=caller_issuer, caller_subject=caller_owner,
+    )[capability]["value"] == "allow"
 
 
 def validate_shared_permission_changes(changes, allow_inherit=True):
@@ -4417,18 +4536,35 @@ def validate_shared_permission_changes(changes, allow_inherit=True):
     return clean
 
 
-def set_shared_permissions(changes, environment_id=None, updated_by=None):
+def set_shared_permissions(changes, environment_id=None, updated_by=None, grantee=None):
     """Applies `changes` ({capability: allow|deny|inherit}) to the global
-    defaults (environment_id None) or to one environment's overrides, in
-    one transaction. "inherit" deletes the row. Returns
-    [{"capability", "before", "after"}] for every capability whose stored
-    value actually changed (before/after are "allow"/"deny"/"inherit" --
-    the STORED setting, not the effective one), for the audit entry.
-    Raises KeyError for an unknown environment, ValueError for bad input."""
+    defaults (environment_id None), to one environment's overrides, or
+    (5.43.0) to one user's exceptions on one environment (`grantee` =
+    {"issuer", "subject"}, environment_id required), in one transaction.
+    "inherit" deletes the row. Returns [{"capability", "before", "after"}]
+    for every capability whose stored value actually changed (before/after
+    are "allow"/"deny"/"inherit" -- the STORED setting, not the effective
+    one), for the audit entry. Raises KeyError for an unknown environment,
+    ValueError for bad input."""
     changes = validate_shared_permission_changes(changes)
+    if grantee is not None:
+        if environment_id is None:
+            raise ValueError("a per-user exception needs an environment")
+        if not isinstance(grantee, dict) or not valid_grant_identity(grantee.get("issuer"), grantee.get("subject")):
+            raise ValueError("user must be an Okta issuer URL and an Okta user id (sub)")
     import audit_store
     conn = audit_store._get_connection()
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    # (table, key columns, key values) for the one scope being changed.
+    if grantee is not None:
+        table, cols, keys = ("shared_permission_grants", ("environment_id", "issuer", "subject"),
+                             (environment_id, grantee["issuer"], grantee["subject"]))
+    elif environment_id is not None:
+        table, cols, keys = "shared_permission_overrides", ("environment_id",), (environment_id,)
+    else:
+        table, cols, keys = "shared_permission_defaults", (), ()
+    where = " AND ".join([f"{c} = ?" for c in cols] + ["capability = ?"])
+    scope_where = " AND ".join(f"{c} = ?" for c in cols) or "1 = 1"
     diff = []
     with audit_store._db_lock:
         if not conn.in_transaction:
@@ -4437,39 +4573,22 @@ def set_shared_permissions(changes, environment_id=None, updated_by=None):
             if environment_id is not None:
                 if conn.execute("SELECT 1 FROM app_environments WHERE environment_id = ?", (environment_id,)).fetchone() is None:
                     raise KeyError(f"No saved environment with id '{environment_id}'")
-                rows = conn.execute(
-                    "SELECT capability, value FROM shared_permission_overrides WHERE environment_id = ?", (environment_id,)
-                ).fetchall()
-            else:
-                rows = conn.execute("SELECT capability, value FROM shared_permission_defaults").fetchall()
+            rows = conn.execute(f"SELECT capability, value FROM {table} WHERE {scope_where}", keys).fetchall()
             current = {r["capability"]: r["value"] for r in rows}
             for capability, value in changes.items():
                 before = current.get(capability, "inherit")
                 if before == value:
                     continue
-                if environment_id is not None:
-                    if value == "inherit":
-                        conn.execute("DELETE FROM shared_permission_overrides WHERE environment_id = ? AND capability = ?",
-                                     (environment_id, capability))
-                    else:
-                        conn.execute(
-                            """INSERT INTO shared_permission_overrides (environment_id, capability, value, updated_at, updated_by)
-                               VALUES (?, ?, ?, ?, ?)
-                               ON CONFLICT(environment_id, capability) DO UPDATE SET
-                                   value=excluded.value, updated_at=excluded.updated_at, updated_by=excluded.updated_by""",
-                            (environment_id, capability, value, now, updated_by),
-                        )
+                if value == "inherit":
+                    conn.execute(f"DELETE FROM {table} WHERE {where}", keys + (capability,))
                 else:
-                    if value == "inherit":
-                        conn.execute("DELETE FROM shared_permission_defaults WHERE capability = ?", (capability,))
-                    else:
-                        conn.execute(
-                            """INSERT INTO shared_permission_defaults (capability, value, updated_at, updated_by)
-                               VALUES (?, ?, ?, ?)
-                               ON CONFLICT(capability) DO UPDATE SET
-                                   value=excluded.value, updated_at=excluded.updated_at, updated_by=excluded.updated_by""",
-                            (capability, value, now, updated_by),
-                        )
+                    all_cols = cols + ("capability", "value", "updated_at", "updated_by")
+                    conn.execute(
+                        f"""INSERT INTO {table} ({", ".join(all_cols)}) VALUES ({", ".join("?" * len(all_cols))})
+                            ON CONFLICT({", ".join(cols + ("capability",))}) DO UPDATE SET
+                                value=excluded.value, updated_at=excluded.updated_at, updated_by=excluded.updated_by""",
+                        keys + (capability, value, now, updated_by),
+                    )
                 diff.append({"capability": capability, "before": before, "after": value})
             conn.commit()
         except BaseException:

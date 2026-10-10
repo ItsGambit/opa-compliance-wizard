@@ -2,6 +2,116 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.43.0 — **Shared users can no longer write to the owner's OPA team / Okta org or import a CSV into the owner's archive unless an admin allows it; admins can make exceptions for one user; an additional login gate's site no longer reaches the shared-permission settings or archive purges.**
+A minor release: the per-user exceptions are a new feature (a new
+migration, a new API field, a new screen section and a new header from the
+login gate). The new defaults and the second-gate blocks were 5.42.0's open
+decisions SP-1, SP-2 and SP-5.
+- **What shared users lose on upgrade.** A user working in an environment
+  ANOTHER user owns and has shared now gets `403` with `"reason":
+  "shared_permission_denied"` when they:
+  - **write to the owner's OPA team or Okta org** with the owner's
+    credentials (`tenant_write`): create resource groups, projects, folders
+    and security policies, delete folders, change group membership, create
+    Okta groups with Group Push, run the Folder Builder's Create Folders;
+  - **import a CSV into the owner's compliance archive** (`import_csv`).
+  This applies from the first start of 5.43.0 (they are built-in defaults,
+  not stored settings, so there is nothing to migrate) -- including when
+  upgrading straight from 5.41.0 or older, where shared users could do both.
+  Owners are never limited. Reading (archived reports, live queries) and
+  resetting the sync watermark stay allowed; Sync now and the sync settings
+  stay off, as in 5.42.0.
+- **How an admin allows it again.** **Shared permissions** (sidebar) sets
+  the global default for every shared environment; **Environments → Shared
+  permissions** on one environment overrides it for that environment; set
+  *Write to the OPA tenant / Okta org* or *Import a CSV into the archive*
+  to *Allow*. Each change needs a fresh MFA approval (hosted mode) and is
+  audit-logged as `shared_permissions.update`. Do it from the main login
+  address (see below).
+- **Per-user exceptions.** **Environments → Shared permissions → Per-user
+  exceptions** allows or refuses one thing for one user on one
+  environment, whatever that environment's setting says (a user exception
+  beats the environment's override, which beats the global default, which
+  beats the built-in default). Pick the user by e-mail from everyone the
+  login gates have vouched for since this version (they must have signed
+  in once), or type their Okta issuer and user id. Same admin-only rule,
+  same MFA approval, same `shared_permissions.update` audit entry (`"scope":
+  "user"`, with the user and each value before and after). One check still
+  decides everything (`shared_capability_allowed`, now told the caller's
+  issuer), and the environment list's `permissions` show `"source":
+  "user"` for the caller's own exception.
+- **Users are told apart by Okta org.** A user is the login gate's Okta
+  issuer plus their Okta user id (`sub`): an id alone is only unique
+  within one Okta org (OpenID Connect Core 1.0, section 5.7), and an
+  additional gate fronts another org. The gate now sends its issuer as
+  `X-Auth-Issuer` on `/verify`; nginx forwards it like `X-Auth-Sub`
+  (overwriting a client-sent copy) together with `X-Nginx-Issuer-Forwarded`
+  set to the proxy secret, and `serve.py` believes the issuer only with
+  both the proxy secret and that marker -- an older site passes a
+  client-sent issuer through untouched and never sends the marker. An
+  exception never matches the same id from another org, nor a request
+  without a believed issuer (local mode, or a site or gate older than this
+  release). The audit log records the actor's issuer
+  (`details.actor_issuer`) when there is one. Changing a gate's Okta
+  authorization server (`OKTA_AUTH_SERVER`) changes its issuer, so its
+  users' exceptions stop matching and must be set again. The picker's list
+  (`known_identities`) is refreshed when a user reaches the backend, at
+  most once a day, and a user not recorded for 400 days whom no exception
+  names is dropped from it.
+- **An additional login gate's site (SP-5).** Like Access control
+  (GATE-04), the site `setup-second-gate.sh` generates now answers `403`
+  on the shared-permission settings (`/api/shared_permissions`, read and
+  write), the orphaned-archive list and purge (`/api/archives`), and an
+  environment delete that also purges its archive (`?purge_archive=1`): a
+  location can't match a query string, so the site refuses any `DELETE`
+  whose raw query string mentions `purge` or carries a percent-escape,
+  checked before any location and on the request exactly as sent (nginx's
+  normalised path could differ from the one `serve.py` routes on).
+  Ordinary deletes (`?id=<uuid>` at most) pass. These are settings of the
+  whole backend, changed from the main gate's site; there the dashboard
+  says so instead of a bare `403`. Its users' own Environments changes
+  still work. The environment list no longer carries other users'
+  exceptions (only `/api/shared_permissions` does).
+- **Paths with `.` or `..` segments** (also percent-encoded) under
+  `/api/` are refused with `400`: nginx resolves them before its own checks
+  while `serve.py` routes on the raw path, so the two could disagree about
+  which route a request is. No route of this app has one.
+- **Operator action and deploy impact.**
+  - **Migration 009** (automatic at start): adds `shared_permission_grants`
+    (removed with their environment) and `known_identities`. Nothing
+    existing is altered; no evidence-chain table is touched. Rollback-safe:
+    older code ignores both tables. A rollback to 5.42.0 or older also
+    brings back that release's defaults: shared users may write to the
+    owner's tenant and import CSVs again unless an admin stored a global
+    *Don't allow* for both before rolling back.
+  - **nginx:** the main site template forwards `X-Auth-Issuer`;
+    `deploy.sh` applies it and restarts every login gate, as usual.
+  - **An additional gate's site picks up none of this until it is
+    regenerated** (`deploy.sh` never touches it): remove
+    `/etc/nginx/sites-available/opa-<name>` and its `sites-enabled` link
+    and re-run the same `setup-second-gate.sh` command (docs/hosting.md),
+    AFTER deploying 5.43.0 (it is built from the live main site). Until
+    then that site has no SP-5 blocks, its users' issuer is not believed
+    (no marker, so no per-user exception applies there), and -- if it
+    predates 5.42.0 -- it still refuses Environments changes
+    (`step_up_unavailable`).
+- **Tests.** The built-in defaults are pinned in two places (the engine
+  test and the authz matrix, which now states them itself), and every
+  tenant-write and CSV-import route is driven as a shared user with
+  nothing configured (`403 shared_permission_denied`) as well as through
+  global/override changes. Per-user exceptions: precedence in both
+  directions, no match across orgs or without an issuer, the issuer header
+  believed only from nginx, a granted user can run Sync now and another
+  shared user (or the same id from another org) can't, MFA binding (the
+  save's body can't change the user or capability; single use; another
+  admin can't spend it), audit details, migration 009 constraints, the
+  picker. The generated second site is served by a real nginx: every
+  blocked route (and encoded / mixed-case / double-slash forms of the
+  purge, including `..` / `%2e%2e` paths that nginx and `serve.py` would
+  read differently) answers `403` without reaching the backend, everything
+  else is still proxied with the gate's issuer; a client-sent issuer or
+  marker never reaches the backend. Every new rule was mutation-checked.
+
 5.42.0 — **Admins decide what users may do with an environment shared with them (a global default plus per-environment overrides), and every change in the Environments area now needs a fresh MFA approval.**
 A minor release (two new features). Until now a shared environment gave
 every other logged-in user the owner's credentials for everything this app

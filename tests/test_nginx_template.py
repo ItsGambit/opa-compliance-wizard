@@ -34,6 +34,7 @@ from server import nginx_second_site
 
 REPO = Path(__file__).resolve().parent.parent
 TEMPLATE = REPO / "server" / "nginx-opa-secrets-wizard.conf"
+GATE_ISSUER = "https://login.example.org/oauth2/default"
 
 
 def _nginx_bin():
@@ -180,6 +181,7 @@ def served(tmp_path):
                     self.send_header("X-Auth-Sub", "00uREALUSER")
                     self.send_header("X-Auth-User", "user@example.com")
                     self.send_header("X-Auth-Is-Admin", "false")
+                    self.send_header("X-Auth-Issuer", GATE_ISSUER)
                     if stepup:
                         self.send_header("X-Auth-Action-Id", "action-from-the-signed-cookie")
                 else:
@@ -269,12 +271,14 @@ def test_security_headers_on_every_kind_of_response(served, path, cookie):
 
 def test_healthz_is_an_exact_match_and_drops_client_identity_headers(served):
     request, rec, _ = served
-    resp = request("/healthz", {"X-Auth-Sub": "00uVICTIM", "X-Auth-Is-Admin": "true",
+    resp = request("/healthz", {"X-Auth-Sub": "00uVICTIM", "X-Auth-Is-Admin": "true", "X-Auth-Issuer": "https://evil.example",
+                                "X-Nginx-Issuer-Forwarded": "guess",
                                 "X-Nginx-Proxy-Secret": "guess", "X-Auth-User": "x", "X-Auth-Action-Id": "y"})
     assert resp.status == 200
     _path, headers = rec.backend_requests[-1]
     lowered = {k.lower() for k in headers}
-    for name in ("x-auth-sub", "x-auth-is-admin", "x-nginx-proxy-secret", "x-auth-user", "x-auth-action-id"):
+    for name in ("x-auth-sub", "x-auth-is-admin", "x-nginx-proxy-secret", "x-auth-user", "x-auth-action-id",
+                 "x-auth-issuer", "x-nginx-issuer-forwarded"):
         assert name not in lowered
     # /healthzanything no longer skips the login: it goes through auth_request.
     before = len(rec.backend_requests)
@@ -339,3 +343,141 @@ def test_ordinary_routes_drop_client_sent_step_up_headers(served):
     _path, headers = rec.backend_requests[-1]
     lowered = {k.lower() for k in headers}
     assert "x-auth-action-id" not in lowered and "x-nginx-stepup-location" not in lowered
+
+
+# 5.43.0: the gate's issuer reaches the backend from the gate only.
+def test_the_gates_issuer_replaces_a_client_sent_one(served):
+    request, rec, _ = served
+    forged = {"Cookie": "opa_wizard_session=good", "X-Auth-Issuer": "https://evil.example"}
+    forged["X-Nginx-Issuer-Forwarded"] = "guess"
+    assert request("/api/environments", forged).status == 200
+    assert rec.backend_requests[-1][1]["X-Auth-Issuer"] == GATE_ISSUER
+    marker = rec.backend_requests[-1][1]["X-Nginx-Issuer-Forwarded"]
+    assert marker == rec.backend_requests[-1][1]["X-Nginx-Proxy-Secret"] != "guess"
+    resp = request("/api/environment_changes/save", {**forged, "Cookie": "opa_wizard_session=good; opa_wizard_stepup=good"})
+    assert resp.status == 200 and rec.backend_requests[-1][1]["X-Auth-Issuer"] == GATE_ISSUER
+
+
+# ---------------------------------------------------------------------------
+# GATE-04 + SP-5 (5.43.0): an additional gate's site, generated from the
+# template by server/nginx_second_site.py and served for real -- the
+# whole-backend admin routes are refused there and never reach the backend.
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def served_second(tmp_path):
+    seen = []
+
+    class Gate(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if not self.path.startswith("/verify"):  # /login etc.: off to the IdP
+                self.send_response(302)
+                self.send_header("Location", "https://idp.example.com/authorize")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            cookie = self.headers.get("Cookie") or ""
+            ok = "opa_wizard_session=good" in cookie and (
+                "require_stepup=1" not in self.path or "opa_wizard_stepup=good" in cookie)
+            self.send_response(200 if ok else 401)
+            if ok:
+                self.send_header("X-Auth-Sub", "00uSECONDORG")
+                self.send_header("X-Auth-User", "admin@second.example")
+                self.send_header("X-Auth-Is-Admin", "true")  # an admin of the SECOND org
+                self.send_header("X-Auth-Issuer", "https://second.example")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    class Backend(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _any(self):
+            seen.append((self.command, self.path, dict(self.headers)))
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        do_GET = do_POST = do_DELETE = _any
+
+    gate, backend = _start(Gate), _start(Backend)
+    crt, key = _self_signed(tmp_path)
+    main = _template_with(tmp_path, crt, key, backend=backend.server_address[1])
+    second_port = _free_port()
+    second = nginx_second_site.build(TEMPLATE.read_text(), gate.server_address[1], f"127.0.0.1:{second_port}",
+                                     "opa.example.com", "second")
+    second = second.replace("127.0.0.1:8766", f"127.0.0.1:{backend.server_address[1]}")
+    conf = _write_config(tmp_path, main, [second])
+    assert _nginx_t(conf, tmp_path).returncode == 0
+    proc = subprocess.Popen([NGINX, "-p", str(tmp_path), "-c", str(conf), "-e", str(tmp_path / "logs" / "e.log")],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            socket.create_connection(("127.0.0.1", second_port), timeout=0.2).close()
+            break
+        except OSError:
+            time.sleep(0.05)
+
+    def request(method, path):
+        conn = http.client.HTTPConnection("127.0.0.1", second_port, timeout=10)
+        conn.request(method, path, body=b"{}" if method == "POST" else None,
+                     headers={"Cookie": "opa_wizard_session=good", "Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        return resp.status
+
+    try:
+        yield request, seen
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+        gate.shutdown()
+        backend.shutdown()
+
+
+@pytest.mark.parametrize("method,path", [
+    ("GET", "/api/access_control"), ("POST", "/api/access_control/save"), ("POST", "/api/access_control/prepare"),
+    ("GET", "/api/shared_permissions"), ("POST", "/api/shared_permissions"),
+    ("GET", "/api/archives/orphaned"), ("DELETE", "/api/archives/aaaaaaaa-0000-4000-8000-0000000000ff"),
+    ("DELETE", "/api/environments/dev?purge_archive=1"),
+    ("DELETE", "/api/environments/dev?id=aaaaaaaa-0000-4000-8000-000000000001&purge_archive=true"),
+    ("DELETE", "/api/environments/dev?PURGE_ARCHIVE=1"),
+    ("DELETE", "/api/environments/dev?purge%5Farchive=1"),       # serve.py would decode the name
+    ("DELETE", "/api/environments/dev?purge_archive=%31"),       # ... and the value
+    ("DELETE", "/api/%65nvironments/dev?purge_archive=1"),       # nginx's $uri is decoded
+    ("DELETE", "/api//environments/dev?purge_archive=1"),        # ... and has merged slashes
+    ("DELETE", "/api/environments/a%2Fb?purge_archive=1"),
+    # nginx resolves dot segments, serve.py routes on the raw path and an
+    # admin delete resolves its target by ?id= (Opus review, 5.43.0).
+    ("DELETE", "/api/environments/..?id=aaaaaaaa-0000-4000-8000-000000000001&purge_archive=1"),
+    ("DELETE", "/api/environments/%2e%2e?id=aaaaaaaa-0000-4000-8000-000000000001&purge_archive=1"),
+    ("DELETE", "/api/environments/./x?purge_archive=1"),
+    ("DELETE", "/api/x/../environments/dev?purge_archive=1"),
+    ("DELETE", "/api/resource_groups/x?purge_archive=1"),  # any DELETE path
+])
+def test_second_site_refuses_the_whole_backend_admin_routes(served_second, method, path):
+    request, seen = served_second
+    assert request(method, path) == 403
+    assert seen == []  # never reached the backend
+
+
+@pytest.mark.parametrize("method,path", [
+    ("GET", "/api/environments"),
+    ("DELETE", "/api/environments/dev"),
+    ("DELETE", "/api/environments/dev?id=aaaaaaaa-0000-4000-8000-000000000001"),  # what the UI sends
+    ("GET", "/api/environments?purge_archive=1"),                                  # only a DELETE purges
+    ("POST", "/api/environments/dev/sync/start"),
+    ("POST", "/api/environment_changes/save"),  # needs the step-up -> /login redirect, not a 403
+])
+def test_second_site_still_serves_everything_else(served_second, method, path):
+    request, seen = served_second
+    status = request(method, path)
+    if path == "/api/environment_changes/save":
+        assert status == 302 and seen == []
+        return
+    assert status == 200
+    assert seen[-1][0] == method and seen[-1][2]["X-Auth-Issuer"] == "https://second.example"

@@ -743,6 +743,50 @@ def _migration_008_shared_environment_permissions(conn):
     )
 
 
+
+def _migration_009_shared_permission_grants_and_known_identities(conn):
+    """5.43.0: per-user exceptions to the shared-environment permissions
+    (migration 008), and the identities the login gates have vouched for.
+    Two new tables, both IF NOT EXISTS; nothing existing is altered and no
+    evidence-chain table is touched. A new migration rather than an edit to
+    008: anyone who already ran 5.42.0 is at schema 8 and would never see
+    an edited 008.
+
+    - shared_permission_grants: one capability for one user on one
+      environment (allow/deny), above that environment's override. The
+      user is the pair (issuer, subject) -- the Okta issuer of the login
+      gate that authenticated them and their `sub` there. A `sub` alone is
+      only unique within one Okta org (OIDC Core 5.7: iss + sub together
+      are the stable identifier), and two gates can front different orgs.
+      Removed with their environment (ON DELETE CASCADE).
+    - known_identities: (issuer, subject) -> the e-mail last seen and when,
+      written when a gate-authenticated user first reaches the backend in a
+      process, so an admin can pick a user for a grant by e-mail.
+
+    A rollback to older code leaves both tables unused and harmless."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS shared_permission_grants (
+               environment_id TEXT NOT NULL REFERENCES app_environments(environment_id) ON DELETE CASCADE,
+               capability TEXT NOT NULL,
+               issuer TEXT NOT NULL CHECK (issuer <> ''),
+               subject TEXT NOT NULL CHECK (subject <> ''),
+               value TEXT NOT NULL CHECK (value IN ('allow', 'deny')),
+               updated_at TEXT NOT NULL,
+               updated_by TEXT,
+               PRIMARY KEY (environment_id, capability, issuer, subject)
+           )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS known_identities (
+               issuer TEXT NOT NULL,
+               subject TEXT NOT NULL,
+               email TEXT,
+               first_seen_at TEXT NOT NULL,
+               last_seen_at TEXT NOT NULL,
+               PRIMARY KEY (issuer, subject)
+           )"""
+    )
+
 MIGRATIONS = {
     1: _migration_001_unified_schema,
     2: _migration_002_ingestion_manifests,
@@ -752,6 +796,7 @@ MIGRATIONS = {
     6: _migration_006_evidence_chain_v2_and_sync_attempts,
     7: _migration_007_manifest_entries_and_chain_heads,
     8: _migration_008_shared_environment_permissions,
+    9: _migration_009_shared_permission_grants_and_known_identities,
 }
 
 # DATA-08: migration 4 needs ALTER TABLE ... DROP COLUMN (SQLite 3.35.0,

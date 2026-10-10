@@ -25,6 +25,7 @@ serve.py's first-match order. A new route without a matrix entry, or a
 changed route condition, fails test_matrix_covers_every_route.
 """
 import ast
+import datetime
 import json
 import socket
 import threading
@@ -287,6 +288,7 @@ def matrix_server(tmp_audit_store, tmp_environments_file, fake_keyring, tmp_audi
     monkeypatch.setattr(serve, "_run_access_job", lambda *a, **k: started.append(("access", a)))
     with serve._sessions_lock:
         serve._seen_owners.clear()
+        serve._recorded_identities.clear()  # 5.43.0: each test starts with a fresh DB
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
@@ -306,6 +308,7 @@ def matrix_server(tmp_audit_store, tmp_environments_file, fake_keyring, tmp_audi
     server_instance.server_close()
     with serve._sessions_lock:
         serve._seen_owners.clear()
+        serve._recorded_identities.clear()  # 5.43.0: each test starts with a fresh DB
 
 
 REAL_JOB_BODIES = {}  # the unpatched job functions, for tests that run one synchronously
@@ -1069,6 +1072,27 @@ def _share_a_dev_with_b_session(serve):
 
 CAP_ROUTES = [r for r in ROUTES.values() if r.caps]
 
+# What a shared non-owner gets with nothing configured, pinned here rather
+# than read from the engine (so a changed built-in default fails this
+# matrix too). 5.43.0 (SP-1, SP-2): tenant writes and CSV import are denied.
+BUILT_IN = {"view_archive": "allow", "live_read": "allow", "tenant_write": "deny", "import_csv": "deny",
+            "reset_watermark": "allow", "sync_now": "deny", "sync_settings": "deny"}
+
+
+def test_matrix_built_ins_match_the_engine():
+    assert {c["key"]: c["builtin"] for c in engine.SHARED_CAPABILITIES} == BUILT_IN
+
+
+def test_tenant_write_and_csv_import_routes_are_denied_to_shared_users_by_default():
+    """SP-1/SP-2: every route that writes to the owner's tenant or imports a
+    CSV checks a capability that is denied out of the box (the behavioural
+    403 per route is driven in test_shared_capabilities_default_global_and_override)."""
+    denied = [r for r in CAP_ROUTES if {"tenant_write", "import_csv"} & set(r.caps)]
+    tenant_routes = [r for r in denied if "tenant_write" in r.caps]
+    assert len(tenant_routes) == SERVE_PY.read_text(encoding="utf-8").count('("tenant_write",)') == 8
+    assert [r.sample for r in denied if "import_csv" in r.caps] == ["/api/environments/dev/sync/import_csv"]
+    assert all(any(BUILT_IN[c] == "deny" for c in r.caps) for r in denied)
+
 
 def _expected_when_allowed(route):
     # B reaches exactly what A reaches (B's session client is an upstream probe too).
@@ -1079,7 +1103,7 @@ def _expected_when_allowed(route):
 def test_shared_capabilities_default_global_and_override(matrix_server, route):
     base_url, serve = matrix_server
     env_id = _share_a_dev_with_b_session(serve)
-    builtin = {c["key"]: c["builtin"] for c in engine.SHARED_CAPABILITIES}
+    builtin = BUILT_IN
 
     def as_(who, admin=False):
         return _call(base_url, route.method, route.sample, route.body, _who(who, admin=admin))
@@ -1093,7 +1117,8 @@ def test_shared_capabilities_default_global_and_override(matrix_server, route):
         with serve._sync_jobs_lock:
             serve._sync_jobs.clear()
 
-    # 1. Built-in defaults (= the behaviour before 5.42.0).
+    # 1. Built-in defaults (5.43.0: tenant writes and CSV import denied ->
+    #    403 shared_permission_denied; the owner still reaches the route).
     resp = as_(OWNER_B)
     if all(builtin[c] == "allow" for c in route.caps):
         assert resp.status_code == _expected_when_allowed(route), (route.sample, resp.status_code, resp.text)
@@ -1217,6 +1242,205 @@ def test_shared_permission_settings_are_admin_only_and_audited(matrix_server, tm
     assert body["environments"][env_id]["overrides"] == {"tenant_write": "allow", "sync_now": "deny"}
     # The local-mode operator is the admin there.
     assert requests.get(url, timeout=10).status_code == 200
+
+
+# --- per-user exceptions (5.43.0) ----------------------------------------------
+PERSONAL_ISS = "https://login.example.org"      # e.g. an additional gate's org
+WORK_ISS = "https://work.example.com/oauth2/default"
+OWNER_C = "00uOWNERC"
+
+
+def _as_user(sub, issuer, email=None, admin=False):
+    # What a 5.43.0 nginx site sends: the gate's issuer plus the marker
+    # proving the site overwrote it (an older site passes client copies on).
+    headers = {**_who(sub, admin=admin), "X-Auth-Issuer": issuer, "X-Nginx-Issuer-Forwarded": SECRET}
+    if email:
+        headers["X-Auth-User"] = email
+    return headers
+
+
+def test_a_granted_user_can_sync_now_and_other_shared_users_cannot(matrix_server, monkeypatch):
+    base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    calls = []
+    monkeypatch.setattr(serve, "_start_sync_job", lambda *a, **k: calls.append((a, k)) or True)
+    url = base_url + "/api/environments/dev/sync/start"
+    engine.set_shared_permissions({"sync_now": "allow"}, environment_id=env_id,
+                                  grantee={"issuer": PERSONAL_ISS, "subject": OWNER_B})
+    resp = requests.post(url, json={}, headers=_as_user(OWNER_B, PERSONAL_ISS), timeout=10)
+    assert resp.status_code == 200, resp.text
+    assert calls[-1][1]["owner"] == OWNER_A  # still the owner's sync
+    # Everyone else stays on the setting: another shared user, the same sub
+    # vouched for by another org, the same sub with no verified issuer.
+    for headers in (_as_user(OWNER_C, PERSONAL_ISS), _as_user(OWNER_B, WORK_ISS), _who(OWNER_B),
+                    _as_user(OWNER_B, PERSONAL_ISS + "/oauth2/x"), _as_user(ADMIN, PERSONAL_ISS, admin=True)):
+        resp = requests.post(url, json={}, headers=headers, timeout=10)
+        assert resp.status_code == 403 and resp.json()["capability"] == "sync_now", (headers, resp.text)
+    assert len(calls) == 1
+    # The issuer is only believed from nginx (the proxy secret), like X-Auth-Sub.
+    marked = {"X-Auth-Sub": OWNER_B, "X-Auth-Issuer": PERSONAL_ISS, "X-Nginx-Proxy-Secret": SECRET,
+              "X-Nginx-Issuer-Forwarded": SECRET}
+    assert serve._issuer_from_headers(marked) == PERSONAL_ISS
+    assert serve._issuer_from_headers({**marked, "X-Nginx-Proxy-Secret": "wrong"}) is None
+    assert serve._issuer_from_headers({**marked, "X-Auth-Issuer": "https://x.example/evil"}) is None
+    # Through a site older than 5.43.0 (no marker; a client-sent issuer passes
+    # through it) or with a guessed marker, the issuer is not believed.
+    assert serve._issuer_from_headers({**marked, "X-Nginx-Issuer-Forwarded": "guess"}) is None
+    unmarked = {k: v for k, v in marked.items() if k != "X-Nginx-Issuer-Forwarded"}
+    assert serve._issuer_from_headers(unmarked) is None
+    resp = requests.post(url, json={}, headers=unmarked, timeout=10)
+    assert resp.status_code == 403 and resp.json()["capability"] == "sync_now"
+    # Local mode (no proxy secret at all) never has an issuer.
+    monkeypatch.setattr(serve, "NGINX_PROXY_SECRET", "")
+    assert serve._issuer_from_headers({**marked, "X-Nginx-Issuer-Forwarded": ""}) is None
+
+
+def test_a_user_deny_beats_the_environment_allow_over_http(matrix_server):
+    base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    engine.set_shared_permissions({"live_read": "deny"}, environment_id=env_id,
+                                  grantee={"issuer": PERSONAL_ISS, "subject": OWNER_B})
+    resp = requests.post(base_url + "/api/preview", json={"resource_group_id": RG, "project_id": PROJ, "rows": [{"path": "A"}]},
+                         headers=_as_user(OWNER_B, PERSONAL_ISS), timeout=10)
+    assert resp.status_code == 403 and resp.json()["capability"] == "live_read"
+    assert requests.post(base_url + "/api/preview", json={"resource_group_id": RG, "project_id": PROJ, "rows": [{"path": "A"}]},
+                         headers=_as_user(OWNER_B, WORK_ISS), timeout=10).status_code != 403
+
+
+def test_environment_list_shows_the_callers_own_exception(matrix_server):
+    base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    engine.set_shared_permissions({"sync_now": "allow"}, environment_id=env_id,
+                                  grantee={"issuer": PERSONAL_ISS, "subject": OWNER_B})
+    rows = requests.get(base_url + "/api/environments", headers=_as_user(OWNER_B, PERSONAL_ISS), timeout=10).json()
+    assert rows["environments"][0]["permissions"]["sync_now"] == {"value": "allow", "source": "user"}
+    assert "permission_grants" not in rows["environments"][0]
+    rows = requests.get(base_url + "/api/environments", headers=_as_user(OWNER_B, WORK_ISS), timeout=10).json()
+    assert rows["environments"][0]["permissions"]["sync_now"] == {"value": "deny", "source": "built_in"}
+    admin_row = next(e for e in requests.get(base_url + "/api/environments", headers=_who(ADMIN, admin=True),
+                                             timeout=10).json()["environments"] if e["id"] == env_id)
+    # Grants (other users' e-mails) are not in the list: it is reachable from
+    # an additional gate's site, /api/shared_permissions is not (SP-5).
+    assert "permission_grants" not in admin_row and "permission_overrides" in admin_row
+
+
+def test_identities_are_recorded_for_the_picker_and_grants_are_audited(matrix_server, tmp_audit_log):
+    base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    requests.get(base_url + "/api/environments", headers=_as_user(OWNER_B, PERSONAL_ISS, "me@example.org"), timeout=10)
+    requests.get(base_url + "/api/environments", headers=_who(OWNER_C), timeout=10)  # no issuer: not recorded
+    url = base_url + "/api/shared_permissions"
+    body = requests.get(url, headers=_who(ADMIN, admin=True), timeout=10).json()
+    assert [(i["issuer"], i["subject"], i["email"]) for i in body["identities"]] == [
+        (PERSONAL_ISS, OWNER_B, "me@example.org")]
+    user = {"issuer": PERSONAL_ISS, "subject": OWNER_B}
+    # Admin-only, validated, needs an environment.
+    assert requests.post(url, json={"environment_id": env_id, "user": user, "changes": {"sync_now": "allow"}},
+                         headers=_who(OWNER_A), timeout=10).status_code == 403
+    for bad in ({"environment_id": env_id, "user": {"issuer": PERSONAL_ISS, "subject": "a-b"}},
+                {"environment_id": env_id, "user": {"subject": OWNER_B}},
+                {"environment_id": env_id, "user": "00uOWNERB"},
+                {"user": user}):
+        resp = requests.post(url, json={**bad, "changes": {"sync_now": "allow"}}, headers=_who(ADMIN, admin=True), timeout=10)
+        assert resp.status_code == 400, (bad, resp.text)
+    assert audit_store._get_connection().execute("SELECT COUNT(*) FROM shared_permission_grants").fetchone()[0] == 0
+    resp = requests.post(url, json={"environment_id": env_id, "user": user, "changes": {"sync_now": "allow"}},
+                         headers=_who(ADMIN, admin=True), timeout=10)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["grants"] == [{**user, "email": "me@example.org", "capability": "sync_now", "value": "allow"}]
+    assert resp.json()["overrides"] == {}
+    entries = [json.loads(line) for line in open(tmp_audit_log, encoding="utf-8") if line.strip()]
+    update, = [e for e in entries if e["action"] == "shared_permissions.update"]
+    assert update["details"] == {"scope": "user", "environment_id": env_id, "name": "dev",
+                                 "user": {**user, "email": "me@example.org"},
+                                 "changes": [{"capability": "sync_now", "before": "inherit", "after": "allow"}]}
+    assert requests.get(url, headers=_who(ADMIN, admin=True), timeout=10).json()["environments"][env_id]["grants"] == \
+        resp.json()["grants"]
+    # The actor's own org is recorded when nginx vouches for it.
+    requests.post(url, json={"environment_id": env_id, "user": user, "changes": {"sync_now": "deny"}},
+                  headers=_as_user(ADMIN, WORK_ISS, admin=True), timeout=10)
+    last = [json.loads(line) for line in open(tmp_audit_log, encoding="utf-8") if line.strip()][-1]
+    assert last["action"] == "shared_permissions.update" and last["details"]["actor_issuer"] == WORK_ISS
+
+
+def test_identities_are_refreshed_daily_not_on_every_request(matrix_server, monkeypatch):
+    base_url, serve = matrix_server
+    _share_a_dev_with_b_session(serve)
+    calls = []
+    real = engine.record_known_identity
+    monkeypatch.setattr(engine, "record_known_identity", lambda *a: calls.append(a) or real(*a))
+    headers = _as_user(OWNER_B, PERSONAL_ISS, "me@example.org")
+    for _ in range(3):
+        requests.get(base_url + "/api/environments", headers=headers, timeout=10)
+    assert len(calls) == 1
+    serve._recorded_identities_day[0] = datetime.date(2000, 1, 1)  # the next day
+    requests.get(base_url + "/api/environments", headers=headers, timeout=10)
+    assert len(calls) == 2
+
+
+def test_a_grant_reaches_the_step_up_executors_too(matrix_server):
+    """The Environments-change executors check through _shared_refusal --
+    with the caller's issuer, like every other route."""
+    base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    url = base_url + "/api/environments/dev/sync/import_csv"
+    body = {"csv_path": "syslog_export.csv"}
+    engine.set_shared_permissions({"import_csv": "allow"}, environment_id=env_id,
+                                  grantee={"issuer": PERSONAL_ISS, "subject": OWNER_B})
+    assert requests.post(url, json=body, headers=_as_user(OWNER_B, WORK_ISS), timeout=10).status_code == 403
+    assert requests.post(url, json=body, headers=_as_user(OWNER_B, PERSONAL_ISS), timeout=10).status_code == 200
+
+
+def test_paths_with_dot_segments_are_refused(matrix_server):
+    """nginx resolves . / .. before its own checks while serve.py routes on
+    the raw path -- an admin delete resolves by ?id= whatever the name, so
+    /api/environments/..?id=<id>&purge_archive=1 could slip past the
+    additional gate's purge block. No route has such a segment."""
+    base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    import http.client
+    from urllib.parse import urlparse as _urlparse
+
+    host = _urlparse(base_url)
+
+    def raw(method, target):  # sent exactly as written (requests would resolve the dots first)
+        conn = http.client.HTTPConnection(host.hostname, host.port, timeout=10)
+        conn.request(method, target, headers=_who(ADMIN, admin=True))
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        return resp.status
+
+    for path in ("/api/environments/..", "/api/environments/%2e%2e", "/api/environments/%2E", "/api/./environments",
+                 "/api/environments/dev/../x"):
+        assert raw("DELETE", f"{path}?id={env_id}&purge_archive=1") == 400, path
+        assert raw("GET", path) == 400, path
+    assert env_id in engine.list_all_environments()
+    assert requests.get(base_url + "/api/environments", headers=_who(OWNER_A), timeout=10).status_code == 200
+
+
+def test_a_grant_change_is_bound_to_its_mfa_approval(matrix_server, monkeypatch):
+    base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    user = {"issuer": PERSONAL_ISS, "subject": OWNER_B}
+    aid = _prepare(base_url, "POST", "/api/shared_permissions",
+                   {"environment_id": env_id, "user": user, "changes": {"sync_now": "allow"}}, ADMIN, admin=True)
+    assert audit_store._get_connection().execute("SELECT COUNT(*) FROM shared_permission_grants").fetchone()[0] == 0
+    # The save's own body can't redirect the approval to another user or capability.
+    resp = requests.post(base_url + "/api/environment_changes/save",
+                         json={"environment_id": env_id, "user": {"issuer": PERSONAL_ISS, "subject": OWNER_C},
+                               "changes": {"tenant_write": "allow"}},
+                         headers={**_who(ADMIN, admin=True), "X-Auth-Action-Id": aid,
+                                  "X-Nginx-Stepup-Location": SECRET}, timeout=10)
+    assert resp.status_code == 200, resp.text
+    assert engine.get_shared_permission_grants(env_id) == [{**user, "email": None, "capability": "sync_now", "value": "allow"}]
+    assert _stepup(base_url, ADMIN, aid, admin=True).status_code != 200  # single use
+    # Another admin can't spend this admin's approval.
+    aid = _prepare(base_url, "POST", "/api/shared_permissions",
+                   {"environment_id": env_id, "user": user, "changes": {"sync_now": "inherit"}}, ADMIN, admin=True)
+    assert _stepup(base_url, "00uOTHERADMIN", aid, admin=True).status_code != 200
+    assert len(engine.get_shared_permission_grants(env_id)) == 1
 
 
 def test_overrides_go_with_their_environment(matrix_server):
@@ -1468,6 +1692,7 @@ def test_every_check_runs_again_when_the_approved_change_is_applied(matrix_serve
         engine.set_shared_permissions({"reset_watermark": "deny"}, environment_id=env_id)
         expected, who, admin = (403, "shared_permission_denied"), OWNER_B, False
     elif case == "import_csv_revoked":
+        engine.set_shared_permissions({"import_csv": "allow"})  # built-in is deny (5.43.0)
         aid = _prepare(base_url, "POST", "/api/environments/dev/sync/import_csv", {"csv_path": "syslog_export.csv"}, OWNER_B)
         engine.set_shared_permissions({"import_csv": "deny"})
         expected, who, admin = (403, "shared_permission_denied"), OWNER_B, False

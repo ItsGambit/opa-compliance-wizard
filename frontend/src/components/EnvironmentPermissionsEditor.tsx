@@ -3,19 +3,23 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { isStepUpRequired, saveSharedPermissions } from '../api/client'
 import { useSharedPermissions } from '../api/hooks'
 import { toast } from '../hooks/useToast'
-import type { Environment, PermissionSetting, SharedCapabilityKey } from '../types'
-import { SOURCE_LABELS, changedSettings } from '../utils/sharedPermissions'
+import type { Environment, GrantUser, PermissionSetting, SharedCapabilityKey } from '../types'
+import { SOURCE_LABELS, changedSettings, mainAddressOnly } from '../utils/sharedPermissions'
 import { beginStepUp } from '../utils/stepUp'
 import { ErrorNotice } from './ErrorNotice'
 import { PermissionSettingsList } from './PermissionSettingsList'
+import { UserPermissionExceptions } from './UserPermissionExceptions'
 
 /** 5.42.0, admin-only: one environment's overrides of the global
  * shared-environment defaults (inherit / allow / deny per capability), with
- * the value in effect and where it comes from. */
-export function EnvironmentPermissionsEditor({ env, draft }: {
+ * the value in effect and where it comes from; since 5.43.0 also its
+ * per-user exceptions. */
+export function EnvironmentPermissionsEditor({ env, draft, draftUser }: {
   env: Environment
   /** Settings restored after an MFA approval that didn't complete. */
   draft?: Partial<Record<SharedCapabilityKey, PermissionSetting>>
+  /** Set when `draft` was one user's exceptions, not the environment's. */
+  draftUser?: GrantUser
 }) {
   const queryClient = useQueryClient()
   const { data, isLoading, isError, error, refetch, isFetching } = useSharedPermissions(true)
@@ -31,7 +35,7 @@ export function EnvironmentPermissionsEditor({ env, draft }: {
   useEffect(() => {
     if (data && !seeded.current) {
       seeded.current = true
-      setSettings({ ...stored(), ...(draft ?? {}) })
+      setSettings({ ...stored(), ...(draftUser ? {} : draft ?? {}) })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data])
@@ -56,7 +60,7 @@ export function EnvironmentPermissionsEditor({ env, draft }: {
   })
 
   if (isLoading) return <div className="text-xs text-text-dim">Loading…</div>
-  if (isError) return <ErrorNotice title="Could not load shared permissions" error={error} onRetry={() => refetch()} retrying={isFetching} />
+  if (isError) return <ErrorNotice title="Could not load shared permissions" error={mainAddressOnly(error)} onRetry={() => refetch()} retrying={isFetching} />
   if (!data || !row) return null
   return (
     <div className="flex flex-col gap-2 border-t border-border-sub pt-2" role="group" aria-label={`Shared permissions for ${env.name}`}>
@@ -80,6 +84,7 @@ export function EnvironmentPermissionsEditor({ env, draft }: {
       >
         Verify &amp; Save
       </button>
+      <UserPermissionExceptions env={env} data={data} draftUser={draftUser} draft={draftUser ? draft : undefined} />
     </div>
   )
 }

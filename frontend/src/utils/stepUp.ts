@@ -1,4 +1,4 @@
-import type { EnvironmentFormValues, PermissionSetting, SharedCapabilityKey, SyncSchedule } from '../types'
+import type { EnvironmentFormValues, GrantUser, PermissionSetting, SharedCapabilityKey, SyncSchedule } from '../types'
 
 /** 5.42.0: what the browser remembers across the step-up MFA round trip
  * (a full-page redirect to Okta and back, the same one the Access Control
@@ -20,8 +20,12 @@ export type PendingStepUp =
       /** Sync settings form input, and which environment it was for. */
       syncDraft?: { environmentId: string; schedule: SyncSchedule }
       /** Shared-permission settings being saved (environmentId absent =
-       * the global defaults). */
-      permissionsDraft?: { environmentId?: string; settings: Partial<Record<SharedCapabilityKey, PermissionSetting>> }
+       * the global defaults; user = one user's exceptions, 5.43.0). */
+      permissionsDraft?: {
+        environmentId?: string
+        user?: GrantUser
+        settings: Partial<Record<SharedCapabilityKey, PermissionSetting>>
+      }
       /** Which screen to reopen if the change wasn't applied. */
       reopen?: 'environments' | 'orphaned_archives' | 'shared_permissions'
     }

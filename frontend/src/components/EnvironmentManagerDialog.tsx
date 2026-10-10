@@ -316,6 +316,7 @@ export function EnvironmentManagerDialog({ data, open, onOpenChange, isAdmin, ca
                     <EnvironmentPermissionsEditor
                       env={env}
                       draft={restore?.permissionsDraft?.environmentId === env.id ? restore.permissionsDraft.settings : undefined}
+                      draftUser={restore?.permissionsDraft?.environmentId === env.id ? restore.permissionsDraft.user : undefined}
                     />
                   )}
                   {confirmingShare === env.id && (

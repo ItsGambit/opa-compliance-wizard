@@ -6,6 +6,7 @@ import { fetchOrphanedArchives, isStepUpRequired, purgeOrphanedArchive } from '.
 import { toast } from '../hooks/useToast'
 import { formatDateTime } from '../utils/format'
 import { formatBytes, purgeConfirmationToken } from '../utils/orphanedArchives'
+import { mainAddressOnly } from '../utils/sharedPermissions'
 import { beginStepUp } from '../utils/stepUp'
 import { DialogCloseButton } from './DialogCloseButton'
 import { ErrorNotice } from './ErrorNotice'
@@ -88,7 +89,7 @@ export function OrphanedArchivesDialog({ open, onOpenChange }: Props) {
           </Dialog.Description>
 
           {isLoading && <div className="text-xs text-text-faint">Loading…</div>}
-          {isError && <ErrorNotice title="Could not list orphaned archives" error={error} onRetry={() => refetch()} retrying={isFetching} />}
+          {isError && <ErrorNotice title="Could not list orphaned archives" error={mainAddressOnly(error)} onRetry={() => refetch()} retrying={isFetching} />}
           {!isLoading && !isError && archives.length === 0 && (
             <div className="text-xs text-text-dim">No orphaned archives. Every archive belongs to an existing environment.</div>
           )}

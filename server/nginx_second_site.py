@@ -6,7 +6,10 @@ templated), keeps only its HTTPS server block, and:
 - answers to the new hostname,
 - drops the ssl_* lines (TLS ends in front of this site, e.g. at Cloudflare) and sends
   X-Forwarded-Proto https accordingly,
-- points every route that went to the main gate (127.0.0.1:8767) at the additional gate.
+- points every route that went to the main gate (127.0.0.1:8767) at the additional gate,
+- answers 403 to the whole-backend admin routes: Access control (GATE-04), and since 5.43.0 the
+  shared-environment permissions, the orphaned-archive list/purge and an environment delete that
+  also purges its archive (SP-5).
 The backend (127.0.0.1:8766), auth_request rules and the proxy secret stay exactly as in the main site.
 
 Usage: python3 server/nginx_second_site.py <main site> <output> <gate port> <listen> <host> <name>
@@ -136,10 +139,47 @@ def _location_blocks(text):
 # there is no "this gate's own access control" for it to edit instead --
 # the simplest and safest fix is to make these three routes unreachable
 # from an additional gate's hostname entirely.
+#
+# SP-5 (5.43.0): the same reasoning covers the other settings that belong
+# to the whole backend rather than to one org -- the shared-environment
+# permissions (who may do what with another user's environment, read and
+# write: /api/shared_permissions) and destroying evidence (the orphaned-
+# archive list and purge: /api/archives). Same mechanism: one prefix
+# location per route family that answers 403 before any login check, so a
+# request never reaches the backend. Admins change these from the main
+# gate's site.
+SECOND_SITE_DENIED_PREFIXES = ("/api/access_control", "/api/shared_permissions", "/api/archives")
+
 _ACCESS_CONTROL_BLOCK = (
     "\n    # GATE-04: access_control.json belongs to the MAIN org only --\n"
     "    # see server/nginx_second_site.py's module comment.\n"
     "    location /api/access_control {\n"
+    "        return 403;\n"
+    "    }\n"
+    "    # SP-5: shared-environment permissions and orphaned-archive purges are\n"
+    "    # whole-backend admin settings too -- changed from the main site only.\n"
+    "    location /api/shared_permissions {\n"
+    "        return 403;\n"
+    "    }\n"
+    "    location /api/archives {\n"
+    "        return 403;\n"
+    "    }\n"
+    # Deleting an environment WITH its archive (DELETE
+    # /api/environments/<name>?purge_archive=1) is the same admin-only
+    # evidence purge, but a location can't match a query string. A
+    # server-level rewrite check runs before any location is chosen, so
+    # nothing in the site can shadow it. It tests the RAW request line
+    # ($request_uri), not nginx's normalised $uri, and no path at all:
+    # serve.py routes on the raw path, and an admin delete resolves its
+    # target by ?id= whatever the name, so /api/environments/..?id=..
+    # (normalised by nginx to /api/) must not slip past. Any DELETE whose
+    # query string names "purge" in any case, or carries a percent-escape
+    # (which serve.py would decode into one), is refused. The UI's deletes
+    # send at most ?id=<uuid> and pass.
+    "    # SP-5: deleting an environment together with its archive is the same\n"
+    "    # purge (?purge_archive=1); a location can't match a query string.\n"
+    "    set $opa_second_site_delete \"$request_method $request_uri\";\n"
+    "    if ($opa_second_site_delete ~* \"^DELETE [^?]*\\?.*(purge|%)\") {\n"
     "        return 403;\n"
     "    }\n"
 )
@@ -195,13 +235,17 @@ def build(main_site, gate_port, listen, host, name, allow_public_listen=False):
         raise ValueError("the HTTPS listen directive was not rewritten")
     if not re.search(rf"(?<![A-Za-z0-9_$])server_name {re.escape(host)};", structure):
         raise ValueError("server_name was not rewritten")
-    # A regex location could also match /api/access_control/save and win over
-    # the prefix deny block (regex locations beat prefix ones in nginx).
-    if any("access_control" in path for path, _ in _location_blocks(b)
-           if path not in ("/api/access_control",)):
-        raise ValueError("another location matching /api/access_control survived -- it could shadow the deny block")
-    if "location /api/access_control {" not in structure:
-        raise ValueError("access_control block was not inserted")
+    # A regex location could also match /api/access_control/save (or another
+    # denied route) and win over the prefix deny block (regex locations beat
+    # prefix ones in nginx), as could a longer prefix location.
+    for prefix in SECOND_SITE_DENIED_PREFIXES:
+        word = prefix.rsplit("/", 1)[-1]
+        if any(word in path for path, _ in _location_blocks(b) if path != prefix):
+            raise ValueError(f"another location matching {prefix} survived -- it could shadow the deny block")
+        if not re.search(rf"location {re.escape(prefix)} \{{\s*return 403;\s*\}}", structure):
+            raise ValueError(f"{prefix} deny block was not inserted")
+    if "if ($opa_second_site_delete ~* " not in structure or "set $opa_second_site_delete " not in structure:
+        raise ValueError("the purge-on-delete deny was not inserted")
     if re.search(r"location\s+(=\s*)?/api/access_control/save", structure):
         raise ValueError("the main site's own access_control/save location survived -- it would shadow the deny block")
     header = (f"# OPA auth gate '{name}' on {host}. Generated from sites-available/opa-secrets-wizard by\n"

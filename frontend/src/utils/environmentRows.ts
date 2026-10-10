@@ -36,7 +36,8 @@ export function can(env: Environment, capability: SharedCapabilityKey): boolean 
 /** Why a control is disabled for this environment ('' when it isn't). */
 export function permissionReason(env: Environment, capability: SharedCapabilityKey): string {
   if (can(env, capability)) return ''
-  return `Shared with you: an admin hasn't allowed shared users to ${CAPABILITY_VERBS[capability]} on '${env.name}'. Its owner can.`
+  const who = env.permissions?.[capability]?.source === 'user' ? 'you' : 'shared users'
+  return `Shared with you: an admin hasn't allowed ${who} to ${CAPABILITY_VERBS[capability]} on '${env.name}'. Its owner can.`
 }
 
 const CAPABILITY_VERBS: Record<SharedCapabilityKey, string> = {

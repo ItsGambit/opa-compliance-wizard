@@ -1083,6 +1083,13 @@ class Handler(BaseHTTPRequestHandler):
         # printable ASCII now falls back to the sub, as a missing e-mail does.
         self.send_header("X-Auth-User", _header_safe(session.get("email")) or sub)
         self.send_header("X-Auth-Is-Admin", "true" if session.get("is_admin") else "false")
+        # 5.43.0: which Okta org vouched for this `sub`. A sub is only unique
+        # within one org (OIDC Core 5.7: iss + sub together identify a
+        # user), and an additional gate (setup-second-gate.sh) fronts another
+        # org on the same backend; serve.py keys per-user permission
+        # exceptions on the pair. This gate's own configured issuer -- every
+        # session it signs came from a token validated against it.
+        self.send_header("X-Auth-Issuer", OKTA_ISSUER)
         if action_id is not None:
             # Phase 3: carries the pending-action id this step-up is
             # approving through to serve.py's save route, which consumes

@@ -12,6 +12,7 @@ import type {
   CsvRow,
   EnvironmentFormValues,
   EnvironmentsResponse,
+  GrantUser,
   ExecuteResponse,
   FolderSecurityPolicy,
   IngestionScope,
@@ -568,14 +569,16 @@ export function fetchSharedPermissions(): Promise<SharedPermissionsResponse> {
   return apiFetch('/api/shared_permissions')
 }
 
-/** The global defaults (no environmentId) or one environment's overrides.
+/** The global defaults (no environmentId), one environment's overrides, or
+ * (5.43.0, with `user`) one user's exceptions on that environment.
  * Step-up MFA in hosted mode, like every Environments change. */
 export function saveSharedPermissions(
   changes: Partial<Record<SharedCapabilityKey, PermissionSetting>>,
   environmentId?: string,
+  user?: GrantUser,
 ): Promise<{ changed: { capability: string; before: string; after: string }[] } | StepUpRequired> {
-  return apiFetch('/api/shared_permissions', {
-    method: 'POST',
-    body: JSON.stringify(environmentId ? { environment_id: environmentId, changes } : { changes }),
-  })
+  const body = environmentId
+    ? { environment_id: environmentId, changes, ...(user ? { user: { issuer: user.issuer, subject: user.subject } } : {}) }
+    : { changes }
+  return apiFetch('/api/shared_permissions', { method: 'POST', body: JSON.stringify(body) })
 }

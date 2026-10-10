@@ -62,8 +62,9 @@ export type SharedCapabilityKey =
 export type PermissionValue = 'allow' | 'deny'
 /** A stored setting: "inherit" is the absence of one. */
 export type PermissionSetting = PermissionValue | 'inherit'
-/** Where an effective value came from. */
-export type PermissionSource = 'owner' | 'override' | 'default' | 'built_in'
+/** Where an effective value came from ("user" = an exception for the
+ * caller themself, 5.43.0). */
+export type PermissionSource = 'owner' | 'user' | 'override' | 'default' | 'built_in'
 
 export interface EffectivePermission {
   value: PermissionValue
@@ -82,6 +83,28 @@ export interface SharedPermissionDefault extends EffectivePermission {
   updated_by: string | null
 }
 
+/** 5.43.0: a user as the login gates identify them -- the Okta issuer of
+ * the gate that signed them in plus their Okta user id there (an id alone
+ * is only unique within one Okta org). */
+export interface GrantUser {
+  issuer: string
+  subject: string
+}
+
+/** 5.43.0: one capability allowed or denied to one user on one environment
+ * (beats the environment's override). */
+export interface SharedPermissionGrant extends GrantUser {
+  email: string | null
+  capability: SharedCapabilityKey
+  value: PermissionValue
+}
+
+/** 5.43.0: a user a login gate has vouched for, for the exception picker. */
+export interface KnownIdentity extends GrantUser {
+  email: string | null
+  last_seen_at: string
+}
+
 export interface SharedPermissionsResponse {
   capabilities: SharedCapability[]
   defaults: Record<SharedCapabilityKey, SharedPermissionDefault>
@@ -89,8 +112,12 @@ export interface SharedPermissionsResponse {
     name: string
     shared: boolean
     overrides: Partial<Record<SharedCapabilityKey, PermissionValue>>
+    /** 5.43.0 (older servers omit it). */
+    grants?: SharedPermissionGrant[]
     effective: Record<SharedCapabilityKey, EffectivePermission>
   }>
+  /** 5.43.0 (older servers omit it). */
+  identities?: KnownIdentity[]
 }
 
 /** 5.42.0: an Environments change answered "approve it with MFA first"

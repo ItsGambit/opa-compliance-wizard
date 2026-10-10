@@ -5,7 +5,7 @@ import { isStepUpRequired, saveSharedPermissions } from '../api/client'
 import { useSharedPermissions } from '../api/hooks'
 import { toast } from '../hooks/useToast'
 import type { PermissionSetting, SharedCapabilityKey } from '../types'
-import { SOURCE_LABELS, changedSettings } from '../utils/sharedPermissions'
+import { SOURCE_LABELS, changedSettings, mainAddressOnly } from '../utils/sharedPermissions'
 import { beginStepUp } from '../utils/stepUp'
 import { DialogCloseButton } from './DialogCloseButton'
 import { ErrorNotice } from './ErrorNotice'
@@ -88,7 +88,7 @@ export function SharedPermissionsDialog({ open, onOpenChange, draft }: Props) {
           </Dialog.Description>
 
           {isLoading && <div className="text-xs text-text-dim">Loading…</div>}
-          {isError && <ErrorNotice title="Could not load shared permissions" error={error} onRetry={() => refetch()} retrying={isFetching} />}
+          {isError && <ErrorNotice title="Could not load shared permissions" error={mainAddressOnly(error)} onRetry={() => refetch()} retrying={isFetching} />}
           {data && (
             <PermissionSettingsList
               capabilities={data.capabilities}

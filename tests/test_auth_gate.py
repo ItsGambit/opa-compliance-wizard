@@ -438,6 +438,34 @@ def test_verify_falls_back_to_sub_for_an_unsendable_email(gate_server, email):
     assert _header(headers, "X-Auth-Is-Admin") == "false"
 
 
+def test_verify_names_the_gates_issuer_for_the_backend(gate_server):
+    """5.43.0: a sub is only unique within one Okta org; serve.py keys
+    per-user permission exceptions on (issuer, sub), so /verify says which
+    org's gate vouched for the session -- and the issuer matches the shape
+    serve.py accepts."""
+    import create_secret_folders as engine
+
+    gate, port = gate_server
+    status, headers, _ = _call(port, "/verify", {"Cookie": f"opa_wizard_session={_session(gate)}"})
+    assert status == 200
+    assert _header(headers, "X-Auth-Issuer") == gate.OKTA_ISSUER == "https://example.oktapreview.com/oauth2/default"
+    assert engine.SHARED_GRANT_ISSUER_PATTERN.fullmatch(gate.OKTA_ISSUER)
+    status, headers, _ = _call(port, "/verify")
+    assert status == 401 and _header(headers, "X-Auth-Issuer") is None
+
+
+@pytest.mark.parametrize("auth_server,issuer", [
+    ("default", "https://login.example.com/oauth2/default"), ("org", "https://login.example.com"),
+    ("aus1a2b3c4D5e6F7g8", "https://login.example.com/oauth2/aus1a2b3c4D5e6F7g8"),
+])
+def test_every_gate_issuer_shape_is_accepted_by_the_backend(auth_server, issuer):
+    import create_secret_folders as engine
+    from server.gate_config import okta_endpoints
+
+    assert okta_endpoints("https://login.example.com", auth_server)["issuer"] == issuer
+    assert engine.SHARED_GRANT_ISSUER_PATTERN.fullmatch(issuer)
+
+
 def test_verify_refuses_a_session_whose_sub_is_not_header_safe(gate_server):
     gate, port = gate_server
     status, headers, _ = _call(port, "/verify", {"Cookie": f"opa_wizard_session={_session(gate, sub='00u X')}"})

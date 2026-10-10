@@ -287,6 +287,8 @@ LOCAL_OWNER_KEY_HEADER = "__local__"
 _sessions_lock = threading.Lock()
 _sessions = {}  # owner_key -> {"client": OpaClient, "okta_client": OktaClient|None, "env_name": str}
 _seen_owners = set()  # tracks who's already had a lazy auto-activate attempt this process
+_recorded_identities = set()  # 5.43.0: (issuer, sub, email) already written to known_identities today
+_recorded_identities_day = [None]  # the UTC date _recorded_identities is for (cleared when it changes)
 
 
 def _owner_key_from_headers(headers):
@@ -308,6 +310,44 @@ def _engine_owner(owner_key):
     expects: LOCAL_OWNER_KEY (None) for the local sentinel, the real Okta
     sub otherwise."""
     return engine.LOCAL_OWNER_KEY if owner_key == LOCAL_OWNER_KEY_HEADER else owner_key
+
+
+def _issuer_from_headers(headers):
+    """5.43.0: the Okta issuer of the login gate that authenticated this
+    request (auth_gate.py's X-Auth-Issuer on /verify, forwarded by nginx) --
+    trusted only when the request came through nginx, like X-Auth-Sub, AND
+    carries X-Nginx-Issuer-Forwarded = the proxy secret, which only a
+    5.43.0+ nginx site sets, in exactly the locations that also overwrite
+    X-Auth-Issuer with the gate's value. An older site (an additional gate's
+    site not yet regenerated, or the main site during a deploy) passes a
+    client-sent X-Auth-Issuer through untouched, and would otherwise let any
+    user claim another org. Only a gate-built shape is accepted. None
+    otherwise (local mode has no proxy secret, so always None): then no
+    per-user exception can match this caller, since a `sub` alone is only
+    unique within one Okta org."""
+    if not NGINX_PROXY_SECRET or not _request_is_from_nginx(headers):
+        return None
+    marker = headers.get("X-Nginx-Issuer-Forwarded")
+    if not isinstance(marker, str) or not hmac.compare_digest(marker.encode("utf-8"), NGINX_PROXY_SECRET.encode("utf-8")):
+        return None
+    issuer = headers.get("X-Auth-Issuer")
+    return issuer if isinstance(issuer, str) and engine.SHARED_GRANT_ISSUER_PATTERN.fullmatch(issuer) else None
+
+
+def _reject_ambiguous_api_path(handler, path):
+    """5.43.0 (SP-5 review): refuses an /api/ path with a "." or ".."
+    segment (also percent-encoded). nginx resolves those before matching
+    its locations and checks, while this server routes on the raw path, so
+    the two would disagree about which route a request is -- e.g. an
+    additional gate's site refusing DELETE /api/environments/<name>?purge...
+    sees /api/environments/..?id=... as /api/. No route of this app has
+    such a segment."""
+    if not path.startswith("/api/"):
+        return False
+    if any(unquote(segment) in (".", "..") for segment in path.split("/")):
+        handler._send_json(400, {"error": "Invalid path."})
+        return True
+    return False
 
 
 # The two routes reachable without the nginx proxy secret in hosted mode
@@ -1278,6 +1318,11 @@ class Handler(SimpleHTTPRequestHandler):
         always includes both; this audit log never did) without having to
         thread self.client_address/self.headers through each one by
         hand."""
+        # 5.43.0: a sub is only unique within one Okta org; record which
+        # org's gate vouched for the actor, when nginx says so.
+        issuer = _issuer_from_headers(self.headers)
+        if issuer:
+            details = {**(details or {}), "actor_issuer": issuer}
         return engine.log_audit_event(
             actor_email, actor_sub, action, details,
             client_ip=self._request_client_ip(),
@@ -1404,7 +1449,8 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json(409, {"error": "No active environment configured. Use the gear menu to set one up."})
             return True
         for capability in capabilities:
-            if not engine.shared_capability_allowed(environment_id, engine_owner, capability):
+            if not engine.shared_capability_allowed(environment_id, engine_owner, capability,
+                                                    caller_issuer=_issuer_from_headers(self.headers)):
                 self._send_json(403, {
                     "error": _shared_permission_message(capability),
                     "reason": "shared_permission_denied", "capability": capability,
@@ -1667,7 +1713,8 @@ class Handler(SimpleHTTPRequestHandler):
         environment, else None -- the executors' form of
         _capability_refused (same check, returned instead of sent)."""
         _owner_key, engine_owner, _email, _sub = self._caller()
-        if engine.shared_capability_allowed(meta["environment_id"], engine_owner, capability):
+        if engine.shared_capability_allowed(meta["environment_id"], engine_owner, capability,
+                                            caller_issuer=_issuer_from_headers(self.headers)):
             return None
         return 403, {"error": _shared_permission_message(capability), "reason": "shared_permission_denied",
                      "capability": capability}
@@ -1841,9 +1888,10 @@ class Handler(SimpleHTTPRequestHandler):
         return 200, {"purged": archive_id, **counts}
 
     def _exec_shared_permissions_update(self, params, dry_run, via_step_up):
-        """Admin-only: the global defaults (no environment_id) or one
-        environment's overrides. Audit-logged with every changed
-        capability's stored value before and after."""
+        """Admin-only: the global defaults (no environment_id), one
+        environment's overrides, or (5.43.0, `user` = {"issuer", "subject"})
+        one user's exceptions on one environment. Audit-logged with every
+        changed capability's stored value before and after."""
         owner_key, _engine_owner_, actor_email, actor_sub = self._caller()
         if not _can_admin(owner_key, self.headers):
             return 403, {"error": "Admin access required to change shared-environment permissions."}
@@ -1855,6 +1903,13 @@ class Handler(SimpleHTTPRequestHandler):
             changes = engine.validate_shared_permission_changes(payload.get("changes"))
         except ValueError as exc:
             return 400, {"error": str(exc)}
+        grantee = payload.get("user")
+        if grantee is not None:
+            if environment_id is None:
+                return 400, {"error": "A per-user exception needs an environment_id."}
+            if not isinstance(grantee, dict) or not engine.valid_grant_identity(grantee.get("issuer"), grantee.get("subject")):
+                return 400, {"error": "user must be {issuer: the Okta issuer URL, subject: the user's Okta id (sub)}"}
+            grantee = {"issuer": grantee["issuer"], "subject": grantee["subject"]}
         meta = None
         if environment_id is not None:
             meta = engine.list_all_environments().get(environment_id)
@@ -1863,12 +1918,16 @@ class Handler(SimpleHTTPRequestHandler):
         if dry_run:
             return None, None
         try:
-            diff = engine.set_shared_permissions(changes, environment_id=environment_id, updated_by=actor_email or actor_sub)
+            diff = engine.set_shared_permissions(changes, environment_id=environment_id,
+                                                 updated_by=actor_email or actor_sub, grantee=grantee)
         except KeyError as exc:
             return 404, {"error": str(exc)}
-        details = {"scope": "environment" if environment_id else "default", "changes": diff}
+        details = {"scope": "user" if grantee else "environment" if environment_id else "default", "changes": diff}
         if environment_id:
             details.update({"environment_id": environment_id, "name": meta.get("name")})
+        if grantee:
+            known = {(i["issuer"], i["subject"]): i.get("email") for i in engine.list_known_identities()}
+            details["user"] = {**grantee, "email": known.get((grantee["issuer"], grantee["subject"]))}
         if via_step_up:
             details["step_up_verified"] = True
         if diff:
@@ -1878,6 +1937,7 @@ class Handler(SimpleHTTPRequestHandler):
             "defaults": engine.get_shared_permission_defaults(),
             **({"environment_id": environment_id,
                 "overrides": engine.get_shared_permission_overrides(environment_id),
+                "grants": engine.get_shared_permission_grants(environment_id),
                 "effective": engine.effective_shared_permissions(environment_id)} if environment_id else {}),
         }
 
@@ -1900,7 +1960,7 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
-        if _reject_if_hosted_without_nginx(self, path):
+        if _reject_if_hosted_without_nginx(self, path) or _reject_ambiguous_api_path(self, path):
             return
         # Snapshot this owner's active client(s) ONCE at the start of this
         # request. Sessions are per-owner now (see _sessions above), but the
@@ -1911,7 +1971,7 @@ class Handler(SimpleHTTPRequestHandler):
         # no) client than the one the request started with.
         owner_key = _owner_key_from_headers(self.headers)
         engine_owner = _engine_owner(owner_key)
-        _ensure_session_initialized(owner_key)
+        _ensure_session_initialized(owner_key, self.headers)
         local_client, local_okta_client, local_env_name, local_env_id = _session_snapshot(owner_key)
 
         try:
@@ -2034,7 +2094,9 @@ class Handler(SimpleHTTPRequestHandler):
                     elif entry["is_own"]:
                         entry["permissions"] = {k: {"value": "allow", "source": "owner"} for k in engine.SHARED_CAPABILITY_KEYS}
                     else:
-                        entry["permissions"] = engine.effective_shared_permissions(entry["id"], defaults=defaults)
+                        entry["permissions"] = engine.effective_shared_permissions(
+                            entry["id"], defaults=defaults,
+                            caller_issuer=_issuer_from_headers(self.headers), caller_subject=engine_owner)
                     if can_admin:
                         entry["permission_overrides"] = engine.get_shared_permission_overrides(entry["id"])
                 return self._send_json(200, {"environments": envs, "active": local_env_name, "active_id": local_env_id})
@@ -2471,9 +2533,13 @@ class Handler(SimpleHTTPRequestHandler):
                     "environments": {
                         env_id: {"name": meta.get("name"), "shared": bool(meta.get("shared")),
                                  "overrides": engine.get_shared_permission_overrides(env_id),
+                                 "grants": engine.get_shared_permission_grants(env_id),
                                  "effective": engine.effective_shared_permissions(env_id, defaults=defaults)}
                         for env_id, meta in engine.list_all_environments().items()
                     },
+                    # 5.43.0: who a per-user exception can name -- every user
+                    # a login gate has vouched for, with the e-mail last seen.
+                    "identities": engine.list_known_identities(),
                 })
 
             if path == "/api/access_control":
@@ -2501,7 +2567,7 @@ class Handler(SimpleHTTPRequestHandler):
         correlation_id = uuid.uuid4().hex[:12]
         engine.CORRELATION_ID.set(correlation_id)
         path = urlparse(self.path).path
-        if _reject_if_hosted_without_nginx(self, path):
+        if _reject_if_hosted_without_nginx(self, path) or _reject_ambiguous_api_path(self, path):
             return
         if not self._check_origin():
             return
@@ -2509,7 +2575,7 @@ class Handler(SimpleHTTPRequestHandler):
         engine_owner = _engine_owner(owner_key)
         actor_email = self.headers.get("X-Auth-User")
         actor_sub = None if owner_key == LOCAL_OWNER_KEY_HEADER else owner_key
-        _ensure_session_initialized(owner_key)
+        _ensure_session_initialized(owner_key, self.headers)
         # Snapshot ONCE at request start -- see the identical note in
         # do_GET. This matters even more here: /api/preview and
         # /api/execute can run for a while, and without this snapshot a
@@ -3212,7 +3278,7 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
-        if _reject_if_hosted_without_nginx(self, path):
+        if _reject_if_hosted_without_nginx(self, path) or _reject_ambiguous_api_path(self, path):
             return
         if not self._check_origin():
             return
@@ -3220,7 +3286,7 @@ class Handler(SimpleHTTPRequestHandler):
         engine_owner = _engine_owner(owner_key)
         actor_email = self.headers.get("X-Auth-User")
         actor_sub = None if owner_key == LOCAL_OWNER_KEY_HEADER else owner_key
-        _ensure_session_initialized(owner_key)
+        _ensure_session_initialized(owner_key, self.headers)
         # Snapshot for the folder-delete branch below -- see the identical
         # note in do_GET/do_POST. The environment-delete branch legitimately
         # clears this owner's session slot itself (that's the whole point
@@ -3334,11 +3400,43 @@ def _try_activate_saved_environment(owner_key):
         engine.log("WARN", f"Could not auto-activate the saved environment for owner '{owner_key}': {exc}")
 
 
-def _ensure_session_initialized(owner_key):
+def _remember_identity(owner_key, headers):
+    """5.43.0: records the gate-verified (issuer, sub, e-mail) of a hosted
+    request in known_identities, once per UTC day per triple and process (so
+    last_seen_at keeps moving for active users and the 400-day prune never
+    drops one, however long the process runs), so an admin can pick this
+    user for a per-user exception by e-mail. Never fails the request."""
+    issuer = _issuer_from_headers(headers)
+    if issuer is None or owner_key == LOCAL_OWNER_KEY_HEADER:
+        return
+    email = headers.get("X-Auth-User")
+    if email == owner_key:  # the gate sends the sub when the user has no usable e-mail
+        email = None
+    key = (issuer, owner_key, email)
+    today = datetime.now(timezone.utc).date()
+    with _sessions_lock:
+        if _recorded_identities_day[0] != today:
+            _recorded_identities.clear()
+            _recorded_identities_day[0] = today
+        if key in _recorded_identities:
+            return
+        _recorded_identities.add(key)
+    try:
+        engine.record_known_identity(*key)
+    except Exception as exc:
+        with _sessions_lock:
+            _recorded_identities.discard(key)
+        engine.log("WARN", f"Could not record the identity of owner '{owner_key}': {type(exc).__name__}")
+
+
+def _ensure_session_initialized(owner_key, headers=None):
     """Lazily runs _try_activate_saved_environment for an owner the first
     time any request from them arrives in this process -- avoids requiring
     every logged-in user to explicitly re-activate an environment they'd
-    already set active in a previous session/process."""
+    already set active in a previous session/process. With `headers`, also
+    remembers the caller's identity (_remember_identity)."""
+    if headers is not None:
+        _remember_identity(owner_key, headers)
     with _sessions_lock:
         already_seen = owner_key in _sessions or owner_key in _seen_owners
         _seen_owners.add(owner_key)

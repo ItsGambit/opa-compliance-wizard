@@ -556,13 +556,37 @@ permissions** on a row): inherit, allow or don't allow. Owners are never
 limited, and retention (which deletes archived events) stays the owner's
 even for a shared user allowed to change sync settings. The server enforces every setting on every route (a refused call
 answers `403` with `"reason": "shared_permission_denied"`); the UI only
-mirrors it. The built-in defaults are exactly what shared users could do
-before 5.42.0 -- everything except Sync now and the sync settings -- so an
-upgrade changes nothing until an admin changes a setting. Admins using
-someone else's shared environment get the same limits as anyone else
-(they can change the setting, which is audited). Every change is logged as
-`shared_permissions.update` with each capability's stored value before and
-after.
+mirrors it. **Built-in defaults (5.43.0):** view archived reports, live
+read queries and reset the sync watermark are allowed; write to the OPA
+tenant / Okta org, import a CSV, Sync now and the sync settings are not.
+(In 5.42.0 the tenant writes and CSV import were allowed too, as before
+that release.) Admins using someone else's shared environment get the same
+limits as anyone else (they can change the setting, which is audited).
+Every change is logged as `shared_permissions.update` with each
+capability's stored value before and after.
+
+**Per-user exceptions (5.43.0).** Under **Environments → Shared
+permissions → Per-user exceptions** an admin can allow or refuse one
+capability for one user on one environment, above that environment's
+setting: a user exception beats the environment's override, which beats
+the global default, which beats the built-in default. A user is the pair
+the login gate vouches for -- the gate's Okta issuer (sent to the backend
+as `X-Auth-Issuer`, alongside `X-Auth-Sub`; nginx adds
+`X-Nginx-Issuer-Forwarded` = the proxy secret where it overwrote it, and
+`serve.py` believes the issuer only with that marker) and the user's Okta
+id (`sub`)
+in that org: an Okta id alone is only unique within one org (OpenID Connect
+Core 1.0, section 5.7), and an additional gate (below) fronts another org.
+So the same person signing in through two gates is two users, and an
+exception never applies to a request that arrives without an issuer (local
+mode, or an nginx site / gate older than 5.43.0). The picker lists every
+user a gate has vouched for since 5.43.0 (`known_identities`, refreshed when
+a user reaches the backend, at most once a day; a user not
+recorded for 400 days whom no exception names is dropped) by e-mail, org
+and id; you can also type an issuer and id. Saving uses the same MFA
+approval and `shared_permissions.update` audit entry (`"scope": "user"`)
+as the other settings. Changing a gate's `OKTA_AUTH_SERVER` changes its
+issuer: its users' exceptions stop matching and must be set again.
 
 **Every change in the Environments area needs a fresh MFA approval
 (5.42.0).** Creating, editing (credentials and rename included), deleting
@@ -807,6 +831,21 @@ write) instead of proxying it, so that route is reachable only through the
 main gate's own site. There is no per-gate equivalent to redirect it to --
 the dashboard's Access control page only ever edits the one, default file.
 
+**Shared permissions and archive purges are main-gate-only too (SP-5,
+5.43.0).** The same way, the generated site answers `403` on
+`/api/shared_permissions` (read and write) and `/api/archives` (the
+orphaned-archive list and purge), and on any `DELETE` whose raw query
+string mentions `purge` or carries a percent-escape -- deleting an
+environment together with its archive (`?purge_archive=1`); a location
+can't match a query string, so that one is a server-level check on the
+request exactly as sent, before any location. Ordinary deletes (the UI
+sends at most `?id=<uuid>`) pass. (`serve.py` also refuses any `/api/`
+path with a `.` or `..` segment, so nginx's normalised path and the one
+it routes on can't differ.) Admins change these settings
+from the main gate's site. A site generated before 5.43.0 has none of
+these blocks (nor the `X-Auth-Issuer` forwarding per-user exceptions need)
+until it is rebuilt as described below.
+
 `server/deploy.sh` restarts every enabled `opa-auth-gate-*` unit after the
 main gate, so deploys keep both gates on the same code.
 
@@ -817,9 +856,10 @@ the same way), so its users approve Environments changes with their own
 org's MFA. A site generated before 5.42.0 doesn't have that location: there
 those changes are refused (`"reason": "step_up_unavailable"`) until the site
 is rebuilt as described below -- serve.py accepts the save only with a
-header that location alone sets. As with every admin route, an admin of the
-additional org's admin group is an admin of the shared backend, including
-the shared-permission settings.
+header that location alone sets. An admin of the additional org's admin
+group is otherwise an admin of the shared backend (audit log, banner);
+since 5.43.0 the shared-permission settings and archive purges are not
+reachable through that site (above).
 
 **The generated site is a snapshot.** It is built once from the live main
 site and `deploy.sh` never updates it, so changes to the main template
