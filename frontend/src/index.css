@@ -231,6 +231,11 @@ html[data-theme="light"] .xp-wrap { --xp-muted: var(--color-text-dim); --xp-link
 .xp-wrap[data-layout="wide"] .xp-expander-body { background: none; padding: 0.25rem 0 0; margin: 0.25rem 0 0; }
 .xp-namelist { list-style: none; margin: 0; padding: 0; }
 .xp-namelist > li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.25rem 0.75rem; padding: 0.3125rem 0; font-size: 0.875rem; color: var(--color-text-dim); overflow-wrap: anywhere; }
+.xp-typelist { list-style: none; margin: 0.25rem 0 0; padding: 0; max-height: 15rem; overflow-y: auto; }
+.xp-typelist > li { display: block; }
+.xp-typelist button { display: block; width: 100%; text-align: left; background: none; border: 0; padding: 0.25rem 0; font: inherit; font-size: 0.8125rem; color: var(--color-text-dim); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.xp-typelist button:hover { color: var(--xp-link); text-decoration: underline; }
+.xp-typelist-empty { display: block; margin-top: 0.25rem; }
 .xp-linkbtn { background: none; border: 0; padding: 0; font: inherit; font-size: 0.8125rem; color: var(--xp-muted); cursor: pointer; }
 .xp-linkbtn:hover { color: var(--xp-link); text-decoration: underline; }
 .xp-confirm { flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; font-size: 0.8125rem; color: var(--color-loss); max-width: 72ch; }

@@ -7,6 +7,10 @@ export function sectionHeaderId(id: string): string {
   return `xp-sec-btn-${id}`
 }
 
+export function rowButtonId(rowId: string): string {
+  return `xp-row-btn-${rowId}`
+}
+
 /** Open/closed state of a view's sections.
  *
  * - Until the user changes anything, only the first section is open.
@@ -14,11 +18,12 @@ export function sectionHeaderId(id: string): string {
  * - `autoOpenKey`: while non-empty (a search or filter is active) and every
  *   time it changes, all sections that have rows open, so matches are seen.
  * - `jumpTo(id)` opens a section, scrolls to it and moves focus to its
- *   header (the count list in the rail uses it). */
+ *   header (the count list in the rail uses it). With a `rowId` it scrolls
+ *   to that row's button and focuses it instead (the caller opens the row). */
 export function useSectionState(sectionIds: string[], options: { resetKey?: string; autoOpenKey?: string } = {}) {
   const { resetKey = '', autoOpenKey = '' } = options
   const [open, setOpen] = useState<Set<string> | null>(null)
-  const [pendingJump, setPendingJump] = useState<{ id: string; n: number } | null>(null)
+  const [pendingJump, setPendingJump] = useState<{ id: string; rowId?: string; n: number } | null>(null)
   const idsSignature = sectionIds.join('\u0000')
 
   useEffect(() => { setOpen(null) }, [resetKey])
@@ -45,16 +50,22 @@ export function useSectionState(sectionIds: string[], options: { resetKey?: stri
   }, [current])
   const expandAll = useCallback(() => setOpen(new Set(idsSignature ? idsSignature.split('\u0000') : [])), [idsSignature])
   const collapseAll = useCallback(() => setOpen(new Set()), [])
-  const jumpTo = useCallback((id: string) => {
+  const jumpTo = useCallback((id: string, rowId?: string) => {
     const next = current()
     next.add(id)
     setOpen(next)
-    setPendingJump(prev => ({ id, n: (prev?.n ?? 0) + 1 }))
+    setPendingJump(prev => ({ id, rowId, n: (prev?.n ?? 0) + 1 }))
   }, [current])
 
   // Runs after the section has rendered open: scroll to it and focus its header.
   useEffect(() => {
     if (!pendingJump) return
+    const rowButton = pendingJump.rowId ? document.getElementById(rowButtonId(pendingJump.rowId)) : null
+    if (rowButton) {
+      rowButton.scrollIntoView?.({ behavior: 'smooth', block: 'center' })
+      rowButton.focus({ preventScroll: true })
+      return
+    }
     const section = document.getElementById(sectionDomId(pendingJump.id))
     section?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })
     document.getElementById(sectionHeaderId(pendingJump.id))?.focus({ preventScroll: true })

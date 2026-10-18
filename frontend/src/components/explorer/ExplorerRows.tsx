@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react'
 import { useExplorerLayout } from './explorerContext'
 import { stripeFor } from './layout'
+import { rowButtonId } from './useSectionState'
 
 export interface ExplorerRowData {
   /** Unique across the whole view (the one-open-at-a-time key). */
@@ -37,6 +38,7 @@ export function ExplorerRows({ rows }: { rows: ExplorerRowData[] }) {
           <div key={row.id} role="listitem" className="xp-row" data-stripe={stripeFor(i)} data-open={open}>
             <button
               type="button"
+              id={rowButtonId(row.id)}
               className="xp-sum"
               aria-expanded={open}
               aria-controls={open ? detailId : undefined}

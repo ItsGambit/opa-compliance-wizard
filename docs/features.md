@@ -272,7 +272,8 @@ compact progress panel runs at the bottom of the screen.
 
 **Layout (all seven views, since 5.44.0).** At 1100 px of page content or
 wider the view is two columns: a sticky left rail (the selector or
-identity, a count per resource type that jumps to its section, a Filter
+identity, a count per resource type that opens as a dropdown of the
+resources in it, each jumping to its row, plus Go to section, a Filter
 list, Export) and a full-width main pane with a search box and one
 collapsible section per resource type. Narrower, it stacks. Each
 resource is one calm row (name, what they can do, how they get it, last

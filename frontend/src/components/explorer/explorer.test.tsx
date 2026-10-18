@@ -249,11 +249,109 @@ describe('resource sections (GrantsMain)', () => {
     expect(screen.getByRole('button', { name: /Managed SaaS app accounts\s*3/ }).getAttribute('aria-expanded')).toBe('false')
   })
 
-  it('the count list jumps to and opens its section', () => {
+  it('the count list "Go to section" jumps to and opens its section', () => {
     renderHarness()
     fireEvent.click(screen.getByRole('button', { name: /3\s*managed saas app accounts/i }))
+    expect(screen.getByRole('button', { name: /Managed SaaS app accounts\s*3/ }).getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(within(screen.getByRole('group', { name: /managed saas app accounts list/i })).getByRole('button', { name: 'Go to section' }))
     expect(screen.getByRole('button', { name: /Managed SaaS app accounts\s*3/ }).getAttribute('aria-expanded')).toBe('true')
-    expect(screen.getByText('crm-svc@example.test')).toBeTruthy()
+    expect(document.querySelector('.xp-main')!.textContent).toContain('crm-svc@example.test')
+  })
+
+  describe('type dropdowns in the rail', () => {
+    const saas = () => screen.getByRole('button', { name: /3\s*managed saas app accounts/i })
+    const servers = () => screen.getByRole('button', { name: /2\s*servers/i })
+
+    it('are collapsed by default, toggle with aria-expanded and list the resources of the type', () => {
+      renderHarness()
+      expect(saas().getAttribute('aria-expanded')).toBe('false')
+      expect(screen.queryByRole('group', { name: /managed saas app accounts list/i })).toBeNull()
+      fireEvent.click(saas())
+      expect(saas().getAttribute('aria-expanded')).toBe('true')
+      const list = within(screen.getByRole('group', { name: /managed saas app accounts list/i }))
+      expect(list.getAllByRole('listitem').length).toBe(3)
+      expect(list.getByRole('button', { name: 'crm-svc@example.test' }).getAttribute('title')).toBe('crm-svc@example.test')
+      fireEvent.click(saas())
+      expect(saas().getAttribute('aria-expanded')).toBe('false')
+      expect(screen.queryByRole('group', { name: /managed saas app accounts list/i })).toBeNull()
+    })
+
+    it('several can be open at once', () => {
+      renderHarness()
+      fireEvent.click(saas())
+      fireEvent.click(servers())
+      expect(saas().getAttribute('aria-expanded')).toBe('true')
+      expect(servers().getAttribute('aria-expanded')).toBe('true')
+      const list = within(screen.getByRole('group', { name: /servers list/i }))
+      expect(list.getByRole('button', { name: 'lab-linux-example-01' })).toBeTruthy()
+    })
+
+    it('are real buttons, so Enter and Space work, and stay in the tab order', () => {
+      renderHarness()
+      saas().focus()
+      expect(document.activeElement).toBe(saas())
+      expect(saas().tagName).toBe('BUTTON')
+      expect(saas().getAttribute('type')).toBe('button')
+      fireEvent.click(saas())
+      const entry = within(screen.getByRole('group', { name: /managed saas app accounts list/i })).getByRole('button', { name: 'crm-svc@example.test' })
+      expect(entry.tagName).toBe('BUTTON')
+      expect(entry.getAttribute('tabindex')).toBeNull()
+    })
+
+    it('clicking a name opens its section and row, focuses it and keeps one row open', () => {
+      renderHarness()
+      fireEvent.click(saas())
+      fireEvent.click(within(screen.getByRole('group', { name: /managed saas app accounts list/i })).getByRole('button', { name: 'crm-svc@example.test' }))
+      expect(screen.getByRole('button', { name: /Managed SaaS app accounts\s*3/ }).getAttribute('aria-expanded')).toBe('true')
+      const row = document.activeElement as HTMLElement
+      expect(row.classList.contains('xp-sum')).toBe(true)
+      expect(row.textContent).toContain('crm-svc@example.test')
+      expect(row.getAttribute('aria-expanded')).toBe('true')
+      expect(document.querySelectorAll('.xp-sum[aria-expanded="true"]').length).toBe(1)
+      // a second pick elsewhere moves the single open row
+      fireEvent.click(servers())
+      fireEvent.click(within(screen.getByRole('group', { name: /servers list/i })).getByRole('button', { name: 'lab-linux-example-01' }))
+      const next = document.activeElement as HTMLElement
+      expect(next.textContent).toContain('lab-linux-example-01')
+      expect(next.getAttribute('aria-expanded')).toBe('true')
+      expect(document.querySelectorAll('.xp-sum[aria-expanded="true"]').length).toBe(1)
+    })
+
+    it('list only what is visible and show "visible of total" while a filter hides some', () => {
+      renderHarness()
+      fireEvent.click(servers())
+      fireEvent.click(screen.getByRole('checkbox', { name: /No approval or MFA/ }))
+      const button = screen.getByRole('button', { name: /0 of 2\s*servers/i })
+      expect(button.getAttribute('aria-expanded')).toBe('true')
+      const list = within(screen.getByRole('group', { name: /servers list/i }))
+      expect(list.queryByRole('button', { name: 'lab-linux-example-01' })).toBeNull()
+      expect(list.getByText(/None match/)).toBeTruthy()
+      expect(list.getByRole('button', { name: 'Go to section' })).toBeTruthy()
+      fireEvent.click(saas())
+      expect(within(screen.getByRole('group', { name: /managed saas app accounts list/i })).getAllByRole('listitem').length).toBe(3)
+    })
+
+    it('search narrows the list to the matching resources', () => {
+      renderHarness()
+      fireEvent.change(screen.getByLabelText('Search access'), { target: { value: 'crm-redonly' } })
+      fireEvent.click(screen.getByRole('button', { name: /1 of 3\s*managed saas app accounts/i }))
+      const list = within(screen.getByRole('group', { name: /managed saas app accounts list/i }))
+      expect(list.getAllByRole('listitem').length).toBe(1)
+      expect(list.getByRole('button', { name: 'crm-readonly@example.test' })).toBeTruthy()
+    })
+
+    it('when stacked the open lists are panels under the band, not inside the entries', () => {
+      const { container } = render(<ExplorerLayout rail={null}><Harness /></ExplorerLayout>)
+      resizeTo(900)
+      expect(screen.getByTestId('wide').textContent).toBe('false')
+      fireEvent.click(saas())
+      const panel = screen.getByRole('group', { name: /managed saas app accounts list/i })
+      expect(panel.closest('li')).toBeNull()
+      expect(container.querySelector('.xp-counts')!.contains(panel)).toBe(false)
+      expect(saas().getAttribute('aria-controls')).toBe(panel.id)
+      fireEvent.click(within(panel).getByRole('button', { name: 'crm-svc@example.test' }))
+      expect((document.activeElement as HTMLElement).textContent).toContain('crm-svc@example.test')
+    })
   })
 
   it('the "No approval or MFA" filter hides rows, drops empty sections and restripes', () => {

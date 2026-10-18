@@ -5,6 +5,7 @@ import {
   type AccessLookup, type AccessResource, type LastUsed, type ResourceSection,
 } from '../../utils/accessResources'
 import type { CountItem, FilterItem } from './RailParts'
+import { withCountEntries } from './countEntries'
 import { useFilterState } from './useFilterState'
 import { useSectionState } from './useSectionState'
 
@@ -63,8 +64,11 @@ export function useGrantsExplorer({ resources, lookup, resetKey }: { resources: 
   const sections = useSectionState(sectionIds, { resetKey, autoOpenKey })
 
   const countItems: CountItem[] = useMemo(
-    () => allSections.map(s => ({ id: s.id, label: countLabel(s.title, s.resources.length), count: s.resources.length })),
-    [allSections]
+    () => withCountEntries(
+      allSections.map(s => ({ id: s.id, label: countLabel(s.title, s.resources.length), count: s.resources.length })),
+      visibleSections.map(s => ({ id: s.id, rows: s.visible.map(v => ({ id: `${s.id}:${v.resource.key}`, label: v.resource.name })) }))
+    ),
+    [allSections, visibleSections]
   )
 
   const filterItems: FilterItem[] = useMemo(() => {

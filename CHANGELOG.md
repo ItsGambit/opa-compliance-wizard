@@ -2,6 +2,14 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.44.2 — **In the Access Explorer, the per-type counts in the rail ("servers 2", "SaaS accounts 5" ...) are now dropdowns that list which resources are in that type.**
+A minor release: screen behaviour only. No server, API or data change.
+- **Added.** Each type count in the left rail (Users, Groups, Projects, Resource Groups, Policies, Relationships, and the current kind in Resources) opens in place, like the members and groups lists: a chevron, the count on the right, collapsed by default, several can be open at once. The list shows each resource by the name shown in the main pane (selectors by their label, for example "Servers labeled system.os_type=linux"); a long list scrolls inside the rail.
+- **Added.** Clicking a name opens its type section if needed, opens its row (still one open row at a time), scrolls to it and moves keyboard focus to it. "Go to section" is the first item in every opened list and keeps the old jump-to-section behaviour.
+- **Changed.** The list respects the search and filters: it shows only the resources currently visible, and the count reads "2 of 5" while something is hidden. When the page is narrower than 1100 px, the counts stay a band and an opened list appears as a panel under the band.
+- **Security and privacy.** None: display code only; no new request or stored data.
+- **Known limitations.** Not checked in a real browser (tests cover behaviour, not pixels); please look at both themes at wide and narrow widths. In Resources, the other kinds in the quick view still just switch kind.
+
 5.44.0 — **The Access Explorer has a new, calmer layout in all seven views: a left rail with the selector, counts and filters, and a wide main pane of one-line rows that open in place.**
 A minor release: screen layout only. No server, API or data change, and nothing was removed from what the views show; where a view now hides detail, it is one click away in the opened row.
 - **Added.** A shared layout for Resource Groups, Projects, Resources, Policies, Relationships, Users and Groups. At 1100 px or wider (measured on the page content, not the window, so the side navigation is accounted for) the page is two columns: a sticky left rail (selector or identity, a count per resource type, filters, export) and a full-width main pane. Narrower, it stacks, and below 560 px rows wrap onto two lines. Sections can be expanded and collapsed individually or all at once, and clicking a count in the rail opens and jumps to its section.

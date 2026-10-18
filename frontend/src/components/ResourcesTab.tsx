@@ -24,6 +24,7 @@ import { useExplorerLayout } from './explorer/explorerContext'
 import type { ExplorerRowData } from './explorer/ExplorerRows'
 import { ExplorerToolbar } from './explorer/ExplorerToolbar'
 import { CountList, RailField } from './explorer/RailParts'
+import { withCountEntries } from './explorer/countEntries'
 import { RowSections } from './explorer/RowSections'
 import { useSectionState } from './explorer/useSectionState'
 import { ExportButtons } from './ExportButtons'
@@ -409,7 +410,11 @@ export function ResourcesTab({ model }: Props) {
         <Select ariaLabel="Resource kind" value={kind} onValueChange={k => { setKind(k); setQuery('') }} placeholder="Select a resource kind" options={RESOURCE_KINDS} />
       </RailField>
       <CountList
-        items={kindCounts.filter(k => k.count > 0).map(k => ({ id: k.value, label: k.label.toLowerCase(), count: k.count }))}
+        items={kindCounts.filter(k => k.count > 0).map(k => {
+          const item = { id: k.value, label: k.label.toLowerCase(), count: k.count }
+          // Only the kind on screen has rows to list; the others switch kind.
+          return k.value === kind ? withCountEntries([item], sections)[0] : item
+        })}
         onSelect={id => { setKind(id); setQuery('') }}
       />
       <div className="xp-rail-actions">

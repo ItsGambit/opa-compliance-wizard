@@ -1,30 +1,89 @@
 import { useId, useState, type ReactNode } from 'react'
 import { useExplorerLayout } from './explorerContext'
 
+export interface CountEntry {
+  /** The id of the row this entry opens (the same id the main pane's row uses). */
+  id: string
+  /** The row label as shown in the main pane. */
+  label: string
+}
+
 export interface CountItem {
   id: string
   /** Already counted-correctly, e.g. "servers" or "domain". */
   label: string
+  /** The total in this type. */
   count: number
+  /** The resources of this type that are currently visible (after search and
+   * filters). When given, the entry is a dropdown listing them; without it
+   * the entry only jumps to its section. */
+  entries?: CountEntry[]
 }
 
 /** The per-type counts ("4 servers  1 domain ..."): a vertical list in the
- * wide rail, a band when stacked. Each entry opens and jumps to its section
- * (or does whatever `onSelect` says). */
-export function CountList({ items, onSelect }: { items: CountItem[]; onSelect: (id: string) => void }) {
+ * wide rail, a band when stacked. An entry with `entries` is a dropdown (a
+ * button with aria-expanded, several can be open): inside it, "Go to section"
+ * jumps to the type's section and each name jumps to that resource's row.
+ * Stacked, the open lists show as panels under the band. An entry without
+ * `entries` just jumps (or does whatever `onSelect` says). */
+export function CountList({ items, onSelect }: { items: CountItem[]; onSelect: (id: string, rowId?: string) => void }) {
+  const { wide, setOpenRowId } = useExplorerLayout()
+  const [open, setOpen] = useState<Set<string>>(new Set())
+  const baseId = useId()
   if (items.length === 0) return null
+  const bodyId = (id: string) => `${baseId}-${id}`
+  const toggle = (id: string) => setOpen(prev => {
+    const next = new Set(prev)
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    return next
+  })
+  const openRow = (sectionId: string, rowId: string) => {
+    setOpenRowId(rowId)
+    onSelect(sectionId, rowId)
+  }
+  const body = (item: CountItem) => (
+    <div id={bodyId(item.id)} className="xp-expander-body" role="group" aria-label={`${item.label} list`}>
+      <button type="button" className="xp-linkbtn" onClick={() => onSelect(item.id)}>Go to section</button>
+      {item.entries!.length === 0 ? (
+        <span className="xp-note xp-typelist-empty">None match the current search and filters</span>
+      ) : (
+        <ul className="xp-typelist">
+          {item.entries!.map(entry => (
+            <li key={entry.id}>
+              <button type="button" title={entry.label} onClick={() => openRow(item.id, entry.id)}>{entry.label}</button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+  const openItems = items.filter(i => i.entries && open.has(i.id))
   return (
     <nav aria-label="Quick view">
       <ul className="xp-counts">
-        {items.map(item => (
-          <li key={item.id}>
-            <button type="button" className="xp-count" onClick={() => onSelect(item.id)}>
-              <span className="xp-count-v">{item.count}</span>{' '}
-              <span className="xp-count-l">{item.label}</span>
-            </button>
-          </li>
-        ))}
+        {items.map(item => {
+          const dropdown = !!item.entries
+          const isOpen = dropdown && open.has(item.id)
+          const shown = item.entries && item.entries.length !== item.count ? `${item.entries.length} of ${item.count}` : String(item.count)
+          return (
+            <li key={item.id}>
+              <button
+                type="button"
+                className="xp-count"
+                aria-expanded={dropdown ? isOpen : undefined}
+                aria-controls={isOpen ? bodyId(item.id) : undefined}
+                onClick={() => (dropdown ? toggle(item.id) : onSelect(item.id))}
+              >
+                <span className="xp-count-v">{shown}</span>{' '}
+                <span className="xp-count-l">{item.label}{dropdown && <> <span aria-hidden="true">{isOpen ? '▴' : '▾'}</span></>}</span>
+              </button>
+              {wide && isOpen && body(item)}
+            </li>
+          )
+        })}
       </ul>
+      {!wide && openItems.map(item => <div key={item.id}>{body(item)}</div>)}
     </nav>
   )
 }

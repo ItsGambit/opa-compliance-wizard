@@ -12,6 +12,7 @@ import { ExplorerToolbar } from './explorer/ExplorerToolbar'
 import { PolicyDetail } from './explorer/PolicyDetail'
 import { RailGroupsExpander } from './explorer/RailGroupsExpander'
 import { CountList, RailBlock, RailField } from './explorer/RailParts'
+import { withCountEntries } from './explorer/countEntries'
 import { RowSections } from './explorer/RowSections'
 import { useSectionState } from './explorer/useSectionState'
 import { ExportButtons } from './ExportButtons'
@@ -135,10 +136,10 @@ export function ResourceGroupsTab({ model }: Props) {
             {rg.description && <span className="xp-rail-sub">{rg.description}</span>}
           </div>
           <CountList
-            items={[
+            items={withCountEntries([
               { id: 'projects', label: projects.length === 1 ? 'project' : 'projects', count: projects.length },
               { id: 'policies', label: policies.length === 1 ? 'policy' : 'policies', count: policies.length },
-            ]}
+            ], sections)}
             onSelect={state.jumpTo}
           />
           <RailBlock title="Delegated admin group(s)">

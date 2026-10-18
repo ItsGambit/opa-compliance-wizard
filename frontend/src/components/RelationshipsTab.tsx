@@ -9,6 +9,7 @@ import { ExplorerLayout } from './explorer/ExplorerLayout'
 import type { ExplorerRowData } from './explorer/ExplorerRows'
 import { ExplorerToolbar, ResultsNote } from './explorer/ExplorerToolbar'
 import { CountList, FilterMenu, type FilterItem } from './explorer/RailParts'
+import { withCountEntries } from './explorer/countEntries'
 import { RowSections } from './explorer/RowSections'
 import { useFilterState } from './explorer/useFilterState'
 import { useSectionState } from './explorer/useSectionState'
@@ -126,9 +127,9 @@ export function RelationshipsTab({ model }: Props) {
         <span className="xp-rail-sub">Open one to see its assignments, principals and the policies using it.</span>
       </div>
       <CountList
-        items={[
+        items={withCountEntries([
           { id: 'relationships', label: model.relationships.length === 1 ? 'relationship' : 'relationships', count: model.relationships.length },
-        ]}
+        ], sections)}
         onSelect={state.jumpTo}
       />
       <p className="xp-note">{assignmentTotal} assignment{assignmentTotal === 1 ? '' : 's'} in total.</p>

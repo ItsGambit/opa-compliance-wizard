@@ -10,6 +10,7 @@ import type { ExplorerRowData } from './explorer/ExplorerRows'
 import { ExplorerToolbar, ResultsNote } from './explorer/ExplorerToolbar'
 import { PolicyDetail } from './explorer/PolicyDetail'
 import { CountList, FilterMenu, type FilterItem } from './explorer/RailParts'
+import { withCountEntries } from './explorer/countEntries'
 import { RowSections } from './explorer/RowSections'
 import { useFilterState } from './explorer/useFilterState'
 import { useSectionState } from './explorer/useSectionState'
@@ -104,10 +105,10 @@ export function PoliciesTab({ model }: Props) {
         <span className="xp-rail-sub">Open one to see who it is for and every rule.</span>
       </div>
       <CountList
-        items={[
+        items={withCountEntries([
           { id: 'scoped', label: 'scoped to a resource group', count: allScoped },
           ...(allTeam > 0 ? [{ id: 'team-wide', label: 'team-wide', count: allTeam }] : []),
-        ]}
+        ], sections)}
         onSelect={state.jumpTo}
       />
       <FilterMenu items={filterItems} active={active} onToggle={toggle} />
