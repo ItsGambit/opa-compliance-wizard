@@ -1,10 +1,11 @@
-import { useCallback, useMemo, useState } from 'react'
+import { useMemo } from 'react'
 import { useFuzzyFilter } from '../../utils/fuzzySearch'
 import {
   countLabel, lastUsedFor, sectionsByType,
   type AccessLookup, type AccessResource, type LastUsed, type ResourceSection,
 } from '../../utils/accessResources'
 import type { CountItem, FilterItem } from './RailParts'
+import { useFilterState } from './useFilterState'
 import { useSectionState } from './useSectionState'
 
 export const FILTER_RISK = 'risk'
@@ -27,8 +28,7 @@ export interface VisibleResource {
  * always (it reads the rule conditions), the three usage entries only when
  * a last-accessed lookup exists (the Users view). */
 export function useGrantsExplorer({ resources, lookup, resetKey }: { resources: AccessResource[]; lookup?: AccessLookup; resetKey: string }) {
-  const [query, setQuery] = useState('')
-  const [active, setActive] = useState<Set<string>>(() => new Set())
+  const { query, setQuery, active, toggle: toggleFilter, clear: clearFilters, filtering, autoOpenKey } = useFilterState()
 
   const lastUsedByKey = useMemo(() => {
     const map = new Map<string, LastUsed>()
@@ -59,19 +59,8 @@ export function useGrantsExplorer({ resources, lookup, resetKey }: { resources: 
   }, [visible])
 
   const allSections = useMemo(() => sectionsByType(resources), [resources])
-  const filtering = query.trim() !== '' || active.size > 0
   const sectionIds = visibleSections.map(s => s.id)
-  const sections = useSectionState(sectionIds, { resetKey, autoOpenKey: filtering ? `${query.trim()}|${[...active].sort().join(',')}` : '' })
-
-  const toggleFilter = useCallback((id: string) => {
-    setActive(prev => {
-      const next = new Set(prev)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return next
-    })
-  }, [])
-  const clearFilters = useCallback(() => { setActive(new Set()); setQuery('') }, [])
+  const sections = useSectionState(sectionIds, { resetKey, autoOpenKey })
 
   const countItems: CountItem[] = useMemo(
     () => allSections.map(s => ({ id: s.id, label: countLabel(s.title, s.resources.length), count: s.resources.length })),

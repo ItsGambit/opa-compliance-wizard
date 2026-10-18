@@ -1,15 +1,17 @@
-import { useMemo, useState } from 'react'
+import { useMemo } from 'react'
 import type { AccessModel, AccessPolicy } from '../types'
 import { ruleHasApprovalOrMfa } from '../utils/accessResources'
 import type { ExportSection } from '../utils/export'
 import { grantRows, policySummaryRows } from '../utils/exportSections'
+import { firstPlusMore } from '../utils/format'
 import { HighlightedText, useFuzzyFilter } from '../utils/fuzzySearch'
 import { ExplorerLayout } from './explorer/ExplorerLayout'
 import type { ExplorerRowData } from './explorer/ExplorerRows'
-import { ExplorerToolbar } from './explorer/ExplorerToolbar'
+import { ExplorerToolbar, ResultsNote } from './explorer/ExplorerToolbar'
 import { PolicyDetail } from './explorer/PolicyDetail'
 import { CountList, FilterMenu, type FilterItem } from './explorer/RailParts'
 import { RowSections } from './explorer/RowSections'
+import { useFilterState } from './explorer/useFilterState'
 import { useSectionState } from './explorer/useSectionState'
 import { ExportButtons } from './ExportButtons'
 
@@ -31,10 +33,6 @@ const FILTER_INACTIVE = 'inactive'
 const FILTER_RISK = 'risk'
 const SEARCH_KEYS = ['policy.name', 'policy.description', 'resourceGroupName', 'groupNames', 'types', 'ruleNames']
 
-function joinWithMore(names: string[]): string {
-  return names.length <= 1 ? (names[0] ?? '') : `${names[0]} +${names.length - 1}`
-}
-
 function policyExport(policy: AccessPolicy): ExportSection[] {
   return [
     {
@@ -54,8 +52,7 @@ function policyExport(policy: AccessPolicy): ExportSection[] {
 }
 
 export function PoliciesTab({ model }: Props) {
-  const [query, setQuery] = useState('')
-  const [active, setActive] = useState<Set<string>>(() => new Set())
+  const { query, setQuery, active, toggle, clear, filtering, autoOpenKey } = useFilterState()
 
   const entries: Entry[] = useMemo(
     () => [...model.policies].sort((a, b) => a.name.localeCompare(b.name)).map(policy => ({
@@ -78,7 +75,7 @@ export function PoliciesTab({ model }: Props) {
     name: <HighlightedText text={e.policy.name} indices={matches.find(m => m.key === 'policy.name')?.indices} />,
     hint: e.policy.active ? undefined : 'inactive',
     can: e.policy.description || e.types.join(', '),
-    via: joinWithMore(e.groupNames),
+    via: firstPlusMore(e.groupNames),
     used: `${e.policy.rules.length} rule${e.policy.rules.length === 1 ? '' : 's'}`,
     detail: () => <PolicyDetail policy={e.policy} showLastModified exportSections={policyExport(e.policy)} exportName={`opa-policy-${e.policy.name}`} />,
   })
@@ -89,8 +86,7 @@ export function PoliciesTab({ model }: Props) {
     { id: 'team-wide', title: 'Team-wide', rows: teamWide.map(toRow) },
   ]
   const visibleIds = sections.filter(s => s.rows.length > 0).map(s => s.id)
-  const filtering = query.trim() !== '' || active.size > 0
-  const state = useSectionState(visibleIds, { autoOpenKey: filtering ? `${query.trim()}|${[...active].sort().join(',')}` : '' })
+  const state = useSectionState(visibleIds, { autoOpenKey })
 
   const allScoped = entries.filter(e => e.policy.resource_group).length
   const allTeam = entries.length - allScoped
@@ -98,12 +94,6 @@ export function PoliciesTab({ model }: Props) {
     { id: FILTER_INACTIVE, label: 'Inactive policies', count: entries.filter(e => !e.policy.active).length },
     { id: FILTER_RISK, label: 'A rule with no approval or MFA', count: entries.filter(e => e.openRule).length },
   ]
-  const toggle = (id: string) => setActive(prev => {
-    const next = new Set(prev)
-    if (next.has(id)) next.delete(id)
-    else next.add(id)
-    return next
-  })
 
   const exportSectionsForView: ExportSection[] = useMemo(() => [{ title: 'Policies', rows: policySummaryRows(model.policies) }], [model.policies])
 
@@ -130,12 +120,7 @@ export function PoliciesTab({ model }: Props) {
   return (
     <ExplorerLayout rail={rail} railLabel="Policy quick view and filters">
       <ExplorerToolbar query={query} onQueryChange={setQuery} label="Search policies" sections={state} />
-      {filtering && (
-        <p className="xp-note" role="status">
-          Showing {visible.length} of {entries.length} ·{' '}
-          <button type="button" className="xp-linkbtn" onClick={() => { setActive(new Set()); setQuery('') }}>Clear</button>
-        </p>
-      )}
+      {filtering && <ResultsNote shown={visible.length} total={entries.length} onClear={clear} />}
       {entries.length === 0 && <p className="xp-note">No policies were found.</p>}
       {entries.length > 0 && visible.length === 0 && <p className="xp-note">Nothing matches the current search and filters.</p>}
       <RowSections sections={sections} state={state} />

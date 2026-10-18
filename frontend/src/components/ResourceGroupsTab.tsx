@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import type { AccessModel, AccessPolicy, AccessProject } from '../types'
 import type { ExportSection } from '../utils/export'
 import { grantRows } from '../utils/exportSections'
+import { firstPlusMore } from '../utils/format'
 import { HighlightedText, useFuzzyFilter } from '../utils/fuzzySearch'
 import { policiesForResourceGroup } from '../utils/policy'
 import { Chip } from './explorer/DetailBlocks'
@@ -32,10 +33,6 @@ function projectCounts(p: AccessProject): string {
   const active = typeof p.active_resource_count === 'number' ? `${p.active_resource_count} active` : ''
   const stale = typeof p.stale_resource_count === 'number' && p.stale_resource_count > 0 ? `${p.stale_resource_count} stale` : ''
   return [active, stale].filter(Boolean).join(' · ')
-}
-
-function joinWithMore(names: string[]): string {
-  return names.length <= 1 ? (names[0] ?? '') : `${names[0]} +${names.length - 1}`
 }
 
 export function ResourceGroupsTab({ model }: Props) {
@@ -109,7 +106,7 @@ export function ResourceGroupsTab({ model }: Props) {
     name: <HighlightedText text={e.policy.name} indices={matches.find(m => m.key === 'policy.name')?.indices} />,
     hint: e.policy.active ? undefined : 'inactive',
     can: e.types.join(', '),
-    via: joinWithMore(e.groupNames),
+    via: firstPlusMore(e.groupNames),
     used: `${e.policy.rules.length} rule${e.policy.rules.length === 1 ? '' : 's'}`,
     detail: () => <PolicyDetail policy={e.policy} />,
   }))

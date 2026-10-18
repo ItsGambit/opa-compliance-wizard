@@ -19,7 +19,7 @@ export function CountList({ items, onSelect }: { items: CountItem[]; onSelect: (
         {items.map(item => (
           <li key={item.id}>
             <button type="button" className="xp-count" onClick={() => onSelect(item.id)}>
-              <span className="xp-count-v">{item.count}</span>
+              <span className="xp-count-v">{item.count}</span>{' '}
               <span className="xp-count-l">{item.label}</span>
             </button>
           </li>
@@ -37,8 +37,8 @@ export function RailExpander({ count, label, children }: { count: number; label:
   return (
     <div>
       <button type="button" className="xp-count" aria-expanded={open} aria-controls={open ? bodyId : undefined} onClick={() => setOpen(o => !o)}>
-        <span className="xp-count-v">{count}</span>
-        <span className="xp-count-l">{label} {open ? '▴' : '▾'}</span>
+        <span className="xp-count-v">{count}</span>{' '}
+        <span className="xp-count-l">{label} <span aria-hidden="true">{open ? '▴' : '▾'}</span></span>
       </button>
       {open && <div id={bodyId} className="xp-expander-body">{children}</div>}
     </div>

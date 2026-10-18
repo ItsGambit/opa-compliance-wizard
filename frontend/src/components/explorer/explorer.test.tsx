@@ -1,6 +1,6 @@
 /** The shared Access Explorer pieces: layout switch, zebra rows, one open row,
  * sections, filters, group removal and last accessed. */
-import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, renderHook, screen, within } from '@testing-library/react'
 import { useState } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { aggregateResources, type AccessLookup } from '../../utils/accessResources'
@@ -16,6 +16,9 @@ import { CountList, FilterMenu } from './RailParts'
 import { ResourceAccessView } from './ResourceAccessView'
 import { TypeSection } from './TypeSection'
 import { COMPACT_MAX_WIDTH, WIDE_MIN_WIDTH, layoutForWidth, stripeFor } from './layout'
+import { firstPlusMore } from '../../utils/format'
+import { ResultsNote } from './ExplorerToolbar'
+import { useFilterState } from './useFilterState'
 import { useGrantsExplorer } from './useGrantsExplorer'
 import { useSectionState } from './useSectionState'
 
@@ -423,5 +426,36 @@ describe('GroupRemoveControl', () => {
     expect(screen.queryByText(/also backs/)).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Yes, remove' }))
     expect(onConfirm).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('filter state helpers', () => {
+  it('useFilterState toggles entries, builds the auto-open key and clears', () => {
+    const { result } = renderHook(() => useFilterState())
+    expect(result.current.filtering).toBe(false)
+    expect(result.current.autoOpenKey).toBe('')
+    act(() => result.current.toggle('risk'))
+    act(() => result.current.setQuery(' crm '))
+    expect(result.current.filtering).toBe(true)
+    expect(result.current.autoOpenKey).toBe('crm|risk')
+    act(() => result.current.toggle('risk'))
+    expect(result.current.active.size).toBe(0)
+    act(() => result.current.clear())
+    expect(result.current.query).toBe('')
+    expect(result.current.autoOpenKey).toBe('')
+  })
+
+  it('firstPlusMore shows the first name and the rest as +N', () => {
+    expect(firstPlusMore([])).toBe('')
+    expect(firstPlusMore(['A'])).toBe('A')
+    expect(firstPlusMore(['A', 'B', 'C'])).toBe('A +2')
+  })
+
+  it('ResultsNote announces the count and clears', () => {
+    const onClear = vi.fn()
+    render(<ResultsNote shown={2} total={9} onClear={onClear} />)
+    expect(screen.getByRole('status').textContent).toContain('Showing 2 of 9')
+    fireEvent.click(screen.getByRole('button', { name: 'Clear' }))
+    expect(onClear).toHaveBeenCalled()
   })
 })

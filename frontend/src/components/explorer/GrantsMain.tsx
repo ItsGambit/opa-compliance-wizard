@@ -1,16 +1,12 @@
 import type { ReactNode } from 'react'
 import type { AccessResource } from '../../utils/accessResources'
+import { firstPlusMore } from '../../utils/format'
 import { HighlightedText } from '../../utils/fuzzySearch'
 import { lastUsedText } from './lastUsedText'
 import type { ExplorerRowData } from './ExplorerRows'
-import { ExplorerToolbar } from './ExplorerToolbar'
+import { ExplorerToolbar, ResultsNote } from './ExplorerToolbar'
 import { RowSections } from './RowSections'
 import type { GrantsExplorer } from './useGrantsExplorer'
-
-function joinWithMore(names: string[]): string {
-  if (names.length === 0) return ''
-  return names.length === 1 ? names[0] : `${names[0]} +${names.length - 1}`
-}
 
 interface Props {
   ex: GrantsExplorer
@@ -32,13 +28,7 @@ export function GrantsMain({ ex, now, searchLabel, viaOf = r => r.viaNames, rend
   return (
     <>
       <ExplorerToolbar query={ex.query} onQueryChange={ex.setQuery} label={searchLabel} sections={ex.sections} />
-      {ex.filtering && (
-        <p className="xp-note" role="status">
-          Showing {shown} of {ex.total}
-          {ex.active.size > 0 || ex.query.trim() ? ' · ' : ''}
-          <button type="button" className="xp-linkbtn" onClick={ex.clearFilters}>Clear</button>
-        </p>
-      )}
+      {ex.filtering && <ResultsNote shown={shown} total={ex.total} onClear={ex.clearFilters} />}
       {ex.total === 0 && <p className="xp-note">{emptyMessage}</p>}
       {ex.total > 0 && shown === 0 && <p className="xp-note">Nothing matches the current search and filters.</p>}
       <RowSections
@@ -54,7 +44,7 @@ export function GrantsMain({ ex, now, searchLabel, viaOf = r => r.viaNames, rend
               name: <HighlightedText text={resource.name} indices={nameIndices} />,
               hint: resource.hint,
               can: resource.actions.join(', '),
-              via: joinWithMore(viaOf(resource)),
+              via: firstPlusMore(viaOf(resource)),
               used: used.text,
               usedTitle: used.title,
               detail: () => renderDetail(resource),

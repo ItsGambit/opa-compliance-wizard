@@ -46,8 +46,8 @@ export function ExplorerRows({ rows }: { rows: ExplorerRowData[] }) {
                 {row.name ?? row.label}
                 {row.hint && <small>{row.hint}</small>}
               </span>
-              <span className="xp-can">{row.can}</span>
-              <span className="xp-via">{row.via}</span>
+              <span className="xp-can" title={typeof row.can === 'string' ? row.can : undefined}>{row.can}</span>
+              <span className="xp-via" title={typeof row.via === 'string' ? row.via : undefined}>{row.via}</span>
               <span className="xp-used" title={row.usedTitle}>{row.used}</span>
             </button>
             {open && (

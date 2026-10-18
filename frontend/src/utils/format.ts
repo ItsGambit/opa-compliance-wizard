@@ -31,3 +31,9 @@ export function cellValue(value: unknown): string {
   if (typeof value === 'object') return JSON.stringify(value)
   return String(value)
 }
+
+/** "Example-All-Users +2": the first name and how many more there are. */
+export function firstPlusMore(names: string[]): string {
+  if (names.length === 0) return ''
+  return names.length === 1 ? names[0] : `${names[0]} +${names.length - 1}`
+}

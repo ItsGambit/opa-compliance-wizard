@@ -264,6 +264,23 @@ compact progress panel runs at the bottom of the screen.
   conditions).
 - **Users** / **Groups** — pick one, see everything it has access to
   via policies naming its group(s) as a principal.
+- **Relationships** — each relationship opens to its assignments,
+  principals, resolved resources and the policies using it.
+- **Resources** — the tenant's servers, accounts, clients, devices and
+  connections, one kind at a time; open a row for every column and its
+  access history.
+
+**Layout (all seven views, since 5.44.0).** At 1100 px of page content or
+wider the view is two columns: a sticky left rail (the selector or
+identity, a count per resource type that jumps to its section, a Filter
+list, Export) and a full-width main pane with a search box and one
+collapsible section per resource type. Narrower, it stacks. Each
+resource is one calm row (name, what they can do, how they get it, last
+used) with alternating light and dark stripes; open one row at a time to
+see what it is, what they can do, the conditions, every policy rule and
+group behind it (with **Remove from group** in the Users view) and its
+last access. Filters are only offered where the data can answer them
+(e.g. "No approval or MFA"; usage filters for a user).
 
 Every tab (plus the header) has **Export CSV** / **Export MD**
 buttons — per-tab exports cover whatever's currently selected; the

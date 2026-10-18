@@ -28,3 +28,13 @@ export function ExplorerToolbar({
     </div>
   )
 }
+
+/** "Showing 3 of 5 · Clear", announced politely when a search or filter is active. */
+export function ResultsNote({ shown, total, onClear }: { shown: number; total: number; onClear: () => void }) {
+  return (
+    <p className="xp-note" role="status">
+      Showing {shown} of {total} ·{' '}
+      <button type="button" className="xp-linkbtn" onClick={onClear}>Clear</button>
+    </p>
+  )
+}

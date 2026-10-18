@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useMemo } from 'react'
 import type { AccessAssignment, AccessModel, AccessRelationship } from '../types'
 import type { ExportSection } from '../utils/export'
 import { relationshipAssignmentRows } from '../utils/exportSections'
@@ -7,9 +7,10 @@ import { assignmentsForRelationship, policiesUsingAssignment, principalsForRelat
 import { Chip, ChipList, DetailGrid, DetailSection } from './explorer/DetailBlocks'
 import { ExplorerLayout } from './explorer/ExplorerLayout'
 import type { ExplorerRowData } from './explorer/ExplorerRows'
-import { ExplorerToolbar } from './explorer/ExplorerToolbar'
+import { ExplorerToolbar, ResultsNote } from './explorer/ExplorerToolbar'
 import { CountList, FilterMenu, type FilterItem } from './explorer/RailParts'
 import { RowSections } from './explorer/RowSections'
+import { useFilterState } from './explorer/useFilterState'
 import { useSectionState } from './explorer/useSectionState'
 import { ExportButtons } from './ExportButtons'
 
@@ -39,8 +40,7 @@ const SEARCH_KEYS = ['relationship.name', 'relationship.description', 'assignmen
  * "via {relationship} -> {assignment}"), so this view exists for browsing
  * the relationship/assignment CONFIG itself. */
 export function RelationshipsTab({ model }: Props) {
-  const [query, setQuery] = useState('')
-  const [active, setActive] = useState<Set<string>>(() => new Set())
+  const { query, setQuery, active, toggle, clear, filtering, autoOpenKey } = useFilterState()
 
   const entries: Entry[] = useMemo(
     () => model.relationships.map(relationship => {
@@ -109,19 +109,12 @@ export function RelationshipsTab({ model }: Props) {
   }))
 
   const sections = [{ id: 'relationships', title: 'Relationships', rows }]
-  const filtering = query.trim() !== '' || active.size > 0
-  const state = useSectionState(rows.length > 0 ? ['relationships'] : [], { autoOpenKey: filtering ? `${query.trim()}|${[...active].sort().join(',')}` : '' })
+  const state = useSectionState(rows.length > 0 ? ['relationships'] : [], { autoOpenKey })
 
   const filterItems: FilterItem[] = [
     { id: FILTER_NO_ASSIGNMENTS, label: 'No assignments', count: entries.filter(e => e.assignments.length === 0).length },
     { id: FILTER_UNUSED, label: 'Not used by any policy', count: entries.filter(e => e.policyCount === 0).length },
   ]
-  const toggle = (id: string) => setActive(prev => {
-    const next = new Set(prev)
-    if (next.has(id)) next.delete(id)
-    else next.add(id)
-    return next
-  })
 
   const exportSections: ExportSection[] = useMemo(() => [{ title: 'Relationships', rows: relationshipAssignmentRows(model) }], [model])
   const assignmentTotal = model.assignments.length
@@ -149,12 +142,7 @@ export function RelationshipsTab({ model }: Props) {
   return (
     <ExplorerLayout rail={rail} railLabel="Relationship quick view and filters">
       <ExplorerToolbar query={query} onQueryChange={setQuery} label="Search relationships" sections={state} />
-      {filtering && (
-        <p className="xp-note" role="status">
-          Showing {visible.length} of {entries.length} ·{' '}
-          <button type="button" className="xp-linkbtn" onClick={() => { setActive(new Set()); setQuery('') }}>Clear</button>
-        </p>
-      )}
+      {filtering && <ResultsNote shown={visible.length} total={entries.length} onClear={clear} />}
       {model.relationships.length === 0 && <p className="xp-note">None configured in this tenant.</p>}
       {entries.length > 0 && visible.length === 0 && <p className="xp-note">Nothing matches the current search and filters.</p>}
       <RowSections sections={sections} state={state} />
