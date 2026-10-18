@@ -58,7 +58,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.44.5
+# Version     : 5.44.6
 # =============================================================================
 
 import argparse
@@ -84,7 +84,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.44.5"
+SCRIPT_VERSION = "5.44.6"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 # ENG2-12: OPA's spec documents no pattern or length for a secret-folder
 # name (SecretFolderCreateRequest.name is a bare string); 255 is the limit
@@ -289,13 +289,19 @@ ACTIVE_DIRECTORY_ACCOUNT_ANY_ID = "active_directory_accounts"
 SELECTOR_ACCOUNT_EVENT_LIMIT = 50
 
 
-def _family_account_ids(any_id, service_account_types, resource_types):
-    def extract(event):
+def _family_matcher(service_account_types, resource_types):
+    """True for an event whose debugData says it is about this account family
+    (never by target type alone: every family shares the 'Service Account'
+    target type)."""
+    def matches(event):
         debug_data = (event.get("debugContext") or {}).get("debugData") or {}
-        if debug_data.get("serviceAccountType") in service_account_types or debug_data.get("resourceType") in resource_types:
-            return {any_id}
-        return set()
-    return extract
+        return debug_data.get("serviceAccountType") in service_account_types or debug_data.get("resourceType") in resource_types
+    return matches
+
+
+def _family_account_ids(any_id, service_account_types, resource_types):
+    matches = _family_matcher(service_account_types, resource_types)
+    return lambda event: {any_id} if matches(event) else set()
 
 
 def _selector_account_name(event):
@@ -320,11 +326,24 @@ RESOURCE_ACCESS_EVENT_TYPES = {
     # accounts (see _resolve_account_selector): tracked per account by the
     # account's OPA id, which is the "Service Account" target id of its events.
     # Active Directory stays reveal-only (see the selector kinds above).
+    #
+    # 5.44.6: the OPA account id equalling the log target id is documented
+    # only for SaaS / Okta accounts; for database and Active Directory
+    # accounts it was never verified (and one real database account showed
+    # "never used" despite reveal and checkout events). So an event ALSO
+    # counts when it is of the right account family (`family`) and its
+    # 'Service Account' target displayName equals the account's name exactly
+    # (case-sensitive), and that name is unique among the family's accounts
+    # (`name_unique`, computed from the complete account list). The log event
+    # carries no project, so a shared name is never guessed: it is reported as
+    # ambiguous instead (see find_last_access_for_user).
     "individual_database_account": {
         "event_types": ["pam.service_account.password.reveal", "pam.resource.checkout"], "extract_ids": _target_ids,
+        "family": _family_matcher({"DATABASE_ACCOUNT"}, {"PAM_DATABASE_ACCOUNT"}),
     },
     "individual_active_directory_account": {
         "event_types": ["pam.service_account.password.reveal"], "extract_ids": _target_ids,
+        "family": _family_matcher({"PAM_AD_ACCOUNT"}, set()),
     },
     "secret": {"event_types": ["pam.secret.reveal"], "extract_ids": _target_ids},
     "individual_server_account": {"event_types": ["pam.gateway_creds.issue"], "extract_ids": _gateway_creds_server_ids},
@@ -4179,6 +4198,10 @@ def _resolve_account_selector(selector_type, selector, accounts, policy_rg_id):
         if {a["id"] for a in scope if a["id"] in matched_ids and a.get("resource_group_id") == policy_rg_id} != matched_ids:
             return None
         description = describe_dynamic_selector(None, selector_type, selector)
+        name_counts = {}
+        for a in accounts:
+            if isinstance(a.get("account_name"), str):
+                name_counts[a["account_name"]] = name_counts.get(a["account_name"], 0) + 1
         out = []
         for a in sorted((a for a in scope if a["id"] in matched_ids), key=lambda a: (a.get("account_name") or "").lower()):
             out.append({
@@ -4187,10 +4210,116 @@ def _resolve_account_selector(selector_type, selector, accounts, policy_rg_id):
                 "project_id": a.get("project_id"), "project_name": a.get("project_name"),
                 "resource_group_id": a.get("resource_group_id"),
                 "access_tracking_id": a["id"], "via_selector": description, "sub_label": sub_label(a),
+                # Last-used fallback (5.44.6), see RESOURCE_ACCESS_EVENT_TYPES:
+                # the exact account name, and whether it is unique among ALL
+                # accounts of this family (the complete list `accounts`).
+                "account_name": a.get("account_name") if isinstance(a.get("account_name"), str) and a.get("account_name") else None,
+                "name_unique": name_counts.get(a.get("account_name")) == 1,
             })
         return out
     except (ValueError, KeyError, TypeError, AttributeError):
         return None
+
+
+def _shared_ad_account_rows(selector, accounts, policy_rg_id):
+    """Named rows for the Active Directory SHARED accounts a selector lists
+    explicitly (`shared_accounts.specific_accounts`): their names are in the
+    selector itself, so they are certain. Each is marked by name only (the
+    id in the selector is not assumed to equal any account id). Returns []
+    when there are none."""
+    out = []
+    try:
+        specific = (selector.get("shared_accounts") or {}).get("specific_accounts") or []
+        name_counts = {}
+        for a in accounts or []:
+            if isinstance(a.get("account_name"), str):
+                name_counts[a["account_name"]] = name_counts.get(a["account_name"], 0) + 1
+        for entry in specific:
+            if not isinstance(entry, dict):
+                continue
+            # The documented shape nests the account under `shared_account`;
+            # the one confirmed live carries `account_name` directly.
+            ref = entry.get("shared_account") if isinstance(entry.get("shared_account"), dict) else entry
+            name = ref.get("account_name") or ref.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            hit = next((a for a in accounts or [] if a.get("account_name") == name and name_counts.get(name) == 1), None)
+            out.append({
+                "kind": "resolved", "id": (hit or {}).get("id") or f"shared:{name}", "name": name,
+                "resource_kind": "individual_active_directory_account",
+                "project_id": (hit or {}).get("project_id"), "project_name": (hit or {}).get("project_name"),
+                "resource_group_id": (hit or {}).get("resource_group_id"),
+                "via_selector": "Shared AD account(s) named in the rule",
+                "sub_label": ((hit or {}).get("domain") or {}).get("name"),
+                "account_name": name, "name_unique": accounts is not None and name_counts.get(name, 0) == 1,
+            })
+            if hit:
+                out[-1]["access_tracking_id"] = hit["id"]
+    except (KeyError, TypeError, AttributeError):
+        return []
+    return out
+
+
+def _server_label_matches(labels_wanted, server, fold, any_pair):
+    labels = server["labels"]
+    norm = (lambda t: t.lower()) if fold else (lambda t: t)
+    have = {norm(k): norm(v) for k, v in labels.items()}
+    tests = [have.get(norm(k)) == norm(v) for k, v in labels_wanted.items()]
+    return any(tests) if any_pair else all(tests)
+
+
+def _resolve_server_selector(selector, servers, policy_rg_id):
+    """Resolves a `server_label` selector to the concrete servers it covers,
+    or None when that cannot be done with certainty (the caller keeps the
+    selector row). Same rules as _resolve_account_selector: the server list
+    must be COMPLETE and every server must carry a readable `labels` map;
+    the selector needs at least one label, each a plain non-empty string pair;
+    `system.` labels are refused because it is not known that they appear in
+    a listed server's `labels`; every plausible reading (all labels vs any
+    label, case-sensitive vs not, all servers vs only active ones) must give
+    the same servers; the policy's resource group must not change the result;
+    and no match at all keeps the selector row."""
+    try:
+        if servers is None or not policy_rg_id:
+            return None
+        wanted = (selector.get("server_selector") or {}).get("labels")
+        if not isinstance(wanted, dict) or not wanted:
+            return None
+        if not all(isinstance(k, str) and k and isinstance(v, str) and v for k, v in wanted.items()):
+            return None
+        if any(k.lower().startswith("system.") for k in wanted):
+            return None
+        for s in servers:
+            if not isinstance(s.get("id"), str) or not isinstance(s.get("hostname"), str) or not s["hostname"]:
+                return None
+            if not isinstance(s.get("labels"), dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in s["labels"].items()):
+                return None
+        results = []
+        for fold in (False, True):
+            for any_pair in ((False, True) if len(wanted) > 1 else (False,)):
+                hits = [s for s in servers if _server_label_matches(wanted, s, fold, any_pair)]
+                results.append({s["id"] for s in hits})
+                results.append({s["id"] for s in hits if s.get("state") == "ACTIVE" and not s.get("deleted_at")})
+        matched_ids = results[0]
+        if not matched_ids or any(r != matched_ids for r in results):
+            return None
+        matched = [s for s in servers if s["id"] in matched_ids]
+        if any(s.get("resource_group_id") != policy_rg_id for s in matched):
+            return None
+        description = describe_dynamic_selector(None, "server_label", selector)
+        return [{
+            "kind": "resolved", "id": s["id"], "name": s["hostname"], "resource_kind": "individual_server",
+            "project_id": s.get("project_id"), "project_name": s.get("project_name"),
+            "resource_group_id": s.get("resource_group_id"), "via_selector": description, "sub_label": None,
+        } for s in sorted(matched, key=lambda s: s["hostname"].lower())]
+    except (KeyError, TypeError, AttributeError):
+        return None
+
+
+def _has_unresolved_ad_part(selector):
+    individual = selector.get("individual_accounts") or {}
+    shared = selector.get("shared_accounts") or {}
+    return bool(individual.get("by_condition") or individual.get("by_domain") or shared.get("by_domain") or shared.get("by_matching_names"))
 
 
 def _resolve_rule(rule, indexes, policy_rg_id=None):
@@ -4200,9 +4329,30 @@ def _resolve_rule(rule, indexes, policy_rg_id=None):
     for entry in entries:
         selector_type, selector = entry.get("selector_type"), entry.get("selector") or {}
         accounts = (indexes.get("selector_accounts") or {}).get(selector_type)
-        named = _resolve_account_selector(selector_type, selector, accounts, policy_rg_id) if selector_type in _SELECTOR_ACCOUNT_KINDS else None
+        if selector_type == "server_label":
+            named = _resolve_server_selector(selector, accounts, policy_rg_id)
+        elif selector_type in _SELECTOR_ACCOUNT_KINDS:
+            named = _resolve_account_selector(selector_type, selector, accounts, policy_rg_id)
+        else:
+            named = None
+        remainder = selector
+        if selector_type == "active_directory":
+            # Shared accounts named in the rule are certain from the rule
+            # itself; whatever part of the selector is still unnamed stays a
+            # selector row (described without the parts that are now rows).
+            shared = _shared_ad_account_rows(selector, accounts, policy_rg_id)
+            if named or shared:
+                remainder = dict(selector)
+                if named:
+                    remainder.pop("individual_accounts", None)
+                if shared:
+                    remainder["shared_accounts"] = {k: v for k, v in (selector.get("shared_accounts") or {}).items() if k != "specific_accounts"}
+                have = {n["id"] for n in named or []}
+                named = (named or []) + [r for r in shared if r["id"] not in have]
         if named:
             resolutions.extend(named)
+            if remainder is not selector and _has_unresolved_ad_part(remainder):
+                resolutions.append(_resolve_selector_entry(resource_type, selector_type, remainder, indexes))
         else:
             resolutions.append(_resolve_selector_entry(resource_type, selector_type, selector, indexes))
     return resolutions or [{"kind": "condition",
@@ -4256,8 +4406,13 @@ def find_last_access_for_user(okta_client, actor_user_id, resources, limit_per_r
     why those are intentionally left unmapped rather than guessed."""
     results = {}
     by_kind = {}
+    # Optional per-resource name fallback (see "family" in
+    # RESOURCE_ACCESS_EVENT_TYPES): {(kind, id): (account_name, name_unique)}.
+    names = {}
     for r in resources:
         by_kind.setdefault(r["resource_kind"], []).append(r["resource_id"])
+        if isinstance(r.get("account_name"), str) and r["account_name"]:
+            names[(r["resource_kind"], r["resource_id"])] = (r["account_name"], r.get("name_unique") is True)
 
     since = (datetime.now(timezone.utc) - timedelta(days=since_days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
@@ -4278,9 +4433,25 @@ def find_last_access_for_user(okta_client, actor_user_id, resources, limit_per_r
 
         wanted = set(resource_ids)
         buckets = {rid: [] for rid in resource_ids}
+        ambiguous = set()
+        family = mapping.get("family")
         for event in events:  # already DESCENDING (most-recent-first) by default
-            hit_ids = mapping["extract_ids"](event) & wanted
-            for rid in hit_ids:
+            hit_ids = {rid: "id" for rid in mapping["extract_ids"](event) & wanted}
+            if family is not None and family(event):
+                event_name = _selector_account_name(event)
+                id_matched = bool(hit_ids)
+                for rid in resource_ids:
+                    name, unique = names.get((resource_kind, rid), (None, False))
+                    if rid in hit_ids or not name or event_name != name:
+                        continue
+                    if unique:
+                        hit_ids[rid] = "name"
+                    elif not id_matched:
+                        # Several accounts share this name and no wanted id
+                        # matched: the event may be this account's or
+                        # another's, so say so rather than guess.
+                        ambiguous.add(rid)
+            for rid, how in hit_ids.items():
                 if len(buckets[rid]) < mapping.get("limit", limit_per_resource):
                     entry = {
                         "published": event.get("published"),
@@ -4289,11 +4460,15 @@ def find_last_access_for_user(okta_client, actor_user_id, resources, limit_per_r
                     }
                     if "event_name" in mapping:
                         entry["account_name"] = mapping["event_name"](event)
+                    if how == "name":
+                        entry["matched_by"] = "name"
                     buckets[rid].append(entry)
 
         for rid in resource_ids:
             results[rid] = {"resource_kind": resource_kind, "supported": True, "events": buckets[rid],
                             "complete": bool(complete)}
+            if rid in ambiguous and not buckets[rid]:
+                results[rid]["ambiguous"] = True
 
     return results
 
@@ -5661,6 +5836,9 @@ def build_access_model(client, okta_client=None, on_progress=None):
     indexes["selector_accounts"] = {
         "database": None if any(w["section"].startswith("database accounts in project") for w in warnings) else all_database_accounts,
         "active_directory": None if any(w["section"].startswith("Active Directory accounts in project") for w in warnings) else all_active_directory_accounts,
+        # 5.44.6: the complete server list (with each server's labels) for
+        # resolving server_label selectors; None when any project's list failed.
+        "server_label": None if any(w["section"].startswith("servers in project") for w in warnings) else all_servers,
     }
 
     _report(on_progress, "user_groups", "start")

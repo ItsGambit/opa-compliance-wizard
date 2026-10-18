@@ -527,6 +527,12 @@ export type PolicyRuleResolution =
        * _resolve_account_selector. */
       via_selector?: string
       sub_label?: string | null
+      /** Database / Active Directory accounts only (5.44.6): the exact account
+       * name and whether it is unique among all accounts of that family. Used
+       * by the last-used lookup when the System Log's account id differs from
+       * the OPA account id. */
+      account_name?: string | null
+      name_unique?: boolean
     }
   | { kind: 'condition'; description: string }
 
@@ -866,6 +872,9 @@ export interface ResourceAccessEvent {
   outcome: string | null
   /** Only on database_account lookups: the account the event was about. */
   account_name?: string | null
+  /** 'name' when the event was attributed by the account's exact name
+   * because its id did not match (database / Active Directory accounts). */
+  matched_by?: 'name'
 }
 
 export interface ResourceAccessInfo {
@@ -879,6 +888,10 @@ export interface ResourceAccessInfo {
   /** False when the System Log lookup hit its page cap -- "no access" may
    * then just mean "not within what was read". */
   complete?: boolean
+  /** True when no event matched by id, but events with this account's name
+   * exist and another account shares that name: it cannot be told which
+   * account was used. */
+  ambiguous?: boolean
 }
 
 // ── Folder Builder: policy assignment ────────────────────────────────────

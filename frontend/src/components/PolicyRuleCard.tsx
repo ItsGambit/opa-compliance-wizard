@@ -1,4 +1,5 @@
 import type { PolicyRule } from '../types'
+import { rowQualifier } from '../utils/accessResources'
 import { describeCondition } from '../utils/policy'
 import { Chip } from './explorer/DetailBlocks'
 
@@ -31,7 +32,7 @@ export function PolicyRuleCard({ rule, policyName }: Props) {
             res.kind === 'resolved' ? (
               <Tag key={i}>
                 {res.name}
-                {res.sub_label ? ` · ${res.sub_label}` : ''}
+                {rowQualifier(res) ? ` · ${rowQualifier(res)}` : ''}
                 {res.project_name
                   ? ` — ${res.project_name}`
                   // relationship_assignment resolutions (see

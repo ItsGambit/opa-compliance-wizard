@@ -301,7 +301,10 @@ specific-shared-account-by-SID shape — see "Confirmed tenant behavior"
 below, both non-resolvable), Database accounts — there's nothing to
 resolve to one project, so the condition itself is shown as readable
 text (e.g. "Servers labeled `system.os_type=linux`") at the
-resource-group level.
+resource-group level. (Since 5.44.5 and 5.44.6, database and Active
+Directory selectors, shared Active Directory accounts named in a rule, and
+server-label selectors are listed by the actual account or server names
+whenever the match is certain; otherwise the text above remains.)
 
 ### Secrets Access Dashboard
 

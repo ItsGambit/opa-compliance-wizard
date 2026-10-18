@@ -53,6 +53,9 @@ export function ResourceAccessView({ resource, lookup, now, renderGroupAction }:
                 : res.resource_kind.startsWith('relationship_assignment:') ? '' : ' (project unknown)'}
               .
             </p>
+            {res.sub_label && (
+              <p className="xp-mute">{res.resource_kind === 'individual_active_directory_account' ? 'Domain' : 'Connection'}: {res.sub_label}.</p>
+            )}
             {resource.selectors.length > 0 && (
               <p className="xp-mute">Matched by the rule selector: {resource.selectors.join('; ')}.</p>
             )}

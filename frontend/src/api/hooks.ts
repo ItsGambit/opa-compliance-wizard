@@ -165,7 +165,7 @@ export function useWorkloadRoles(enabled = true) {
  * at most of it. */
 export function useUserResourceAccess(
   userId: string | undefined,
-  resources: { resource_kind: string; resource_id: string }[],
+  resources: { resource_kind: string; resource_id: string; account_name?: string; name_unique?: boolean }[],
   // A service user (e.g. this dashboard's own service account) has no
   // Okta identity/email, so System Log's actor lookup can never resolve
   // for it — the server already fails that gracefully rather than

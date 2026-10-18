@@ -234,3 +234,51 @@ describe('database selectors resolved to named accounts (5.44.5)', () => {
     expect(row['Rule Selector']).toBe("Database accounts in example-conn-1 where name contains 'svc'")
   })
 })
+
+describe('last used by account name, Active Directory rows and named servers (5.44.6)', () => {
+  const adAcct = (id: string, name: string) => ({
+    ...resolved(id, name, 'individual_active_directory_account'), access_tracking_id: id, sub_label: 'example.test',
+    via_selector: 'AD accounts in domain(s): example.test', account_name: name, name_unique: true,
+  })
+  const adRule = rule('Rule AD', 'Active Directory accounts', [adAcct('d1', 'svc_one')], { resource_type: 'active_directory_based_resource' })
+  const adGrants = rulesGrantedToGroupIds([policy('p1', 'Policy One', [{ id: 'g1', name: 'G' }], [adRule])], new Set(['g1']))
+  const adRows = aggregateResources(adGrants)
+
+  it('headers an Active Directory row with the account name alone; the domain goes in the export and the opened row', () => {
+    expect(adRows[0].name).toBe('svc_one')
+    expect(adRows[0].hint).toBe('Example Project')
+    const [row] = grantRows(adGrants)
+    expect(row['Applies To']).toBe('svc_one — Example Project')
+    expect(row['Connection or Domain']).toBe('example.test')
+    expect(row['Rule Selector']).toBe('AD accounts in domain(s): example.test')
+  })
+
+  it('sends the account name and its uniqueness with each database / Active Directory request, nothing else', () => {
+    expect(trackedRequests(adRows)).toEqual([
+      { resource_kind: 'individual_active_directory_account', resource_id: 'd1', account_name: 'svc_one', name_unique: true },
+    ])
+    const server = aggregateResources(rulesGrantedToGroupIds([policy('p2', 'P2', [{ id: 'g1', name: 'G' }], [rule('S', 'Servers', [resolved('s1', 'example-web-01')])])], new Set(['g1'])))
+    expect(trackedRequests(server)).toEqual([{ resource_kind: 'individual_server_account', resource_id: 's1' }])
+  })
+
+  it('never reports "never used" for an ambiguous name, and still reports a name-matched use', () => {
+    const lookup = (info: object): AccessLookup => ({ status: 'ready', byId: new Map([['d1', { resource_kind: 'individual_active_directory_account', supported: true, events: [], complete: true, ...info }]]) })
+    expect(lastUsedFor(adRows[0], lookup({ ambiguous: true }))).toEqual({ state: 'ambiguous' })
+    expect(lastUsedFor(adRows[0], lookup({}))).toEqual({ state: 'never' })
+    expect(lastUsedFor(adRows[0], lookup({ events: [{ published: '2026-10-05T00:00:00Z', request_id: 'r', outcome: 'SUCCESS', matched_by: 'name' }], ambiguous: true })))
+      .toEqual({ state: 'used', at: '2026-10-05T00:00:00Z' })
+    expect(lastUsedFor(adRows[0], lookup({ ambiguous: true, complete: false }))).toEqual({ state: 'unknown' })
+  })
+
+  it('shows servers by name, merged with the same server named another way, and keeps a selector row as a selector', () => {
+    const named = { ...resolved('s1', 'example-web-01', 'individual_server'), via_selector: 'Servers labeled env=prod' }
+    const grantsSrv = rulesGrantedToGroupIds([
+      policy('p1', 'P1', [{ id: 'g1', name: 'G' }], [rule('By label', 'Servers', [named])]),
+      policy('p2', 'P2', [{ id: 'g1', name: 'G' }], [rule('By id', 'Servers', [resolved('s1', 'example-web-01', 'individual_server'), { kind: 'condition', description: 'Servers labeled system.os_type=linux' }])]),
+    ], new Set(['g1']))
+    const rows = aggregateResources(grantsSrv)
+    expect(rows.map(r => [r.name, r.hint])).toEqual([['example-web-01', 'Example Project'], ['Servers labeled system.os_type=linux', 'selector']])
+    expect(rows[0].lines.length).toBe(2)
+    expect(rows[0].selectors).toEqual(['Servers labeled env=prod'])
+  })
+})

@@ -3,7 +3,8 @@
 import { act, cleanup, fireEvent, render, renderHook, screen, within } from '@testing-library/react'
 import { useState } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { aggregateResources, type AccessLookup } from '../../utils/accessResources'
+import { aggregateResources, lastUsedFor, type AccessLookup } from '../../utils/accessResources'
+import { lastUsedText } from './lastUsedText'
 import { rulesGrantedToGroupIds } from '../../utils/policy'
 import { exampleModel } from '../../test/accessFixtures'
 import { ExplorerLayout } from './ExplorerLayout'
@@ -537,6 +538,33 @@ describe('LastAccessed for database selector rules', () => {
     render(<ResourceAccessView resource={res} lookup={{ status: 'loading' }} now={0} />)
     expect(screen.queryByText(/Not tracked/)).toBeNull()
     expect(screen.getByText(/Any database account this user accessed/)).toBeTruthy()
+  })
+})
+
+describe('Active Directory rows and ambiguous last used (5.44.6)', () => {
+  const adAcct = {
+    kind: 'resolved' as const, id: 'd1', name: 'svc_one', resource_kind: 'individual_active_directory_account', project_id: 'p1', project_name: 'Example Project',
+    resource_group_id: 'rg', access_tracking_id: 'd1', sub_label: 'example.test', via_selector: 'AD accounts in domain(s): example.test', account_name: 'svc_one', name_unique: false,
+  }
+  const [res] = aggregateResources(rulesGrantedToGroupIds([{
+    id: 'pa', name: 'Ad Policy', description: '', active: true, type: 'SECURITY_POLICY', resource_group: { id: 'rg', name: 'RG' },
+    principals: { user_groups: [{ id: 'g1', name: 'G' }], workload_roles: [] }, last_updated: null, last_updated_by: null,
+    rules: [{ name: 'Ad', resource_type: 'active_directory_based_resource', resource_type_label: 'Active Directory accounts', privileges: [], conditions: [], resolutions: [adAcct] }],
+  } as never], new Set(['g1'])))
+
+  it('the opened row shows the domain and the rule, while the name stays the account name', () => {
+    render(<ResourceAccessView resource={res} now={0} />)
+    expect(screen.getByText(/Domain: example\.test/)).toBeTruthy()
+    expect(screen.getByText(/Matched by the rule selector: AD accounts in domain\(s\): example\.test/)).toBeTruthy()
+    expect(res.name).toBe('svc_one')
+    expect(res.hint).toBe('Example Project')
+  })
+
+  it('says it cannot tell which account when the name is shared, and the row text is not "Never used"', () => {
+    const lookup: AccessLookup = { status: 'ready', byId: new Map([['d1', { resource_kind: 'individual_active_directory_account', supported: true, events: [], complete: true, ambiguous: true }]]) }
+    render(<ResourceAccessView resource={res} lookup={lookup} now={0} />)
+    expect(screen.getByText(/cannot tell which account/)).toBeTruthy()
+    expect(lastUsedText(lastUsedFor(res, lookup), 0).text).toBe('Unknown')
   })
 })
 

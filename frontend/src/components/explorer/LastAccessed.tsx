@@ -81,6 +81,9 @@ function TargetAccess({ lookup, target, now }: { lookup: AccessLookup; target: T
   // report on it -- say so rather than spinning forever.
   if (!info) return <span className="xp-mute italic">no result returned for this resource</span>
   if (!info.supported) return <span className="xp-mute italic">access tracking not available for this resource type</span>
+  if (info.events.length === 0 && info.ambiguous) {
+    return <span className="text-warn">cannot tell which account: another account has the same name and was used in the last 90 days</span>
+  }
   if (info.events.length === 0) {
     return info.complete === false
       ? <span className="text-warn">no access found in the events read — the lookup hit its page limit, so this is not a complete 90-day answer</span>

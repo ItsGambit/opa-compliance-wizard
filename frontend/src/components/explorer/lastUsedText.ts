@@ -8,6 +8,7 @@ export function lastUsedText(lu: LastUsed, now: number): { text: string; title?:
     case 'used': return { text: `Last used ${relativeTime(lu.at, now) ?? formatDateTime(lu.at)}`, title: formatDateTime(lu.at) }
     case 'never': return { text: 'Never used', title: 'No access found in the last 90 days' }
     case 'unknown': return { text: 'Unknown', title: 'The lookup did not give a complete answer' }
+    case 'ambiguous': return { text: 'Unknown', title: 'Another account has the same name, so it cannot be told which account was used' }
     case 'untracked': return { text: 'Not tracked', title: 'The System Log does not record access for this kind of resource' }
     case 'loading': return { text: 'Loading…' }
     case 'error': return { text: 'Unavailable' }

@@ -20,6 +20,13 @@ export interface GrantLine {
   othersCount: number
 }
 
+/** The muted qualifier shown beside a resolved account's name. An Active
+ * Directory account shows only its own name in the row (the domain is in the
+ * opened row, see ResourceAccessView), so it gets none here. */
+export function rowQualifier(res: { resource_kind: string; sub_label?: string | null }): string | null | undefined {
+  return res.resource_kind === 'individual_active_directory_account' ? null : res.sub_label
+}
+
 export interface AccessResource {
   key: string
   /** Section id and title: the rule's resource type ("Servers" ...). */
@@ -176,7 +183,7 @@ export function aggregateResources(grants: GrantedRule[], options: AggregateOpti
         const hint =
           res.kind === 'condition'
             ? 'selector'
-            : [res.sub_label, res.resource_kind === 'secret_folder' ? 'folder' : null, res.project_name].filter(Boolean).join(' · ') || undefined
+            : [rowQualifier(res), res.resource_kind === 'secret_folder' ? 'folder' : null, res.project_name].filter(Boolean).join(' · ') || undefined
         item = {
           key, typeId, typeLabel, name, hint, resolution: res, lines: [], actions: [], conditions: [], risky: false, viaNames: [], policyNames: [], selectors: [],
         }
@@ -254,8 +261,18 @@ export function trackTargets(resource: AccessResource): TrackTarget[] {
 }
 
 /** The de-duplicated request list the server lookup wants. */
-export function trackedRequests(resources: AccessResource[]): { resource_kind: string; resource_id: string }[] {
-  const seen = new Map<string, { resource_kind: string; resource_id: string }>()
+export interface TrackedRequest {
+  resource_kind: string
+  resource_id: string
+  /** Database / Active Directory accounts: lets the server also match the
+   * System Log by the exact account name when its id differs, but only when
+   * `name_unique` says no other account of the family has that name. */
+  account_name?: string
+  name_unique?: boolean
+}
+
+export function trackedRequests(resources: AccessResource[]): TrackedRequest[] {
+  const seen = new Map<string, TrackedRequest>()
   for (const r of resources) {
     const res = r.resolution
     const family = selectorFamily(r)
@@ -266,7 +283,12 @@ export function trackedRequests(resources: AccessResource[]): { resource_kind: s
     if (res.kind !== 'resolved') continue
     if (TRACKABLE_KINDS.has(res.resource_kind)) {
       const id = res.access_tracking_id ?? res.id
-      seen.set(id, { resource_kind: res.resource_kind, resource_id: id })
+      const request: TrackedRequest = { resource_kind: res.resource_kind, resource_id: id }
+      if (res.account_name && (res.resource_kind === 'individual_database_account' || res.resource_kind === 'individual_active_directory_account')) {
+        request.account_name = res.account_name
+        request.name_unique = res.name_unique === true
+      }
+      seen.set(id, request)
     } else if (res.resource_kind === 'secret_folder') {
       for (const child of res.child_secrets ?? []) seen.set(child.id, { resource_kind: 'secret', resource_id: child.id })
     }
@@ -278,6 +300,8 @@ export type LastUsed =
   | { state: 'used'; at: string }
   | { state: 'never' }
   | { state: 'unknown' }
+  /** No event matched by id, but another account shares this account's name and has events: cannot tell which was used. */
+  | { state: 'ambiguous' }
   | { state: 'untracked' }
   | { state: 'loading' }
   | { state: 'error' }
@@ -300,5 +324,6 @@ export function lastUsedFor(resource: AccessResource, lookup: AccessLookup | und
     }
   }
   if (latest) return { state: 'used', at: latest }
-  return infos.some(i => i.supported && i.complete === false) ? { state: 'unknown' } : { state: 'never' }
+  if (infos.some(i => i.supported && i.complete === false)) return { state: 'unknown' }
+  return infos.some(i => i.ambiguous) ? { state: 'ambiguous' } : { state: 'never' }
 }
