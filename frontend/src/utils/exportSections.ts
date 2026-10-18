@@ -27,10 +27,13 @@ function grantRow(policy: AccessPolicy, rule: PolicyRule): Record<string, string
     'Applies To': rule.resolutions
       .map(r =>
         r.kind === 'resolved'
-          ? `${r.name}${r.project_name ? ` — ${r.project_name}` : ' (project unknown)'}`
+          ? `${r.name}${r.sub_label ? ` · ${r.sub_label}` : ''}${r.project_name ? ` — ${r.project_name}` : ' (project unknown)'}`
           : r.description
       )
       .join('; '),
+    // The rule's own selector text where a selector was resolved to the named
+    // accounts above, so the export keeps both.
+    'Rule Selector': [...new Set(rule.resolutions.flatMap(r => (r.kind === 'resolved' && r.via_selector ? [r.via_selector] : [])))].join('; '),
     Privileges: rule.privileges
       .map(p => (p.flags.length ? `${p.privilege_type}: ${p.flags.join(',')}` : p.privilege_type))
       .join('; '),

@@ -13,6 +13,8 @@ const KIND_WORD: Record<string, string> = {
   individual_managed_saas_app_account: 'Managed SaaS app account',
   individual_unmanaged_saas_app_account: 'Unmanaged SaaS app account',
   individual_okta_account: 'Okta account',
+  individual_database_account: 'Database account',
+  individual_active_directory_account: 'Active Directory account',
 }
 
 function kindWord(kind: string): string {
@@ -51,6 +53,9 @@ export function ResourceAccessView({ resource, lookup, now, renderGroupAction }:
                 : res.resource_kind.startsWith('relationship_assignment:') ? '' : ' (project unknown)'}
               .
             </p>
+            {resource.selectors.length > 0 && (
+              <p className="xp-mute">Matched by the rule selector: {resource.selectors.join('; ')}.</p>
+            )}
             {res.relationship_name && res.assignment_name && (
               <p className="xp-mute">Granted through the relationship {res.relationship_name} → {res.assignment_name}.</p>
             )}

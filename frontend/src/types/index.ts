@@ -521,6 +521,12 @@ export type PolicyRuleResolution =
        * create_secret_folders.py's _resolve_relationship_assignment_resources. */
       relationship_name?: string
       assignment_name?: string
+      /** Only on accounts a database / Active Directory selector was resolved
+       * to (5.44.5): the rule's own selector text, and the connection or
+       * domain the account is in. See create_secret_folders.py's
+       * _resolve_account_selector. */
+      via_selector?: string
+      sub_label?: string | null
     }
   | { kind: 'condition'; description: string }
 

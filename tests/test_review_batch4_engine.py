@@ -1792,3 +1792,98 @@ def test_database_lookup_excludes_ad_events():
     info = engine.find_last_access_for_user(FakeOktaClient([([ad], True)]), "00uUSER", DB_KEY)["database_accounts"]
     assert info["events"] == []
 
+
+# ---------------------------------------------------------------------------
+# 5.44.5: database / Active Directory selectors resolve to named accounts
+# ---------------------------------------------------------------------------
+SEL_RG = "rg-1"
+
+
+def _dbacct(aid, name, conn="c1", rg=SEL_RG):
+    return {"id": aid, "account_name": name, "database_connection": {"id": conn, "name": "example-conn-" + conn},
+            "project_id": "p1", "project_name": "Example Project", "resource_group_id": rg}
+
+
+def _dbsel(conns, *conds):
+    return {"database_connections": [{"id": c, "name": "n"} for c in conns],
+            "database_accounts": [{"account_name_format": f, "value": v} for f, v in conds]}
+
+
+DB_ACCOUNTS = [_dbacct("a1", "svc_app"), _dbacct("a2", "app_svc"), _dbacct("a3", "audit"), _dbacct("a4", "svc_other", conn="c2")]
+
+
+def _names(result):
+    return None if result is None else [r["name"] for r in result]
+
+
+def test_database_selector_resolution_per_format():
+    resolve = lambda sel: engine._resolve_account_selector("database", sel, DB_ACCOUNTS, SEL_RG)  # noqa: E731
+    assert _names(resolve(_dbsel(["c1"], ("CONTAINS", "svc")))) == ["app_svc", "svc_app"]
+    assert _names(resolve(_dbsel(["c1"], ("STARTS_WITH", "svc")))) == ["svc_app"]
+    assert _names(resolve(_dbsel(["c1"], ("ENDS_WITH", "svc")))) == ["app_svc"]
+    assert _names(resolve(_dbsel(["c1"], ("EQUALS", "audit")))) == ["audit"]
+    both = resolve(_dbsel(["c1", "c2"], ("CONTAINS", "svc")))
+    assert _names(both) == ["app_svc", "svc_app", "svc_other"]
+    first = both[0]
+    assert first["resource_kind"] == "individual_database_account" and first["access_tracking_id"] == "a2"
+    assert first["sub_label"] == "example-conn-c1" and "Database accounts in" in first["via_selector"]
+
+
+def test_database_selector_stays_a_selector_when_not_certain():
+    resolve = lambda sel, accts=DB_ACCOUNTS, rg=SEL_RG: engine._resolve_account_selector("database", sel, accts, rg)  # noqa: E731
+    assert resolve(_dbsel(["c1"], ("REGEX", "svc"))) is None            # unknown format
+    assert resolve(_dbsel(["c1"], ("CONTAINS", ""))) is None            # empty value
+    assert resolve(_dbsel(["c1"])) is None                              # no name condition
+    assert resolve(_dbsel([], ("CONTAINS", "svc"))) is None             # no connection
+    assert resolve(_dbsel(["c9"], ("CONTAINS", "svc"))) is None         # connection mismatch -> nothing matched
+    assert resolve(_dbsel(["c1"], ("CONTAINS", "svc")), accts=None) is None   # incomplete account list
+    assert resolve(_dbsel(["c1"], ("CONTAINS", "svc")), rg=None) is None
+    # case-sensitivity is not stated, so an answer that depends on it is refused
+    assert resolve(_dbsel(["c1"], ("CONTAINS", "SVC"))) is None
+    # accounts of another resource group make the policy scope ambiguous
+    assert resolve(_dbsel(["c1"], ("CONTAINS", "svc")), rg="rg-2") is None
+    # two conditions whose AND / OR readings differ are refused; equal ones resolve
+    assert resolve(_dbsel(["c1"], ("CONTAINS", "svc"), ("STARTS_WITH", "svc"))) is None
+    assert _names(resolve(_dbsel(["c1"], ("CONTAINS", "svc"), ("STARTS_WITH", "app")))) is None
+    assert _names(resolve(_dbsel(["c1"], ("EQUALS", "audit"), ("CONTAINS", "udi")))) == ["audit"]
+
+
+def test_active_directory_selector_resolution():
+    accts = [
+        {"id": "d1", "account_name": "svc_one", "sam_account_name": "svc_one", "domain": {"name": "example.test"}, "resource_group_id": SEL_RG},
+        {"id": "d2", "account_name": "jdoe", "sam_account_name": "jdoe", "domain": {"name": "example.test"}, "resource_group_id": SEL_RG},
+        {"id": "d3", "account_name": "svc_two", "sam_account_name": "svc_two", "domain": {"name": "other.test"}, "resource_group_id": SEL_RG},
+    ]
+    cond = {"individual_accounts": {"by_condition": {"account_name_format": "STARTS_WITH", "value": "svc"}}}
+    got = engine._resolve_account_selector("active_directory", cond, accts, SEL_RG)
+    assert _names(got) == ["svc_one", "svc_two"] and got[0]["resource_kind"] == "individual_active_directory_account"
+    assert got[0]["sub_label"] == "example.test"
+    dom = {"individual_accounts": {"by_domain": ["example.test"]}}
+    assert _names(engine._resolve_account_selector("active_directory", dom, accts, SEL_RG)) == ["jdoe", "svc_one"]
+    shared = {"shared_accounts": {"by_domain": ["example.test"]}}
+    assert engine._resolve_account_selector("active_directory", shared, accts, SEL_RG) is None
+    # the display name and the SAM name disagree -> which one OPA compares is unknown
+    accts[0]["sam_account_name"] = "legacy_one"
+    assert engine._resolve_account_selector("active_directory", cond, accts, SEL_RG) is None
+
+
+def test_resolve_rule_replaces_resolved_selectors_and_keeps_the_rest():
+    rule = {"resource_type": "database_based_resource", "resource_selector": {"selectors": [
+        {"selector_type": "database", "selector": _dbsel(["c1"], ("CONTAINS", "svc"))},
+        {"selector_type": "database", "selector": _dbsel(["c1"], ("REGEX", "x"))},
+    ]}}
+    out = engine._resolve_rule(rule, {"selector_accounts": {"database": DB_ACCOUNTS}}, SEL_RG)
+    assert [r["kind"] for r in out] == ["resolved", "resolved", "condition"]
+    # without the account lists the selector row stays exactly as before
+    out = engine._resolve_rule(rule, {}, SEL_RG)
+    assert [r["kind"] for r in out] == ["condition", "condition"]
+
+
+def test_per_account_lookup_matches_the_account_id_for_reveal_and_checkout():
+    ev = _db_event("e1", "2026-10-03T00:00:00.000Z", "pam.service_account.password.reveal", {"serviceAccountType": "DATABASE_ACCOUNT"}, "svc_app")
+    ev["target"][0]["id"] = "a1"
+    res = engine.find_last_access_for_user(FakeOktaClient([([ev], True)]), "00uUSER",
+                                           [{"resource_kind": "individual_database_account", "resource_id": "a1"},
+                                            {"resource_kind": "individual_database_account", "resource_id": "a2"}])
+    assert len(res["a1"]["events"]) == 1 and res["a2"]["events"] == [] and res["a2"]["complete"] is True
+

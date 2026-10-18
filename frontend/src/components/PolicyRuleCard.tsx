@@ -31,6 +31,7 @@ export function PolicyRuleCard({ rule, policyName }: Props) {
             res.kind === 'resolved' ? (
               <Tag key={i}>
                 {res.name}
+                {res.sub_label ? ` · ${res.sub_label}` : ''}
                 {res.project_name
                   ? ` — ${res.project_name}`
                   // relationship_assignment resolutions (see

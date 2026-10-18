@@ -58,7 +58,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.44.4
+# Version     : 5.44.5
 # =============================================================================
 
 import argparse
@@ -84,7 +84,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.44.4"
+SCRIPT_VERSION = "5.44.5"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 # ENG2-12: OPA's spec documents no pattern or length for a secret-folder
 # name (SecretFolderCreateRequest.name is a bare string); 255 is the limit
@@ -315,6 +315,16 @@ RESOURCE_ACCESS_EVENT_TYPES = {
     "active_directory_account": {
         "event_types": ["pam.service_account.password.reveal"],
         "extract_ids": _active_directory_account_ids, "event_name": _selector_account_name, "limit": SELECTOR_ACCOUNT_EVENT_LIMIT,
+    },
+    # 5.44.5: a database / Active Directory selector resolved to concrete
+    # accounts (see _resolve_account_selector): tracked per account by the
+    # account's OPA id, which is the "Service Account" target id of its events.
+    # Active Directory stays reveal-only (see the selector kinds above).
+    "individual_database_account": {
+        "event_types": ["pam.service_account.password.reveal", "pam.resource.checkout"], "extract_ids": _target_ids,
+    },
+    "individual_active_directory_account": {
+        "event_types": ["pam.service_account.password.reveal"], "extract_ids": _target_ids,
     },
     "secret": {"event_types": ["pam.secret.reveal"], "extract_ids": _target_ids},
     "individual_server_account": {"event_types": ["pam.gateway_creds.issue"], "extract_ids": _gateway_creds_server_ids},
@@ -4084,13 +4094,117 @@ def _resolve_relationship_assignment_resources(resource_assignments, relationshi
     return out
 
 
-def _resolve_rule(rule, indexes):
+# Name-condition formats whose meaning is certain. Anything else (or a missing
+# value) makes a selector "cannot resolve" and it stays a selector row.
+_NAME_FORMATS = {
+    "CONTAINS": lambda name, value: value in name,
+    "STARTS_WITH": lambda name, value: name.startswith(value),
+    "ENDS_WITH": lambda name, value: name.endswith(value),
+    "EQUALS": lambda name, value: name == value,
+}
+
+_SELECTOR_ACCOUNT_KINDS = {
+    "database": "individual_database_account",
+    "active_directory": "individual_active_directory_account",
+}
+
+
+def _resolve_account_selector(selector_type, selector, accounts, policy_rg_id):
+    """Resolves a database / Active Directory selector to the concrete
+    accounts it covers, or returns None when that cannot be done with
+    certainty (the caller keeps the selector row then). Certainty rules:
+    - `accounts` must be the COMPLETE list (None = a fetch failed);
+    - only the name formats in _NAME_FORMATS, with a non-empty value;
+    - the OPA docs do not state case-sensitivity, how several conditions
+      combine, or which AD name field is compared, so every plausible
+      reading is evaluated and the result is used only when they all give the
+      same accounts (otherwise None);
+    - the policy's resource-group scope must not change the result either;
+    - no matching account at all -> None (an honest "selector" row stays).
+    Database: connections (matched by id; any listed) AND the name
+    conditions. AD: individual_accounts.by_condition (name) or by_domain
+    (domain name in the list); shared AD accounts are not handled."""
+    try:
+        if accounts is None or not policy_rg_id:
+            return None
+        if selector_type == "database":
+            conn_ids = {c.get("id") for c in selector.get("database_connections") or []}
+            conds = [(c.get("account_name_format"), c.get("value")) for c in selector.get("database_accounts") or []]
+            if not conn_ids or None in conn_ids or not conds:
+                return None
+            scope = [a for a in accounts if (a.get("database_connection") or {}).get("id") in conn_ids]
+            name_fields = ["account_name"]
+            sub_label = lambda a: (a.get("database_connection") or {}).get("name")  # noqa: E731
+        elif selector_type == "active_directory":
+            individual = selector.get("individual_accounts") or {}
+            by_condition, by_domain = individual.get("by_condition"), individual.get("by_domain")
+            if bool(by_condition) == bool(by_domain):
+                return None
+            scope = list(accounts)
+            sub_label = lambda a: (a.get("domain") or {}).get("name")  # noqa: E731
+            if by_condition:
+                conds = [(by_condition.get("account_name_format"), by_condition.get("value"))]
+                name_fields = [f for f in ("account_name", "sam_account_name") if all(isinstance(a.get(f), str) for a in scope)]
+                if "account_name" not in name_fields:
+                    return None
+            else:
+                if not isinstance(by_domain, list) or not by_domain or not all(isinstance(d, str) and d for d in by_domain):
+                    return None
+                if not all(isinstance((a.get("domain") or {}).get("name"), str) for a in scope):
+                    return None
+                conds, name_fields = None, None
+        else:
+            return None
+
+        def variants():
+            for fold in (False, True):
+                norm = (lambda t: t.lower()) if fold else (lambda t: t)
+                if conds is None:
+                    domains = {norm(d) for d in by_domain}
+                    yield {a["id"] for a in scope if norm(a["domain"]["name"]) in domains}
+                    continue
+                for field in name_fields:
+                    tests = []
+                    for fmt, value in conds:
+                        if fmt not in _NAME_FORMATS or not isinstance(value, str) or not value:
+                            raise ValueError("unknown condition")
+                        tests.append(lambda a, f=_NAME_FORMATS[fmt], v=norm(value), fld=field: isinstance(a.get(fld), str) and f(norm(a[fld]), v))
+                    for combine in ((all, any) if len(tests) > 1 else (all,)):
+                        yield {a["id"] for a in scope if combine(t(a) for t in tests)}
+
+        results = list(variants())
+        matched_ids = results[0]
+        if not matched_ids or any(r != matched_ids for r in results):
+            return None
+        if {a["id"] for a in scope if a["id"] in matched_ids and a.get("resource_group_id") == policy_rg_id} != matched_ids:
+            return None
+        description = describe_dynamic_selector(None, selector_type, selector)
+        out = []
+        for a in sorted((a for a in scope if a["id"] in matched_ids), key=lambda a: (a.get("account_name") or "").lower()):
+            out.append({
+                "kind": "resolved", "id": a["id"], "name": a.get("account_name") or a["id"],
+                "resource_kind": _SELECTOR_ACCOUNT_KINDS[selector_type],
+                "project_id": a.get("project_id"), "project_name": a.get("project_name"),
+                "resource_group_id": a.get("resource_group_id"),
+                "access_tracking_id": a["id"], "via_selector": description, "sub_label": sub_label(a),
+            })
+        return out
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def _resolve_rule(rule, indexes, policy_rg_id=None):
     resource_type = rule.get("resource_type")
     entries = (rule.get("resource_selector") or {}).get("selectors") or []
-    resolutions = [
-        _resolve_selector_entry(resource_type, entry.get("selector_type"), entry.get("selector") or {}, indexes)
-        for entry in entries
-    ]
+    resolutions = []
+    for entry in entries:
+        selector_type, selector = entry.get("selector_type"), entry.get("selector") or {}
+        accounts = (indexes.get("selector_accounts") or {}).get(selector_type)
+        named = _resolve_account_selector(selector_type, selector, accounts, policy_rg_id) if selector_type in _SELECTOR_ACCOUNT_KINDS else None
+        if named:
+            resolutions.extend(named)
+        else:
+            resolutions.append(_resolve_selector_entry(resource_type, selector_type, selector, indexes))
     return resolutions or [{"kind": "condition",
                              "description": RESOURCE_TYPE_LABELS.get(resource_type, resource_type)}]
 
@@ -5542,6 +5656,12 @@ def build_access_model(client, okta_client=None, on_progress=None):
             _report(on_progress, "index_resources", "progress",
                     f"{indexed_count}/{total_projects} projects ({project['name']})")
     _report(on_progress, "index_resources", "done", f"{indexed_count} project(s) indexed")
+    # Selector rows can only be resolved to named accounts from a COMPLETE
+    # account list; a project whose list could not be read leaves it None.
+    indexes["selector_accounts"] = {
+        "database": None if any(w["section"].startswith("database accounts in project") for w in warnings) else all_database_accounts,
+        "active_directory": None if any(w["section"].startswith("Active Directory accounts in project") for w in warnings) else all_active_directory_accounts,
+    }
 
     _report(on_progress, "user_groups", "start")
     users_with_groups = []
@@ -5630,7 +5750,7 @@ def build_access_model(client, okta_client=None, on_progress=None):
         for rule in policy.get("rules") or []:  # ENG2-11: "rules": null (a relationship-only policy) is not a crash
             if not isinstance(rule, dict):
                 continue
-            resolutions = _resolve_rule(rule, indexes)
+            resolutions = _resolve_rule(rule, indexes, (policy.get("resource_group") or {}).get("id"))
             # A relationship-based policy's rule has an EMPTY
             # resource_selector (confirmed live -- the real grant comes
             # from the assignment instead), so _resolve_rule's own

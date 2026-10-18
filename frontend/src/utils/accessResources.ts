@@ -39,6 +39,9 @@ export interface AccessResource {
   risky: boolean
   viaNames: string[]
   policyNames: string[]
+  /** The rule selector text(s) that matched this named account (empty for
+   * everything else). Searchable and shown in the opened row. */
+  selectors: string[]
 }
 
 // Resource kinds with a verified, working System Log mapping -- see
@@ -49,6 +52,8 @@ export const TRACKABLE_KINDS = new Set([
   'individual_managed_saas_app_account',
   'individual_unmanaged_saas_app_account',
   'individual_okta_account',
+  'individual_database_account',
+  'individual_active_directory_account',
 ])
 
 /** Database and Active Directory access rules are selectors (connections or
@@ -171,12 +176,13 @@ export function aggregateResources(grants: GrantedRule[], options: AggregateOpti
         const hint =
           res.kind === 'condition'
             ? 'selector'
-            : [res.resource_kind === 'secret_folder' ? 'folder' : null, res.project_name].filter(Boolean).join(' · ') || undefined
+            : [res.sub_label, res.resource_kind === 'secret_folder' ? 'folder' : null, res.project_name].filter(Boolean).join(' · ') || undefined
         item = {
-          key, typeId, typeLabel, name, hint, resolution: res, lines: [], actions: [], conditions: [], risky: false, viaNames: [], policyNames: [],
+          key, typeId, typeLabel, name, hint, resolution: res, lines: [], actions: [], conditions: [], risky: false, viaNames: [], policyNames: [], selectors: [],
         }
         byKey.set(key, item)
       }
+      if (res.kind === 'resolved' && res.via_selector && !item.selectors.includes(res.via_selector)) item.selectors.push(res.via_selector)
       if (!item.lines.some(l => l.policy === policy && l.rule === rule)) {
         item.lines.push({ policy, rule, groups: groupsFor(policy), othersCount })
       }

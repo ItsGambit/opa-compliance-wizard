@@ -1,4 +1,7 @@
+import { act, renderHook } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
+import { useGrantsExplorer } from '../components/explorer/useGrantsExplorer'
+import { grantRows } from './exportSections'
 import { examplePolicies, MFA, policy, resolved, rule } from '../test/accessFixtures'
 import type { ResourceAccessInfo } from '../types'
 import {
@@ -174,5 +177,60 @@ describe('last accessed for Active Directory selector rules', () => {
     expect(lastUsedFor(ad, ready({ complete: false }))).toEqual({ state: 'unknown' })
     expect(lastUsedFor(ad, { status: 'loading' })).toEqual({ state: 'loading' })
     expect(lastUsedFor(ad, { status: 'error', message: 'x', onRetry: () => {} })).toEqual({ state: 'error' })
+  })
+})
+
+describe('database selectors resolved to named accounts (5.44.5)', () => {
+  const acct = (id: string, name: string, conn = 'example-conn-1') => ({
+    ...resolved(id, name, 'individual_database_account'), access_tracking_id: id, sub_label: conn,
+    via_selector: "Database accounts in example-conn-1 where name contains 'svc'",
+  })
+  const ruleA = rule('Rule A', 'Database accounts', [acct('a1', 'svc_app'), acct('a2', 'app_svc')], { resource_type: 'database_based_resource' })
+  const ruleB = rule('Rule B', 'Database accounts', [acct('a1', 'svc_app')], { resource_type: 'database_based_resource' })
+  const grantsDb = rulesGrantedToGroupIds([
+    policy('p1', 'Policy One', [{ id: 'g1', name: 'G' }], [ruleA]),
+    policy('p2', 'Policy Two', [{ id: 'g1', name: 'G' }], [ruleB]),
+  ], new Set(['g1']))
+  const rows = aggregateResources(grantsDb)
+
+  it('shows one row per account named by the account, with the connection as sub-label', () => {
+    expect(rows.map(r => r.name)).toEqual(['app_svc', 'svc_app'])
+    expect(rows[1].hint).toContain('example-conn-1')
+    expect(rows[1].selectors).toEqual(["Database accounts in example-conn-1 where name contains 'svc'"])
+  })
+
+  it('merges an account matched by two rules into one row with both grants', () => {
+    const svc = rows.find(r => r.name === 'svc_app')!
+    expect(svc.lines.map(l => l.policy.name)).toEqual(['Policy One', 'Policy Two'])
+  })
+
+  it('looks each account up by its own id, not the any-account selector id', () => {
+    expect(trackedRequests(rows)).toEqual([
+      { resource_kind: 'individual_database_account', resource_id: 'a2' },
+      { resource_kind: 'individual_database_account', resource_id: 'a1' },
+    ])
+    const lookup: AccessLookup = { status: 'ready', byId: new Map([
+      ['a1', { resource_kind: 'individual_database_account', supported: true, events: [{ published: '2026-10-05T00:00:00Z', request_id: 'r', outcome: 'SUCCESS' }] }],
+      ['a2', { resource_kind: 'individual_database_account', supported: true, events: [], complete: true }],
+    ]) }
+    expect(lastUsedFor(rows.find(r => r.name === 'svc_app')!, lookup)).toEqual({ state: 'used', at: '2026-10-05T00:00:00Z' })
+    expect(lastUsedFor(rows.find(r => r.name === 'app_svc')!, lookup)).toEqual({ state: 'never' })
+  })
+
+  it('counts and searches the named accounts, by account name and by rule text', () => {
+    const { result } = renderHook(() => useGrantsExplorer({ resources: rows, lookup: undefined, resetKey: "u" }))
+    expect(result.current.total).toBe(2)
+    expect(result.current.visible.length).toBe(2)
+    expect(result.current.countItems.find(c => /database/i.test(c.label))?.count).toBe(2)
+    act(() => result.current.setQuery("svc_app"))
+    expect(result.current.visible.map(v => v.resource.name)).toEqual(["svc_app"])
+    act(() => result.current.setQuery("contains svc"))
+    expect(result.current.visible.length).toBe(2)
+  })
+
+  it('exports the account names and keeps the rule selector in its own column', () => {
+    const [row] = grantRows(grantsDb.slice(0, 1))
+    expect(row['Applies To']).toContain('svc_app · example-conn-1')
+    expect(row['Rule Selector']).toBe("Database accounts in example-conn-1 where name contains 'svc'")
   })
 })
