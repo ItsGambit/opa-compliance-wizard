@@ -250,6 +250,7 @@ html[data-theme="light"] .xp-filter-count { color: var(--color-text-dim); }
 html[data-theme="light"] .xp-note { color: var(--color-text-dim); }
 .xp-section { margin-top: 2.125rem; }
 .xp-section:first-of-type { margin-top: 0; }
+.xp-after { margin-top: 2.125rem; }
 .xp-section-h { margin: 0; }
 .xp-section-btn { display: flex; align-items: baseline; gap: 0.5rem; width: 100%; padding: 0 0 0.625rem; background: none; border: 0; text-align: left; cursor: pointer; color: var(--color-text); font: inherit; }
 .xp-section-name { font-size: 0.9375rem; font-weight: 500; }

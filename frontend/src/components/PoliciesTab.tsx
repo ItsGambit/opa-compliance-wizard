@@ -1,158 +1,144 @@
 import { useMemo, useState } from 'react'
-import { useEnvironments, useResourceHistory } from '../api/hooks'
-import type { AccessModel } from '../types'
+import type { AccessModel, AccessPolicy } from '../types'
+import { ruleHasApprovalOrMfa } from '../utils/accessResources'
 import type { ExportSection } from '../utils/export'
 import { grantRows, policySummaryRows } from '../utils/exportSections'
-import { formatDateTime } from '../utils/format'
+import { HighlightedText, useFuzzyFilter } from '../utils/fuzzySearch'
+import { ExplorerLayout } from './explorer/ExplorerLayout'
+import type { ExplorerRowData } from './explorer/ExplorerRows'
+import { ExplorerToolbar } from './explorer/ExplorerToolbar'
+import { PolicyDetail } from './explorer/PolicyDetail'
+import { CountList, FilterMenu, type FilterItem } from './explorer/RailParts'
+import { RowSections } from './explorer/RowSections'
+import { useSectionState } from './explorer/useSectionState'
 import { ExportButtons } from './ExportButtons'
-import { PolicyRuleCard } from './PolicyRuleCard'
 
 interface Props {
   model: AccessModel
 }
 
-/** "Last modified by {user} on {date}" for one policy -- reuses the exact
- * same per-resource history lookup ResourcesTab's drill-down already uses
- * (pam.security_policy.create/.update events target the policy's own id,
- * confirmed live 2026-10-02), not a new backend call. No date range passed
- * (full history) -- this just needs the single most recent create/update
- * entry, not a browsable table. */
-function PolicyLastModified({ policyId }: { policyId: string }) {
-  const { data: environments } = useEnvironments()
-  const activeEnv = environments?.active ?? undefined  // null (no active env) -> undefined, which the hooks treat as "disabled"
-  const { data, isLoading, isError } = useResourceHistory(policyId, activeEnv)
-  const latest = data?.rows.find(r => r.event_type === 'pam.security_policy.create' || r.event_type === 'pam.security_policy.update')
-  if (isLoading) return null
-  // UI-04: a failed lookup says so instead of looking like "never modified".
-  if (isError) return <span className="text-xs text-warn">Last modified: could not load the history</span>
-  if (!latest) return null
-  return (
-    <span className="text-xs text-text-faint">
-      Last modified by {latest.user} on {formatDateTime(latest.timestamp)}
-    </span>
-  )
+interface Entry {
+  policy: AccessPolicy
+  groupNames: string[]
+  types: string[]
+  ruleNames: string[]
+  resourceGroupName: string
+  /** At least one rule needs neither MFA nor an access request. */
+  openRule: boolean
+}
+
+const FILTER_INACTIVE = 'inactive'
+const FILTER_RISK = 'risk'
+const SEARCH_KEYS = ['policy.name', 'policy.description', 'resourceGroupName', 'groupNames', 'types', 'ruleNames']
+
+function joinWithMore(names: string[]): string {
+  return names.length <= 1 ? (names[0] ?? '') : `${names[0]} +${names.length - 1}`
+}
+
+function policyExport(policy: AccessPolicy): ExportSection[] {
+  return [
+    {
+      title: `Policy: ${policy.name}`,
+      rows: [
+        {
+          Description: policy.description ?? '',
+          Active: policy.active ? 'Yes' : 'No',
+          'Resource Group': policy.resource_group?.name ?? 'Team-wide',
+          'Principal Groups': policy.principals.user_groups.map(g => g.name).join(', '),
+          'Workload Roles': policy.principals.workload_roles.map(w => w.name).join(', '),
+        },
+      ],
+    },
+    { title: 'Rules', rows: grantRows(policy.rules.map(rule => ({ policy, rule }))) },
+  ]
 }
 
 export function PoliciesTab({ model }: Props) {
-  const [policyId, setPolicyId] = useState<string | undefined>(undefined)
+  const [query, setQuery] = useState('')
+  const [active, setActive] = useState<Set<string>>(() => new Set())
 
-  const scoped = useMemo(
-    () => model.policies.filter(p => p.resource_group).sort((a, b) => a.name.localeCompare(b.name)),
+  const entries: Entry[] = useMemo(
+    () => [...model.policies].sort((a, b) => a.name.localeCompare(b.name)).map(policy => ({
+      policy,
+      groupNames: [...policy.principals.user_groups.map(g => g.name), ...policy.principals.workload_roles.map(w => `${w.name} (workload role)`)],
+      types: [...new Set(policy.rules.map(r => r.resource_type_label))],
+      ruleNames: policy.rules.map(r => r.name),
+      resourceGroupName: policy.resource_group?.name ?? 'Team-wide',
+      openRule: policy.rules.some(r => !ruleHasApprovalOrMfa(r)),
+    })),
     [model.policies]
   )
-  const teamWide = useMemo(
-    () => model.policies.filter(p => !p.resource_group).sort((a, b) => a.name.localeCompare(b.name)),
-    [model.policies]
-  )
-  const policy = model.policies.find(p => p.id === policyId)
 
-  const exportSectionsForView: ExportSection[] = useMemo(() => {
-    if (!policy) return [{ title: 'Policies', rows: policySummaryRows(model.policies) }]
-    return [
-      {
-        title: `Policy: ${policy.name}`,
-        rows: [
-          {
-            Description: policy.description ?? '',
-            Active: policy.active ? 'Yes' : 'No',
-            'Resource Group': policy.resource_group?.name ?? 'Team-wide',
-            'Principal Groups': policy.principals.user_groups.map(g => g.name).join(', '),
-            'Workload Roles': policy.principals.workload_roles.map(w => w.name).join(', '),
-          },
-        ],
-      },
-      { title: 'Rules', rows: grantRows(policy.rules.map(rule => ({ policy, rule }))) },
-    ]
-  }, [policy, model.policies])
+  const hits = useFuzzyFilter(entries, query, SEARCH_KEYS)
+  const visible = hits.filter(({ item }) => (!active.has(FILTER_INACTIVE) || !item.policy.active) && (!active.has(FILTER_RISK) || item.openRule))
+
+  const toRow = ({ item: e, matches }: (typeof hits)[number]): ExplorerRowData => ({
+    id: `policy:${e.policy.id}`,
+    label: e.policy.name,
+    name: <HighlightedText text={e.policy.name} indices={matches.find(m => m.key === 'policy.name')?.indices} />,
+    hint: e.policy.active ? undefined : 'inactive',
+    can: e.policy.description || e.types.join(', '),
+    via: joinWithMore(e.groupNames),
+    used: `${e.policy.rules.length} rule${e.policy.rules.length === 1 ? '' : 's'}`,
+    detail: () => <PolicyDetail policy={e.policy} showLastModified exportSections={policyExport(e.policy)} exportName={`opa-policy-${e.policy.name}`} />,
+  })
+  const scoped = visible.filter(h => h.item.policy.resource_group)
+  const teamWide = visible.filter(h => !h.item.policy.resource_group)
+  const sections = [
+    { id: 'scoped', title: 'Scoped to a resource group', rows: scoped.map(toRow) },
+    { id: 'team-wide', title: 'Team-wide', rows: teamWide.map(toRow) },
+  ]
+  const visibleIds = sections.filter(s => s.rows.length > 0).map(s => s.id)
+  const filtering = query.trim() !== '' || active.size > 0
+  const state = useSectionState(visibleIds, { autoOpenKey: filtering ? `${query.trim()}|${[...active].sort().join(',')}` : '' })
+
+  const allScoped = entries.filter(e => e.policy.resource_group).length
+  const allTeam = entries.length - allScoped
+  const filterItems: FilterItem[] = [
+    { id: FILTER_INACTIVE, label: 'Inactive policies', count: entries.filter(e => !e.policy.active).length },
+    { id: FILTER_RISK, label: 'A rule with no approval or MFA', count: entries.filter(e => e.openRule).length },
+  ]
+  const toggle = (id: string) => setActive(prev => {
+    const next = new Set(prev)
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    return next
+  })
+
+  const exportSectionsForView: ExportSection[] = useMemo(() => [{ title: 'Policies', rows: policySummaryRows(model.policies) }], [model.policies])
+
+  const rail = (
+    <>
+      <div className="flex flex-col gap-1">
+        <span className="xp-rail-title">Policies</span>
+        <span className="xp-rail-sub">Open one to see who it is for and every rule.</span>
+      </div>
+      <CountList
+        items={[
+          { id: 'scoped', label: 'scoped to a resource group', count: allScoped },
+          ...(allTeam > 0 ? [{ id: 'team-wide', label: 'team-wide', count: allTeam }] : []),
+        ]}
+        onSelect={state.jumpTo}
+      />
+      <FilterMenu items={filterItems} active={active} onToggle={toggle} />
+      <div className="xp-rail-actions">
+        <ExportButtons sections={exportSectionsForView} filenameBase="opa-policies" />
+      </div>
+    </>
+  )
 
   return (
-    <div className="flex flex-col gap-3">
-      <div className="flex justify-end">
-        <ExportButtons
-          sections={exportSectionsForView}
-          filenameBase={policy ? `opa-policy-${policy.name}` : 'opa-policies'}
-        />
-      </div>
-      <div className="flex flex-col md:flex-row gap-4">
-      <div className="card p-2 flex flex-col gap-1 w-full md:w-64 shrink-0 max-h-[70vh] overflow-y-auto">
-        <span className="section-label px-1 py-1">Scoped to a resource group ({scoped.length})</span>
-        {scoped.map(p => (
-          <button
-            key={p.id}
-            type="button"
-            onClick={() => setPolicyId(p.id)}
-            className={`text-left text-sm rounded px-2 py-1.5 transition-colors ${
-              p.id === policyId ? 'bg-accent-dim text-text' : 'text-text-dim hover:bg-bg-hover'
-            }`}
-          >
-            {p.name}
-            {!p.active && <span className="text-text-faint text-xs"> (inactive)</span>}
-          </button>
-        ))}
-
-        {teamWide.length > 0 && (
-          <>
-            <span className="section-label px-1 py-1 mt-2">Team-wide ({teamWide.length})</span>
-            {teamWide.map(p => (
-              <button
-                key={p.id}
-                type="button"
-                onClick={() => setPolicyId(p.id)}
-                className={`text-left text-sm rounded px-2 py-1.5 transition-colors ${
-                  p.id === policyId ? 'bg-accent-dim text-text' : 'text-text-dim hover:bg-bg-hover'
-                }`}
-              >
-                {p.name}
-                {!p.active && <span className="text-text-faint text-xs"> (inactive)</span>}
-              </button>
-            ))}
-          </>
-        )}
-      </div>
-
-      <div className="flex-1 flex flex-col gap-3">
-        {!policy && <span className="text-sm text-text-faint">Select a policy to see its detail.</span>}
-        {policy && (
-          <>
-            <div className="card p-3 flex flex-col gap-2">
-              <div className="flex items-center justify-between">
-                <span className="text-sm font-medium text-text">{policy.name}</span>
-                <span className="text-xs text-text-faint">
-                  {policy.resource_group ? policy.resource_group.name : 'Team-wide'} · {policy.active ? 'Active' : 'Inactive'}
-                </span>
-              </div>
-              {policy.description && <p className="text-sm text-text-dim">{policy.description}</p>}
-              <PolicyLastModified policyId={policy.id} />
-
-              <div className="flex flex-col gap-1">
-                <span className="section-label">Principals</span>
-                <div className="flex flex-wrap gap-1.5">
-                  {policy.principals.user_groups.map(g => (
-                    <span key={g.id} className="text-xs text-text-dim bg-bg-hover border border-border rounded px-1.5 py-0.5">
-                      {g.name}
-                    </span>
-                  ))}
-                  {policy.principals.workload_roles.map(w => (
-                    <span key={w.id} className="text-xs text-text-dim bg-bg-hover border border-border rounded px-1.5 py-0.5">
-                      {w.name} (workload role)
-                    </span>
-                  ))}
-                  {policy.principals.user_groups.length === 0 && policy.principals.workload_roles.length === 0 && (
-                    <span className="text-xs text-text-faint">None</span>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            <div className="flex flex-col gap-2">
-              {policy.rules.map((rule, i) => (
-                <PolicyRuleCard key={i} rule={rule} />
-              ))}
-            </div>
-          </>
-        )}
-      </div>
-      </div>
-    </div>
+    <ExplorerLayout rail={rail} railLabel="Policy quick view and filters">
+      <ExplorerToolbar query={query} onQueryChange={setQuery} label="Search policies" sections={state} />
+      {filtering && (
+        <p className="xp-note" role="status">
+          Showing {visible.length} of {entries.length} ·{' '}
+          <button type="button" className="xp-linkbtn" onClick={() => { setActive(new Set()); setQuery('') }}>Clear</button>
+        </p>
+      )}
+      {entries.length === 0 && <p className="xp-note">No policies were found.</p>}
+      {entries.length > 0 && visible.length === 0 && <p className="xp-note">Nothing matches the current search and filters.</p>}
+      <RowSections sections={sections} state={state} />
+    </ExplorerLayout>
   )
 }

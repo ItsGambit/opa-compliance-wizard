@@ -2,9 +2,9 @@ import type { ReactNode } from 'react'
 import type { AccessResource } from '../../utils/accessResources'
 import { HighlightedText } from '../../utils/fuzzySearch'
 import { lastUsedText } from './lastUsedText'
-import { ExplorerRows, type ExplorerRowData } from './ExplorerRows'
+import type { ExplorerRowData } from './ExplorerRows'
 import { ExplorerToolbar } from './ExplorerToolbar'
-import { TypeSection } from './TypeSection'
+import { RowSections } from './RowSections'
 import type { GrantsExplorer } from './useGrantsExplorer'
 
 function joinWithMore(names: string[]): string {
@@ -21,11 +21,13 @@ interface Props {
   renderDetail: (r: AccessResource) => ReactNode
   /** Shown when the subject has no access resources at all. */
   emptyMessage: string
+  /** Extra sections after the resource types (e.g. a project's settings). */
+  after?: ReactNode
 }
 
 /** The main pane of the resource-centred views: search, Expand/Collapse all,
  * the "showing X of Y" line and one TypeSection per resource type. */
-export function GrantsMain({ ex, now, searchLabel, viaOf = r => r.viaNames, renderDetail, emptyMessage }: Props) {
+export function GrantsMain({ ex, now, searchLabel, viaOf = r => r.viaNames, renderDetail, emptyMessage, after }: Props) {
   const shown = ex.visible.length
   return (
     <>
@@ -39,9 +41,12 @@ export function GrantsMain({ ex, now, searchLabel, viaOf = r => r.viaNames, rend
       )}
       {ex.total === 0 && <p className="xp-note">{emptyMessage}</p>}
       {ex.total > 0 && shown === 0 && <p className="xp-note">Nothing matches the current search and filters.</p>}
-      <div>
-        {ex.visibleSections.map(section => {
-          const rows: ExplorerRowData[] = section.visible.map(({ resource, nameIndices, lastUsed }) => {
+      <RowSections
+        state={ex.sections}
+        sections={ex.visibleSections.map(section => ({
+          id: section.id,
+          title: section.title,
+          rows: section.visible.map(({ resource, nameIndices, lastUsed }): ExplorerRowData => {
             const used = lastUsedText(lastUsed, now)
             return {
               id: `${section.id}:${resource.key}`,
@@ -54,21 +59,10 @@ export function GrantsMain({ ex, now, searchLabel, viaOf = r => r.viaNames, rend
               usedTitle: used.title,
               detail: () => renderDetail(resource),
             }
-          })
-          return (
-            <TypeSection
-              key={section.id}
-              id={section.id}
-              title={section.title}
-              count={rows.length}
-              open={ex.sections.isOpen(section.id)}
-              onToggle={() => ex.sections.toggle(section.id)}
-            >
-              <ExplorerRows rows={rows} />
-            </TypeSection>
-          )
-        })}
-      </div>
+          }),
+        }))}
+      />
+      {after && <div className="xp-after">{after}</div>}
     </>
   )
 }

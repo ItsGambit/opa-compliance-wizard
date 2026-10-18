@@ -1,180 +1,163 @@
 import { useMemo, useState } from 'react'
-import type { AccessAssignment, AccessModel } from '../types'
+import type { AccessAssignment, AccessModel, AccessRelationship } from '../types'
 import type { ExportSection } from '../utils/export'
 import { relationshipAssignmentRows } from '../utils/exportSections'
+import { HighlightedText, useFuzzyFilter } from '../utils/fuzzySearch'
+import { assignmentsForRelationship, policiesUsingAssignment, principalsForRelationship } from '../utils/relationships'
+import { Chip, ChipList, DetailGrid, DetailSection } from './explorer/DetailBlocks'
+import { ExplorerLayout } from './explorer/ExplorerLayout'
+import type { ExplorerRowData } from './explorer/ExplorerRows'
+import { ExplorerToolbar } from './explorer/ExplorerToolbar'
+import { CountList, FilterMenu, type FilterItem } from './explorer/RailParts'
+import { RowSections } from './explorer/RowSections'
+import { useSectionState } from './explorer/useSectionState'
 import { ExportButtons } from './ExportButtons'
-import { Select } from './Select'
-import { Tag } from './PolicyRuleCard'
 
 interface Props {
   model: AccessModel
 }
 
-/** Relationship -> Assignment -> Policy drill-down, mirroring
- * ProjectsTab's resource-group -> project master-detail pattern. A
- * relationship is a named grant type (e.g. "TDI_Safe_Owners"); an
- * assignment links it to a principal group plus specific resources; a
- * policy referencing the relationship effectively inherits every
- * assignment's principal+resources (see create_secret_folders.py's
- * assignments_by_relationship_id, one-to-MANY by design). This tab makes
- * that chain directly browsable -- the same data is already folded into
- * ordinary policy rules elsewhere (Projects/ResourceGroups/Policies/
- * Users/Groups tabs, via PolicyRuleCard's "via {relationship} ->
- * {assignment}" annotation), so this tab exists for browsing the
- * relationship/assignment CONFIG itself, not to duplicate that
- * resolution logic. */
+interface Entry {
+  relationship: AccessRelationship
+  assignments: AccessAssignment[]
+  assignmentNames: string[]
+  policyCount: number
+}
+
+const FILTER_NO_ASSIGNMENTS = 'no-assignments'
+const FILTER_UNUSED = 'unused'
+const SEARCH_KEYS = ['relationship.name', 'relationship.description', 'assignmentNames']
+
+/** Relationship -> Assignment -> Policy, browsable: a relationship is a named
+ * grant type (e.g. "Safe Owners"); an assignment links it to a principal
+ * group plus specific resources; a policy referencing the relationship
+ * effectively inherits every assignment's principal+resources (see
+ * create_secret_folders.py's assignments_by_relationship_id, one-to-MANY by
+ * design). Each relationship is a row; opening it lists every assignment
+ * with its principals, resolved resources and the policies using it. The
+ * same data is already folded into ordinary policy rules elsewhere (via
+ * "via {relationship} -> {assignment}"), so this view exists for browsing
+ * the relationship/assignment CONFIG itself. */
 export function RelationshipsTab({ model }: Props) {
-  const [relationshipId, setRelationshipId] = useState<string | undefined>(undefined)
-  const [assignmentId, setAssignmentId] = useState<string | undefined>(undefined)
+  const [query, setQuery] = useState('')
+  const [active, setActive] = useState<Set<string>>(() => new Set())
 
-  const assignmentsForRelationship = useMemo(
-    () =>
-      relationshipId
-        ? model.assignments.filter(a =>
-            a.relationship_assignments.some(ra => ra.relationship.id === relationshipId)
-          )
-        : [],
-    [model.assignments, relationshipId]
-  )
-  const relationship = model.relationships.find(r => r.id === relationshipId)
-  const assignment = model.assignments.find(a => a.id === assignmentId)
-
-  // Principal(s) this assignment grants specifically FOR the selected
-  // relationship -- one assignment can carry relationship_assignments for
-  // more than one relationship (confirmed live: see
-  // assignments_by_relationship_id's docstring), so this is scoped to the
-  // one currently selected, not every principal on the assignment.
-  const principalsForSelection = useMemo(() => {
-    if (!assignment || !relationshipId) return []
-    const seen = new Map<string, string>()
-    for (const ra of assignment.relationship_assignments) {
-      if (ra.relationship.id === relationshipId && ra.principal?.id) {
-        seen.set(ra.principal.id, ra.principal.name)
+  const entries: Entry[] = useMemo(
+    () => model.relationships.map(relationship => {
+      const assignments = assignmentsForRelationship(model, relationship.id)
+      return {
+        relationship,
+        assignments,
+        assignmentNames: assignments.map(a => a.name),
+        policyCount: model.policies.filter(p => p.relationship_ids.includes(relationship.id)).length,
       }
-    }
-    return [...seen.entries()].map(([id, name]) => ({ id, name }))
-  }, [assignment, relationshipId])
+    }),
+    [model]
+  )
 
-  const policiesUsingAssignment = useMemo(() => {
-    if (!assignment) return []
-    const relIds = new Set(assignment.relationship_assignments.map(ra => ra.relationship.id))
-    return model.policies.filter(p => p.relationship_ids.some(id => relIds.has(id)))
-  }, [assignment, model.policies])
+  const hits = useFuzzyFilter(entries, query, SEARCH_KEYS)
+  const visible = hits.filter(({ item }) =>
+    (!active.has(FILTER_NO_ASSIGNMENTS) || item.assignments.length === 0) && (!active.has(FILTER_UNUSED) || item.policyCount === 0))
 
-  const handleRelationshipChange = (id: string) => {
-    setRelationshipId(id)
-    setAssignmentId(undefined)
-  }
-
-  const exportSectionsForSelection: ExportSection[] = useMemo(() => {
-    if (!assignment || !relationship) return [{ title: 'Relationships', rows: relationshipAssignmentRows(model) }]
-    return [
+  const exportFor = (e: Entry): ExportSection[] => e.assignments.map(a => ({
+    title: `Assignment: ${a.name}`,
+    rows: [
       {
-        title: `Assignment: ${assignment.name}`,
-        rows: [
-          {
-            Relationship: relationship.name,
-            Principals: principalsForSelection.map(p => p.name).join(', '),
-            'Resolved Resources': assignment.resolved_resources.map(r => (r.kind === 'resolved' ? r.name : r.description)).join(', '),
-            'Policies Using This': policiesUsingAssignment.map(p => p.name).join(', '),
-          },
-        ],
+        Relationship: e.relationship.name,
+        Principals: principalsForRelationship(a, e.relationship.id).map(p => p.name).join(', '),
+        'Resolved Resources': a.resolved_resources.map(r => (r.kind === 'resolved' ? r.name : r.description)).join(', '),
+        'Policies Using This': policiesUsingAssignment(a, model.policies).map(p => p.name).join(', '),
       },
-    ]
-  }, [assignment, relationship, principalsForSelection, policiesUsingAssignment, model])
+    ],
+  }))
+
+  const rows: ExplorerRowData[] = visible.map(({ item: e, matches }) => ({
+    id: `relationship:${e.relationship.id}`,
+    label: e.relationship.name,
+    name: <HighlightedText text={e.relationship.name} indices={matches.find(m => m.key === 'relationship.name')?.indices} />,
+    can: e.relationship.description ?? '',
+    via: `${e.assignments.length} assignment${e.assignments.length === 1 ? '' : 's'}`,
+    used: `${e.policyCount} polic${e.policyCount === 1 ? 'y' : 'ies'}`,
+    detail: () => (
+      <DetailGrid>
+        <DetailSection title="What it is">
+          <p>{e.relationship.description || 'A named grant type with no description.'}</p>
+          {e.assignments.length > 0 && <ExportButtons sections={exportFor(e)} filenameBase={`opa-relationship-${e.relationship.name}`} />}
+        </DetailSection>
+        <DetailSection title={`Assignments using this relationship (${e.assignments.length})`}>
+          {e.assignments.length === 0 && <p className="xp-mute">No assignments reference this relationship.</p>}
+        </DetailSection>
+        {e.assignments.map(a => {
+          const principals = principalsForRelationship(a, e.relationship.id)
+          const policies = policiesUsingAssignment(a, model.policies)
+          return (
+            <DetailSection key={a.id} title={`Assignment: ${a.name}`} full>
+              {a.description && <p className="xp-mute">{a.description}</p>}
+              <p className="xp-mute">Principal(s) for this relationship</p>
+              <ChipList empty="None">{principals.map(p => <Chip key={p.id}>{p.name}</Chip>)}</ChipList>
+              <p className="xp-mute mt-2">Resolved resources granted</p>
+              <ChipList empty="None">
+                {a.resolved_resources.map((r, i) => (r.kind === 'resolved' ? <Chip key={i}>{r.name}</Chip> : <span key={i} className="xp-mute italic">{r.description} </span>))}
+              </ChipList>
+              <p className="xp-mute mt-2">Policies using this assignment ({policies.length})</p>
+              <ChipList empty="No policy currently references this relationship.">{policies.map(p => <Chip key={p.id}>{p.name}</Chip>)}</ChipList>
+            </DetailSection>
+          )
+        })}
+      </DetailGrid>
+    ),
+  }))
+
+  const sections = [{ id: 'relationships', title: 'Relationships', rows }]
+  const filtering = query.trim() !== '' || active.size > 0
+  const state = useSectionState(rows.length > 0 ? ['relationships'] : [], { autoOpenKey: filtering ? `${query.trim()}|${[...active].sort().join(',')}` : '' })
+
+  const filterItems: FilterItem[] = [
+    { id: FILTER_NO_ASSIGNMENTS, label: 'No assignments', count: entries.filter(e => e.assignments.length === 0).length },
+    { id: FILTER_UNUSED, label: 'Not used by any policy', count: entries.filter(e => e.policyCount === 0).length },
+  ]
+  const toggle = (id: string) => setActive(prev => {
+    const next = new Set(prev)
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    return next
+  })
+
+  const exportSections: ExportSection[] = useMemo(() => [{ title: 'Relationships', rows: relationshipAssignmentRows(model) }], [model])
+  const assignmentTotal = model.assignments.length
+
+  const rail = (
+    <>
+      <div className="flex flex-col gap-1">
+        <span className="xp-rail-title">Relationships</span>
+        <span className="xp-rail-sub">Open one to see its assignments, principals and the policies using it.</span>
+      </div>
+      <CountList
+        items={[
+          { id: 'relationships', label: model.relationships.length === 1 ? 'relationship' : 'relationships', count: model.relationships.length },
+        ]}
+        onSelect={state.jumpTo}
+      />
+      <p className="xp-note">{assignmentTotal} assignment{assignmentTotal === 1 ? '' : 's'} in total.</p>
+      <FilterMenu items={filterItems} active={active} onToggle={toggle} />
+      <div className="xp-rail-actions">
+        <ExportButtons sections={exportSections} filenameBase="opa-relationships" />
+      </div>
+    </>
+  )
 
   return (
-    <div className="flex flex-col gap-4">
-      <div className="flex justify-end">
-        <ExportButtons sections={exportSectionsForSelection} filenameBase={assignment ? `opa-assignment-${assignment.name}` : 'opa-relationships'} />
-      </div>
-
-      <div className="flex flex-col md:flex-row gap-4">
-        <div className="card p-2 flex flex-col gap-1 w-full md:w-64 shrink-0 max-h-[70vh] overflow-y-auto">
-          <span className="section-label px-1 py-1">Relationships ({model.relationships.length})</span>
-          {model.relationships.length === 0 && (
-            <span className="text-xs text-text-faint px-1 py-1">None configured in this tenant.</span>
-          )}
-          {model.relationships.map(r => (
-            <button
-              key={r.id}
-              type="button"
-              onClick={() => handleRelationshipChange(r.id)}
-              className={`text-left text-sm rounded px-2 py-1.5 transition-colors ${
-                r.id === relationshipId ? 'bg-accent-dim text-text' : 'text-text-dim hover:bg-bg-hover'
-              }`}
-            >
-              {r.name}
-            </button>
-          ))}
-        </div>
-
-        <div className="flex-1 flex flex-col gap-3">
-          {!relationship && <span className="text-sm text-text-faint">Select a relationship to see its assignments.</span>}
-
-          {relationship && (
-            <>
-              <div className="card p-3 flex flex-col gap-2">
-                <span className="text-sm font-medium text-text">{relationship.name}</span>
-                {relationship.description && <p className="text-sm text-text-dim">{relationship.description}</p>}
-              </div>
-
-              <div className="card p-3 flex flex-col gap-1">
-                <span className="section-label">Assignments using this relationship ({assignmentsForRelationship.length})</span>
-                {assignmentsForRelationship.length === 0 && (
-                  <span className="text-xs text-text-faint">No assignments reference this relationship.</span>
-                )}
-                <Select
-                  ariaLabel="Assignment"
-                  value={assignmentId}
-                  onValueChange={setAssignmentId}
-                  placeholder="Select an assignment"
-                  options={assignmentsForRelationship.map((a: AccessAssignment) => ({ value: a.id, label: a.name, keywords: a.description ? [a.description] : undefined }))}
-                />
-              </div>
-
-              {assignment && (
-                <div className="card p-3 flex flex-col gap-3">
-                  <span className="text-sm font-medium text-text">{assignment.name}</span>
-                  {assignment.description && <p className="text-sm text-text-dim">{assignment.description}</p>}
-
-                  <div className="flex flex-col gap-1">
-                    <span className="section-label">Principal(s) for this relationship</span>
-                    <div className="flex flex-wrap gap-1.5">
-                      {principalsForSelection.map(p => <Tag key={p.id}>{p.name}</Tag>)}
-                      {principalsForSelection.length === 0 && <span className="text-xs text-text-faint">None</span>}
-                    </div>
-                  </div>
-
-                  <div className="flex flex-col gap-1">
-                    <span className="section-label">Resolved resources granted</span>
-                    <div className="flex flex-wrap gap-1.5">
-                      {assignment.resolved_resources.map((r, i) =>
-                        r.kind === 'resolved' ? (
-                          <Tag key={i}>{r.name}</Tag>
-                        ) : (
-                          <span key={i} className="text-xs text-text-faint italic">{r.description}</span>
-                        )
-                      )}
-                      {assignment.resolved_resources.length === 0 && <span className="text-xs text-text-faint">None</span>}
-                    </div>
-                  </div>
-
-                  <div className="flex flex-col gap-1">
-                    <span className="section-label">Policies using this assignment ({policiesUsingAssignment.length})</span>
-                    <div className="flex flex-wrap gap-1.5">
-                      {policiesUsingAssignment.map(p => <Tag key={p.id}>{p.name}</Tag>)}
-                      {policiesUsingAssignment.length === 0 && (
-                        <span className="text-xs text-text-faint">No policy currently references this relationship.</span>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-        </div>
-      </div>
-    </div>
+    <ExplorerLayout rail={rail} railLabel="Relationship quick view and filters">
+      <ExplorerToolbar query={query} onQueryChange={setQuery} label="Search relationships" sections={state} />
+      {filtering && (
+        <p className="xp-note" role="status">
+          Showing {visible.length} of {entries.length} ·{' '}
+          <button type="button" className="xp-linkbtn" onClick={() => { setActive(new Set()); setQuery('') }}>Clear</button>
+        </p>
+      )}
+      {model.relationships.length === 0 && <p className="xp-note">None configured in this tenant.</p>}
+      {entries.length > 0 && visible.length === 0 && <p className="xp-note">Nothing matches the current search and filters.</p>}
+      <RowSections sections={sections} state={state} />
+    </ExplorerLayout>
   )
 }

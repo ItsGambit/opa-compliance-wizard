@@ -36,7 +36,7 @@ export const exampleUser: AccessUser = {
 export const examplePolicies: AccessPolicy[] = [
   policy('pol1', 'Linux Servers Policy', [{ id: 'g1', name: 'Example-All-Users' }], [
     rule('Server access', 'Servers', [resolved('s1', 'lab-linux-example-01'), resolved('s2', 'lab-linux-example-02')], { conditions: [MFA] }),
-  ]),
+  ], { relationship_ids: ['rel1'], description: 'Linux access for everyone' }),
   policy('pol2', 'Pull SaaS Policy', [{ id: 'g1', name: 'Example-All-Users' }, { id: 'g2', name: 'Example-Linux-Admins' }], [
     rule('Pull CRM accounts', 'Managed SaaS app accounts', [
       resolved('a1', 'crm-svc@example.test', 'individual_managed_saas_app_account'),
@@ -46,10 +46,34 @@ export const examplePolicies: AccessPolicy[] = [
   ]),
   policy('pol3', 'Other Policy', [{ id: 'g9', name: 'Example-Other' }], [
     rule('Unrelated', 'Servers', [resolved('s9', 'lab-other-example-09')]),
-  ]),
+  ], { resource_group: null, active: false }),
 ]
 
 export const exampleModel = {
-  resource_groups: [], projects: [], groups: [], users: [exampleUser], policies: examplePolicies,
-  servers: [], gateways: [], clients: [], devices: [], okta_accounts: [], saas_accounts: [], relationships: [], assignments: [],
+  resource_groups: [
+    { id: 'rg1', name: 'Example Group', description: 'Example description', delegated_resource_admin_groups: [{ id: 'g2', name: 'Example-Linux-Admins' }] },
+    { id: 'rg2', name: 'Empty Group' },
+  ],
+  projects: [
+    { id: 'p1', name: 'Example Project', resource_group_id: 'rg1', active_resource_count: 4, stale_resource_count: 1 },
+    { id: 'p2', name: 'Second Project', resource_group_id: 'rg1', active_resource_count: 2 },
+  ],
+  groups: [
+    { id: 'g1', name: 'Example-All-Users', roles: ['ADMIN'] },
+    { id: 'g2', name: 'Example-Linux-Admins', roles: [] },
+  ],
+  users: [exampleUser],
+  policies: examplePolicies,
+  servers: [], gateways: [], clients: [], devices: [], okta_accounts: [], saas_accounts: [],
+  relationships: [
+    { id: 'rel1', name: 'Example Safe Owners', description: 'Owners of a safe' },
+    { id: 'rel2', name: 'Unused Relationship' },
+  ],
+  assignments: [
+    {
+      id: 'as1', name: 'Example Assignment', description: 'Assignment one', resource_assignments: null,
+      relationship_assignments: [{ relationship: { id: 'rel1', name: 'Example Safe Owners' }, principal: { id: 'g1', name: 'Example-All-Users' } }],
+      resolved_resources: [resolved('s1', 'lab-linux-example-01'), { kind: 'condition', description: 'Servers labeled role=bastion' }],
+    },
+  ],
 } as unknown as AccessModel

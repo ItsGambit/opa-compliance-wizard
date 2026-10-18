@@ -53,7 +53,7 @@ describe('UsersTab', () => {
     const row = screen.getByRole('button', { name: /lab-linux-example-01/ })
     expect(row.textContent).toContain('View the password')
     expect(row.textContent).toContain('Example-All-Users')
-    expect(row.textContent).toContain('Not tracked') // servers have no System Log mapping
+    expect(row.textContent).toContain('Never used') // tracked, no event in the lookup
     fireEvent.click(row)
     const detail = screen.getByRole('region', { name: 'Details for lab-linux-example-01' })
     expect(within(detail).getByText('How they get it')).toBeTruthy()

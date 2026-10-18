@@ -1,5 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
-import { Search } from 'lucide-react'
+import { useMemo, useState } from 'react'
 import { AdConnectionRulesPanel } from './AdConnectionRulesPanel'
 import type {
   AccessActiveDirectoryAccount,
@@ -19,6 +18,14 @@ import type {
 } from '../types'
 import type { ExportSection } from '../utils/export'
 import { HighlightedText, useFuzzyFilter } from '../utils/fuzzySearch'
+import { DetailGrid, DetailSection } from './explorer/DetailBlocks'
+import { ExplorerLayout } from './explorer/ExplorerLayout'
+import { useExplorerLayout } from './explorer/explorerContext'
+import type { ExplorerRowData } from './explorer/ExplorerRows'
+import { ExplorerToolbar } from './explorer/ExplorerToolbar'
+import { CountList, RailField } from './explorer/RailParts'
+import { RowSections } from './explorer/RowSections'
+import { useSectionState } from './explorer/useSectionState'
 import { ExportButtons } from './ExportButtons'
 import { ResourceHistoryPanel } from './ResourceHistoryPanel'
 import { Select } from './Select'
@@ -297,123 +304,54 @@ function buildRows(kind: string, model: AccessModel, windowsServers: AccessServe
   }
 }
 
-function ResourceTable({
-  headers,
-  rows,
-  query,
-  selectedId,
-  onSelect,
-  kindIsAdConnection = false,
-}: {
-  headers: string[]
-  rows: ResourceRow[]
-  query: string
-  selectedId: string | null
-  onSelect: (row: ResourceRow) => void
-  kindIsAdConnection?: boolean
-}) {
-  const results = useFuzzyFilter(rows, query, ['label', 'cells'])
+const WHERE_HEADERS = ['Resource Group', 'Project']
+const STATE_HEADERS = ['State', 'Status']
 
-  if (rows.length === 0) {
-    return <span className="text-xs text-text-faint">No resources of this kind found.</span>
-  }
-  if (results.length === 0) {
-    return <span className="text-xs text-text-faint">No resources match "{query}".</span>
-  }
+/** Splits a kind's columns into the row's four calm cells without losing
+ * any: name = first column, "where" = resource group / project, "state" =
+ * state / status, summary = every other column. The expanded row lists ALL
+ * columns again, labelled. */
+function summarize(headers: string[], cells: (string | number)[]) {
+  const text = (i: number) => (cells[i] === '' || cells[i] == null ? '' : String(cells[i]))
+  const where: string[] = []
+  const summary: string[] = []
+  let state = ''
+  headers.forEach((h, i) => {
+    if (i === 0) return
+    if (WHERE_HEADERS.includes(h)) { if (text(i)) where.push(text(i)) }
+    else if (STATE_HEADERS.includes(h)) state = text(i)
+    else if (text(i)) summary.push(text(i))
+  })
+  return { summary: summary.join(' · '), where: where.join(' / '), state }
+}
+
+/** The expanded row: every column of the kind, labelled, then the access
+ * history (or, for an AD connection, its discovery configuration). The
+ * panels' Close button closes the row. */
+function ResourceDetail({ headers, row, isAdConnection }: { headers: string[]; row: ResourceRow; isAdConnection: boolean }) {
+  const { setOpenRowId } = useExplorerLayout()
+  const close = () => setOpenRowId(null)
   return (
-    <div className="card p-0 overflow-x-auto">
-      <table className="w-full text-xs">
-        <thead>
-          <tr className="border-b border-border">
-            {headers.map(h => (
-              <th key={h} className="text-left font-semibold text-text-faint uppercase text-[0.625rem] tracking-wide px-3 py-2 whitespace-nowrap">
-                {h}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {results.map(({ item: row, matches }, i) => {
-            const labelMatch = matches.find(m => m.key === 'label')
-            const clickable = row.id !== null
-            return (
-              <tr
-                key={row.id ?? i}
-                onClick={clickable ? () => onSelect(row) : undefined}
-                title={clickable ? 'View access history for this resource' : 'No compliance-report history available for this resource kind'}
-                className={`border-b border-border-sub hover:bg-bg-hover ${clickable ? 'cursor-pointer' : ''} ${
-                  row.id === selectedId ? 'bg-accent-dim/40' : ''
-                }`}
-              >
-                {row.cells.map((cell, j) => {
-                  const content = cell === '' || cell == null ? (
-                    <span className="text-text-faint">—</span>
-                  ) : j === 0 ? (
-                    <HighlightedText text={String(cell)} indices={labelMatch?.indices} />
-                  ) : (
-                    cell
-                  )
-                  return (
-                    <td key={j} className="px-3 py-2 text-text-dim whitespace-nowrap">
-                      {/* UI-19: the row's click target is also a real button
-                          in its first cell, so the drill-down is reachable
-                          (and announced) from the keyboard. The row's own
-                          onClick stays for the mouse. */}
-                      {j === 0 && clickable ? (
-                        <button
-                          type="button"
-                          className="text-left text-text-dim hover:text-text underline-offset-2 hover:underline"
-                          aria-pressed={row.id === selectedId}
-                          aria-label={`${kindIsAdConnection ? 'Show discovery configuration for' : 'Show access history for'} ${row.label}`}
-                          onClick={e => { e.stopPropagation(); onSelect(row) }}
-                        >
-                          {content}
-                        </button>
-                      ) : content}
-                    </td>
-                  )
-                })}
-              </tr>
-            )
-          })}
-        </tbody>
-      </table>
+    <div className="flex flex-col gap-4">
+      <DetailGrid>
+        {headers.map((h, j) => (
+          <DetailSection key={h} title={h}>
+            <p className={row.cells[j] === '' || row.cells[j] == null ? 'xp-mute' : undefined}>
+              {row.cells[j] === '' || row.cells[j] == null ? '—' : String(row.cells[j])}
+            </p>
+          </DetailSection>
+        ))}
+      </DetailGrid>
+      {row.id === null && <p className="xp-note">No compliance-report history is available for this resource kind.</p>}
+      {row.id !== null && !isAdConnection && <ResourceHistoryPanel resourceId={row.id} resourceLabel={row.label} onClose={close} />}
+      {row.id !== null && isAdConnection && <AdConnectionRulesPanel connectionId={row.id} connectionLabel={row.label} onClose={close} />}
     </div>
   )
 }
 
-// ResourceHistoryPanel (the per-resource drill-down clicking a row opens)
-// moved to its own file in 5.40.0 -- the Service Accounts Dashboard reuses
-// it unchanged.
-
 export function ResourcesTab({ model }: Props) {
   const [kind, setKind] = useState(RESOURCE_KINDS[0].value)
   const [query, setQuery] = useState('')
-  // { id, label } rather than a bare string -- this is the seam for the
-  // user's stated future request ("ability to select more than one
-  // resource... feature request later"): swapping this to an array and
-  // rendering N history panels is a follow-up, not built now, but this
-  // shape doesn't need re-architecting to get there.
-  const [selected, setSelected] = useState<{ id: string; label: string } | null>(null)
-  // active_directory_connections rows are clickable too, but for a
-  // GENUINELY different purpose -- "show me discovery configuration"
-  // (AdConnectionRulesPanel), not "show me compliance events"
-  // (ResourceHistoryPanel). Tracked separately from `selected` rather than
-  // adding a `panel` tag to that shape, since the two panels take
-  // different props entirely (resourceName isn't meaningful for an AD
-  // connection) and mixing them would make `selected` harder to reason
-  // about for its original, still-primary use.
-  const [selectedAdConnection, setSelectedAdConnection] = useState<{ id: string; label: string } | null>(null)
-
-  // Changing kind clears whichever panel is open -- it was scoped to a
-  // resource of the previous kind. (A search that filters the selected row
-  // out of the table deliberately leaves its panel open: the panel is
-  // still about a real resource, and closing it on every keystroke would
-  // lose the user's place. UI-22: this comment used to claim otherwise.)
-  useEffect(() => {
-    setSelected(null)
-    setSelectedAdConnection(null)
-  }, [kind])
 
   // Real bug found and fixed 2026-09-30: EVERY OPA-managed server has
   // "broker" in services[] (confirmed live -- it's the always-present
@@ -437,66 +375,61 @@ export function ResourcesTab({ model }: Props) {
     [kind, model, windowsServers, linuxServers, gatewayServers]
   )
 
-  const kindLabel = RESOURCE_KINDS.find(k => k.value === kind)?.label ?? kind
-  const exportSections: ExportSection[] = [{ title: kindLabel, rows: rows.map(r => r.exportRow) }]
+  // How many of each kind there are: the quick view switches kind.
+  const kindCounts = useMemo(
+    () => RESOURCE_KINDS.map(k => ({ ...k, count: buildRows(k.value, model, windowsServers, linuxServers, gatewayServers).rows.length })),
+    [model, windowsServers, linuxServers, gatewayServers]
+  )
 
-  return (
-    <div className="flex flex-col gap-4">
-      <div className="card p-3 flex flex-wrap items-end justify-between gap-4">
-        <div className="flex flex-wrap items-end gap-3">
-          <div className="flex flex-col gap-1">
-            <span className="section-label">Resource kind</span>
-            <Select ariaLabel="Resource kind" value={kind} onValueChange={setKind} placeholder="Select a resource kind" options={RESOURCE_KINDS} />
-          </div>
-          <div className="flex flex-col gap-1">
-            <span className="section-label">Search</span>
-            <div className="flex items-center gap-1.5 text-input min-w-56">
-              <Search size={13} className="text-text-faint shrink-0" aria-hidden="true" />
-              <input
-                type="text"
-                aria-label={`Search ${kindLabel.toLowerCase()}`}
-                placeholder={`Search ${kindLabel.toLowerCase()}…`}
-                value={query}
-                onChange={e => setQuery(e.target.value)}
-                className="flex-1 bg-transparent outline-none placeholder:text-text-faint"
-              />
-            </div>
-          </div>
-        </div>
+  const kindLabel = RESOURCE_KINDS.find(k => k.value === kind)?.label ?? kind
+  const exportSections: ExportSection[] = useMemo(() => [{ title: kindLabel, rows: rows.map(r => r.exportRow) }], [kindLabel, rows])
+
+  const results = useFuzzyFilter(rows, query, ['label', 'cells'])
+  const isAdConnection = kind === 'active_directory_connections'
+
+  const explorerRows: ExplorerRowData[] = results.map(({ item: row, matches }, i) => {
+    const parts = summarize(headers, row.cells)
+    const labelMatch = matches.find(m => m.key === 'label')
+    return {
+      id: `${kind}:${row.id ?? `n${i}`}`,
+      label: row.label,
+      name: <HighlightedText text={String(row.cells[0] ?? row.label)} indices={labelMatch?.indices} />,
+      can: parts.summary,
+      via: parts.where,
+      used: parts.state,
+      detail: () => <ResourceDetail headers={headers} row={row} isAdConnection={isAdConnection} />,
+    }
+  })
+  const sections = [{ id: kind, title: kindLabel, rows: explorerRows }]
+  const state = useSectionState(explorerRows.length > 0 ? [kind] : [], { resetKey: kind, autoOpenKey: query.trim() })
+
+  const rail = (
+    <>
+      <RailField label="Resource kind">
+        <Select ariaLabel="Resource kind" value={kind} onValueChange={k => { setKind(k); setQuery('') }} placeholder="Select a resource kind" options={RESOURCE_KINDS} />
+      </RailField>
+      <CountList
+        items={kindCounts.filter(k => k.count > 0).map(k => ({ id: k.value, label: k.label.toLowerCase(), count: k.count }))}
+        onSelect={id => { setKind(id); setQuery('') }}
+      />
+      <div className="xp-rail-actions">
         <ExportButtons sections={exportSections} filenameBase={`opa-resources-${kind}`} />
       </div>
+    </>
+  )
 
-      <div className="flex items-center justify-between">
-        <span className="section-label">{kindLabel} ({rows.length})</span>
-      </div>
-
-      <ResourceTable
-        headers={headers}
-        rows={rows}
+  return (
+    <ExplorerLayout rail={rail} railLabel="Resource kind and quick view">
+      <ExplorerToolbar
         query={query}
-        selectedId={kind === 'active_directory_connections' ? selectedAdConnection?.id ?? null : selected?.id ?? null}
-        kindIsAdConnection={kind === 'active_directory_connections'}
-        onSelect={row => {
-          if (!row.id) return
-          if (kind === 'active_directory_connections') {
-            setSelectedAdConnection({ id: row.id, label: row.label })
-          } else {
-            setSelected({ id: row.id, label: row.label })
-          }
-        }}
+        onQueryChange={setQuery}
+        label={`Search ${kindLabel.toLowerCase()}`}
+        placeholder={`Search ${kindLabel.toLowerCase()}…`}
+        sections={state}
       />
-
-      {selected && kind !== 'active_directory_connections' && (
-        <ResourceHistoryPanel resourceId={selected.id} resourceLabel={selected.label} onClose={() => setSelected(null)} />
-      )}
-
-      {selectedAdConnection && kind === 'active_directory_connections' && (
-        <AdConnectionRulesPanel
-          connectionId={selectedAdConnection.id}
-          connectionLabel={selectedAdConnection.label}
-          onClose={() => setSelectedAdConnection(null)}
-        />
-      )}
-    </div>
+      {rows.length === 0 && <p className="xp-note">No resources of this kind found.</p>}
+      {rows.length > 0 && results.length === 0 && <p className="xp-note">No resources match "{query}".</p>}
+      <RowSections sections={sections} state={state} />
+    </ExplorerLayout>
   )
 }

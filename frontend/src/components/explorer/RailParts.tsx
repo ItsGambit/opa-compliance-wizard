@@ -88,3 +88,23 @@ export function FilterMenu({ items, active, onToggle }: { items: FilterItem[]; a
     </div>
   )
 }
+
+/** A labelled control in the rail (a selector). */
+export function RailField({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="section-label">{label}</span>
+      {children}
+    </div>
+  )
+}
+
+/** A small headed block in the rail (chips, a note). */
+export function RailBlock({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div>
+      <div className="xp-filter-title">{title}</div>
+      {children}
+    </div>
+  )
+}
