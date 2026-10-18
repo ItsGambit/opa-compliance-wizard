@@ -17,17 +17,20 @@ interface Props {
   renderDetail: (r: AccessResource) => ReactNode
   /** Shown when the subject has no access resources at all. */
   emptyMessage: string
+  /** A muted line above the rows (the Users view puts the last-used coverage here). */
+  note?: ReactNode
   /** Extra sections after the resource types (e.g. a project's settings). */
   after?: ReactNode
 }
 
 /** The main pane of the resource-centred views: search, Expand/Collapse all,
  * the "showing X of Y" line and one TypeSection per resource type. */
-export function GrantsMain({ ex, now, searchLabel, viaOf = r => r.viaNames, renderDetail, emptyMessage, after }: Props) {
+export function GrantsMain({ ex, now, searchLabel, viaOf = r => r.viaNames, renderDetail, emptyMessage, after, note }: Props) {
   const shown = ex.visible.length
   return (
     <>
       <ExplorerToolbar query={ex.query} onQueryChange={ex.setQuery} label={searchLabel} sections={ex.sections} />
+      {note && <p className="xp-note" data-testid="evidence-note">{note}</p>}
       {ex.filtering && <ResultsNote shown={shown} total={ex.total} onClear={ex.clearFilters} />}
       {ex.total === 0 && <p className="xp-note">{emptyMessage}</p>}
       {ex.total > 0 && shown === 0 && <p className="xp-note">Nothing matches the current search and filters.</p>}
@@ -43,9 +46,9 @@ export function GrantsMain({ ex, now, searchLabel, viaOf = r => r.viaNames, rend
               label: resource.name,
               name: <HighlightedText text={resource.name} indices={nameIndices} />,
               hint: resource.hint,
-              can: resource.actions.join(', '),
+              can: resource.inactiveOnly ? 'Not in effect: the policy is inactive' : resource.actions.join(', '),
               via: firstPlusMore(viaOf(resource)),
-              used: used.text,
+              used: used.chip ? <>{used.text}<span className="xp-chip">{used.chip}</span></> : used.text,
               usedTitle: used.title,
               detail: () => renderDetail(resource),
             }

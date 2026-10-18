@@ -482,6 +482,9 @@ export interface AccessUser {
   user_type?: 'human' | 'service'
   details?: { email?: string | null; first_name?: string | null; last_name?: string | null; full_name?: string | null }
   groups: NamedRef[]
+  /** True when this user's groups could not be read while the model was built:
+   * `groups` is then empty because of the error, not because they have none. */
+  groups_error?: boolean
 }
 
 export interface PolicyPrincipals {
@@ -493,7 +496,7 @@ export type PolicyRuleResolution =
   | {
       kind: 'resolved'
       id: string
-      name: string
+      name: string | null
       /** Raw selector_type (e.g. "secret" vs "secret_folder") -- resource_type
        * alone can't distinguish these, but System Log access-tracking only
        * works for one of them. See useUserResourceAccess. */
@@ -533,6 +536,13 @@ export type PolicyRuleResolution =
        * the OPA account id. */
       account_name?: string | null
       name_unique?: boolean
+      /** The object is in no project listing any more (deleted or out of
+       * reach); `name` is the one the rule stored. */
+      missing?: boolean
+      /** individual_server_account only: the server and (in account_name) the
+       * account's username. `name` then reads "server / account". */
+      server_id?: string
+      server_name?: string | null
     }
   | { kind: 'condition'; description: string }
 
@@ -870,11 +880,17 @@ export interface ResourceAccessEvent {
   published: string
   request_id: string | null
   outcome: string | null
+  /** The System Log event type (5.45.0), e.g. pam.secret.reveal. */
+  event_type?: string
   /** Only on database_account lookups: the account the event was about. */
   account_name?: string | null
-  /** 'name' when the event was attributed by the account's exact name
-   * because its id did not match (database / Active Directory accounts). */
-  matched_by?: 'name'
+  /** How the event was attributed when not by id: 'name' (exact account name,
+   * database / Active Directory / server accounts), 'server_account' (server id
+   * plus exact account name) or 'server' (server-level: some account on that
+   * server). */
+  matched_by?: 'name' | 'server_account' | 'server'
+  /** Where the event came from: the synced archive, the live log, or both. */
+  source?: 'archive' | 'live' | 'both'
 }
 
 export interface ResourceAccessInfo {
@@ -882,16 +898,35 @@ export interface ResourceAccessInfo {
   /** False for any resource_kind with no verified, ID-matchable System Log
    * event (see create_secret_folders.py's RESOURCE_ACCESS_EVENT_TYPES
    * comment) -- distinct from "supported but zero events found", which
-   * means genuinely not accessed (or not within the last 90 days). */
+   * means genuinely not accessed (or not within the window below). */
   supported: boolean
   events: ResourceAccessEvent[]
-  /** False when the System Log lookup hit its page cap -- "no access" may
-   * then just mean "not within what was read". */
+  /** False when the answer may be incomplete (a live walk hit its page cap,
+   * the archive left a gap, or the live top-up failed): "no access" may then
+   * just mean "not within what was read". */
   complete?: boolean
   /** True when no event matched by id, but events with this account's name
    * exist and another account shares that name: it cannot be told which
    * account was used. */
   ambiguous?: boolean
+  // ── Access evidence (5.45.0) ──
+  /** Matched events in the window (events[] holds only the newest few). */
+  uses?: number
+  /** The event types this answer counted. */
+  event_types?: string[]
+  source?: 'archive' | 'live' | 'archive+live'
+  coverage_from?: string
+  coverage_to?: string
+  window_days?: number
+  last_synced_at?: string | null
+  archive_oldest?: string | null
+  /** A live event newer than the archive's last synced event was found. */
+  newer_than_sync?: boolean
+  /** Why the archive was not used (or only partly): no_archive, type_not_stored,
+   * not_permitted, stale_gap. */
+  archive_note?: 'no_archive' | 'type_not_stored' | 'not_permitted' | 'stale_gap' | null
+  /** The live top-up failed: the newest events could not be checked. */
+  live_error?: string
 }
 
 // ── Folder Builder: policy assignment ────────────────────────────────────

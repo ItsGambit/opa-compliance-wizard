@@ -13,6 +13,7 @@ export const FILTER_RISK = 'risk'
 export const FILTER_USED = 'used'
 export const FILTER_NEVER = 'never'
 export const FILTER_UNTRACKED = 'untracked'
+export const FILTER_IN_EFFECT = 'in_effect'
 
 const SEARCH_KEYS = ['name', 'hint', 'typeLabel', 'actions', 'conditions', 'viaNames', 'policyNames', 'selectors']
 
@@ -45,6 +46,7 @@ export function useGrantsExplorer({ resources, lookup, resetKey }: { resources: 
     for (const { item, matches } of searched) {
       const lastUsed = lastUsedByKey.get(item.key) ?? { state: 'none' as const }
       if (active.has(FILTER_RISK) && !item.risky) continue
+      if (active.has(FILTER_IN_EFFECT) && item.inactiveOnly) continue
       if (usageSelected.length > 0) {
         const ok = usageSelected.some(f => (f === FILTER_USED ? lastUsed.state === 'used' : f === FILTER_NEVER ? lastUsed.state === 'never' : lastUsed.state === 'untracked'))
         if (!ok) continue
@@ -73,12 +75,16 @@ export function useGrantsExplorer({ resources, lookup, resetKey }: { resources: 
 
   const filterItems: FilterItem[] = useMemo(() => {
     const items: FilterItem[] = [{ id: FILTER_RISK, label: 'No approval or MFA', count: resources.filter(r => r.risky).length }]
+    // Access that only an inactive policy gives is listed but not in effect;
+    // this hides it. Offered only when there is some.
+    const inactive = resources.filter(r => r.inactiveOnly).length
+    if (inactive > 0) items.push({ id: FILTER_IN_EFFECT, label: 'Hide inactive-policy access', count: inactive })
     if (lookup) {
       const ready = lookup.status === 'ready'
       const count = (state: LastUsed['state']) => (ready ? [...lastUsedByKey.values()].filter(l => l.state === state).length : undefined)
       items.push(
-        { id: FILTER_USED, label: 'Used in the last 90 days', count: count('used'), disabled: !ready },
-        { id: FILTER_NEVER, label: 'Not used in 90 days', count: count('never'), disabled: !ready },
+        { id: FILTER_USED, label: 'Used in the period read', count: count('used'), disabled: !ready },
+        { id: FILTER_NEVER, label: 'Never used in the period read', count: count('never'), disabled: !ready },
         { id: FILTER_UNTRACKED, label: 'Not tracked', count: count('untracked'), disabled: !ready },
       )
     }

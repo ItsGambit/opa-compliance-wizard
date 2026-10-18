@@ -283,6 +283,30 @@ group behind it (with **Remove from group** in the Users view) and its
 last access. Filters are only offered where the data can answer them
 (e.g. "No approval or MFA"; usage filters for a user).
 
+**Last used and its evidence (Users view, since 5.45.0).** "Last used"
+means the newest time the user revealed a password or secret, checked an
+account out, or was issued gateway or server credentials for it (the
+System Log event types it counts are listed in the row's tooltip). The
+answer reads the app's synced System Log archive first (sorted, indexed,
+and able to look further back than Okta's own 90 days) and asks the live
+System Log only for the time since the archive's last synced event, so a
+fresh answer never misses recent events. Without a usable archive (never
+synced, no permission to read it, or an ingestion scope that does not
+hold a needed event type) it falls back to the live 90-day answer and
+says so. A row shows "Last used 3 days ago" with a count chip
+("12 uses · 90d"); the opened row adds the latest events in plain words
+("Revealed password", "Checked out", "Issued gateway credentials") with
+outcome and a copyable request id, and a footer such as "Source: archive
++ live · covers 2026-07-20 to now · last synced 3 hours ago". "Never used"
+always names the window it is based on; an answer that may be incomplete
+reads "Unknown" with the reason. An event is matched to a resource only by
+id, or by an exact account name that is unique; a shared name is reported
+as ambiguous, never guessed. Server accounts are looked up by server and
+account name. Policies that are switched off are listed as "inactive
+policy" and never counted as effective access (a filter hides them).
+Groups and Projects views still show no last-used column: aggregating
+over every member would need one lookup per member.
+
 Every tab (plus the header) has **Export CSV** / **Export MD**
 buttons — per-tab exports cover whatever's currently selected; the
 header's export covers the whole access model in one file, regardless

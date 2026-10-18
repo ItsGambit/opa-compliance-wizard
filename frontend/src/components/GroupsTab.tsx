@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import type { AccessModel } from '../types'
 import { aggregateResources } from '../utils/accessResources'
 import type { ExportSection } from '../utils/export'
-import { grantRows } from '../utils/exportSections'
+import { visibleAccessSections } from '../utils/exportSections'
 import { rulesGrantedToGroupIds } from '../utils/policy'
 import { Chip } from './explorer/DetailBlocks'
 import { ExplorerLayout } from './explorer/ExplorerLayout'
@@ -44,9 +44,9 @@ export function GroupsTab({ model }: Props) {
         title: `Group: ${group.name}`,
         rows: [{ Roles: group.roles.join(', '), Members: members.map(u => u.details?.full_name || u.name).join(', ') }],
       },
-      { title: 'Access Granted', rows: grantRows(grants) },
+      ...visibleAccessSections(ex.visible, now),
     ]
-  }, [group, members, grants])
+  }, [group, members, ex.visible, now])
 
   const rail = (
     <>

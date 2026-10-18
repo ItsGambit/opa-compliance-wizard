@@ -1792,6 +1792,32 @@ def environment_has_archive(environment_id):
     return bool(state and (state.get("last_sync_completed_at") or state.get("last_import_at")))
 
 
+def archive_coverage(environment_id):
+    """What this environment's archive can vouch for, for the Access
+    Explorer's evidence layer: whether it has an archive at all, the stored
+    ingestion scope, the sync watermark (`last_synced_at`) and the oldest and
+    newest stored event times. Two cheap reads (no COUNT, no raw_json): the
+    sync_state row and MIN/MAX over the (environment_id, published) index."""
+    conn = _get_connection()
+    state = conn.execute(
+        "SELECT last_synced_at, last_sync_completed_at, last_import_at, ingestion_scope "
+        "FROM sync_state WHERE environment_id = ?", (environment_id,)
+    ).fetchone()
+    state = dict(state) if state else {}
+    span = conn.execute(
+        "SELECT MIN(published) AS oldest, MAX(published) AS newest FROM events WHERE environment_id = ?",
+        (environment_id,),
+    ).fetchone()
+    return {
+        "has_archive": bool(state.get("last_sync_completed_at") or state.get("last_import_at")),
+        "ingestion_scope": state.get("ingestion_scope"),
+        "last_synced_at": state.get("last_synced_at"),
+        "last_sync_completed_at": state.get("last_sync_completed_at"),
+        "last_import_at": state.get("last_import_at"),
+        "oldest": span["oldest"], "newest": span["newest"],
+    }
+
+
 CHUNK_DAYS = 1  # window size for the day-by-day walk below
 
 # BUG FIX (external review, 2026-10-05, DATA-02): the System Log is

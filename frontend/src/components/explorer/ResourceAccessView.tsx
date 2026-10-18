@@ -1,9 +1,10 @@
 import type { ReactNode } from 'react'
 import type { NamedRef } from '../../types'
-import { describePrivilegeRaw, trackTargets, type AccessLookup, type AccessResource } from '../../utils/accessResources'
+import { describePrivilegeRaw, trackingFor, type AccessLookup, type AccessResource } from '../../utils/accessResources'
+import { LAST_USED_MEANING } from '../../utils/accessEvidence'
 import { labelize } from '../../utils/format'
 import { Chip, DetailGrid, DetailSection } from './DetailBlocks'
-import { LastAccessed } from './LastAccessed'
+import { LastAccessed, NoTracking } from './LastAccessed'
 
 const KIND_WORD: Record<string, string> = {
   secret: 'Secret',
@@ -36,7 +37,8 @@ interface Props {
  * behind it) and, where it applies, when it was last accessed. */
 export function ResourceAccessView({ resource, lookup, now, renderGroupAction }: Props) {
   const res = resource.resolution
-  const targets = trackTargets(resource)
+  const tracking = trackingFor(resource)
+  const targets = tracking.targets
   const privileges = resource.lines.flatMap(l => l.rule.privileges.map(describePrivilegeRaw))
   const uniquePrivileges = [...new Set(privileges)]
   return (
@@ -58,6 +60,12 @@ export function ResourceAccessView({ resource, lookup, now, renderGroupAction }:
             )}
             {resource.selectors.length > 0 && (
               <p className="xp-mute">Matched by the rule selector: {resource.selectors.join('; ')}.</p>
+            )}
+            {res.kind === 'resolved' && res.missing && (
+              <p className="text-warn">This object was not found in any project, so it has probably been deleted. The name shown is the one the policy stored.</p>
+            )}
+            {res.resource_kind === 'individual_server_account' && res.account_name && (
+              <p className="xp-mute">Account {res.account_name} on server {res.server_name ?? res.server_id}.</p>
             )}
             {res.relationship_name && res.assignment_name && (
               <p className="xp-mute">Granted through the relationship {res.relationship_name} → {res.assignment_name}.</p>
@@ -95,6 +103,7 @@ export function ResourceAccessView({ resource, lookup, now, renderGroupAction }:
           <div key={`${line.policy.id}-${i}`} className="xp-grant">
             <div>
               Rule “{line.rule.name}” · policy {line.policy.name}
+              {line.inactive && <strong className="text-warn"> (inactive policy: gives no access right now)</strong>}
               {line.groups.length > 0 && (
                 <>
                   , through{' '}
@@ -117,11 +126,11 @@ export function ResourceAccessView({ resource, lookup, now, renderGroupAction }:
       </DetailSection>
 
       {lookup && (
-        <DetailSection title={<>Last accessed <span className="normal-case tracking-normal font-normal">· System Log, 90 days</span></>} full>
+        <DetailSection title={<>Last used <span className="normal-case tracking-normal font-normal" title={LAST_USED_MEANING}>· reveals, checkouts and credentials issued</span></>} full>
           {targets.length > 0 ? (
-            <LastAccessed lookup={lookup} targets={targets} folder={res.kind === 'resolved' && res.resource_kind === 'secret_folder'} now={now} />
+            <LastAccessed lookup={lookup} targets={targets} folder={res.kind === 'resolved' && res.resource_kind.endsWith('secret_folder')} now={now} />
           ) : (
-            <p className="xp-mute">Not tracked: the System Log does not record access per resource of this kind (or the folder is empty).</p>
+            <NoTracking gap={tracking.gap} />
           )}
         </DetailSection>
       )}

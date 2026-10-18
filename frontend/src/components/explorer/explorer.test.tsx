@@ -389,9 +389,9 @@ describe('resource sections (GrantsMain)', () => {
 
   it('usage filters are only offered with a last-accessed lookup, and wait until it is ready', () => {
     renderHarness()
-    expect(screen.queryByRole('checkbox', { name: /Used in the last 90 days/ })).toBeNull()
+    expect(screen.queryByRole('checkbox', { name: /Used in the period read/ })).toBeNull()
     cleanupAndRender({ status: 'loading' })
-    expect((screen.getByRole('checkbox', { name: /Used in the last 90 days/ }) as HTMLInputElement).disabled).toBe(true)
+    expect((screen.getByRole('checkbox', { name: /Used in the period read/ }) as HTMLInputElement).disabled).toBe(true)
   })
 
   it('usage filters narrow to used / never used / not tracked', () => {
@@ -405,10 +405,10 @@ describe('resource sections (GrantsMain)', () => {
       ]),
     }
     const { container } = renderHarness(lookup)
-    fireEvent.click(screen.getByRole('checkbox', { name: /Used in the last 90 days/ }))
+    fireEvent.click(screen.getByRole('checkbox', { name: /Used in the period read/ }))
     expect([...container.querySelectorAll('.xp-row')].map(r => r.textContent)).toEqual([expect.stringContaining('crm-svc@example.test')])
-    fireEvent.click(screen.getByRole('checkbox', { name: /Used in the last 90 days/ }))
-    fireEvent.click(screen.getByRole('checkbox', { name: /Not used in 90 days/ }))
+    fireEvent.click(screen.getByRole('checkbox', { name: /Used in the period read/ }))
+    fireEvent.click(screen.getByRole('checkbox', { name: /Never used in the period read/ }))
     expect(container.querySelectorAll('.xp-row').length).toBe(2)
   })
 })
@@ -456,7 +456,7 @@ describe('ResourceAccessView', () => {
     Object.assign(navigator, { clipboard: { writeText } })
     render(<ResourceAccessView resource={acct} lookup={lookup} now={Date.parse('2026-10-18T09:00:00Z')} />)
     expect(screen.getByText('3 days ago')).toBeTruthy()
-    expect(screen.getByText('1 older')).toBeTruthy()
+    expect(screen.getByRole('table', { name: 'Recent activity' }).querySelectorAll('tr').length).toBe(2)
     fireEvent.click(screen.getByRole('button', { name: 'Copy request id 2b7e1c40-5a9d-4f3e-8b21-7c0d9e6f1a23' }))
     expect(writeText).toHaveBeenCalledWith('2b7e1c40-5a9d-4f3e-8b21-7c0d9e6f1a23')
   })
@@ -476,7 +476,7 @@ describe('LastAccessed states (UI-12: never "loading…" forever)', () => {
 
   it('a finished lookup with no entry for a resource says so', () => {
     render(<LastAccessed lookup={{ status: 'ready', byId: new Map() }} targets={targets} now={0} />)
-    expect(screen.getByText('no result returned for this resource')).toBeTruthy()
+    expect(screen.getByText('Unknown: no result was returned for this resource')).toBeTruthy()
   })
 
   it('while loading, says loading', () => {
@@ -488,11 +488,11 @@ describe('LastAccessed states (UI-12: never "loading…" forever)', () => {
     const base = { resource_kind: 'secret', events: [] }
     const lookup = (info: object): AccessLookup => ({ status: 'ready', byId: new Map([['sec-1', { ...base, supported: true, ...info }]]) })
     const { rerender } = render(<LastAccessed lookup={lookup({ supported: false })} targets={targets} now={0} />)
-    expect(screen.getByText('access tracking not available for this resource type')).toBeTruthy()
+    expect(screen.getByText('Not tracked: the System Log does not record access for this resource type')).toBeTruthy()
     rerender(<LastAccessed lookup={lookup({})} targets={targets} now={0} />)
-    expect(screen.getByText('not accessed (or not within the last 90 days)')).toBeTruthy()
+    expect(screen.getByText('Never used in the period read')).toBeTruthy()
     rerender(<LastAccessed lookup={lookup({ complete: false })} targets={targets} now={0} />)
-    expect(screen.getByText(/lookup hit its page limit/)).toBeTruthy()
+    expect(screen.getByText(/the lookup is not complete/)).toBeTruthy()
   })
 
   it('a folder folds its secrets', () => {
@@ -524,9 +524,9 @@ describe('LastAccessed for database selector rules', () => {
   it('shows never and page-limit states', () => {
     const lookup = (info: object): AccessLookup => ({ status: 'ready', byId: new Map([['database_accounts', { resource_kind: 'database_account', supported: true, events: [], ...info }]]) })
     const { rerender } = render(<LastAccessed lookup={lookup({ complete: true })} targets={targets} now={0} />)
-    expect(screen.getByText('not accessed (or not within the last 90 days)')).toBeTruthy()
+    expect(screen.getByText('Never used in the period read')).toBeTruthy()
     rerender(<LastAccessed lookup={lookup({ complete: false })} targets={targets} now={0} />)
-    expect(screen.getByText(/lookup hit its page limit/)).toBeTruthy()
+    expect(screen.getByText(/the lookup is not complete/)).toBeTruthy()
   })
 
   it('the expanded row shows it instead of "Not tracked"', () => {

@@ -27,6 +27,13 @@ export function describeCondition(condition: PolicyRuleCondition): string {
   }
 }
 
+/** A policy counts as active unless it says otherwise (`active: false`). An
+ * inactive policy grants nothing right now; the Explorer still lists what it
+ * WOULD grant, marked "inactive policy", but never as effective access. */
+export function isPolicyActive(policy: AccessPolicy): boolean {
+  return policy.active !== false
+}
+
 export interface GrantedRule {
   policy: AccessPolicy
   rule: PolicyRule

@@ -430,7 +430,7 @@ export function assignFolderPolicy(
 
 export function fetchUserResourceAccess(
   userId: string,
-  resources: { resource_kind: string; resource_id: string; account_name?: string; name_unique?: boolean }[]
+  resources: { resource_kind: string; resource_id: string; account_name?: string; name_unique?: boolean; server_id?: string }[]
 ): Promise<{ results: Record<string, ResourceAccessInfo> }> {
   return apiFetch(`/api/access/users/${encodeURIComponent(userId)}/resource_access`, {
     method: 'POST',

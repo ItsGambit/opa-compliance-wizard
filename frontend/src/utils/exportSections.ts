@@ -10,7 +10,8 @@ import type {
   SecretAccessRow,
   ServiceAccountReportRow,
 } from '../types'
-import { rowQualifier } from './accessResources'
+import { lastUsedText } from '../components/explorer/lastUsedText'
+import { resourceDisplayName, rowQualifier, type AccessResource, type LastUsed } from './accessResources'
 import type { ExportSection } from './export'
 import { cellValue, formatDateTime, labelize } from './format'
 import type { GrantedRule } from './policy'
@@ -28,7 +29,7 @@ function grantRow(policy: AccessPolicy, rule: PolicyRule): Record<string, string
     'Applies To': rule.resolutions
       .map(r =>
         r.kind === 'resolved'
-          ? `${r.name}${rowQualifier(r) ? ` · ${rowQualifier(r)}` : ''}${r.project_name ? ` — ${r.project_name}` : ' (project unknown)'}`
+          ? `${resourceDisplayName(r)}${rowQualifier(r) ? ` · ${rowQualifier(r)}` : ''}${r.project_name ? ` — ${r.project_name}` : ' (project unknown)'}`
           : r.description
       )
       .join('; '),
@@ -45,6 +46,53 @@ function grantRow(policy: AccessPolicy, rule: PolicyRule): Record<string, string
 
 export function grantRows(grants: GrantedRule[]): Record<string, string>[] {
   return grants.map(({ policy, rule }) => grantRow(policy, rule))
+}
+
+/** What the screen shows, as an export (5.45.0): one row per resource that is
+ * VISIBLE (after search and filters), with the same columns the screen has --
+ * who gets it and how ("Via"), the policies, whether they are active, and,
+ * where the view looks usage up, the last-used text, the use count and the
+ * conditions. Then the rules behind exactly those resources. */
+export function visibleAccessSections(
+  visible: { resource: AccessResource; lastUsed: LastUsed }[],
+  now: number,
+  rulesTitle = 'Rules Behind This Access'
+): ExportSection[] {
+  const hasUsage = visible.some(v => v.lastUsed.state !== 'none')
+  const resourceRows = visible.map(({ resource, lastUsed }) => {
+    const used = lastUsedText(lastUsed, now)
+    const row: Record<string, string> = {
+      Resource: resource.name,
+      Type: resource.typeLabel,
+      Detail: resource.hint ?? '',
+      'What They Can Do': resource.inactiveOnly ? 'Not in effect (inactive policy)' : resource.actions.join(', '),
+      Conditions: resource.conditions.join('; '),
+      Via: resource.viaNames.join(', '),
+      Policies: resource.policyNames.join(', '),
+      'Policy Active': resource.inactiveOnly ? 'No' : resource.lines.some(l => l.inactive) ? 'Partly' : 'Yes',
+      'No Approval Or MFA': resource.risky ? 'Yes' : 'No',
+    }
+    if (hasUsage) {
+      row['Last Used'] = used.text
+      row['Uses'] = lastUsed.state === 'used' && lastUsed.uses !== undefined ? String(lastUsed.uses) : ''
+      row['Last Used At'] = lastUsed.state === 'used' ? lastUsed.at : ''
+    }
+    return row
+  })
+  const seen = new Set<string>()
+  const grants: GrantedRule[] = []
+  for (const { resource } of visible) {
+    for (const line of resource.lines) {
+      const k = `${line.policy.id}|${line.rule.name}`
+      if (seen.has(k)) continue
+      seen.add(k)
+      grants.push({ policy: line.policy, rule: line.rule })
+    }
+  }
+  return [
+    { title: 'Access Granted', rows: resourceRows },
+    { title: rulesTitle, rows: grantRows(grants) },
+  ]
 }
 
 /** One row per field — for exporting a single project's detail (matches
@@ -101,7 +149,7 @@ export function relationshipAssignmentRows(model: AccessModel): Record<string, s
         Relationship: relationship.name,
         Assignment: assignment.name,
         Principals: [...new Set(principals)].join(', '),
-        'Resolved Resources': assignment.resolved_resources.map(r => (r.kind === 'resolved' ? r.name : r.description)).join(', '),
+        'Resolved Resources': assignment.resolved_resources.map(r => (r.kind === 'resolved' ? resourceDisplayName(r) : r.description)).join(', '),
         'Policies Using This': policiesUsing.map(p => p.name).join(', '),
       })
     }

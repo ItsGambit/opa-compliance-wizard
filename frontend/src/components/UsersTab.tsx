@@ -2,9 +2,10 @@ import { useMemo, useRef, useState } from 'react'
 import { useUserResourceAccess } from '../api/hooks'
 import { useRemoveUserFromGroup } from '../hooks/useRemoveUserFromGroup'
 import type { AccessModel, ResourceAccessInfo } from '../types'
+import { coverageNote } from '../utils/accessEvidence'
 import { aggregateResources, trackedRequests, type AccessLookup } from '../utils/accessResources'
 import type { ExportSection } from '../utils/export'
-import { grantRows } from '../utils/exportSections'
+import { visibleAccessSections } from '../utils/exportSections'
 import { policiesUsingGroup, rulesGrantedToGroupIds } from '../utils/policy'
 import { ExplorerLayout } from './explorer/ExplorerLayout'
 import { GrantsMain } from './explorer/GrantsMain'
@@ -79,9 +80,17 @@ export function UsersTab({ model, onUserGroupRemoved }: Props) {
     if (accessIsError) {
       return { status: 'error', message: accessError instanceof Error ? accessError.message : String(accessError), onRetry: () => { void refetchAccess() }, retrying: accessFetching }
     }
+    // A user with nothing trackable sends no request at all (so no data ever
+    // arrives): that is an empty, finished lookup, not a pending one. Without
+    // this the usage filters stayed disabled for such a user.
+    if (trackedResources.length === 0) return { status: 'ready', byId: new Map<string, ResourceAccessInfo>() }
     if (!accessResults) return { status: 'loading' }
     return { status: 'ready', byId: new Map<string, ResourceAccessInfo>(Object.entries(accessResults)) }
-  }, [isServiceAccount, user, accessIsError, accessError, refetchAccess, accessFetching, accessResults])
+  }, [isServiceAccount, user, accessIsError, accessError, refetchAccess, accessFetching, accessResults, trackedResources])
+  const evidenceNote = useMemo(
+    () => (accessResults && trackedResources.length > 0 ? coverageNote(Object.values(accessResults), now) : undefined),
+    [accessResults, trackedResources, now]
+  )
 
   const ex = useGrantsExplorer({ resources, lookup: accessLookup, resetKey: user?.id ?? '' })
 
@@ -130,9 +139,9 @@ export function UsersTab({ model, onUserGroupRemoved }: Props) {
           },
         ],
       },
-      { title: 'Access Granted', rows: grantRows(grants) },
+      ...visibleAccessSections(ex.visible, now),
     ]
-  }, [user, grants])
+  }, [user, ex.visible, now])
 
   const rail = (
     <>
@@ -149,7 +158,10 @@ export function UsersTab({ model, onUserGroupRemoved }: Props) {
               {isServiceAccount && <> {user.status || user.details?.email ? '· ' : ''}<span className="text-warn font-medium">Service account</span></>}
             </span>
             {isServiceAccount && (
-              <span className="xp-rail-sub">No Okta identity — API-key-only, so "last accessed" (System Log) doesn't apply to it.</span>
+              <span className="xp-rail-sub">No Okta identity — API-key-only, so "last used" (System Log) doesn't apply to it.</span>
+            )}
+            {user.groups_error && (
+              <span className="xp-rail-sub text-warn">Groups could not be read for this user, so their access is unknown (not "none").</span>
             )}
           </div>
           <CountList items={ex.countItems} onSelect={ex.jump} />
@@ -181,7 +193,8 @@ export function UsersTab({ model, onUserGroupRemoved }: Props) {
           ex={ex}
           now={now}
           searchLabel="Search this user's access"
-          emptyMessage="No policy grants access via this user's groups."
+          note={evidenceNote}
+          emptyMessage={user.groups_error ? 'Groups could not be read for this user, so it is not known what they can access.' : "No policy grants access via this user's groups."}
           renderDetail={resource => (
             <ResourceAccessView
               resource={resource}

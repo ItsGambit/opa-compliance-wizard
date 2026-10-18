@@ -1,6 +1,6 @@
 import type { AccessPolicy, NamedRef, PolicyRule, PolicyRuleResolution, ResourceAccessInfo } from '../types'
 import { labelize } from './format'
-import { describeCondition, type GrantedRule } from './policy'
+import { describeCondition, isPolicyActive, type GrantedRule } from './policy'
 
 /** The Access Explorer shows access RESOURCE-first: one row per resource
  * (a server, an account, a secret ...) instead of one card per policy rule.
@@ -18,6 +18,8 @@ export interface GrantLine {
   /** Resources the rule also covers that this view does not list
    * (non-zero only when the view filters resolutions, e.g. one project). */
   othersCount: number
+  /** The policy is switched off: this line gives no access right now. */
+  inactive: boolean
 }
 
 /** The muted qualifier shown beside a resolved account's name. An Active
@@ -41,27 +43,18 @@ export interface AccessResource {
   actions: string[]
   /** Conditions, de-duplicated across every line. */
   conditions: string[]
-  /** True when at least one way to get this resource needs neither MFA nor
-   * an access request (approval). */
+  /** True when at least one way to get this resource, through an ACTIVE
+   * policy, needs neither MFA nor an access request (approval). An inactive
+   * policy gives no access, so it never makes a resource risky. */
   risky: boolean
+  /** Every policy behind this resource is inactive: shown, but not in effect. */
+  inactiveOnly: boolean
   viaNames: string[]
   policyNames: string[]
   /** The rule selector text(s) that matched this named account (empty for
    * everything else). Searchable and shown in the opened row. */
   selectors: string[]
 }
-
-// Resource kinds with a verified, working System Log mapping -- see
-// create_secret_folders.py's RESOURCE_ACCESS_EVENT_TYPES.
-export const TRACKABLE_KINDS = new Set([
-  'secret',
-  'individual_server_account',
-  'individual_managed_saas_app_account',
-  'individual_unmanaged_saas_app_account',
-  'individual_okta_account',
-  'individual_database_account',
-  'individual_active_directory_account',
-])
 
 /** Database and Active Directory access rules are selectors (connections or
  * domains plus account-name conditions), so there is no single account to
@@ -167,6 +160,18 @@ export interface AggregateOptions {
   includeResolution?: (res: PolicyRuleResolution & { kind: 'resolved' }) => boolean
 }
 
+/** A resource's display name: the stored name, else its id; "(deleted)" when
+ * the model says the object is in no project any more. A null name used to
+ * crash the sort in aggregateResources. */
+export function resourceDisplayName(res: { name?: string | null; id: string; missing?: boolean }): string {
+  const base = res.name || res.id || 'Unnamed'
+  return res.missing ? `${base} (deleted)` : base
+}
+
+function shortId(id: string): string {
+  return id.length > 8 ? id.slice(0, 8) : id
+}
+
 export function aggregateResources(grants: GrantedRule[], options: AggregateOptions = {}): AccessResource[] {
   const groupsFor = options.groupsFor ?? ((policy: AccessPolicy) => policy.principals.user_groups)
   const byKey = new Map<string, AccessResource>()
@@ -179,19 +184,19 @@ export function aggregateResources(grants: GrantedRule[], options: AggregateOpti
       const key = res.kind === 'resolved' ? `${typeId}|${res.resource_kind}|${res.id}` : `${typeId}|cond|${res.description}`
       let item = byKey.get(key)
       if (!item) {
-        const name = res.kind === 'resolved' ? res.name : res.description
+        const name = res.kind === 'resolved' ? resourceDisplayName(res) : res.description
         const hint =
           res.kind === 'condition'
             ? 'selector'
             : [rowQualifier(res), res.resource_kind === 'secret_folder' ? 'folder' : null, res.project_name].filter(Boolean).join(' · ') || undefined
         item = {
-          key, typeId, typeLabel, name, hint, resolution: res, lines: [], actions: [], conditions: [], risky: false, viaNames: [], policyNames: [], selectors: [],
+          key, typeId, typeLabel, name, hint, resolution: res, lines: [], actions: [], conditions: [], risky: false, inactiveOnly: false, viaNames: [], policyNames: [], selectors: [],
         }
         byKey.set(key, item)
       }
       if (res.kind === 'resolved' && res.via_selector && !item.selectors.includes(res.via_selector)) item.selectors.push(res.via_selector)
       if (!item.lines.some(l => l.policy === policy && l.rule === rule)) {
-        item.lines.push({ policy, rule, groups: groupsFor(policy), othersCount })
+        item.lines.push({ policy, rule, groups: groupsFor(policy), othersCount, inactive: !isPolicyActive(policy) })
       }
     }
   }
@@ -199,9 +204,24 @@ export function aggregateResources(grants: GrantedRule[], options: AggregateOpti
   for (const item of out) {
     item.actions = unique(item.lines.flatMap(l => describeActions(l.rule)))
     item.conditions = unique(item.lines.flatMap(l => l.rule.conditions.map(describeCondition)))
-    item.risky = item.lines.some(l => !ruleHasApprovalOrMfa(l.rule))
+    item.inactiveOnly = item.lines.length > 0 && item.lines.every(l => l.inactive)
+    item.risky = item.lines.some(l => !l.inactive && !ruleHasApprovalOrMfa(l.rule))
     item.viaNames = unique(item.lines.flatMap(l => l.groups.map(g => g.name)))
     item.policyNames = unique(item.lines.map(l => l.policy.name))
+    if (item.inactiveOnly) item.hint = [item.hint, 'inactive policy'].filter(Boolean).join(' · ')
+  }
+  // Two rows with the same name in one section (two secrets, two accounts
+  // ...): the short id tells them apart.
+  const sameName = new Map<string, AccessResource[]>()
+  for (const item of out) {
+    const k = `${item.typeId}|${item.name.toLowerCase()}`
+    sameName.set(k, [...(sameName.get(k) ?? []), item])
+  }
+  for (const group of sameName.values()) {
+    if (group.length < 2) continue
+    for (const item of group) {
+      if (item.resolution.kind === 'resolved') item.hint = [item.hint, `#${shortId(item.resolution.id)}`].filter(Boolean).join(' · ')
+    }
   }
   // Types keep the order in which the grants first mention them; resources
   // sort by name inside their type.
@@ -247,83 +267,190 @@ export interface TrackTarget {
   kind?: 'account_selector'
 }
 
-/** The System Log lookups behind one resource: the account/secret itself,
- * or -- for a folder -- every secret inside it (folder browsing is never
- * logged, reveals reference the secret). */
-export function trackTargets(resource: AccessResource): TrackTarget[] {
-  const res = resource.resolution
-  const family = selectorFamily(resource)
-  if (family) return [{ id: family.anyId, label: family.label, kind: 'account_selector' }]
-  if (res.kind !== 'resolved') return []
-  if (TRACKABLE_KINDS.has(res.resource_kind)) return [{ id: res.access_tracking_id ?? res.id, label: res.name }]
-  if (res.resource_kind === 'secret_folder') return (res.child_secrets ?? []).map(c => ({ id: c.id, label: c.name }))
-  return []
-}
-
 /** The de-duplicated request list the server lookup wants. */
 export interface TrackedRequest {
   resource_kind: string
   resource_id: string
-  /** Database / Active Directory accounts: lets the server also match the
-   * System Log by the exact account name when its id differs, but only when
-   * `name_unique` says no other account of the family has that name. */
+  /** Database / Active Directory / server accounts: lets the server also match
+   * the System Log by the exact account name, but only when `name_unique`
+   * says no other account of that kind has that name. */
   account_name?: string
   name_unique?: boolean
+  /** Server accounts: the server the account is on. */
+  server_id?: string
+}
+
+/** Why a resource has nothing to look up. 'unknown' = it should be trackable
+ * but could not be matched; 'untracked' = the System Log has nothing for it. */
+export interface TrackGap {
+  state: 'unknown' | 'untracked'
+  reason: string
+}
+
+export interface Tracking {
+  targets: TrackTarget[]
+  requests: TrackedRequest[]
+  gap?: TrackGap
+}
+
+const PLAIN_ID = /^[A-Za-z0-9_-]{1,128}$/
+
+/** A short stable hash (FNV-1a, 32 bit, hex) used to build lookup keys for
+ * things that have no id of their own (a server account is "server + user
+ * name"; a shared Active Directory account is only a name). Keys must stay
+ * plain identifiers, so the server accepts them. */
+export function fnvHex(text: string): string {
+  let h = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return h.toString(16).padStart(8, '0')
+}
+
+/** relationship_assignment:secret behaves exactly like a secret granted by a rule. */
+function baseKind(kind: string): string {
+  return kind.startsWith('relationship_assignment:') ? kind.slice('relationship_assignment:'.length) : kind
+}
+
+const SAAS_OKTA_KINDS = new Set(['individual_managed_saas_app_account', 'individual_unmanaged_saas_app_account', 'individual_okta_account'])
+const NAMED_ACCOUNT_KINDS = new Set(['individual_database_account', 'individual_active_directory_account'])
+
+export const NOT_TRACKED_REASON = 'The System Log does not record access per resource of this kind.'
+export const NO_TRACKING_ID_REASON = 'Could not match this account to the System Log: its tracking id was not found.'
+export const UNRESOLVED_FOLDER_REASON = 'This folder was not found in the loaded projects, so the secrets inside it are not known.'
+export const EMPTY_FOLDER_REASON = 'This folder is empty, so there is nothing to track.'
+
+/** Everything the lookup needs for one resource, and why when there is nothing. */
+export function trackingFor(resource: AccessResource): Tracking {
+  const res = resource.resolution
+  const family = selectorFamily(resource)
+  if (family) {
+    return { targets: [{ id: family.anyId, label: family.label, kind: 'account_selector' }], requests: [{ resource_kind: family.kind, resource_id: family.anyId }] }
+  }
+  if (res.kind !== 'resolved') return { targets: [], requests: [], gap: { state: 'untracked', reason: NOT_TRACKED_REASON } }
+  const kind = baseKind(res.resource_kind)
+  const label = resourceDisplayName(res)
+  const single = (request: TrackedRequest): Tracking => ({ targets: [{ id: request.resource_id, label }], requests: [request] })
+
+  if (kind === 'secret') return single({ resource_kind: 'secret', resource_id: res.id })
+  if (kind === 'secret_folder') {
+    // No child_secrets key at all = the folder could not be resolved; an empty
+    // list = it was found and has no secrets. They are different answers.
+    if (res.child_secrets === undefined) return { targets: [], requests: [], gap: { state: 'unknown', reason: UNRESOLVED_FOLDER_REASON } }
+    if (res.child_secrets.length === 0) return { targets: [], requests: [], gap: { state: 'untracked', reason: EMPTY_FOLDER_REASON } }
+    return {
+      targets: res.child_secrets.map(c => ({ id: c.id, label: c.name })),
+      requests: res.child_secrets.map(c => ({ resource_kind: 'secret', resource_id: c.id })),
+    }
+  }
+  if (SAAS_OKTA_KINDS.has(kind)) {
+    // The Okta-side id (res.id) is never a System Log target, so it is NOT a
+    // fallback: without the account's own tracking id there is nothing to match.
+    if (!res.access_tracking_id) return { targets: [], requests: [], gap: { state: 'unknown', reason: NO_TRACKING_ID_REASON } }
+    return single({ resource_kind: kind, resource_id: res.access_tracking_id })
+  }
+  if (NAMED_ACCOUNT_KINDS.has(kind)) {
+    const id = res.access_tracking_id ?? (PLAIN_ID.test(res.id) ? res.id : `shared-${fnvHex(res.account_name ?? res.id)}`)
+    const request: TrackedRequest = { resource_kind: kind, resource_id: id }
+    if (res.account_name) {
+      request.account_name = res.account_name
+      request.name_unique = res.name_unique === true
+    }
+    return single(request)
+  }
+  if (kind === 'individual_server_account') {
+    const serverId = res.server_id ?? res.id
+    if (!PLAIN_ID.test(serverId)) return { targets: [], requests: [], gap: { state: 'untracked', reason: NOT_TRACKED_REASON } }
+    if (!res.account_name) return single({ resource_kind: kind, resource_id: serverId })
+    return single({
+      resource_kind: kind, resource_id: `${serverId}-${fnvHex(res.account_name)}`, server_id: serverId,
+      account_name: res.account_name, name_unique: res.name_unique === true,
+    })
+  }
+  return { targets: [], requests: [], gap: { state: 'untracked', reason: NOT_TRACKED_REASON } }
+}
+
+/** The System Log lookups behind one resource: the account/secret itself,
+ * or -- for a folder -- every secret inside it (folder browsing is never
+ * logged, reveals reference the secret). */
+export function trackTargets(resource: AccessResource): TrackTarget[] {
+  return trackingFor(resource).targets
 }
 
 export function trackedRequests(resources: AccessResource[]): TrackedRequest[] {
   const seen = new Map<string, TrackedRequest>()
-  for (const r of resources) {
-    const res = r.resolution
-    const family = selectorFamily(r)
-    if (family) {
-      seen.set(family.anyId, { resource_kind: family.kind, resource_id: family.anyId })
-      continue
-    }
-    if (res.kind !== 'resolved') continue
-    if (TRACKABLE_KINDS.has(res.resource_kind)) {
-      const id = res.access_tracking_id ?? res.id
-      const request: TrackedRequest = { resource_kind: res.resource_kind, resource_id: id }
-      if (res.account_name && (res.resource_kind === 'individual_database_account' || res.resource_kind === 'individual_active_directory_account')) {
-        request.account_name = res.account_name
-        request.name_unique = res.name_unique === true
-      }
-      seen.set(id, request)
-    } else if (res.resource_kind === 'secret_folder') {
-      for (const child of res.child_secrets ?? []) seen.set(child.id, { resource_kind: 'secret', resource_id: child.id })
-    }
-  }
+  for (const r of resources) for (const request of trackingFor(r).requests) seen.set(request.resource_id, request)
   return [...seen.values()]
 }
 
 export type LastUsed =
-  | { state: 'used'; at: string }
-  | { state: 'never' }
-  | { state: 'unknown' }
+  | {
+      state: 'used'
+      at: string
+      /** Matched events in the window (more than the few the row can list). */
+      uses?: number
+      windowDays?: number
+      eventTypes?: string[]
+      /** Selector row: the time is the newest of ANY account of that family. */
+      anyAccount?: boolean
+      /** A live event newer than the archive's last synced event is included. */
+      newerThanSync?: boolean
+    }
+  | { state: 'never'; windowDays?: number; eventTypes?: string[]; anyAccount?: boolean }
+  | { state: 'unknown'; reason?: string }
   /** No event matched by id, but another account shares this account's name and has events: cannot tell which was used. */
   | { state: 'ambiguous' }
-  | { state: 'untracked' }
+  | { state: 'untracked'; reason?: string }
   | { state: 'loading' }
   | { state: 'error' }
   /** The view has no lookup at all (service account, or a view that never queries). */
   | { state: 'none' }
 
+/** Only the defined entries, so a plain answer stays a plain object. */
+function defined<T extends object>(o: T): Partial<T> {
+  return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as Partial<T>
+}
+
 export function lastUsedFor(resource: AccessResource, lookup: AccessLookup | undefined): LastUsed {
-  const targets = trackTargets(resource)
-  if (targets.length === 0) return { state: lookup ? 'untracked' : 'none' }
+  const tracking = trackingFor(resource)
+  const targets = tracking.targets
+  if (targets.length === 0) {
+    if (!lookup) return { state: 'none' }
+    // Only the cases with something specific to say carry a reason.
+    if (tracking.gap?.state === 'unknown') return { state: 'unknown', reason: tracking.gap.reason }
+    return tracking.gap && tracking.gap.reason !== NOT_TRACKED_REASON ? { state: 'untracked', reason: tracking.gap.reason } : { state: 'untracked' }
+  }
   if (!lookup) return { state: 'none' }
   if (lookup.status === 'loading') return { state: 'loading' }
   if (lookup.status === 'error') return { state: 'error' }
   const infos = targets.map(t => lookup.byId.get(t.id)).filter((i): i is ResourceAccessInfo => !!i)
   if (infos.length === 0) return { state: 'unknown' }
   if (infos.every(i => !i.supported)) return { state: 'untracked' }
+  const supported = infos.filter(i => i.supported)
+  const anyAccount = targets.some(t => t.kind === 'account_selector') || undefined
+  const eventTypes = [...new Set(supported.flatMap(i => i.event_types ?? []))]
+  const windows = supported.map(i => i.window_days).filter((d): d is number => typeof d === 'number')
+  const windowDays = windows.length > 0 ? Math.min(...windows) : undefined
   let latest: string | null = null
   for (const i of infos) {
     for (const e of i.events) {
       if (!latest || new Date(e.published).getTime() > new Date(latest).getTime()) latest = e.published
     }
   }
-  if (latest) return { state: 'used', at: latest }
+  if (latest) {
+    const counts = supported.map(i => i.uses)
+    const uses = counts.every((c): c is number => typeof c === 'number') ? counts.reduce((a, b) => a + b, 0) : undefined
+    return {
+      state: 'used', at: latest,
+      ...defined({
+        uses, windowDays, anyAccount,
+        eventTypes: eventTypes.length > 0 ? eventTypes : undefined,
+        newerThanSync: supported.some(i => i.newer_than_sync) || undefined,
+      }),
+    }
+  }
   if (infos.some(i => i.supported && i.complete === false)) return { state: 'unknown' }
-  return infos.some(i => i.ambiguous) ? { state: 'ambiguous' } : { state: 'never' }
+  if (infos.some(i => i.ambiguous)) return { state: 'ambiguous' }
+  return { state: 'never', ...defined({ windowDays, anyAccount, eventTypes: eventTypes.length > 0 ? eventTypes : undefined }) }
 }

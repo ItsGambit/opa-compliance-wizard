@@ -58,7 +58,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.44.6
+# Version     : 5.45.0
 # =============================================================================
 
 import argparse
@@ -84,7 +84,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.44.6"
+SCRIPT_VERSION = "5.45.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 # ENG2-12: OPA's spec documents no pattern or length for a secret-folder
 # name (SecretFolderCreateRequest.name is a bare string); 255 is the limit
@@ -286,7 +286,6 @@ def _gateway_creds_server_ids(event):
 # guessed.
 DATABASE_ACCOUNT_ANY_ID = "database_accounts"
 ACTIVE_DIRECTORY_ACCOUNT_ANY_ID = "active_directory_accounts"
-SELECTOR_ACCOUNT_EVENT_LIMIT = 50
 
 
 def _family_matcher(service_account_types, resource_types):
@@ -316,11 +315,11 @@ _active_directory_account_ids = _family_account_ids(ACTIVE_DIRECTORY_ACCOUNT_ANY
 RESOURCE_ACCESS_EVENT_TYPES = {
     "database_account": {
         "event_types": ["pam.service_account.password.reveal", "pam.resource.checkout"],
-        "extract_ids": _database_account_ids, "event_name": _selector_account_name, "limit": SELECTOR_ACCOUNT_EVENT_LIMIT,
+        "extract_ids": _database_account_ids, "event_name": _selector_account_name,
     },
     "active_directory_account": {
         "event_types": ["pam.service_account.password.reveal"],
-        "extract_ids": _active_directory_account_ids, "event_name": _selector_account_name, "limit": SELECTOR_ACCOUNT_EVENT_LIMIT,
+        "extract_ids": _active_directory_account_ids, "event_name": _selector_account_name,
     },
     # 5.44.5: a database / Active Directory selector resolved to concrete
     # accounts (see _resolve_account_selector): tracked per account by the
@@ -346,7 +345,17 @@ RESOURCE_ACCESS_EVENT_TYPES = {
         "family": _family_matcher({"PAM_AD_ACCOUNT"}, set()),
     },
     "secret": {"event_types": ["pam.secret.reveal"], "extract_ids": _target_ids},
-    "individual_server_account": {"event_types": ["pam.gateway_creds.issue"], "extract_ids": _gateway_creds_server_ids},
+    # 5.45.0: a server account is tracked by its server id AND the account's
+    # username (the rule's selector carries both). Event shapes read from real
+    # events (see _server_account_match): reveal (server + account), checkout
+    # of a SERVER_ACCOUNT (account only), and the two server-level credential
+    # issues (gateway / user credentials: the server, not the account).
+    "individual_server_account": {
+        "event_types": ["pam.server_account.password.reveal", "pam.resource.checkout",
+                        "pam.gateway_creds.issue", "pam.user_creds.issue"],
+        "extract_ids": _gateway_creds_server_ids,
+        "custom_match": lambda event, req: _server_account_match(event, req),
+    },
     "individual_managed_saas_app_account": {
         "event_types": ["pam.service_account.password.reveal", "pam.resource.checkout"], "extract_ids": _target_ids,
     },
@@ -3672,10 +3681,14 @@ def describe_dynamic_selector(resource_type, selector_type, selector):
             accounts = selector.get("individual_accounts") or {}
             by_condition = accounts.get("by_condition")
             by_domain = accounts.get("by_domain")
+            # 5.45.0: EVERY branch is listed (they used to be a first-match
+            # return, so a selector with an individual and a shared part read
+            # as if it covered the individual part only).
+            parts = []
             if by_condition:
-                return f"AD accounts where {_condition_phrase(by_condition.get('account_name_format'), by_condition.get('value'))}"
+                parts.append(f"AD accounts where {_condition_phrase(by_condition.get('account_name_format'), by_condition.get('value'))}")
             if by_domain:
-                return f"AD accounts in domain(s): {', '.join(by_domain)}"
+                parts.append(f"AD accounts in domain(s): {', '.join(by_domain)}")
 
             # "Shared" AD accounts (live-confirmed 2026-08-14): a distinct
             # sub-shape from individual_accounts above -- names specific
@@ -3685,16 +3698,20 @@ def describe_dynamic_selector(resource_type, selector_type, selector):
             # selector itself, not nested inside it.
             shared = selector.get("shared_accounts") or {}
             specific = shared.get("specific_accounts")
+            scope = ((selector.get("servers") or {}).get("selectors") or [{}])[0].get("selector") or {}
+            scope_labels = scope.get("labels") or {}
+            scope_text = f", on servers labeled {', '.join(f'{k}={v}' for k, v in scope_labels.items())}" if scope_labels else ""
             if specific:
                 names = ", ".join(a.get("account_name", "?") for a in specific)
-                scope = ((selector.get("servers") or {}).get("selectors") or [{}])[0].get("selector") or {}
-                scope_labels = scope.get("labels") or {}
-                scope_text = f", on servers labeled {', '.join(f'{k}={v}' for k, v in scope_labels.items())}" if scope_labels else ""
-                return f"Shared AD account(s): {names}{scope_text}"
+                parts.append(f"Shared AD account(s): {names}{scope_text}")
             if shared.get("by_domain"):
-                return f"Shared AD accounts in domain(s): {', '.join(shared['by_domain'])}"
+                parts.append(f"Shared AD accounts in domain(s): {', '.join(shared['by_domain'])}{'' if specific else scope_text}")
             if shared.get("by_matching_names"):
-                return "Shared AD accounts matching configured name rules"
+                parts.append(f"Shared AD accounts matching configured name rules{'' if specific or shared.get('by_domain') else scope_text}")
+            if scope_labels and not (specific or shared.get("by_domain") or shared.get("by_matching_names")):
+                parts.append(f"limited to servers labeled {', '.join(f'{k}={v}' for k, v in scope_labels.items())}")
+            if parts:
+                return "; ".join(parts)
         if selector_type == "database":
             conns = selector.get("database_connections") or []
             conn_names = ", ".join(c.get("name", "?") for c in conns) or "(any connection)"
@@ -4027,12 +4044,33 @@ def _resolve_selector_entry(resource_type, selector_type, selector, indexes):
                         "project_id": None, "project_name": None, "resource_group_id": None}
             if hit:
                 resolved.update(hit)
+            elif indexes.get("complete") is True:
+                # 5.45.0: every project's resources were listed completely
+                # and this id is in none of them, so the object is gone
+                # (deleted, or moved out of reach). The name is the one the
+                # rule stored.
+                resolved["missing"] = True
             if selector_type == "secret_folder":
                 # A folder grant covers every secret in its subtree, but
                 # System Log events only attribute to individual secrets --
                 # attach the folder's descendant secrets so the frontend can
                 # look up (and roll up) per-secret access under this grant.
-                resolved["child_secrets"] = indexes.get("secret_folder_children", {}).get(ref.get("id"), [])
+                # 5.45.0: only when the folder was found. An unresolved folder
+                # has NO child_secrets key at all, which the screen reads as
+                # "could not be resolved", not as "empty".
+                children = indexes.get("secret_folder_children", {})
+                if ref.get("id") in children:
+                    resolved["child_secrets"] = children[ref.get("id")]
+            elif selector_type == "individual_server_account":
+                # 5.45.0: the rule names a server AND the account on it
+                # (`username`); both are kept so the row can say
+                # "server / account" and last-used can match the account.
+                username = selector.get("username")
+                if isinstance(username, str) and username:
+                    resolved["account_name"] = username
+                    resolved["name"] = f"{ref.get('name') or ref.get('id')} / {username}"
+                resolved["server_id"] = ref.get("id")
+                resolved["server_name"] = ref.get("name")
             return resolved
     except Exception:
         pass
@@ -4336,7 +4374,14 @@ def _resolve_rule(rule, indexes, policy_rg_id=None):
         else:
             named = None
         remainder = selector
-        if selector_type == "active_directory":
+        # 5.45.0: a server scope on an Active Directory selector limits where
+        # its accounts apply, which a named account row cannot carry. Such a
+        # selector is resolved only when it has no scope; else the whole
+        # selector stays one row whose text lists every branch.
+        scoped = selector_type == "active_directory" and bool((selector.get("servers") or {}).get("selectors"))
+        if scoped:
+            named = None
+        if selector_type == "active_directory" and not scoped:
             # Shared accounts named in the rule are certain from the rule
             # itself; whatever part of the selector is still unnamed stays a
             # selector row (described without the parts that are now rows).
@@ -4357,6 +4402,30 @@ def _resolve_rule(rule, indexes, policy_rg_id=None):
             resolutions.append(_resolve_selector_entry(resource_type, selector_type, selector, indexes))
     return resolutions or [{"kind": "condition",
                              "description": RESOURCE_TYPE_LABELS.get(resource_type, resource_type)}]
+
+
+def _finalize_resolutions(policies_out, assignments, indexes):
+    """Two passes over every resolution once the whole model exists (5.45.0):
+    - server-account rows get `name_unique`: no other (server, account) pair in
+      the model uses the same account name. A SERVER_ACCOUNT checkout event
+      names only the account, so its last-used match by name is allowed only
+      when the name is unique;
+    - a secret folder granted through a relationship gets its `child_secrets`
+      (a folder is tracked by the secrets inside it), when the folder is known."""
+    all_resolutions = [r for p in policies_out for rule in p.get("rules") or [] for r in rule.get("resolutions") or []]
+    all_resolutions += [r for a in assignments if isinstance(a, dict) for r in a.get("resolved_resources") or []]
+    pairs_by_name = defaultdict(set)
+    for r in all_resolutions:
+        if r.get("kind") == "resolved" and r.get("resource_kind") == "individual_server_account" and r.get("account_name"):
+            pairs_by_name[r["account_name"]].add(r.get("server_id"))
+    children = indexes.get("secret_folder_children", {})
+    for r in all_resolutions:
+        if r.get("kind") != "resolved":
+            continue
+        if r.get("resource_kind") == "individual_server_account" and r.get("account_name"):
+            r["name_unique"] = len(pairs_by_name[r["account_name"]]) == 1
+        elif r.get("resource_kind") == "relationship_assignment:secret_folder" and r.get("id") in children:
+            r["child_secrets"] = children[r["id"]]
 
 
 def _extract_request_id(event):
@@ -4381,96 +4450,338 @@ def resolve_okta_actor_id(okta_client, email):
     return okta_client.find_user_by_login_or_email(email)["id"]
 
 
-def find_last_access_for_user(okta_client, actor_user_id, resources, limit_per_resource=5, since_days=90):
-    """For each {resource_kind, resource_id} in `resources`, finds up to
-    `limit_per_resource` most-recent System Log events (within the last
-    `since_days`) where `actor_user_id` accessed that specific resource.
+# ---------------------------------------------------------------------------
+# Access evidence (5.45.0)
+# ---------------------------------------------------------------------------
+# "When did this user last use this resource, how often, and how do we know?"
+# The synced System Log archive (audit_store.py) is read first: it is sorted,
+# indexed per actor and looks back further than Okta's own 90-day retention.
+# The live System Log is then asked only for the gap since the archive's last
+# synced event, so a fresh answer never misses recent events. Without a usable
+# archive (never synced, no permission to read it, or an ingestion scope that
+# does not store a needed event type) the live 90-day answer is given and the
+# result says so. The matching rules are the same for both sources.
+ACCESS_LIVE_WINDOW_DAYS = 90        # Okta's System Log retention
+ACCESS_ARCHIVE_WINDOW_DAYS = 365    # how far back the archive is read
+ACCESS_RECENT_EVENTS = 10           # events returned per resource
+ACCESS_EVENTS_PER_ACCOUNT = 5       # per account name, for selector kinds
+ACCESS_ARCHIVE_ROW_CAP = 200000     # rows read from the archive per event-type set
+ACCESS_TOPUP_OVERLAP = timedelta(hours=1)  # re-read just before the watermark; events dedupe by uuid
+MAX_ACCESS_REQUESTS = 20000
 
-    One System Log call per distinct resource_kind present in `resources`
-    (not one per resource) -- events are fetched filtered by actor+eventType
-    only, then bucketed client-side by matching each event's target[] ids
-    against the requested resource ids. This is the only viable approach:
-    Okta's log `filter` doesn't support querying by target.id, so per-
-    resource server-side filtering isn't possible; filtering by actor+
-    eventType first keeps each query's result set small instead of scanning
-    the org's entire log.
 
-    Returns a dict keyed by resource_id:
-        {"resource_kind": ..., "supported": bool, "events": [
-            {"published": ..., "request_id": ..., "outcome": ...}, ...
-        ]}
-    Supported entries also carry "complete" (False when the System Log
-    walk hit its page cap, ENG2-09).
-    `supported=False` (empty events, no query made) for any resource_kind
-    not in RESOURCE_ACCESS_EVENT_TYPES -- see that constant's comment for
-    why those are intentionally left unmapped rather than guessed."""
-    results = {}
-    by_kind = {}
-    # Optional per-resource name fallback (see "family" in
-    # RESOURCE_ACCESS_EVENT_TYPES): {(kind, id): (account_name, name_unique)}.
-    names = {}
+def validate_access_requests(resources):
+    """Checks the browser-supplied lookup list and returns a clean copy
+    (ValueError -> HTTP 400). Every id is a plain identifier, every kind a
+    short token, names are strings; nothing here reaches a URL or an Okta
+    filter, but all of it is validated anyway."""
+    if not isinstance(resources, list):
+        raise ValueError("resources must be a list")
+    if len(resources) > MAX_ACCESS_REQUESTS:
+        raise ValueError(f"at most {MAX_ACCESS_REQUESTS} resources can be looked up at once")
+    clean = []
     for r in resources:
-        by_kind.setdefault(r["resource_kind"], []).append(r["resource_id"])
-        if isinstance(r.get("account_name"), str) and r["account_name"]:
-            names[(r["resource_kind"], r["resource_id"])] = (r["account_name"], r.get("name_unique") is True)
+        if not isinstance(r, dict):
+            raise ValueError("every resource must be an object")
+        kind = r.get("resource_kind")
+        if not isinstance(kind, str) or not re.match(r"^[A-Za-z0-9_:.-]{1,80}$", kind):
+            raise ValueError("resource_kind is not valid")
+        item = {"resource_kind": kind, "resource_id": validate_resource_id(r.get("resource_id"), "resource id")}
+        if r.get("account_name") is not None:
+            if not isinstance(r["account_name"], str) or len(r["account_name"]) > 512:
+                raise ValueError("account_name must be a string")
+            item["account_name"] = r["account_name"]
+        if r.get("name_unique") is not None:
+            if not isinstance(r["name_unique"], bool):
+                raise ValueError("name_unique must be true or false")
+            item["name_unique"] = r["name_unique"]
+        if r.get("server_id") is not None:
+            item["server_id"] = validate_resource_id(r["server_id"], "server id")
+        clean.append(item)
+    return clean
 
-    since = (datetime.now(timezone.utc) - timedelta(days=since_days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-    for resource_kind, resource_ids in by_kind.items():
-        mapping = RESOURCE_ACCESS_EVENT_TYPES.get(resource_kind)
-        if not mapping:
-            for rid in resource_ids:
-                results[rid] = {"resource_kind": resource_kind, "supported": False, "events": []}
-            continue
+def _server_account_match(event, req):
+    """How `event` ties to one server-account request, or None. Shapes were
+    read from real events: pam.server_account.password.reveal targets a
+    'Server Account' AND its 'Server'; pam.resource.checkout with resourceType
+    SERVER_ACCOUNT targets the 'Server Account' only (no server);
+    pam.gateway_creds.issue / pam.user_creds.issue name only the server
+    (debugData nextHopServerIds / servers) and not the account. Returns
+    'server_account' (server id + exact account name), 'name' (exact account
+    name only), 'server' (server-level: some account on the server) or
+    'ambiguous' (the name is shared by several server accounts)."""
+    event_type = event.get("eventType")
+    debug_data = (event.get("debugContext") or {}).get("debugData") or {}
+    targets = event.get("target") or []
+    account = next((t for t in targets if t.get("type") == "Server Account"), None)
+    server = next((t for t in targets if t.get("type") == "Server"), None)
+    server_id = req.get("server_id") or req["resource_id"]
+    username = req.get("account_name")
+    if event_type == "pam.gateway_creds.issue":
+        return "server" if server_id in _gateway_creds_server_ids(event) else None
+    if event_type == "pam.user_creds.issue":
+        ids = {part.strip() for part in str(debug_data.get("servers") or "").split(",") if part.strip()}
+        return "server" if server_id in ids else None
+    if event_type == "pam.server_account.password.reveal":
+        if not server or server.get("id") != server_id:
+            return None
+        if username:
+            return "server_account" if (account or {}).get("displayName") == username else None
+        return "server"
+    if event_type == "pam.resource.checkout":
+        if debug_data.get("resourceType") != "SERVER_ACCOUNT" or not username:
+            return None
+        if (account or {}).get("displayName") != username:
+            return None
+        return "name" if req.get("name_unique") is True else "ambiguous"
+    return None
 
-        type_filter = " or ".join(f'eventType eq "{t}"' for t in mapping["event_types"])
-        filter_expr = f'actor.id eq "{validate_resource_id(actor_user_id, "actor id")}" and ({type_filter})'
-        # ENG2-09 (external review, 2026-10-05): nothing is persisted here,
-        # but the reader still needs to know when the walk hit the page cap
-        # -- the newest events are kept (DESCENDING), so a resource whose
-        # only events are past the cap shows "no access" when it wasn't.
-        events, complete = okta_client.get_system_log(filter_expr=filter_expr, since=since, limit=1000)
 
-        wanted = set(resource_ids)
-        buckets = {rid: [] for rid in resource_ids}
-        ambiguous = set()
-        family = mapping.get("family")
-        for event in events:  # already DESCENDING (most-recent-first) by default
-            hit_ids = {rid: "id" for rid in mapping["extract_ids"](event) & wanted}
+def _bucket_access_events(mapping, requests, events):
+    """Sorts the events (any order) into one bucket per requested resource id:
+    {rid: {"entries": [...], "ambiguous": bool}}. Matching is exact: an id
+    equal to one of the event's, or (families with `family`) the right
+    account family plus an exact, unique account name; never fuzzy. An event
+    whose ids match no requested resource is dropped silently."""
+    resource_ids = [r["resource_id"] for r in requests]
+    wanted = set(resource_ids)
+    names = {r["resource_id"]: (r["account_name"], r.get("name_unique") is True)
+             for r in requests if isinstance(r.get("account_name"), str) and r["account_name"]}
+    buckets = {rid: {"entries": [], "ambiguous": False} for rid in resource_ids}
+    family = mapping.get("family")
+    custom = mapping.get("custom_match")
+    for event in events:
+        hits = {}
+        if custom is not None:
+            for req in requests:
+                how = custom(event, req)
+                if how == "ambiguous":
+                    buckets[req["resource_id"]]["ambiguous"] = True
+                elif how:
+                    hits[req["resource_id"]] = how
+        else:
+            hits = {rid: "id" for rid in mapping["extract_ids"](event) & wanted}
             if family is not None and family(event):
                 event_name = _selector_account_name(event)
-                id_matched = bool(hit_ids)
+                id_matched = bool(hits)
                 for rid in resource_ids:
-                    name, unique = names.get((resource_kind, rid), (None, False))
-                    if rid in hit_ids or not name or event_name != name:
+                    name, unique = names.get(rid, (None, False))
+                    if rid in hits or not name or event_name != name:
                         continue
                     if unique:
-                        hit_ids[rid] = "name"
+                        hits[rid] = "name"
                     elif not id_matched:
                         # Several accounts share this name and no wanted id
                         # matched: the event may be this account's or
                         # another's, so say so rather than guess.
-                        ambiguous.add(rid)
-            for rid, how in hit_ids.items():
-                if len(buckets[rid]) < mapping.get("limit", limit_per_resource):
-                    entry = {
-                        "published": event.get("published"),
-                        "request_id": _extract_request_id(event),
-                        "outcome": (event.get("outcome") or {}).get("result"),
-                    }
-                    if "event_name" in mapping:
-                        entry["account_name"] = mapping["event_name"](event)
-                    if how == "name":
-                        entry["matched_by"] = "name"
-                    buckets[rid].append(entry)
+                        buckets[rid]["ambiguous"] = True
+        for rid, how in hits.items():
+            entry = {
+                "uuid": event.get("uuid"),
+                "published": event.get("published"),
+                "request_id": _extract_request_id(event),
+                "outcome": (event.get("outcome") or {}).get("result"),
+                "event_type": event.get("eventType"),
+            }
+            if "event_name" in mapping:
+                entry["account_name"] = mapping["event_name"](event)
+            if how != "id":
+                entry["matched_by"] = how
+            buckets[rid]["entries"].append(entry)
+    return buckets
 
-        for rid in resource_ids:
-            results[rid] = {"resource_kind": resource_kind, "supported": True, "events": buckets[rid],
-                            "complete": bool(complete)}
-            if rid in ambiguous and not buckets[rid]:
-                results[rid]["ambiguous"] = True
 
-    return results
+def _iso_ms_z(moment):
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _parse_iso(value):
+    if not isinstance(value, str) or len(value) < 19:
+        return None
+    try:
+        return datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _entry_key(entry):
+    return entry.get("uuid") or (entry.get("published"), entry.get("request_id"), entry.get("event_type"))
+
+
+def find_access_evidence(okta_client, actor_user_id, resources, environment_id=None, use_archive=True,
+                         limit_per_resource=ACCESS_RECENT_EVENTS, now=None):
+    """Access evidence for one user over the requested resources. See the
+    section comment above for the archive-first design. `resources` is the
+    output of validate_access_requests. Returns
+    {"results": {resource_id: {...}}, "coverage": {...}}.
+
+    Each result: resource_kind, supported, events (newest first: published,
+    request_id, outcome, event_type, optional account_name / matched_by,
+    source 'archive' | 'live' | 'both'), uses (matched events in the window),
+    event_types (what was counted), complete, optional ambiguous, source
+    ('archive' | 'live' | 'archive+live'), coverage_from / coverage_to /
+    window_days, newer_than_sync (a live event newer than the archive's last
+    synced event), archive_note (None | 'no_archive' | 'type_not_stored' |
+    'not_permitted' | 'stale_gap') and live_error (the live top-up failed, so
+    the newest events could not be checked)."""
+    import audit_store
+    actor_id = validate_resource_id(actor_user_id, "actor id")
+    requests_by_kind = {}
+    for r in resources:
+        requests_by_kind.setdefault(r["resource_kind"], []).append(r)
+    now = now or datetime.now(timezone.utc)
+    live_from = now - timedelta(days=ACCESS_LIVE_WINDOW_DAYS)
+    archive_from = now - timedelta(days=ACCESS_ARCHIVE_WINDOW_DAYS)
+
+    archive_info = None
+    if environment_id and use_archive:
+        archive_info = audit_store.archive_coverage(environment_id)
+    stored_scope = (archive_info or {}).get("ingestion_scope")
+    watermark = (archive_info or {}).get("last_synced_at") or (archive_info or {}).get("newest")
+    watermark_dt = _parse_iso(watermark)
+
+    def archive_status(types):
+        if not environment_id:
+            return "no_archive"
+        if not use_archive:
+            return "not_permitted"
+        if not archive_info or not archive_info.get("has_archive") or watermark_dt is None:
+            return "no_archive"
+        if stored_scope != "all" and any(t not in audit_store.COMPLIANCE_EVENT_TYPES for t in types):
+            return "type_not_stored"
+        return "ok"
+
+    # One archive read and one live walk per DISTINCT event-type set, shared
+    # by every kind that uses it (SaaS, Okta and Active Directory accounts
+    # all read the same two event types).
+    fetched = {}
+    for kind in requests_by_kind:
+        mapping = RESOURCE_ACCESS_EVENT_TYPES.get(kind)
+        if not mapping:
+            continue
+        key = tuple(sorted(mapping["event_types"]))
+        if key in fetched:
+            continue
+        status = archive_status(key)
+        record = {"status": status, "archive": [], "archive_complete": True, "live": [], "live_complete": True,
+                  "live_error": None, "live_from": live_from, "gap": False}
+        if status == "ok":
+            rows = audit_store.query_events(environment_id, event_types=list(key), since=_iso_ms_z(archive_from),
+                                            actor_id=actor_id, limit=ACCESS_ARCHIVE_ROW_CAP)
+            record["archive"] = [row["raw"] for row in rows]
+            record["archive_complete"] = len(rows) < ACCESS_ARCHIVE_ROW_CAP
+            record["live_from"] = max(live_from, watermark_dt - ACCESS_TOPUP_OVERLAP)
+            # Okta keeps only 90 days: an archive last synced longer ago than
+            # that leaves a stretch nobody can read, so "never" is unprovable.
+            record["gap"] = watermark_dt < live_from
+        type_filter = " or ".join(f'eventType eq "{t}"' for t in key)
+        filter_expr = f'actor.id eq "{actor_id}" and ({type_filter})'
+        if okta_client is None:
+            record["live_error"] = "no live connection"
+            record["live_complete"] = False
+        else:
+            try:
+                # ENG2-09: `complete` False = the walk hit its page cap, so
+                # "no access" may only mean "not within what was read".
+                events, complete = okta_client.get_system_log(
+                    filter_expr=filter_expr, since=_iso_ms_z(record["live_from"]), limit=1000)
+                record["live"], record["live_complete"] = events, bool(complete)
+            except OktaApiError as exc:
+                if status != "ok":
+                    raise
+                log("WARN", f"Access evidence: live top-up failed ({type(exc).__name__}); using the archive only.")
+                record["live_error"] = "the live System Log could not be read"
+                record["live_complete"] = False
+        fetched[key] = record
+
+    archive_oldest = _parse_iso((archive_info or {}).get("oldest"))
+    results = {}
+    for kind, requests in requests_by_kind.items():
+        mapping = RESOURCE_ACCESS_EVENT_TYPES.get(kind)
+        if not mapping:
+            for r in requests:
+                results[r["resource_id"]] = {"resource_kind": kind, "supported": False, "events": [], "uses": 0}
+            continue
+        record = fetched[tuple(sorted(mapping["event_types"]))]
+        archive_ok = record["status"] == "ok"
+        from_archive = _bucket_access_events(mapping, requests, record["archive"]) if archive_ok else {}
+        from_live = _bucket_access_events(mapping, requests, record["live"])
+        gap = record["gap"]
+        if archive_ok and not gap:
+            coverage_from = max(archive_from, archive_oldest or archive_from)
+        else:
+            coverage_from = live_from
+        for r in requests:
+            rid = r["resource_id"]
+            merged = {}
+            for entry in from_archive.get(rid, {}).get("entries", []):
+                merged[_entry_key(entry)] = dict(entry, source="archive")
+            newer = False
+            for entry in from_live[rid]["entries"]:
+                k = _entry_key(entry)
+                if k in merged:
+                    merged[k]["source"] = "both"
+                else:
+                    merged[k] = dict(entry, source="live")
+                    if archive_ok and (entry.get("published") or "")[:19] > watermark[:19]:
+                        newer = True
+            ordered = sorted(merged.values(), key=lambda e: e.get("published") or "", reverse=True)
+            if mapping.get("event_name"):
+                per_name, kept = {}, []
+                for e in ordered:
+                    count = per_name.get(e.get("account_name"), 0)
+                    if count < ACCESS_EVENTS_PER_ACCOUNT:
+                        per_name[e.get("account_name")] = count + 1
+                        kept.append(e)
+            else:
+                kept = ordered[:limit_per_resource]
+            for e in kept:
+                e.pop("uuid", None)
+            ambiguous = (from_live[rid]["ambiguous"] or from_archive.get(rid, {}).get("ambiguous", False)) and not ordered
+            complete = record["live_complete"] and (record["archive_complete"] if archive_ok else True) and not gap
+            if archive_ok:
+                source = "archive" if record["live_error"] else "archive+live"
+            else:
+                source = "live"
+            entry = {
+                "resource_kind": kind, "supported": True, "events": kept, "uses": len(ordered),
+                "event_types": list(mapping["event_types"]), "complete": bool(complete), "source": source,
+                "coverage_from": _iso_ms_z(coverage_from), "coverage_to": _iso_ms_z(now),
+                "window_days": max(1, int((now - coverage_from).total_seconds() // 86400)),
+                "newer_than_sync": newer,
+                "archive_note": ("stale_gap" if gap else None) if archive_ok else record["status"],
+            }
+            if archive_ok:
+                entry["last_synced_at"] = (archive_info or {}).get("last_synced_at")
+                entry["archive_oldest"] = (archive_info or {}).get("oldest")
+            if record["live_error"]:
+                entry["live_error"] = record["live_error"]
+            if ambiguous:
+                entry["ambiguous"] = True
+            results[rid] = entry
+    coverage = {
+        "now": _iso_ms_z(now), "live_window_days": ACCESS_LIVE_WINDOW_DAYS,
+        "archive": None if not archive_info else {
+            "has_archive": bool(archive_info.get("has_archive")), "oldest": archive_info.get("oldest"),
+            "newest": archive_info.get("newest"), "last_synced_at": archive_info.get("last_synced_at"),
+            "last_sync_completed_at": archive_info.get("last_sync_completed_at"), "ingestion_scope": stored_scope,
+        },
+    }
+    return {"results": results, "coverage": coverage}
+
+
+def find_last_access_for_user(okta_client, actor_user_id, resources, limit_per_resource=5, since_days=90,
+                              environment_id=None, use_archive=True):
+    """Compatibility wrapper around find_access_evidence: just the per-
+    resource results, keyed by resource_id. Without an environment_id this
+    is the original live-only lookup (plus the extra evidence fields).
+    `resources` may be raw {resource_kind, resource_id, ...} dicts."""
+    return find_access_evidence(
+        okta_client, actor_user_id, resources, environment_id=environment_id, use_archive=use_archive,
+        limit_per_resource=limit_per_resource,
+    )["results"]
+
 
 
 def _access_report_target(event, target_type):
@@ -5833,6 +6144,12 @@ def build_access_model(client, okta_client=None, on_progress=None):
     _report(on_progress, "index_resources", "done", f"{indexed_count} project(s) indexed")
     # Selector rows can only be resolved to named accounts from a COMPLETE
     # account list; a project whose list could not be read leaves it None.
+    # 5.45.0: "complete" lets a resolution say a referenced object is gone
+    # (`missing`) only when every listing that could have found it succeeded.
+    indexes["complete"] = not any(
+        w["section"].startswith(("servers in project", "SaaS app accounts in project", "Okta Universal Directory accounts in project"))
+        for w in warnings
+    )
     indexes["selector_accounts"] = {
         "database": None if any(w["section"].startswith("database accounts in project") for w in warnings) else all_database_accounts,
         "active_directory": None if any(w["section"].startswith("Active Directory accounts in project") for w in warnings) else all_active_directory_accounts,
@@ -5849,7 +6166,7 @@ def build_access_model(client, okta_client=None, on_progress=None):
             return client.list_user_groups(user.get("name"))
         except OpaApiError as exc:
             log("WARN", f"Could not fetch groups for user '{user.get('name')}': {exc}")
-            return []
+            return None  # not []: "no groups" and "could not be read" must differ (5.45.0)
 
     # ENG2-08 (external review, 2026-10-05): one call per user, independent
     # of each other and already failure-tolerant -- the one part of the
@@ -5864,9 +6181,20 @@ def build_access_model(client, okta_client=None, on_progress=None):
     with ThreadPoolExecutor(max_workers=USER_GROUP_WORKERS, thread_name_prefix="user-groups") as pool:
         futures = [pool.submit(contextvars.copy_context().run, _user_groups, u) for u in user_dicts]
         for i, (user, future) in enumerate(zip(user_dicts, futures)):
-            user["groups"] = future.result() or []
+            groups_read = future.result()
+            user["groups"] = groups_read or []
+            if groups_read is None:
+                # 5.45.0: an unreadable group list used to look exactly like
+                # "no groups", so the Users view said "No policy grants
+                # access" for that user. Flag the user and say so once.
+                user["groups_error"] = True
             users_with_groups.append(user)
             _report(on_progress, "user_groups", "progress", f"{i + 1}/{len(user_dicts)} users ({user.get('name')})")
+    unreadable = sum(1 for u in users_with_groups if u.get("groups_error"))
+    if unreadable:
+        warnings.append({"section": "user groups", "status": "error",
+                         "message": f"Groups could not be read for {unreadable} user(s); they are marked "
+                                    "'groups could not be read' instead of 'no access'."})
     _report(on_progress, "user_groups", "done", f"{len(users)} user(s)")
 
     _report(on_progress, "policies", "start")
@@ -5964,6 +6292,7 @@ def build_access_model(client, okta_client=None, on_progress=None):
             # relationship" without re-deriving the match itself.
             "relationship_ids": [r["id"] for r in policy_relationships if isinstance(r, dict) and r.get("id")],
         })
+    _finalize_resolutions(policies_out, assignments, indexes)
     _report(on_progress, "resolve", "done", f"{len(policies_out)} polic(ies) resolved")
 
     return {

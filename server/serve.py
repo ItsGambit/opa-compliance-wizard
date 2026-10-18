@@ -3243,7 +3243,8 @@ class Handler(SimpleHTTPRequestHandler):
                 user_id = path[len("/api/access/users/"):-len("/resource_access")]
                 if not user_id:
                     return self._send_json(400, {"error": "missing user_id"})
-                resources = payload.get("resources") or []
+                # 5.45.0: every id and kind is validated (ValueError -> 400).
+                resources = engine.validate_access_requests(payload.get("resources") or [])
                 if not resources:
                     return self._send_json(200, {"results": {}})
                 with _access_jobs_lock:
@@ -3256,8 +3257,17 @@ class Handler(SimpleHTTPRequestHandler):
                 # System Log's actor.id is the Okta identity id, not this PAM
                 # user's own (OPA-internal) id -- see resolve_okta_actor_id.
                 actor_id = engine.resolve_okta_actor_id(local_okta_client, (opa_user.get("details") or {}).get("email"))
-                results = engine.find_last_access_for_user(local_okta_client, actor_id, resources)
-                return self._send_json(200, {"results": results})
+                # 5.45.0: the answer is archive-first (the app's synced System
+                # Log, this environment only) topped up from the live log.
+                # Reading the archive needs the same `view_archive` permission
+                # as the reports; without it the lookup is live-only (what it
+                # was before) and says so. Live access still needs `live_read`
+                # (checked above), so nobody sees more than they could.
+                use_archive = bool(_local_env_id) and engine.shared_capability_allowed(
+                    _local_env_id, engine_owner, "view_archive", caller_issuer=_issuer_from_headers(self.headers))
+                evidence = engine.find_access_evidence(
+                    local_okta_client, actor_id, resources, environment_id=_local_env_id, use_archive=use_archive)
+                return self._send_json(200, evidence)
 
             return self._send_json(404, {"error": "not found"})
         except _RequestAborted:

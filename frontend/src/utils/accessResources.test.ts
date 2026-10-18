@@ -149,8 +149,8 @@ describe('last accessed for database selector rules', () => {
   })
 
   it('uses the newest event overall, and has never / unknown / loading / error states', () => {
-    expect(lastUsedFor(db, ready({ events: [ev('2026-10-05T00:00:00Z'), ev('2026-10-01T00:00:00Z', 'example-db-b')] }))).toEqual({ state: 'used', at: '2026-10-05T00:00:00Z' })
-    expect(lastUsedFor(db, ready({}))).toEqual({ state: 'never' })
+    expect(lastUsedFor(db, ready({ events: [ev('2026-10-05T00:00:00Z'), ev('2026-10-01T00:00:00Z', 'example-db-b')] }))).toEqual({ state: 'used', at: '2026-10-05T00:00:00Z', anyAccount: true })
+    expect(lastUsedFor(db, ready({}))).toEqual({ state: 'never', anyAccount: true })
     expect(lastUsedFor(db, ready({ complete: false }))).toEqual({ state: 'unknown' })
     expect(lastUsedFor(db, { status: 'loading' })).toEqual({ state: 'loading' })
     expect(lastUsedFor(db, { status: 'error', message: 'x', onRetry: () => {} })).toEqual({ state: 'error' })
@@ -172,8 +172,8 @@ describe('last accessed for Active Directory selector rules', () => {
 
   it('reports used, never, unknown, loading and error', () => {
     const ev = { published: '2026-10-05T00:00:00Z', request_id: 'r', outcome: 'SUCCESS', account_name: 'example-ad-a' }
-    expect(lastUsedFor(ad, ready({ events: [ev] }))).toEqual({ state: 'used', at: '2026-10-05T00:00:00Z' })
-    expect(lastUsedFor(ad, ready({}))).toEqual({ state: 'never' })
+    expect(lastUsedFor(ad, ready({ events: [ev] }))).toEqual({ state: 'used', at: '2026-10-05T00:00:00Z', anyAccount: true })
+    expect(lastUsedFor(ad, ready({}))).toEqual({ state: 'never', anyAccount: true })
     expect(lastUsedFor(ad, ready({ complete: false }))).toEqual({ state: 'unknown' })
     expect(lastUsedFor(ad, { status: 'loading' })).toEqual({ state: 'loading' })
     expect(lastUsedFor(ad, { status: 'error', message: 'x', onRetry: () => {} })).toEqual({ state: 'error' })

@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import type { AccessModel } from '../types'
 import { aggregateResources } from '../utils/accessResources'
 import type { ExportSection } from '../utils/export'
-import { grantRows, projectFieldRows } from '../utils/exportSections'
+import { projectFieldRows, visibleAccessSections } from '../utils/exportSections'
 import { rulesGrantedForProject } from '../utils/policy'
 import { ExplorerLayout } from './explorer/ExplorerLayout'
 import { GrantsMain } from './explorer/GrantsMain'
@@ -41,9 +41,9 @@ export function ProjectsTab({ model }: Props) {
     if (!project) return []
     return [
       { title: `Project: ${project.name}`, rows: projectFieldRows(project) },
-      { title: 'Policies Granting Access', rows: grantRows(grants) },
+      ...visibleAccessSections(ex.visible, now, 'Policies Granting Access'),
     ]
-  }, [project, grants])
+  }, [project, ex.visible, now])
 
   const handleRgChange = (id: string) => {
     setRgId(id)

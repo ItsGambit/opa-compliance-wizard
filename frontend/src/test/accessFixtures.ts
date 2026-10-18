@@ -3,7 +3,9 @@ import type { AccessModel, AccessPolicy, AccessUser, PolicyRule } from '../types
 /** Fictional Access Explorer data for component tests. */
 
 export function resolved(id: string, name: string, kind = 'individual_server_account', project = 'Example Project') {
-  return { kind: 'resolved' as const, id, name, resource_kind: kind, project_id: 'p1', project_name: project, resource_group_id: 'rg1' }
+  const base = { kind: 'resolved' as const, id, name, resource_kind: kind, project_id: 'p1', project_name: project, resource_group_id: 'rg1' }
+  // SaaS / Okta accounts are looked up by their own tracking id (never the Okta-side id).
+  return /saas_app_account|okta_account/.test(kind) ? { ...base, access_tracking_id: id } : base
 }
 
 export function rule(name: string, typeLabel: string, resolutions: PolicyRule['resolutions'], opts: Partial<PolicyRule> = {}): PolicyRule {

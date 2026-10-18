@@ -91,12 +91,52 @@ describe('UsersTab', () => {
     open(model)
     expect(screen.getByText(/No Okta identity/)).toBeTruthy()
     expect(vi.mocked(useUserResourceAccess).mock.calls.at(-1)?.[2]).toBe(false)
-    expect(screen.queryByRole('checkbox', { name: /Used in the last 90 days/ })).toBeNull()
+    expect(screen.queryByRole('checkbox', { name: /Used in the period read/ })).toBeNull()
   })
 
   it('says so when no policy grants anything', () => {
     const model = { ...exampleModel, policies: [] } as unknown as AccessModel
     open(model)
     expect(screen.getByText("No policy grants access via this user's groups.")).toBeTruthy()
+  })
+
+  it('C4: a user whose groups could not be read is not shown as having no access', () => {
+    const model = { ...exampleModel, users: [{ ...exampleUser, groups: [], groups_error: true }] } as unknown as AccessModel
+    open(model)
+    expect(screen.getByText(/Groups could not be read for this user, so it is not known what they can access/)).toBeTruthy()
+    expect(screen.getByText(/so their access is unknown/)).toBeTruthy()
+    expect(screen.queryByText("No policy grants access via this user's groups.")).toBeNull()
+  })
+
+  it('M4: a user with nothing trackable has usage filters ready, not stuck disabled', () => {
+    // Only the Servers rule has resources without a lookup kind: use a model whose
+    // policies grant nothing trackable (a server selector row).
+    const model = {
+      ...exampleModel,
+      policies: [{ ...exampleModel.policies[0], rules: [{ ...exampleModel.policies[0].rules[0], resolutions: [{ kind: 'condition', description: 'Servers labeled env=prod' }] }] }],
+    } as unknown as AccessModel
+    open(model)
+    fireEvent.click(screen.getByRole('button', { name: /Filter/ }))
+    const box = screen.getByRole('checkbox', { name: /Used in the period read/ }) as HTMLInputElement
+    expect(box.disabled).toBe(false)
+  })
+
+  it('shows the coverage note, the count chip and the evidence in the opened row', () => {
+    vi.mocked(useUserResourceAccess).mockReturnValue(lookupResult({
+      s1: {
+        resource_kind: 'individual_server_account', supported: true, complete: true, source: 'archive+live', uses: 12, window_days: 120,
+        coverage_from: '2026-06-20T00:00:00.000Z', last_synced_at: '2026-10-18T06:00:00.000Z', event_types: ['pam.gateway_creds.issue'],
+        events: [{ published: '2026-10-17T00:00:00Z', request_id: 'req-1', outcome: 'SUCCESS', event_type: 'pam.gateway_creds.issue', matched_by: 'server' }],
+      },
+    }) as never)
+    open()
+    expect(screen.getByTestId('evidence-note').textContent).toContain('Last used reads archive + live')
+    expect(screen.getByTestId('evidence-note').textContent).toContain('covers 2026-06-20 to now')
+    const row = screen.getByRole('button', { name: /lab-linux-example-01/ })
+    expect(row.textContent).toContain('12 uses · 120d')
+    fireEvent.click(row)
+    const detail = screen.getByRole('region', { name: 'Details for lab-linux-example-01' })
+    expect(within(detail).getByRole('table', { name: 'Recent activity' })).toBeTruthy()
+    expect(within(detail).getByText(/^Source: archive \+ live/)).toBeTruthy()
   })
 })
