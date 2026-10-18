@@ -501,7 +501,7 @@ describe('LastAccessed states (UI-12: never "loading…" forever)', () => {
 })
 
 describe('LastAccessed for database selector rules', () => {
-  const targets = [{ id: 'database_accounts', label: 'Any database account this user accessed (the rule is a selector, so this is not limited to the rule\'s connection or name pattern)', kind: 'database' as const }]
+  const targets = [{ id: 'database_accounts', label: 'Any database account this user accessed (the rule is a selector, so this is not limited to the rule\'s connection or name pattern)', kind: 'account_selector' as const }]
   const ev = (published: string, name: string, request_id: string) => ({ published, request_id, outcome: 'SUCCESS', account_name: name })
 
   it('says what it covers and lists newest time, outcome and request id per account name', () => {

@@ -42,16 +42,16 @@ function EventTable({ events }: { events: ResourceAccessEvent[] }) {
   )
 }
 
-/** Database selector rows: the events of every database account the user
- * accessed, grouped by account name (newest first). */
-function DatabaseAccess({ events, now }: { events: ResourceAccessEvent[]; now: number }) {
+/** Database / Active Directory selector rows: the events of every account of
+ * that family the user accessed, grouped by account name (newest first). */
+function AccountSelectorAccess({ events, now }: { events: ResourceAccessEvent[]; now: number }) {
   const groups = new Map<string, ResourceAccessEvent[]>()
   for (const e of events) {
     const name = e.account_name || 'Unnamed account'
     groups.set(name, [...(groups.get(name) ?? []), e])
   }
   return (
-    <ul className="flex flex-col gap-1.5" aria-label="Database accounts accessed">
+    <ul className="flex flex-col gap-1.5" aria-label="Accounts accessed">
       {[...groups.entries()].map(([name, evs]) => {
         const [latest, ...older] = evs
         const rel = relativeTime(latest.published, now)
@@ -86,7 +86,7 @@ function TargetAccess({ lookup, target, now }: { lookup: AccessLookup; target: T
       ? <span className="text-warn">no access found in the events read — the lookup hit its page limit, so this is not a complete 90-day answer</span>
       : <span className="xp-mute">not accessed (or not within the last 90 days)</span>
   }
-  if (target.kind === 'database') return <DatabaseAccess events={info.events} now={now} />
+  if (target.kind === 'account_selector') return <AccountSelectorAccess events={info.events} now={now} />
   const [latest, ...older] = info.events
   const rel = relativeTime(latest.published, now)
   return (

@@ -2,6 +2,14 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.44.4 — **Active Directory account access now shows when it was last used instead of "Not tracked".**
+A fix-only release; no data is stored and no new permission is needed.
+- **Fixed.** In the Access Explorer, a row for Active Directory account access (a rule such as "AD accounts in domain(s): ...") used to say "Not tracked". It now shows the newest time the user revealed an Active Directory account password in the last 90 days, or "Never used" / "Unknown" as for other kinds. Opening the row lists each account name with its newest access time, outcome and a copy-able request id, labelled "Any Active Directory account this user revealed" because the rule is a selector and the list is not narrowed to its domain or name pattern.
+- **Changed.** Database and Active Directory selector rows now share one implementation, in every view that shows last accessed.
+- **Not included.** Password rotations (system activity, very high volume) are never read. Only password reveals are counted: no Active Directory check-out event has been seen in the System Log, so none is guessed; if Okta starts recording one it will need adding.
+- **Security and privacy.** None: the same on-request System Log query as other kinds, nothing stored.
+- **Known limitations.** Two Active Directory rules for the same user show the same list. At most the newest 50 events are shown.
+
 5.44.3 — **Database account access now shows when it was last used instead of "Not tracked".**
 A fix-only release; no data is stored and no new permission is needed.
 - **Fixed.** In the Access Explorer (Users, and the other views that show last accessed), a row for database access used to say "Not tracked: the System Log does not record access per resource of this kind". That was wrong: Okta Privileged Access records a database account being revealed or checked out. The row now shows the newest such access in the last 90 days ("Last used 3 days ago", "Never used", or "Unknown" when the lookup hit its page limit).

@@ -58,7 +58,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.44.3
+# Version     : 5.44.4
 # =============================================================================
 
 import argparse
@@ -84,7 +84,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.44.3"
+SCRIPT_VERSION = "5.44.4"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 # ENG2-12: OPA's spec documents no pattern or length for a secret-folder
 # name (SecretFolderCreateRequest.name is a bare string); 255 is the limit
@@ -272,35 +272,49 @@ def _gateway_creds_server_ids(event):
 #   different Okta OIN lifecycle-management category) -- included on that
 #   basis even though this tenant only had "managed" ones configured to
 #   test directly.
-# "database_account" (5.44.3) is a different shape: database access rules are
-# SELECTORS (connection + account-name conditions), so there is no single
-# account id to match. The kind means "any database account this user
-# revealed or checked out": one virtual id (DATABASE_ACCOUNT_ANY_ID) matches
-# every such event, and each kept event also carries the account's name.
-# Database accounts are recognised by debugData (serviceAccountType /
-# resourceType), never by target type alone, because Active Directory
-# accounts share the "Service Account" target type and the same eventTypes.
-# password_rotation events are system activity, not user access: excluded.
+# "database_account" (5.44.3) and "active_directory_account" (5.44.4) are a
+# different shape: those access rules are SELECTORS (connections/domains plus
+# account-name conditions), so there is no single account id to match. Each
+# kind means "any account of that family this user revealed (or, for
+# databases, checked out)": one virtual id matches every such event, and each
+# kept event also carries the account's name. The family is recognised by
+# debugData (serviceAccountType / resourceType), never by target type alone,
+# because all these families share the "Service Account" target type and the
+# same eventTypes. password_rotation events are system activity, not user
+# access: never requested. Active Directory is reveal-only: no
+# pam.resource.checkout with an AD resourceType has been observed, so none is
+# guessed.
 DATABASE_ACCOUNT_ANY_ID = "database_accounts"
-DATABASE_ACCOUNT_EVENT_LIMIT = 50
+ACTIVE_DIRECTORY_ACCOUNT_ANY_ID = "active_directory_accounts"
+SELECTOR_ACCOUNT_EVENT_LIMIT = 50
 
 
-def _database_account_ids(event):
-    debug_data = (event.get("debugContext") or {}).get("debugData") or {}
-    if debug_data.get("serviceAccountType") == "DATABASE_ACCOUNT" or debug_data.get("resourceType") == "PAM_DATABASE_ACCOUNT":
-        return {DATABASE_ACCOUNT_ANY_ID}
-    return set()
+def _family_account_ids(any_id, service_account_types, resource_types):
+    def extract(event):
+        debug_data = (event.get("debugContext") or {}).get("debugData") or {}
+        if debug_data.get("serviceAccountType") in service_account_types or debug_data.get("resourceType") in resource_types:
+            return {any_id}
+        return set()
+    return extract
 
 
-def _database_account_name(event):
+def _selector_account_name(event):
     target = next((t for t in (event.get("target") or []) if t.get("type") == "Service Account"), None)
     return (target or {}).get("displayName")
+
+
+_database_account_ids = _family_account_ids(DATABASE_ACCOUNT_ANY_ID, {"DATABASE_ACCOUNT"}, {"PAM_DATABASE_ACCOUNT"})
+_active_directory_account_ids = _family_account_ids(ACTIVE_DIRECTORY_ACCOUNT_ANY_ID, {"PAM_AD_ACCOUNT"}, set())
 
 
 RESOURCE_ACCESS_EVENT_TYPES = {
     "database_account": {
         "event_types": ["pam.service_account.password.reveal", "pam.resource.checkout"],
-        "extract_ids": _database_account_ids, "event_name": _database_account_name, "limit": DATABASE_ACCOUNT_EVENT_LIMIT,
+        "extract_ids": _database_account_ids, "event_name": _selector_account_name, "limit": SELECTOR_ACCOUNT_EVENT_LIMIT,
+    },
+    "active_directory_account": {
+        "event_types": ["pam.service_account.password.reveal"],
+        "extract_ids": _active_directory_account_ids, "event_name": _selector_account_name, "limit": SELECTOR_ACCOUNT_EVENT_LIMIT,
     },
     "secret": {"event_types": ["pam.secret.reveal"], "extract_ids": _target_ids},
     "individual_server_account": {"event_types": ["pam.gateway_creds.issue"], "extract_ids": _gateway_creds_server_ids},

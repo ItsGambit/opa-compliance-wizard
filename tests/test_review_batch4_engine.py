@@ -1757,3 +1757,38 @@ def test_database_account_lookup_page_cap_is_incomplete_and_empty_is_complete():
     assert capped["complete"] is False and capped["events"] == []
     empty = engine.find_last_access_for_user(FakeOktaClient([([], True)]), "00uUSER", DB_KEY)["database_accounts"]
     assert empty["complete"] is True and empty["events"] == []
+
+
+AD_KEY = [{"resource_kind": "active_directory_account", "resource_id": "active_directory_accounts"}]
+
+
+def test_active_directory_lookup_keeps_only_ad_reveals():
+    ad_new = _db_event("a1", "2026-10-03T00:00:00.000Z", "pam.service_account.password.reveal",
+                       {"serviceAccountType": "PAM_AD_ACCOUNT"}, "example-ad-a", request_id="req-ad-new")
+    ad_old = _db_event("a2", "2026-10-01T00:00:00.000Z", "pam.service_account.password.reveal",
+                       {"serviceAccountType": "PAM_AD_ACCOUNT"}, "example-ad-b", request_id="req-ad-old")
+    db = _db_event("a3", "2026-10-04T00:00:00.000Z", "pam.service_account.password.reveal",
+                   {"serviceAccountType": "DATABASE_ACCOUNT"}, "example-db-a")
+    server = _db_event("a4", "2026-10-04T01:00:00.000Z", "pam.resource.checkout",
+                       {"resourceType": "SERVER_ACCOUNT"}, "example-server-account")
+    client = RecordingOktaClient([([db, server, ad_new, ad_old], True)])
+    info = engine.find_last_access_for_user(client, "00uUSER", AD_KEY)["active_directory_accounts"]
+    assert info["supported"] is True and info["complete"] is True
+    assert [(e["account_name"], e["request_id"]) for e in info["events"]] == [("example-ad-a", "req-ad-new"), ("example-ad-b", "req-ad-old")]
+    expr = client.calls[0]["filter_expr"]
+    assert 'actor.id eq "00uUSER"' in expr and "pam.service_account.password.reveal" in expr
+    assert "rotation" not in expr and "checkout" not in expr
+
+
+def test_active_directory_lookup_page_cap_is_incomplete():
+    capped = engine.find_last_access_for_user(FakeOktaClient([([], False)]), "00uUSER", AD_KEY)["active_directory_accounts"]
+    assert capped["complete"] is False and capped["events"] == []
+    empty = engine.find_last_access_for_user(FakeOktaClient([([], True)]), "00uUSER", AD_KEY)["active_directory_accounts"]
+    assert empty["complete"] is True
+
+
+def test_database_lookup_excludes_ad_events():
+    ad = _db_event("a1", "2026-10-03T00:00:00.000Z", "pam.service_account.password.reveal", {"serviceAccountType": "PAM_AD_ACCOUNT"})
+    info = engine.find_last_access_for_user(FakeOktaClient([([ad], True)]), "00uUSER", DB_KEY)["database_accounts"]
+    assert info["events"] == []
+

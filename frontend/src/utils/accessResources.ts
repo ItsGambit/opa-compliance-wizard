@@ -51,19 +51,34 @@ export const TRACKABLE_KINDS = new Set([
   'individual_okta_account',
 ])
 
-/** Database access rules are selectors (connection + account-name
- * conditions), so there is no single account to look up. The server kind
- * `database_account` means "any database account this user revealed or checked
- * out" and answers under one virtual id. See create_secret_folders.py's
- * DATABASE_ACCOUNT_ANY_ID. */
+/** Database and Active Directory access rules are selectors (connections or
+ * domains plus account-name conditions), so there is no single account to
+ * look up. Each server kind (`database_account`, `active_directory_account`)
+ * means "any account of that family this user accessed" and answers under one
+ * virtual id. See create_secret_folders.py's *_ANY_ID constants. */
 export const DATABASE_ACCOUNT_KIND = 'database_account'
 export const DATABASE_ACCOUNT_ANY_ID = 'database_accounts'
+export const ACTIVE_DIRECTORY_ACCOUNT_KIND = 'active_directory_account'
+export const ACTIVE_DIRECTORY_ACCOUNT_ANY_ID = 'active_directory_accounts'
 export const DATABASE_ACCESS_LABEL =
   "Any database account this user accessed (the rule is a selector, so this is not limited to the rule's connection or name pattern)"
+export const ACTIVE_DIRECTORY_ACCESS_LABEL =
+  "Any Active Directory account this user revealed (the rule is a selector, so not limited to the rule's domain or name pattern)"
 
-/** True for a database rule's selector row (a condition, not one account). */
+const SELECTOR_FAMILIES = [
+  { ruleType: 'database_based_resource', kind: DATABASE_ACCOUNT_KIND, anyId: DATABASE_ACCOUNT_ANY_ID, label: DATABASE_ACCESS_LABEL },
+  { ruleType: 'active_directory_based_resource', kind: ACTIVE_DIRECTORY_ACCOUNT_KIND, anyId: ACTIVE_DIRECTORY_ACCOUNT_ANY_ID, label: ACTIVE_DIRECTORY_ACCESS_LABEL },
+]
+
+/** The account family a selector row (a condition, not one account) tracks
+ * as a whole, or undefined for any other row. */
+export function selectorFamily(resource: AccessResource) {
+  if (resource.resolution.kind !== 'condition') return undefined
+  return SELECTOR_FAMILIES.find(f => resource.lines.some(l => l.rule.resource_type === f.ruleType))
+}
+
 export function isDatabaseSelector(resource: AccessResource): boolean {
-  return resource.resolution.kind === 'condition' && resource.lines.some(l => l.rule.resource_type === 'database_based_resource')
+  return selectorFamily(resource)?.kind === DATABASE_ACCOUNT_KIND
 }
 
 /** UI-12 (external review, 2026-10-05): the state of the per-user "last
@@ -215,8 +230,8 @@ export function countLabel(title: string, count: number): string {
 export interface TrackTarget {
   id: string
   label: string
-  /** 'database': the answer lists events per account name, not one resource. */
-  kind?: 'database'
+  /** 'account_selector': the answer lists events per account name, not one resource. */
+  kind?: 'account_selector'
 }
 
 /** The System Log lookups behind one resource: the account/secret itself,
@@ -224,7 +239,8 @@ export interface TrackTarget {
  * logged, reveals reference the secret). */
 export function trackTargets(resource: AccessResource): TrackTarget[] {
   const res = resource.resolution
-  if (isDatabaseSelector(resource)) return [{ id: DATABASE_ACCOUNT_ANY_ID, label: DATABASE_ACCESS_LABEL, kind: 'database' }]
+  const family = selectorFamily(resource)
+  if (family) return [{ id: family.anyId, label: family.label, kind: 'account_selector' }]
   if (res.kind !== 'resolved') return []
   if (TRACKABLE_KINDS.has(res.resource_kind)) return [{ id: res.access_tracking_id ?? res.id, label: res.name }]
   if (res.resource_kind === 'secret_folder') return (res.child_secrets ?? []).map(c => ({ id: c.id, label: c.name }))
@@ -236,8 +252,9 @@ export function trackedRequests(resources: AccessResource[]): { resource_kind: s
   const seen = new Map<string, { resource_kind: string; resource_id: string }>()
   for (const r of resources) {
     const res = r.resolution
-    if (isDatabaseSelector(r)) {
-      seen.set(DATABASE_ACCOUNT_ANY_ID, { resource_kind: DATABASE_ACCOUNT_KIND, resource_id: DATABASE_ACCOUNT_ANY_ID })
+    const family = selectorFamily(r)
+    if (family) {
+      seen.set(family.anyId, { resource_kind: family.kind, resource_id: family.anyId })
       continue
     }
     if (res.kind !== 'resolved') continue

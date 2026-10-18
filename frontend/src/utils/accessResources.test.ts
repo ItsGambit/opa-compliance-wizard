@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { examplePolicies, MFA, policy, resolved, rule } from '../test/accessFixtures'
 import type { ResourceAccessInfo } from '../types'
 import {
-  aggregateResources, countLabel, DATABASE_ACCOUNT_ANY_ID, describeActions, lastUsedFor, sectionsByType, trackedRequests, trackTargets,
+  aggregateResources, countLabel, ACTIVE_DIRECTORY_ACCOUNT_ANY_ID, DATABASE_ACCOUNT_ANY_ID, describeActions, lastUsedFor, sectionsByType, trackedRequests, trackTargets,
   type AccessLookup,
 } from './accessResources'
 import { rulesGrantedToGroupIds } from './policy'
@@ -135,7 +135,7 @@ describe('last accessed for database selector rules', () => {
   })
 
   it('targets and requests the single any-database-account lookup, once', () => {
-    expect(trackTargets(db)).toEqual([expect.objectContaining({ id: DATABASE_ACCOUNT_ANY_ID, kind: 'database' })])
+    expect(trackTargets(db)).toEqual([expect.objectContaining({ id: DATABASE_ACCOUNT_ANY_ID, kind: 'account_selector' })])
     expect(trackedRequests([db, ...mk()])).toEqual([{ resource_kind: 'database_account', resource_id: DATABASE_ACCOUNT_ANY_ID }])
   })
 
@@ -151,5 +151,28 @@ describe('last accessed for database selector rules', () => {
     expect(lastUsedFor(db, ready({ complete: false }))).toEqual({ state: 'unknown' })
     expect(lastUsedFor(db, { status: 'loading' })).toEqual({ state: 'loading' })
     expect(lastUsedFor(db, { status: 'error', message: 'x', onRetry: () => {} })).toEqual({ state: 'error' })
+  })
+})
+
+describe('last accessed for Active Directory selector rules', () => {
+  const adRule = rule('Ad', 'Active Directory accounts', [{ kind: 'condition', description: 'AD accounts in domain(s): example.test' }], { resource_type: 'active_directory_based_resource' })
+  const mk = (r = adRule) => aggregateResources(rulesGrantedToGroupIds([policy('pa', 'Ad Policy', [{ id: 'g1', name: 'G' }], [r])], new Set(['g1'])))
+  const [ad] = mk()
+  const ready = (info: Partial<ResourceAccessInfo>): AccessLookup => ({
+    status: 'ready', byId: new Map([[ACTIVE_DIRECTORY_ACCOUNT_ANY_ID, { resource_kind: 'active_directory_account', supported: true, events: [], ...info }]]),
+  })
+
+  it('targets and requests the Active Directory lookup, separate from databases', () => {
+    expect(trackTargets(ad)).toEqual([expect.objectContaining({ id: ACTIVE_DIRECTORY_ACCOUNT_ANY_ID, kind: 'account_selector', label: expect.stringContaining('Active Directory account this user revealed') })])
+    expect(trackedRequests([ad, ...mk()])).toEqual([{ resource_kind: 'active_directory_account', resource_id: ACTIVE_DIRECTORY_ACCOUNT_ANY_ID }])
+  })
+
+  it('reports used, never, unknown, loading and error', () => {
+    const ev = { published: '2026-10-05T00:00:00Z', request_id: 'r', outcome: 'SUCCESS', account_name: 'example-ad-a' }
+    expect(lastUsedFor(ad, ready({ events: [ev] }))).toEqual({ state: 'used', at: '2026-10-05T00:00:00Z' })
+    expect(lastUsedFor(ad, ready({}))).toEqual({ state: 'never' })
+    expect(lastUsedFor(ad, ready({ complete: false }))).toEqual({ state: 'unknown' })
+    expect(lastUsedFor(ad, { status: 'loading' })).toEqual({ state: 'loading' })
+    expect(lastUsedFor(ad, { status: 'error', message: 'x', onRetry: () => {} })).toEqual({ state: 'error' })
   })
 })
