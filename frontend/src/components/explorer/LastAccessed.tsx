@@ -42,6 +42,37 @@ function EventTable({ events }: { events: ResourceAccessEvent[] }) {
   )
 }
 
+/** Database selector rows: the events of every database account the user
+ * accessed, grouped by account name (newest first). */
+function DatabaseAccess({ events, now }: { events: ResourceAccessEvent[]; now: number }) {
+  const groups = new Map<string, ResourceAccessEvent[]>()
+  for (const e of events) {
+    const name = e.account_name || 'Unnamed account'
+    groups.set(name, [...(groups.get(name) ?? []), e])
+  }
+  return (
+    <ul className="flex flex-col gap-1.5" aria-label="Database accounts accessed">
+      {[...groups.entries()].map(([name, evs]) => {
+        const [latest, ...older] = evs
+        const rel = relativeTime(latest.published, now)
+        return (
+          <li key={name}>
+            <strong>{name}</strong>: last accessed <time dateTime={latest.published} title={formatDateTime(latest.published)}>{rel ?? formatDateTime(latest.published)}</time>
+            {latest.outcome && <> · {latest.outcome}</>}
+            {latest.request_id && <> · request <CopyId id={latest.request_id} /></>}
+            {older.length > 0 && (
+              <details className="xp-more">
+                <summary>{older.length} older</summary>
+                <EventTable events={older} />
+              </details>
+            )}
+          </li>
+        )
+      })}
+    </ul>
+  )
+}
+
 function TargetAccess({ lookup, target, now }: { lookup: AccessLookup; target: TrackTarget; now: number }) {
   if (lookup.status === 'loading') return <span className="xp-mute">loading…</span>
   if (lookup.status === 'error') return <span className="text-warn">unavailable</span>
@@ -55,6 +86,7 @@ function TargetAccess({ lookup, target, now }: { lookup: AccessLookup; target: T
       ? <span className="text-warn">no access found in the events read — the lookup hit its page limit, so this is not a complete 90-day answer</span>
       : <span className="xp-mute">not accessed (or not within the last 90 days)</span>
   }
+  if (target.kind === 'database') return <DatabaseAccess events={info.events} now={now} />
   const [latest, ...older] = info.events
   const rel = relativeTime(latest.published, now)
   return (

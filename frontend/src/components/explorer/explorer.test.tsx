@@ -500,6 +500,46 @@ describe('LastAccessed states (UI-12: never "loading…" forever)', () => {
   })
 })
 
+describe('LastAccessed for database selector rules', () => {
+  const targets = [{ id: 'database_accounts', label: 'Any database account this user accessed (the rule is a selector, so this is not limited to the rule\'s connection or name pattern)', kind: 'database' as const }]
+  const ev = (published: string, name: string, request_id: string) => ({ published, request_id, outcome: 'SUCCESS', account_name: name })
+
+  it('says what it covers and lists newest time, outcome and request id per account name', () => {
+    const lookup: AccessLookup = {
+      status: 'ready',
+      byId: new Map([['database_accounts', {
+        resource_kind: 'database_account', supported: true, complete: true,
+        events: [ev('2026-10-17T00:00:00Z', 'example-db-a', 'req-a-new'), ev('2026-10-16T00:00:00Z', 'example-db-b', 'req-b'), ev('2026-10-10T00:00:00Z', 'example-db-a', 'req-a-old')],
+      }]]),
+    }
+    render(<LastAccessed lookup={lookup} targets={targets} now={Date.parse('2026-10-18T00:00:00Z')} />)
+    expect(screen.getByText(/the rule is a selector, so this is not limited/)).toBeTruthy()
+    expect(screen.getByText('example-db-a')).toBeTruthy()
+    expect(screen.getByText('example-db-b')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Copy request id req-a-new' })).toBeTruthy()
+    expect(screen.getByText('1 older')).toBeTruthy()
+  })
+
+  it('shows never and page-limit states', () => {
+    const lookup = (info: object): AccessLookup => ({ status: 'ready', byId: new Map([['database_accounts', { resource_kind: 'database_account', supported: true, events: [], ...info }]]) })
+    const { rerender } = render(<LastAccessed lookup={lookup({ complete: true })} targets={targets} now={0} />)
+    expect(screen.getByText('not accessed (or not within the last 90 days)')).toBeTruthy()
+    rerender(<LastAccessed lookup={lookup({ complete: false })} targets={targets} now={0} />)
+    expect(screen.getByText(/lookup hit its page limit/)).toBeTruthy()
+  })
+
+  it('the expanded row shows it instead of "Not tracked"', () => {
+    const [res] = aggregateResources(rulesGrantedToGroupIds([{
+      id: 'pd', name: 'Db Policy', description: '', active: true, type: 'SECURITY_POLICY', resource_group: { id: 'rg', name: 'RG' },
+      principals: { user_groups: [{ id: 'g1', name: 'G' }], workload_roles: [] }, last_updated: null, last_updated_by: null,
+      rules: [{ name: 'Db', resource_type: 'database_based_resource', resource_type_label: 'Database accounts', privileges: [], conditions: [], resolutions: [{ kind: 'condition', description: 'Database accounts in example-conn' }] }],
+    } as never], new Set(['g1'])))
+    render(<ResourceAccessView resource={res} lookup={{ status: 'loading' }} now={0} />)
+    expect(screen.queryByText(/Not tracked/)).toBeNull()
+    expect(screen.getByText(/Any database account this user accessed/)).toBeTruthy()
+  })
+})
+
 describe('GroupRemoveControl', () => {
   function Wrap({ others, onConfirm }: { others: number; onConfirm: () => void }) {
     const [pending] = useState(false)

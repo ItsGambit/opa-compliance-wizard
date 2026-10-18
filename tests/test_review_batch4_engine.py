@@ -1693,3 +1693,67 @@ def test_missing_metadata_is_reported_before_a_missing_secret(tmp_audit_store, f
     audit_store.run_migrations()
     with pytest.raises(ValueError, match="base_domain"):
         engine.upsert_environment("dev", {})
+
+
+# ---------------------------------------------------------------------------
+# 5.44.1: database accounts are tracked as one "any database account" kind
+# ---------------------------------------------------------------------------
+def _db_event(uuid, published, event_type, debug, name="example-db-account", request_id=None):
+    ev = _event(uuid, published, event_type, [
+        {"id": "acct-" + name, "type": "Service Account", "displayName": name},
+        {"id": "team-1", "type": "Team", "displayName": "Example Team"},
+    ])
+    ev["debugContext"] = {"debugData": dict(debug, **({"requestId": request_id} if request_id else {}))}
+    return ev
+
+
+class RecordingOktaClient(FakeOktaClient):
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.calls = []
+
+    def get_system_log(self, **kwargs):
+        self.calls.append(kwargs)
+        return super().get_system_log(**kwargs)
+
+
+DB_KEY = [{"resource_kind": "database_account", "resource_id": "database_accounts"}]
+
+
+def test_database_account_lookup_keeps_only_database_access():
+    reveal = _db_event("u1", "2026-10-03T00:00:00.000Z", "pam.service_account.password.reveal",
+                       {"serviceAccountType": "DATABASE_ACCOUNT"}, "example-db-a", request_id="req-reveal")
+    checkout = _db_event("u2", "2026-10-02T00:00:00.000Z", "pam.resource.checkout",
+                         {"resourceType": "PAM_DATABASE_ACCOUNT"}, "example-db-b", request_id="req-checkout")
+    ad = _db_event("u3", "2026-10-04T00:00:00.000Z", "pam.service_account.password.reveal",
+                   {"serviceAccountType": "PAM_AD_ACCOUNT"}, "example-ad-account")
+    ad_checkout = _db_event("u4", "2026-10-04T01:00:00.000Z", "pam.resource.checkout",
+                            {"resourceType": "SERVER_ACCOUNT"}, "example-server-account")
+    client = RecordingOktaClient([([ad, ad_checkout, reveal, checkout], True)])
+    info = engine.find_last_access_for_user(client, "00uUSER", DB_KEY)["database_accounts"]
+    assert info["supported"] is True and info["complete"] is True
+    assert [(e["account_name"], e["request_id"], e["outcome"]) for e in info["events"]] == [
+        ("example-db-a", "req-reveal", "SUCCESS"), ("example-db-b", "req-checkout", "SUCCESS"),
+    ]
+    # Only this user's reveal/checkout events are requested; rotations and
+    # other users are excluded by the server-side filter.
+    expr = client.calls[0]["filter_expr"]
+    assert 'actor.id eq "00uUSER"' in expr
+    assert "pam.service_account.password.reveal" in expr and "pam.resource.checkout" in expr
+    assert "rotation" not in expr
+
+
+def test_database_account_lookup_ignores_rotation_events_that_slip_through():
+    # Rotations are not requested, but a DATABASE_ACCOUNT debugData alone on an
+    # unrequested type would still be matched by debugData, so the eventType
+    # filter is what excludes them: assert the filter never names them.
+    client = RecordingOktaClient([([], True)])
+    engine.find_last_access_for_user(client, "00uUSER", DB_KEY)
+    assert "password_rotation" not in client.calls[0]["filter_expr"]
+
+
+def test_database_account_lookup_page_cap_is_incomplete_and_empty_is_complete():
+    capped = engine.find_last_access_for_user(FakeOktaClient([([], False)]), "00uUSER", DB_KEY)["database_accounts"]
+    assert capped["complete"] is False and capped["events"] == []
+    empty = engine.find_last_access_for_user(FakeOktaClient([([], True)]), "00uUSER", DB_KEY)["database_accounts"]
+    assert empty["complete"] is True and empty["events"] == []

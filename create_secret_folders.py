@@ -58,7 +58,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.44.2
+# Version     : 5.44.3
 # =============================================================================
 
 import argparse
@@ -84,7 +84,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.44.2"
+SCRIPT_VERSION = "5.44.3"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 # ENG2-12: OPA's spec documents no pattern or length for a secret-folder
 # name (SecretFolderCreateRequest.name is a bare string); 255 is the limit
@@ -272,7 +272,36 @@ def _gateway_creds_server_ids(event):
 #   different Okta OIN lifecycle-management category) -- included on that
 #   basis even though this tenant only had "managed" ones configured to
 #   test directly.
+# "database_account" (5.44.3) is a different shape: database access rules are
+# SELECTORS (connection + account-name conditions), so there is no single
+# account id to match. The kind means "any database account this user
+# revealed or checked out": one virtual id (DATABASE_ACCOUNT_ANY_ID) matches
+# every such event, and each kept event also carries the account's name.
+# Database accounts are recognised by debugData (serviceAccountType /
+# resourceType), never by target type alone, because Active Directory
+# accounts share the "Service Account" target type and the same eventTypes.
+# password_rotation events are system activity, not user access: excluded.
+DATABASE_ACCOUNT_ANY_ID = "database_accounts"
+DATABASE_ACCOUNT_EVENT_LIMIT = 50
+
+
+def _database_account_ids(event):
+    debug_data = (event.get("debugContext") or {}).get("debugData") or {}
+    if debug_data.get("serviceAccountType") == "DATABASE_ACCOUNT" or debug_data.get("resourceType") == "PAM_DATABASE_ACCOUNT":
+        return {DATABASE_ACCOUNT_ANY_ID}
+    return set()
+
+
+def _database_account_name(event):
+    target = next((t for t in (event.get("target") or []) if t.get("type") == "Service Account"), None)
+    return (target or {}).get("displayName")
+
+
 RESOURCE_ACCESS_EVENT_TYPES = {
+    "database_account": {
+        "event_types": ["pam.service_account.password.reveal", "pam.resource.checkout"],
+        "extract_ids": _database_account_ids, "event_name": _database_account_name, "limit": DATABASE_ACCOUNT_EVENT_LIMIT,
+    },
     "secret": {"event_types": ["pam.secret.reveal"], "extract_ids": _target_ids},
     "individual_server_account": {"event_types": ["pam.gateway_creds.issue"], "extract_ids": _gateway_creds_server_ids},
     "individual_managed_saas_app_account": {
@@ -4124,12 +4153,15 @@ def find_last_access_for_user(okta_client, actor_user_id, resources, limit_per_r
         for event in events:  # already DESCENDING (most-recent-first) by default
             hit_ids = mapping["extract_ids"](event) & wanted
             for rid in hit_ids:
-                if len(buckets[rid]) < limit_per_resource:
-                    buckets[rid].append({
+                if len(buckets[rid]) < mapping.get("limit", limit_per_resource):
+                    entry = {
                         "published": event.get("published"),
                         "request_id": _extract_request_id(event),
                         "outcome": (event.get("outcome") or {}).get("result"),
-                    })
+                    }
+                    if "event_name" in mapping:
+                        entry["account_name"] = mapping["event_name"](event)
+                    buckets[rid].append(entry)
 
         for rid in resource_ids:
             results[rid] = {"resource_kind": resource_kind, "supported": True, "events": buckets[rid],

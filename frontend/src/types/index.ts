@@ -858,6 +858,8 @@ export interface ResourceAccessEvent {
   published: string
   request_id: string | null
   outcome: string | null
+  /** Only on database_account lookups: the account the event was about. */
+  account_name?: string | null
 }
 
 export interface ResourceAccessInfo {

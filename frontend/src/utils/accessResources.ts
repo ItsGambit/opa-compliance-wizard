@@ -51,6 +51,21 @@ export const TRACKABLE_KINDS = new Set([
   'individual_okta_account',
 ])
 
+/** Database access rules are selectors (connection + account-name
+ * conditions), so there is no single account to look up. The server kind
+ * `database_account` means "any database account this user revealed or checked
+ * out" and answers under one virtual id. See create_secret_folders.py's
+ * DATABASE_ACCOUNT_ANY_ID. */
+export const DATABASE_ACCOUNT_KIND = 'database_account'
+export const DATABASE_ACCOUNT_ANY_ID = 'database_accounts'
+export const DATABASE_ACCESS_LABEL =
+  "Any database account this user accessed (the rule is a selector, so this is not limited to the rule's connection or name pattern)"
+
+/** True for a database rule's selector row (a condition, not one account). */
+export function isDatabaseSelector(resource: AccessResource): boolean {
+  return resource.resolution.kind === 'condition' && resource.lines.some(l => l.rule.resource_type === 'database_based_resource')
+}
+
 /** UI-12 (external review, 2026-10-05): the state of the per-user "last
  * accessed" lookup, not just its results -- a failed or disabled lookup
  * used to leave every row reading "loading…" forever. */
@@ -200,6 +215,8 @@ export function countLabel(title: string, count: number): string {
 export interface TrackTarget {
   id: string
   label: string
+  /** 'database': the answer lists events per account name, not one resource. */
+  kind?: 'database'
 }
 
 /** The System Log lookups behind one resource: the account/secret itself,
@@ -207,6 +224,7 @@ export interface TrackTarget {
  * logged, reveals reference the secret). */
 export function trackTargets(resource: AccessResource): TrackTarget[] {
   const res = resource.resolution
+  if (isDatabaseSelector(resource)) return [{ id: DATABASE_ACCOUNT_ANY_ID, label: DATABASE_ACCESS_LABEL, kind: 'database' }]
   if (res.kind !== 'resolved') return []
   if (TRACKABLE_KINDS.has(res.resource_kind)) return [{ id: res.access_tracking_id ?? res.id, label: res.name }]
   if (res.resource_kind === 'secret_folder') return (res.child_secrets ?? []).map(c => ({ id: c.id, label: c.name }))
@@ -218,6 +236,10 @@ export function trackedRequests(resources: AccessResource[]): { resource_kind: s
   const seen = new Map<string, { resource_kind: string; resource_id: string }>()
   for (const r of resources) {
     const res = r.resolution
+    if (isDatabaseSelector(r)) {
+      seen.set(DATABASE_ACCOUNT_ANY_ID, { resource_kind: DATABASE_ACCOUNT_KIND, resource_id: DATABASE_ACCOUNT_ANY_ID })
+      continue
+    }
     if (res.kind !== 'resolved') continue
     if (TRACKABLE_KINDS.has(res.resource_kind)) {
       const id = res.access_tracking_id ?? res.id

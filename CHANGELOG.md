@@ -2,6 +2,14 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.44.3 — **Database account access now shows when it was last used instead of "Not tracked".**
+A fix-only release; no data is stored and no new permission is needed.
+- **Fixed.** In the Access Explorer (Users, and the other views that show last accessed), a row for database access used to say "Not tracked: the System Log does not record access per resource of this kind". That was wrong: Okta Privileged Access records a database account being revealed or checked out. The row now shows the newest such access in the last 90 days ("Last used 3 days ago", "Never used", or "Unknown" when the lookup hit its page limit).
+- **Changed.** Opening such a row lists, per database account name, the newest access time, outcome and a copy-able request id, with older events folded. Because a database rule is a selector (connections plus account-name conditions) and not a single account, the list is labelled honestly as "Any database account this user accessed" and is not narrowed to the rule's connection or name pattern.
+- **Not included.** Password rotations are system activity, not a person using an account, and are left out. Active Directory accounts are not covered by this change; they still read "Not tracked".
+- **Security and privacy.** None: the same System Log query the other kinds use, run only on request for the selected user, nothing stored.
+- **Known limitations.** Because the rule's own connection and name conditions are not applied, two different database rules for the same user show the same list. At most the newest 50 events are shown.
+
 5.44.2 — **In the Access Explorer, the per-type counts in the rail ("servers 2", "SaaS accounts 5" ...) are now dropdowns that list which resources are in that type.**
 A minor release: screen behaviour only. No server, API or data change.
 - **Added.** Each type count in the left rail (Users, Groups, Projects, Resource Groups, Policies, Relationships, and the current kind in Resources) opens in place, like the members and groups lists: a chevron, the count on the right, collapsed by default, several can be open at once. The list shows each resource by the name shown in the main pane (selectors by their label, for example "Servers labeled system.os_type=linux"); a long list scrolls inside the rail.

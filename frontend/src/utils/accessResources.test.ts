@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { examplePolicies, MFA, policy, resolved, rule } from '../test/accessFixtures'
 import type { ResourceAccessInfo } from '../types'
 import {
-  aggregateResources, countLabel, describeActions, lastUsedFor, sectionsByType, trackedRequests, trackTargets,
+  aggregateResources, countLabel, DATABASE_ACCOUNT_ANY_ID, describeActions, lastUsedFor, sectionsByType, trackedRequests, trackTargets,
   type AccessLookup,
 } from './accessResources'
 import { rulesGrantedToGroupIds } from './policy'
@@ -122,5 +122,34 @@ describe('last accessed', () => {
     const [server] = aggregateResources(rulesGrantedToGroupIds([policy('ps', 'P', [{ id: 'g1', name: 'G' }], [rule('S', 'Servers', [resolved('s1', 'srv', 'individual_server')], { conditions: [MFA] })])], new Set(['g1'])))
     expect(lastUsedFor(server, { status: 'loading' })).toEqual({ state: 'untracked' })
     expect(lastUsedFor(server, undefined)).toEqual({ state: 'none' })
+  })
+})
+
+describe('last accessed for database selector rules', () => {
+  const dbRule = rule('Db', 'Database accounts', [{ kind: 'condition', description: 'Database accounts in example-conn where name contains app' }], { resource_type: 'database_based_resource' })
+  const mk = (r = dbRule) => aggregateResources(rulesGrantedToGroupIds([policy('pd', 'Db Policy', [{ id: 'g1', name: 'G' }], [r])], new Set(['g1'])))
+  const [db] = mk()
+  const ev = (published: string, name = 'example-db-a') => ({ published, request_id: 'r', outcome: 'SUCCESS', account_name: name })
+  const ready = (info: Partial<ResourceAccessInfo>): AccessLookup => ({
+    status: 'ready', byId: new Map([[DATABASE_ACCOUNT_ANY_ID, { resource_kind: 'database_account', supported: true, events: [], ...info }]]),
+  })
+
+  it('targets and requests the single any-database-account lookup, once', () => {
+    expect(trackTargets(db)).toEqual([expect.objectContaining({ id: DATABASE_ACCOUNT_ANY_ID, kind: 'database' })])
+    expect(trackedRequests([db, ...mk()])).toEqual([{ resource_kind: 'database_account', resource_id: DATABASE_ACCOUNT_ANY_ID }])
+  })
+
+  it('does not track a non-database selector', () => {
+    const [labelled] = mk(rule('S', 'Servers', [{ kind: 'condition', description: 'Servers labeled role=x' }]))
+    expect(trackTargets(labelled)).toEqual([])
+    expect(lastUsedFor(labelled, { status: 'loading' })).toEqual({ state: 'untracked' })
+  })
+
+  it('uses the newest event overall, and has never / unknown / loading / error states', () => {
+    expect(lastUsedFor(db, ready({ events: [ev('2026-10-05T00:00:00Z'), ev('2026-10-01T00:00:00Z', 'example-db-b')] }))).toEqual({ state: 'used', at: '2026-10-05T00:00:00Z' })
+    expect(lastUsedFor(db, ready({}))).toEqual({ state: 'never' })
+    expect(lastUsedFor(db, ready({ complete: false }))).toEqual({ state: 'unknown' })
+    expect(lastUsedFor(db, { status: 'loading' })).toEqual({ state: 'loading' })
+    expect(lastUsedFor(db, { status: 'error', message: 'x', onRetry: () => {} })).toEqual({ state: 'error' })
   })
 })
