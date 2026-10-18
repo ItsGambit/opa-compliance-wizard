@@ -65,7 +65,7 @@ export function ResourceGroupsTab({ model }: Props) {
             value={rgId}
             onValueChange={setRgId}
             placeholder="Select a resource group"
-            options={model.resource_groups.map(r => ({ value: r.id, label: r.name }))}
+            options={model.resource_groups.map(r => ({ value: r.id, label: r.name, keywords: r.description ? [r.description] : undefined }))}
           />
         </div>
         {rg && <ExportButtons sections={exportSectionsForRg} filenameBase={`opa-resource-group-${rg.name}`} />}

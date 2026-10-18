@@ -1,4 +1,4 @@
-import { useId, useState } from 'react'
+import { useId, useMemo, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { isStepUpRequired, saveSharedPermissions } from '../api/client'
 import { toast } from '../hooks/useToast'
@@ -8,6 +8,7 @@ import type {
 import { SOURCE_LABELS, changedSettings, groupGrants, orgLabel, userKey, valueLabel } from '../utils/sharedPermissions'
 import { beginStepUp } from '../utils/stepUp'
 import { PermissionSettingsList } from './PermissionSettingsList'
+import { Select } from './Select'
 
 type Settings = Partial<Record<SharedCapabilityKey, PermissionSetting>>
 
@@ -32,8 +33,20 @@ export function UserPermissionExceptions({ env, data, draftUser, draft }: {
   const base = useId()
   const row = data.environments[env.id]
   const grants = row?.grants ?? []
-  const identities = data.identities ?? []
+  const identities = useMemo(() => data.identities ?? [], [data.identities])
   const knownKeys = new Set(identities.map(userKey))
+  // The shared fuzzy picker: typo-tolerant over e-mail, org and user id
+  // (all in the label), so a long list of users is searchable.
+  const userOptions = useMemo(
+    () => [
+      ...identities.map(i => ({
+        value: userKey(i),
+        label: `${i.email ?? 'no e-mail'} — ${orgLabel(i.issuer)} · ${i.subject}`,
+      })),
+      { value: MANUAL, label: 'Enter an Okta issuer and user id…' },
+    ],
+    [identities],
+  )
 
   const storedFor = (user: GrantUser | null): Settings => {
     const out: Settings = {}
@@ -133,21 +146,14 @@ export function UserPermissionExceptions({ env, data, draftUser, draft }: {
       )}
       <div className="flex flex-wrap items-center gap-2">
         <label htmlFor={`${base}-user`} className="text-xs font-medium text-text">User</label>
-        <select
+        <Select
           id={`${base}-user`}
-          className="text-input !py-1 text-xs min-w-[14rem]"
           value={choice}
           disabled={save.isPending}
-          onChange={e => { setChoice(e.target.value); setCommitted(null) }}
-        >
-          <option value="">Choose a user…</option>
-          {identities.map(i => (
-            <option key={userKey(i)} value={userKey(i)}>
-              {i.email ?? 'no e-mail'} — {orgLabel(i.issuer)} · {i.subject}
-            </option>
-          ))}
-          <option value={MANUAL}>Enter an Okta issuer and user id…</option>
-        </select>
+          onValueChange={v => { setChoice(v); setCommitted(null) }}
+          placeholder="Choose a user…"
+          options={userOptions}
+        />
       </div>
       {identities.length === 0 && (
         <p className="text-[0.6875rem] text-text-dim">

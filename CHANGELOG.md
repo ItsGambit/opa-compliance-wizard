@@ -2,6 +2,14 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.43.1 — **Fuzzy (typo-tolerant) search now works in every picker and list that filters data already loaded in the browser.**
+A fix-only release; no server, API or data change.
+- **Added.** The per-user exception picker (Environments → Shared permissions) is now the shared searchable dropdown instead of a plain native one, so a long list of users can be searched by e-mail, Okta org or user id, with typo tolerance and match highlighting. The group and workload-role checkbox lists in the Assign access dialog get the same search box once they have 8 or more entries.
+- **Changed.** The shared dropdown can now search text that is not displayed: users are found by e-mail, login name and first/last name as well as display name; resource groups and relationship assignments are also found by their description. All of it uses the one shared matcher (`useFuzzyFilter`).
+- **Left exact on purpose.** The typed-confirmation box for permanently deleting orphaned archives (a typo must never confirm a destructive action), the CSV import mapping, ID lookups, and the fixed short lists (outcome, banner style, allow/deny settings).
+- **Known limitation.** The audit log search box searches only the entries already loaded in the browser (it was already fuzzy; use "Load more" to search further back). There is no server-side search.
+- **Security and privacy.** None; all of this filtering stays in the browser.
+
 5.43.0 — **Shared users can no longer write to the owner's OPA team / Okta org or import a CSV into the owner's archive unless an admin allows it; admins can make exceptions for one user; an additional login gate's site no longer reaches the shared-permission settings or archive purges.**
 A minor release: the per-user exceptions are a new feature (a new
 migration, a new API field, a new screen section and a new header from the

@@ -10,6 +10,10 @@ export interface SelectOption {
   // out a service account among human users. Every existing caller leaves
   // this unset and is unaffected.
   labelClassName?: string
+  // Optional extra searchable text that is NOT shown (e.g. a user's e-mail
+  // and login next to their display name, a description). Fuzzy-matched by
+  // the same shared hook as the label and value; never highlighted.
+  keywords?: string[]
 }
 
 interface SelectProps {
@@ -33,11 +37,12 @@ interface SelectProps {
 // scanning by eye impractical. A short list (e.g. the 3 CONTROL tabs) has
 // no real need for a search box, so it's only shown once there's enough
 // to search through.
-const SEARCH_THRESHOLD = 8
+export const SEARCH_THRESHOLD = 8
+const SELECT_FUZZY_KEYS = ['label', 'value', 'keywords']
 
 export function Select({ value, onValueChange, options, placeholder, disabled, loading, id, ariaLabel }: SelectProps) {
   const [query, setQuery] = useState('')
-  const filtered = useFuzzyFilter(options, query, ['label', 'value'])
+  const filtered = useFuzzyFilter(options, query, SELECT_FUZZY_KEYS)
 
   return (
     <RadixSelect.Root

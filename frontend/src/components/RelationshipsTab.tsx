@@ -129,7 +129,7 @@ export function RelationshipsTab({ model }: Props) {
                   value={assignmentId}
                   onValueChange={setAssignmentId}
                   placeholder="Select an assignment"
-                  options={assignmentsForRelationship.map((a: AccessAssignment) => ({ value: a.id, label: a.name }))}
+                  options={assignmentsForRelationship.map((a: AccessAssignment) => ({ value: a.id, label: a.name, keywords: a.description ? [a.description] : undefined }))}
                 />
               </div>
 

@@ -8,6 +8,7 @@ import { beginStepUp } from '../utils/stepUp'
 import { groupGrants, mainAddressOnly, orgLabel } from '../utils/sharedPermissions'
 import { UserPermissionExceptions } from './UserPermissionExceptions'
 
+vi.mock('./Select', async () => ({ Select: (await import('../test/MockSelect')).MockSelect }))
 vi.mock('../api/client', async importOriginal => {
   const actual = await importOriginal<typeof import('../api/client')>()
   return { ...actual, saveSharedPermissions: vi.fn() }

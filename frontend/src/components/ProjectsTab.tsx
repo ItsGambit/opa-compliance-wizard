@@ -44,7 +44,7 @@ export function ProjectsTab({ model }: Props) {
             value={rgId}
             onValueChange={handleRgChange}
             placeholder="Select a resource group"
-            options={model.resource_groups.map(r => ({ value: r.id, label: r.name }))}
+            options={model.resource_groups.map(r => ({ value: r.id, label: r.name, keywords: r.description ? [r.description] : undefined }))}
           />
         </div>
         <div className="flex flex-col gap-1">

@@ -9,7 +9,8 @@ import { toast } from '../hooks/useToast'
 import type { ApiErrorBody, FolderAccessEntry, FolderSecurityPolicy, NamedRef } from '../types'
 import { DialogCloseButton } from './DialogCloseButton'
 import { GroupCreateForm } from './GroupCreateForm'
-import { Select } from './Select'
+import { SEARCH_THRESHOLD, Select } from './Select'
+import { HighlightedText, useFuzzyFilter } from '../utils/fuzzySearch'
 import { ServiceAccountGroupStatus } from './ServiceAccountGroupStatus'
 import { computeBlastRadius, describeBlastRadius } from '../utils/blastRadius'
 
@@ -34,7 +35,9 @@ const PRIVILEGE_GROUPS: { label: string; fields: { key: string; label: string }[
   },
 ]
 
-function MultiSelect({
+const MULTI_FUZZY_KEYS = ['name', 'id']
+
+export function MultiSelect({
   options,
   selectedIds,
   onToggle,
@@ -45,13 +48,29 @@ function MultiSelect({
   onToggle: (id: string) => void
   emptyText: string
 }) {
+  // Same shared fuzzy search as the Select pickers, offered once the list
+  // is long enough to need it (the same threshold). Ticked boxes live in
+  // selectedIds, so filtering never loses a selection.
+  const [query, setQuery] = useState('')
+  const results = useFuzzyFilter(options, query, MULTI_FUZZY_KEYS)
   return (
     <div className="border border-border rounded-md max-h-32 overflow-y-auto p-1.5 flex flex-col gap-0.5">
+      {options.length >= SEARCH_THRESHOLD && (
+        <input
+          type="text"
+          aria-label="Search options"
+          placeholder="Search…"
+          value={query}
+          onChange={e => setQuery(e.target.value)}
+          className="text-input !py-0.5 text-xs mb-1"
+        />
+      )}
       {options.length === 0 && <span className="text-xs text-text-faint px-1 py-1">{emptyText}</span>}
-      {options.map(opt => (
+      {options.length > 0 && results.length === 0 && <span className="text-xs text-text-faint px-1 py-1">No options</span>}
+      {results.map(({ item: opt, matches }) => (
         <label key={opt.id} className="flex items-center gap-2 text-sm text-text-dim px-1 py-0.5 rounded hover:bg-bg-hover cursor-pointer">
           <input type="checkbox" checked={selectedIds.has(opt.id)} onChange={() => onToggle(opt.id)} />
-          {opt.name}
+          <HighlightedText text={opt.name} indices={matches.find(m => m.key === 'name')?.indices} />
         </label>
       ))}
     </div>

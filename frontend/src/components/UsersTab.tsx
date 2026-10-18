@@ -116,6 +116,8 @@ export function UsersTab({ model, onUserGroupRemoved }: Props) {
     () => model.users.map(u => ({
       value: u.id,
       label: u.details?.full_name || u.name,
+      // Not shown, but typed often: e-mail, login name, first/last name.
+      keywords: [u.details?.email, u.name, u.details?.first_name, u.details?.last_name].filter((v): v is string => !!v),
       labelClassName: u.user_type === 'service' ? 'text-warn' : undefined,
     })),
     [model.users]
