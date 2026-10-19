@@ -15,7 +15,7 @@ export const FILTER_NEVER = 'never'
 export const FILTER_UNTRACKED = 'untracked'
 export const FILTER_IN_EFFECT = 'in_effect'
 
-const SEARCH_KEYS = ['name', 'hint', 'typeLabel', 'actions', 'conditions', 'viaNames', 'policyNames', 'selectors']
+const SEARCH_KEYS = ['name', 'hint', 'typeLabel', 'actions', 'conditions', 'viaNames', 'policyNames', 'selectors', 'candidates', 'scopes', 'scopeServers', 'unresolvedReasons']
 
 export interface VisibleResource {
   resource: AccessResource

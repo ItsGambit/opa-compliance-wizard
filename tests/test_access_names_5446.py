@@ -188,7 +188,7 @@ def test_server_label_selector_stays_a_selector_when_not_certain():
     assert resolve(_label_sel(env="prod"), servers=None) is None            # list incomplete
     assert resolve(_label_sel(env="prod"), rg=None) is None
     assert resolve(_label_sel(env="prod"), rg="rg-2") is None               # resource group changes the result
-    assert resolve(_label_sel(**{"system.os_type": "linux"})) is None       # system labels: not known to be listed
+    assert resolve(_label_sel(**{"system.cloud_provider": "aws"})) is None  # a system label with no source on the server
     assert resolve({"server_selector": {"labels": {}}}) is None
     assert resolve({"server_selector": {}}) is None
     assert resolve(_label_sel(env="Prod")) is None                          # only matches if case is ignored

@@ -61,6 +61,19 @@ export function ResourceAccessView({ resource, lookup, now, renderGroupAction }:
             {resource.selectors.length > 0 && (
               <p className="xp-mute">Matched by the rule selector: {resource.selectors.join('; ')}.</p>
             )}
+            {(res.server_os || res.server_os_type) && (
+              <p className="xp-mute">Operating system: {[res.server_os, res.server_os_type].filter(Boolean).join(' · ')}.</p>
+            )}
+            {resource.matchNotes.length > 0 && <p className="xp-mute">{resource.matchNotes.join(' ')}</p>}
+            {resource.scopes.map(scope => (
+              <p key={scope} className="xp-mute">{scope}.</p>
+            ))}
+            {resource.scopeServers.length > 0 && (
+              <p className="xp-mute">Those servers: {resource.scopeServers.join(', ')}.</p>
+            )}
+            {resource.scopeNotes.length > 0 && (
+              <p className="xp-mute">The servers in that scope are not named: {resource.scopeNotes.join(' ')}</p>
+            )}
             {res.kind === 'resolved' && res.missing && (
               <p className="text-warn">This object was not found in any project, so it has probably been deleted. The name shown is the one the policy stored.</p>
             )}
@@ -75,6 +88,18 @@ export function ResourceAccessView({ resource, lookup, now, renderGroupAction }:
           <>
             <p>{res.description}</p>
             <p className="xp-mute">A selector (a pattern), not a list of resources, so the individual resources it matches are not named here.</p>
+            {resource.unresolvedReasons.length > 0 && (
+              <p>Why this is not listed by name: {resource.unresolvedReasons.join(' ')}</p>
+            )}
+            {resource.scopes.map(scope => (
+              <p key={scope} className="xp-mute">{scope}.</p>
+            ))}
+            {resource.candidates.length > 0 && (
+              <>
+                <p className="xp-mute">Possible matches, not confirmed ({resource.candidates.length}):</p>
+                <ul>{resource.candidates.map(c => <li key={c}>{c}</li>)}</ul>
+              </>
+            )}
           </>
         )}
       </DetailSection>

@@ -568,6 +568,51 @@ describe('Active Directory rows and ambiguous last used (5.44.6)', () => {
   })
 })
 
+describe('unresolved selector rows explain themselves (5.45.1)', () => {
+  const grants = rulesGrantedToGroupIds([{
+    id: 'pa', name: 'Ad Policy', description: '', active: true, type: 'SECURITY_POLICY', resource_group: { id: 'rg', name: 'RG' },
+    principals: { user_groups: [{ id: 'g1', name: 'G' }], workload_roles: [] }, last_updated: null, last_updated_by: null,
+    rules: [{
+      name: 'Ad', resource_type: 'active_directory_based_resource', resource_type_label: 'Active Directory accounts', privileges: [], conditions: [],
+      resolutions: [
+        {
+          kind: 'condition', description: 'AD accounts in domain(s): example.test', scope_text: 'Only on servers labeled env=prod',
+          unresolved_reason: { code: 'no_account_matched', text: 'No account in the loaded account list matches the rule.' }, candidates: ['svc_one', 'svc_two'],
+        },
+        {
+          kind: 'resolved', id: 's1', name: 'srv-example-1', resource_kind: 'individual_server', project_id: 'p1', project_name: 'Example Project',
+          resource_group_id: 'rg', via_selector: 'Servers labeled system.os=ubuntu_24.04', sub_label: null, server_os: 'Ubuntu 24.04', server_os_type: 'linux',
+          inferred: true, match_note: 'Matched by OS name (inferred): example note.',
+        },
+        {
+          kind: 'resolved', id: 'd1', name: 'svc_one', resource_kind: 'individual_active_directory_account', project_id: 'p1', project_name: 'Example Project',
+          resource_group_id: 'rg', sub_label: 'example.test', scope_text: 'Only on servers labeled env=prod', scope_servers: ['srv-example-1'],
+        },
+      ],
+    }],
+  } as never], new Set(['g1']))
+  const rows = aggregateResources(grants)
+
+  it('shows the reason in plain words, the scope and the candidates in the opened selector row', () => {
+    render(<ResourceAccessView resource={rows.find(r => r.resolution.kind === 'condition')!} now={0} />)
+    expect(screen.getByText('Why this is not listed by name: No account in the loaded account list matches the rule.')).toBeTruthy()
+    expect(screen.getByText('Only on servers labeled env=prod.')).toBeTruthy()
+    expect(screen.getByText('svc_two')).toBeTruthy()
+    expect(screen.queryByText(/no_account_matched/)).toBeNull()
+  })
+
+  it('shows the OS, the inferred note, and the scope with its servers on named rows', () => {
+    render(<ResourceAccessView resource={rows.find(r => r.name === 'srv-example-1')!} now={0} />)
+    expect(screen.getByText(/Operating system: Ubuntu 24\.04 · linux/)).toBeTruthy()
+    expect(screen.getByText(/Matched by OS name \(inferred\)/)).toBeTruthy()
+    cleanup()
+    render(<ResourceAccessView resource={rows.find(r => r.name === 'svc_one')!} now={0} />)
+    expect(screen.getByText('Only on servers labeled env=prod.')).toBeTruthy()
+    expect(screen.getByText('Those servers: srv-example-1.')).toBeTruthy()
+    expect(screen.getByText(/Domain: example\.test/)).toBeTruthy()
+  })
+})
+
 describe('GroupRemoveControl', () => {
   function Wrap({ others, onConfirm }: { others: number; onConfirm: () => void }) {
     const [pending] = useState(false)

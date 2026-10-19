@@ -347,14 +347,13 @@ def test_active_directory_description_lists_every_branch():
         assert part in text
 
 
-def test_a_server_scoped_active_directory_selector_stays_one_row():
+def test_a_server_scoped_active_directory_selector_is_named_with_its_scope_in_words():
+    # 5.45.1: a server scope no longer stops the accounts being named
     accounts = [{"id": "ad1", "account_name": "svc", "domain": {"name": "example.test"}, "resource_group_id": "rg1"}]
     selector = {"individual_accounts": {"by_domain": ["example.test"]},
                 "servers": {"selectors": [{"selector": {"labels": {"env": "prod"}}}]}}
     rule = {"resource_type": "active_directory_based_resource",
             "resource_selector": {"selectors": [{"selector_type": "active_directory", "selector": selector}]}}
     out = engine._resolve_rule(rule, {"selector_accounts": {"active_directory": accounts}}, "rg1")
-    assert len(out) == 1 and out[0]["kind"] == "condition" and "env=prod" in out[0]["description"]
-    selector.pop("servers")
-    out = engine._resolve_rule(rule, {"selector_accounts": {"active_directory": accounts}}, "rg1")
-    assert out[0]["kind"] == "resolved" and out[0]["name"] == "svc"
+    assert len(out) == 1 and out[0]["kind"] == "resolved" and out[0]["name"] == "svc"
+    assert out[0]["scope_text"] == "Only on servers labeled env=prod"

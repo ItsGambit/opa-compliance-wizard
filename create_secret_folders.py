@@ -58,7 +58,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.45.0
+# Version     : 5.45.1
 # =============================================================================
 
 import argparse
@@ -84,7 +84,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.45.0"
+SCRIPT_VERSION = "5.45.1"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 # ENG2-12: OPA's spec documents no pattern or length for a secret-folder
 # name (SecretFolderCreateRequest.name is a bare string); 255 is the limit
@@ -4166,83 +4166,220 @@ _SELECTOR_ACCOUNT_KINDS = {
 }
 
 
-def _resolve_account_selector(selector_type, selector, accounts, policy_rg_id):
-    """Resolves a database / Active Directory selector to the concrete
-    accounts it covers, or returns None when that cannot be done with
-    certainty (the caller keeps the selector row then). Certainty rules:
-    - `accounts` must be the COMPLETE list (None = a fetch failed);
-    - only the name formats in _NAME_FORMATS, with a non-empty value;
-    - the OPA docs do not state case-sensitivity, how several conditions
-      combine, or which AD name field is compared, so every plausible
-      reading is evaluated and the result is used only when they all give the
-      same accounts (otherwise None);
-    - the policy's resource-group scope must not change the result either;
-    - no matching account at all -> None (an honest "selector" row stays).
-    Database: connections (matched by id; any listed) AND the name
-    conditions. AD: individual_accounts.by_condition (name) or by_domain
-    (domain name in the list); shared AD accounts are not handled."""
+# Why a selector row was not turned into named rows (5.45.1). Every selector
+# row that stays a selector carries `unresolved_reason` = {"code", "text"}
+# (several reasons: "codes" lists them all and "text" joins the sentences).
+UNRESOLVED_CODES = (
+    "accounts_unavailable", "servers_unavailable", "no_resource_group", "unsupported_selector",
+    "unsupported_name_format", "name_field_unreadable", "domain_unreadable", "server_field_unreadable",
+    "system_label_unsupported", "no_account_matched", "no_server_matched", "readings_disagree",
+    "resource_group_scope", "shared_selection_unsupported", "unsupported_selector_kind", "no_selector",
+)
+_CANDIDATE_CAP = 200
+
+
+def _reason(code, text):
+    return {"code": code, "text": text}
+
+
+def _join_reasons(reasons):
+    reasons = [r for r in reasons if r]
+    if not reasons:
+        return None
+    if len(reasons) == 1:
+        return dict(reasons[0])
+    seen, texts, codes = set(), [], []
+    for r in reasons:
+        if r["code"] not in codes:
+            codes.append(r["code"])
+        if r["text"] not in seen:
+            seen.add(r["text"])
+            texts.append(r["text"])
+    return {"code": codes[0], "codes": codes, "text": " ".join(texts)}
+
+
+def _agree(variants):
+    """variants: {label: set of ids} (insertion ordered). -> ("ok", ids),
+    ("none", set()) when every reading finds nothing, or ("differ", union,
+    sentence) when the readings give different sets."""
+    items = list(variants.items())
+    first_label, first = items[0]
+    if all(s == first for _l, s in items):
+        return ("ok", first) if first else ("none", set())
+    union = set().union(*[s for _l, s in items])
+    others = [f"'{lab}' finds {len(s)}" for lab, s in items[1:] if s != first][:3]
+    return ("differ", union, f"The readings of the rule disagree: '{first_label}' finds {len(first)} but " + "; ".join(others) + ".")
+
+
+def _cap_names(names):
+    return sorted({n for n in names if isinstance(n, str) and n}, key=str.lower)[:_CANDIDATE_CAP]
+
+
+def _norm_os(text):
+    return re.sub(r"[\W_]+", "_", text.strip().lower()).strip("_") if isinstance(text, str) else ""
+
+
+def _ad_domain_values(account):
+    """Every spelling of the account's domain name that holds a non-empty
+    string, as [(spelling, value)]. The spec gives `domain` as a named object
+    ({id, name}); a plain string `domain`, `domain.domain`, `domain_name` and
+    `dns_name` are read too so a differently shaped listing is still understood."""
+    dom = account.get("domain")
+    candidates = [
+        ("domain.name", dom.get("name") if isinstance(dom, dict) else None),
+        ("domain", dom if isinstance(dom, str) else None),
+        ("domain.domain", dom.get("domain") if isinstance(dom, dict) else None),
+        ("domain_name", account.get("domain_name")),
+        ("dns_name", account.get("dns_name")),
+    ]
+    return [(label, value) for label, value in candidates if isinstance(value, str) and value]
+
+
+def _first_domain(account):
+    vals = _ad_domain_values(account)
+    return vals[0][1] if vals else None
+
+
+def _ad_domain_hints(account):
+    """Domain names hidden in the account's UPN suffix / distinguished name;
+    used only to notice accounts whose domain field is empty but that might
+    belong to a wanted domain."""
+    hints = []
+    upn = account.get("upn")
+    if isinstance(upn, str) and "@" in upn:
+        hints.append(upn.rsplit("@", 1)[1])
+    dn = account.get("distinguished_name")
+    if isinstance(dn, str):
+        parts = re.findall(r"DC=([^,]+)", dn, flags=re.IGNORECASE)
+        if parts:
+            hints.append(".".join(parts))
+    return hints
+
+
+def _count_text(n, noun):
+    return f"{n} {noun}{'' if n == 1 else 's'}"
+
+
+def _account_selector_outcome(selector_type, selector, accounts, policy_rg_id):
+    """The full outcome of resolving a database / Active Directory (individual
+    accounts) selector: {"rows": [...] or None, "candidates": [names],
+    "reason": {...} or None}. Certainty rules are those of the 5.44.5 resolver
+    (complete list, known name formats, every plausible reading must agree,
+    resource-group scope must not change the result, something must match),
+    extended in 5.45.1: an AD `by_domain` reads every spelling of the domain
+    (see _ad_domain_values) and an account with no readable domain no longer
+    blocks the others; `by_condition` AND `by_domain` together are evaluated
+    both as AND and as OR and named only when both give the same accounts, else
+    the union is returned as candidates."""
+    def fail(code, text, ids=None):
+        names = _cap_names([a.get("account_name") for a in accounts or [] if ids and a.get("id") in ids])
+        return {"rows": None, "candidates": names, "reason": _reason(code, text)}
+
     try:
-        if accounts is None or not policy_rg_id:
-            return None
+        if accounts is None:
+            return fail("accounts_unavailable", "The list of accounts could not be read completely, so the accounts this rule covers cannot be named.")
+        if not policy_rg_id:
+            return fail("no_resource_group", "The policy has no resource group, so the accounts it covers cannot be told apart.")
+        by_domain = None
         if selector_type == "database":
-            conn_ids = {c.get("id") for c in selector.get("database_connections") or []}
-            conds = [(c.get("account_name_format"), c.get("value")) for c in selector.get("database_accounts") or []]
+            conn_ids = {c.get("id") for c in selector.get("database_connections") or [] if isinstance(c, dict)}
+            conds = [(c.get("account_name_format"), c.get("value")) for c in selector.get("database_accounts") or [] if isinstance(c, dict)]
             if not conn_ids or None in conn_ids or not conds:
-                return None
+                return fail("unsupported_selector", "The rule does not name both a database connection and a name condition.")
             scope = [a for a in accounts if (a.get("database_connection") or {}).get("id") in conn_ids]
-            name_fields = ["account_name"]
             sub_label = lambda a: (a.get("database_connection") or {}).get("name")  # noqa: E731
+            part_cond, part_domain = True, False
+            name_fields = ["account_name"]
         elif selector_type == "active_directory":
             individual = selector.get("individual_accounts") or {}
             by_condition, by_domain = individual.get("by_condition"), individual.get("by_domain")
-            if bool(by_condition) == bool(by_domain):
-                return None
+            if not by_condition and not by_domain:
+                return fail("unsupported_selector", "The rule has no individual-account name or domain condition.")
             scope = list(accounts)
-            sub_label = lambda a: (a.get("domain") or {}).get("name")  # noqa: E731
-            if by_condition:
-                conds = [(by_condition.get("account_name_format"), by_condition.get("value"))]
-                name_fields = [f for f in ("account_name", "sam_account_name") if all(isinstance(a.get(f), str) for a in scope)]
-                if "account_name" not in name_fields:
-                    return None
-            else:
-                if not isinstance(by_domain, list) or not by_domain or not all(isinstance(d, str) and d for d in by_domain):
-                    return None
-                if not all(isinstance((a.get("domain") or {}).get("name"), str) for a in scope):
-                    return None
-                conds, name_fields = None, None
+            sub_label = _first_domain
+            part_cond, part_domain = bool(by_condition), bool(by_domain)
+            conds = [(by_condition.get("account_name_format"), by_condition.get("value"))] if part_cond else []
+            name_fields = [f for f in ("account_name", "sam_account_name") if all(isinstance(a.get(f), str) for a in scope)]
+            if part_cond and "account_name" not in name_fields:
+                return fail("name_field_unreadable", "Some accounts have no readable account name, so a name condition cannot be applied reliably.")
+            if part_domain and (not isinstance(by_domain, list) or not by_domain or not all(isinstance(d, str) and d for d in by_domain)):
+                return fail("unsupported_selector", "The domain list in the rule is empty or not in a form the model understands.")
         else:
-            return None
+            return fail("unsupported_selector_kind", "The model does not name the accounts of this kind of selector.")
 
-        def variants():
+        for fmt, value in conds:
+            if fmt not in _NAME_FORMATS:
+                return fail("unsupported_name_format", f"The name condition uses a format the model does not know ({fmt or 'none given'}).")
+            if not isinstance(value, str) or not value:
+                return fail("unsupported_name_format", "The name condition has no value to compare with.")
+
+        # Accounts whose domain cannot be read at all must not stop the
+        # others being named, but are flagged when they might belong to a
+        # wanted domain (UPN suffix / distinguished name).
+        if part_domain:
+            wanted_l = {d.lower() for d in by_domain}
+            unreadable = [a for a in scope if not _ad_domain_values(a) and any(h.lower() in wanted_l for h in _ad_domain_hints(a))]
+            if unreadable:
+                return fail("domain_unreadable",
+                            f"{_count_text(len(unreadable), 'account')} may belong to the domain but their domain field is empty, so the list cannot be named with certainty.",
+                            {a["id"] for a in unreadable})
+
+        def case_tag(fold):
+            return ", ignoring case" if fold else ", exact case"
+
+        cond_sets, domain_sets, variants = {}, {}, {}
+        if selector_type == "database":
             for fold in (False, True):
                 norm = (lambda t: t.lower()) if fold else (lambda t: t)
-                if conds is None:
-                    domains = {norm(d) for d in by_domain}
-                    yield {a["id"] for a in scope if norm(a["domain"]["name"]) in domains}
-                    continue
-                for field in name_fields:
-                    tests = []
-                    for fmt, value in conds:
-                        if fmt not in _NAME_FORMATS or not isinstance(value, str) or not value:
-                            raise ValueError("unknown condition")
-                        tests.append(lambda a, f=_NAME_FORMATS[fmt], v=norm(value), fld=field: isinstance(a.get(fld), str) and f(norm(a[fld]), v))
-                    for combine in ((all, any) if len(tests) > 1 else (all,)):
-                        yield {a["id"] for a in scope if combine(t(a) for t in tests)}
+                tests = [(lambda a, f=_NAME_FORMATS[fmt], v=norm(value): isinstance(a.get("account_name"), str) and f(norm(a["account_name"]), v)) for fmt, value in conds]
+                for name, combine in (("all conditions", all), ("any condition", any)) if len(tests) > 1 else (("the condition", all),):
+                    variants[name + case_tag(fold)] = {a["id"] for a in scope if combine(t(a) for t in tests)}
+        else:
+            if part_cond:
+                (fmt, value), = conds
+                for fold in (False, True):
+                    norm = (lambda t: t.lower()) if fold else (lambda t: t)
+                    for field in name_fields:
+                        cond_sets[f"{field}{case_tag(fold)}"] = {a["id"] for a in scope if _NAME_FORMATS[fmt](norm(a[field]), norm(value))}
+            if part_domain:
+                for fold in (False, True):
+                    norm = (lambda t: t.lower()) if fold else (lambda t: t)
+                    wanted = {norm(d) for d in by_domain}
+                    for mode in ("first spelling", "any spelling"):
+                        ids = set()
+                        for a in scope:
+                            vals = _ad_domain_values(a)
+                            if any(norm(v) in wanted for _l, v in (vals[:1] if mode == "first spelling" else vals)):
+                                ids.add(a["id"])
+                        domain_sets[f"domain ({mode}{case_tag(fold)})"] = ids
+            if part_cond and part_domain:
+                for cl, cs in cond_sets.items():
+                    for dl, ds in domain_sets.items():
+                        variants[f"{cl} AND {dl}"] = cs & ds
+                        variants[f"{cl} OR {dl}"] = cs | ds
+            else:
+                variants = cond_sets or domain_sets
 
-        results = list(variants())
-        matched_ids = results[0]
-        if not matched_ids or any(r != matched_ids for r in results):
-            return None
-        if {a["id"] for a in scope if a["id"] in matched_ids and a.get("resource_group_id") == policy_rg_id} != matched_ids:
-            return None
+        verdict = _agree(variants)
+        if verdict[0] == "none":
+            return fail("no_account_matched", "No account in the loaded account list matches the rule.")
+        if verdict[0] == "differ":
+            extra = " The accounts found by any reading are listed as candidates, not as certain."
+            return fail("readings_disagree", verdict[2] + extra, verdict[1])
+        matched_ids = verdict[1]
+        outside = {a["id"] for a in scope if a["id"] in matched_ids and a.get("resource_group_id") != policy_rg_id}
+        if outside:
+            return fail("resource_group_scope",
+                        f"{_count_text(len(outside), 'account')} matching the rule sit in another resource group than the policy, so which accounts it covers depends on how the policy's resource group limits it.",
+                        matched_ids)
         description = describe_dynamic_selector(None, selector_type, selector)
         name_counts = {}
         for a in accounts:
             if isinstance(a.get("account_name"), str):
                 name_counts[a["account_name"]] = name_counts.get(a["account_name"], 0) + 1
-        out = []
+        rows = []
         for a in sorted((a for a in scope if a["id"] in matched_ids), key=lambda a: (a.get("account_name") or "").lower()):
-            out.append({
+            rows.append({
                 "kind": "resolved", "id": a["id"], "name": a.get("account_name") or a["id"],
                 "resource_kind": _SELECTOR_ACCOUNT_KINDS[selector_type],
                 "project_id": a.get("project_id"), "project_name": a.get("project_name"),
@@ -4254,17 +4391,24 @@ def _resolve_account_selector(selector_type, selector, accounts, policy_rg_id):
                 "account_name": a.get("account_name") if isinstance(a.get("account_name"), str) and a.get("account_name") else None,
                 "name_unique": name_counts.get(a.get("account_name")) == 1,
             })
-        return out
+        return {"rows": rows, "candidates": [], "reason": None}
     except (ValueError, KeyError, TypeError, AttributeError):
-        return None
+        return {"rows": None, "candidates": [], "reason": _reason("unsupported_selector", "The rule is not in a shape the model understands.")}
+
+
+def _resolve_account_selector(selector_type, selector, accounts, policy_rg_id):
+    """Rows for the accounts the selector covers, or None when that cannot be
+    done with certainty (see _account_selector_outcome for the reason)."""
+    return _account_selector_outcome(selector_type, selector, accounts, policy_rg_id)["rows"]
 
 
 def _shared_ad_account_rows(selector, accounts, policy_rg_id):
     """Named rows for the Active Directory SHARED accounts a selector lists
     explicitly (`shared_accounts.specific_accounts`): their names are in the
-    selector itself, so they are certain. Each is marked by name only (the
-    id in the selector is not assumed to equal any account id). Returns []
-    when there are none."""
+    selector itself, so they are certain. The rule's name may be a plain
+    account name or `name@domain`; the listed account is found by exact
+    account name, UPN, or name plus domain (5.45.1), so the same account gets
+    the same id however a rule spells it. Returns [] when there are none."""
     out = []
     try:
         specific = (selector.get("shared_accounts") or {}).get("specific_accounts") or []
@@ -4282,14 +4426,21 @@ def _shared_ad_account_rows(selector, accounts, policy_rg_id):
             if not isinstance(name, str) or not name:
                 continue
             hit = next((a for a in accounts or [] if a.get("account_name") == name and name_counts.get(name) == 1), None)
+            if hit is None and "@" in name:
+                local, dom = name.rsplit("@", 1)
+                cands = [a for a in accounts or [] if a.get("upn") == name or (
+                    a.get("account_name") == local and any(v.lower() == dom.lower() for _l, v in _ad_domain_values(a)))]
+                hit = cands[0] if len(cands) == 1 else None
+            shown = hit["account_name"] if hit and isinstance(hit.get("account_name"), str) and hit["account_name"] else name
+            domain = _first_domain(hit) if hit else (name.rsplit("@", 1)[1] if "@" in name else None)
             out.append({
-                "kind": "resolved", "id": (hit or {}).get("id") or f"shared:{name}", "name": name,
+                "kind": "resolved", "id": (hit or {}).get("id") or f"shared:{name}", "name": shown,
                 "resource_kind": "individual_active_directory_account",
                 "project_id": (hit or {}).get("project_id"), "project_name": (hit or {}).get("project_name"),
                 "resource_group_id": (hit or {}).get("resource_group_id"),
                 "via_selector": "Shared AD account(s) named in the rule",
-                "sub_label": ((hit or {}).get("domain") or {}).get("name"),
-                "account_name": name, "name_unique": accounts is not None and name_counts.get(name, 0) == 1,
+                "sub_label": domain,
+                "account_name": shown, "name_unique": accounts is not None and name_counts.get(shown, 0) == 1,
             })
             if hit:
                 out[-1]["access_tracking_id"] = hit["id"]
@@ -4298,60 +4449,181 @@ def _shared_ad_account_rows(selector, accounts, policy_rg_id):
     return out
 
 
-def _server_label_matches(labels_wanted, server, fold, any_pair):
-    labels = server["labels"]
-    norm = (lambda t: t.lower()) if fold else (lambda t: t)
-    have = {norm(k): norm(v) for k, v in labels.items()}
-    tests = [have.get(norm(k)) == norm(v) for k, v in labels_wanted.items()]
-    return any(tests) if any_pair else all(tests)
+def _label_text(labels):
+    return ", ".join(f"{k}={v}" for k, v in labels.items())
+
+
+_SYSTEM_SERVER_FIELDS = {"system.hostname": "hostname", "system.os_type": "os_type", "system.os": "os"}
+
+
+def _system_candidates(server, key):
+    """Values of the server a system label may be compared with:
+    (exact readings, alternative readings)."""
+    if key == "system.hostname":
+        extra = [server.get("canonical_name")] + (server.get("alt_names") if isinstance(server.get("alt_names"), list) else [])
+        return [server.get("hostname")], [server.get("hostname")] + extra
+    field = _SYSTEM_SERVER_FIELDS[key]
+    return [server.get(field)], [server.get(field)]
+
+
+def _server_outcome(selector, servers, policy_rg_id):
+    """Outcome of resolving a `server_label` selector: {"rows", "candidates",
+    "reason", "inferred"}. Same certainty rules as the account resolver. System
+    labels (5.45.1) are derived from the server's own fields because they are
+    not in its `labels` map: system.hostname = hostname, system.os_type =
+    os_type, system.os = os (raw equality; if no server matches raw but the
+    value matches a server's OS text after lower-casing and turning runs of
+    spaces/punctuation into one underscore, the match is used and marked
+    inferred). Several labels are read both as AND and as OR and used only
+    when they agree."""
+    def fail(code, text, ids=None):
+        names = _cap_names([s.get("hostname") for s in servers or [] if ids and s.get("id") in ids])
+        return {"rows": None, "candidates": names, "reason": _reason(code, text), "inferred": False}
+    try:
+        if servers is None:
+            return fail("servers_unavailable", "The list of servers could not be read completely, so the servers this rule covers cannot be named.")
+        if not policy_rg_id:
+            return fail("no_resource_group", "The policy has no resource group, so the servers it covers cannot be told apart.")
+        wanted = (selector.get("server_selector") or {}).get("labels")
+        if not isinstance(wanted, dict) or not wanted:
+            return fail("unsupported_selector", "The rule has no server labels to match.")
+        if not all(isinstance(k, str) and k and isinstance(v, str) and v for k, v in wanted.items()):
+            return fail("unsupported_selector", "A server label in the rule is empty or not plain text.")
+        for s in servers:
+            if not isinstance(s.get("id"), str) or not isinstance(s.get("hostname"), str) or not s["hostname"]:
+                return fail("server_field_unreadable", "Some servers have no readable id or hostname.")
+        keys = list(wanted.items())
+        matchers, inferred_labels, needs_labels = [], [], False
+        for k, v in keys:
+            kl = k.lower()
+            if kl in _SYSTEM_SERVER_FIELDS:
+                field = _SYSTEM_SERVER_FIELDS[kl]
+                if not any(isinstance(s.get(field), str) and s[field] for s in servers):
+                    return fail("server_field_unreadable", f"No server carries a readable '{field}', which the label {k} is derived from.")
+                if kl == "system.os":
+                    raw = lambda s, v=v: isinstance(s.get("os"), str) and s["os"] == v  # noqa: E731
+                    norm = lambda s, v=v: _norm_os(s.get("os")) != "" and _norm_os(s.get("os")) == _norm_os(v)  # noqa: E731
+                    if any(raw(s) for s in servers):
+                        matchers.append((raw, norm))
+                    else:
+                        matchers.append((norm, norm))
+                        if any(norm(s) for s in servers):
+                            inferred_labels.append(k)
+                else:
+                    matchers.append((
+                        lambda s, v=v, kl=kl: v in [x for x in _system_candidates(s, kl)[0] if isinstance(x, str)],
+                        lambda s, v=v, kl=kl: v.lower() in [x.lower() for x in _system_candidates(s, kl)[1] if isinstance(x, str)],
+                    ))
+            elif kl.startswith("system."):
+                if not any(isinstance(s.get("labels"), dict) and k in s["labels"] for s in servers):
+                    return fail("system_label_unsupported", f"The label {k} is not one the model can read from a server's own fields or labels.")
+                matchers.append(None)
+                needs_labels = True
+            else:
+                matchers.append(None)
+                needs_labels = True
+        if needs_labels:
+            for s in servers:
+                if not isinstance(s.get("labels"), dict) or not all(isinstance(a, str) and isinstance(b, str) for a, b in s["labels"].items()):
+                    return fail("server_field_unreadable", "Some servers have no readable labels, which a custom label in the rule needs.")
+
+        def label_match(i, s, reading):
+            m = matchers[i]
+            if m is not None:
+                return m[0 if reading == "exact" else 1](s)
+            k, v = keys[i]
+            if reading == "exact":
+                return s["labels"].get(k) == v
+            return {a.lower(): b.lower() for a, b in s["labels"].items()}.get(k.lower()) == v.lower()
+
+        variants = {}
+        for reading in ("exact", "loose"):
+            for cname, combine in ((("all labels", all), ("any label", any)) if len(keys) > 1 else (("the label", all),)):
+                hits = [s for s in servers if combine(label_match(i, s, reading) for i in range(len(keys)))]
+                tag = f"{cname}, {'exact match' if reading == 'exact' else 'ignoring case / alternative names'}"
+                variants[tag] = {s["id"] for s in hits}
+                variants[tag + ", active servers only"] = {s["id"] for s in hits if s.get("state") == "ACTIVE" and not s.get("deleted_at")}
+        verdict = _agree(variants)
+        if verdict[0] == "none":
+            return fail("no_server_matched", "No server in the loaded server list matches the rule.")
+        if verdict[0] == "differ":
+            return fail("readings_disagree", verdict[2] + " The servers found by any reading are listed as candidates, not as certain.", verdict[1])
+        matched_ids = verdict[1]
+        matched = [s for s in servers if s["id"] in matched_ids]
+        if any(s.get("resource_group_id") != policy_rg_id for s in matched):
+            return fail("resource_group_scope", "Some servers matching the rule sit in another resource group than the policy, so which servers it covers depends on how the policy's resource group limits it.", matched_ids)
+        description = describe_dynamic_selector(None, "server_label", selector)
+        rows = []
+        for s in sorted(matched, key=lambda s: s["hostname"].lower()):
+            row = {
+                "kind": "resolved", "id": s["id"], "name": s["hostname"], "resource_kind": "individual_server",
+                "project_id": s.get("project_id"), "project_name": s.get("project_name"),
+                "resource_group_id": s.get("resource_group_id"), "via_selector": description, "sub_label": None,
+                "server_os": s.get("os") if isinstance(s.get("os"), str) else None,
+                "server_os_type": s.get("os_type") if isinstance(s.get("os_type"), str) else None,
+            }
+            if inferred_labels:
+                row["inferred"] = True
+                row["match_note"] = "Matched by OS name (inferred): the label value is the OS name written in lower case with underscores, and no server's OS text equals it exactly."
+            rows.append(row)
+        return {"rows": rows, "candidates": [], "reason": None, "inferred": bool(inferred_labels)}
+    except (KeyError, TypeError, AttributeError):
+        return {"rows": None, "candidates": [], "reason": _reason("unsupported_selector", "The rule is not in a shape the model understands."), "inferred": False}
 
 
 def _resolve_server_selector(selector, servers, policy_rg_id):
-    """Resolves a `server_label` selector to the concrete servers it covers,
-    or None when that cannot be done with certainty (the caller keeps the
-    selector row). Same rules as _resolve_account_selector: the server list
-    must be COMPLETE and every server must carry a readable `labels` map;
-    the selector needs at least one label, each a plain non-empty string pair;
-    `system.` labels are refused because it is not known that they appear in
-    a listed server's `labels`; every plausible reading (all labels vs any
-    label, case-sensitive vs not, all servers vs only active ones) must give
-    the same servers; the policy's resource group must not change the result;
-    and no match at all keeps the selector row."""
-    try:
-        if servers is None or not policy_rg_id:
-            return None
-        wanted = (selector.get("server_selector") or {}).get("labels")
-        if not isinstance(wanted, dict) or not wanted:
-            return None
-        if not all(isinstance(k, str) and k and isinstance(v, str) and v for k, v in wanted.items()):
-            return None
-        if any(k.lower().startswith("system.") for k in wanted):
-            return None
-        for s in servers:
-            if not isinstance(s.get("id"), str) or not isinstance(s.get("hostname"), str) or not s["hostname"]:
-                return None
-            if not isinstance(s.get("labels"), dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in s["labels"].items()):
-                return None
-        results = []
-        for fold in (False, True):
-            for any_pair in ((False, True) if len(wanted) > 1 else (False,)):
-                hits = [s for s in servers if _server_label_matches(wanted, s, fold, any_pair)]
-                results.append({s["id"] for s in hits})
-                results.append({s["id"] for s in hits if s.get("state") == "ACTIVE" and not s.get("deleted_at")})
-        matched_ids = results[0]
-        if not matched_ids or any(r != matched_ids for r in results):
-            return None
-        matched = [s for s in servers if s["id"] in matched_ids]
-        if any(s.get("resource_group_id") != policy_rg_id for s in matched):
-            return None
-        description = describe_dynamic_selector(None, "server_label", selector)
-        return [{
-            "kind": "resolved", "id": s["id"], "name": s["hostname"], "resource_kind": "individual_server",
-            "project_id": s.get("project_id"), "project_name": s.get("project_name"),
-            "resource_group_id": s.get("resource_group_id"), "via_selector": description, "sub_label": None,
-        } for s in sorted(matched, key=lambda s: s["hostname"].lower())]
-    except (KeyError, TypeError, AttributeError):
+    """Rows for the servers the selector covers, or None (see _server_outcome)."""
+    return _server_outcome(selector, servers, policy_rg_id)["rows"]
+
+
+def _scope_labels(sel):
+    """Labels of a server scope entry; live scope entries carry them directly
+    (`selector.labels`), the documented shape under `server_selector`."""
+    inner = sel.get("server_selector") if isinstance(sel.get("server_selector"), dict) else {}
+    for holder in (sel, inner):
+        labels = holder.get("labels")
+        if isinstance(labels, dict) and labels:
+            return labels
+    return None
+
+
+def _ad_scope(selector, servers, policy_rg_id):
+    """The server scope of an Active Directory selector (`servers` and
+    `ssh_servers`) in plain words, and the server names when they can be
+    named with certainty: {"text", "servers": [names] or None, "reason"} or
+    None when there is no scope. Several entries are read as alternatives."""
+    texts, names, reasons, any_scope = [], [], [], False
+    for key, word in (("servers", "servers"), ("ssh_servers", "SSH servers")):
+        block = selector.get(key)
+        for e in (block.get("selectors") if isinstance(block, dict) else None) or []:
+            if not isinstance(e, dict):
+                continue
+            any_scope = True
+            sel = e.get("selector") if isinstance(e.get("selector"), dict) else {}
+            labels = _scope_labels(sel)
+            if e.get("selector_type") == "individual_server" or isinstance(sel.get("server"), dict):
+                ref = sel.get("server") or {}
+                hit = next((s for s in servers or [] if s.get("id") == ref.get("id")), None)
+                shown = (hit or {}).get("hostname") or ref.get("name") or ref.get("id") or "(unnamed)"
+                texts.append(f"{word} {shown}")
+                if hit and isinstance(hit.get("hostname"), str):
+                    names.append(hit["hostname"])
+                else:
+                    reasons.append(_reason("servers_unavailable", f"A server named in the scope ({shown}) is not in the loaded server list."))
+            elif labels:
+                texts.append(f"{word} labeled {_label_text(labels)}")
+                out = _server_outcome({"server_selector": {"labels": labels}}, servers, policy_rg_id)
+                if out["rows"]:
+                    names.extend(r["name"] for r in out["rows"])
+                else:
+                    reasons.append(out["reason"])
+            else:
+                texts.append(f"{word} (a scope the model cannot read)")
+                reasons.append(_reason("unsupported_selector", "The server scope is in a shape the model does not understand."))
+    if not any_scope:
         return None
+    return {"text": "Only on " + "; or ".join(texts), "servers": None if reasons else _cap_names(names),
+            "reason": _join_reasons(reasons)}
 
 
 def _has_unresolved_ad_part(selector):
@@ -4360,48 +4632,93 @@ def _has_unresolved_ad_part(selector):
     return bool(individual.get("by_condition") or individual.get("by_domain") or shared.get("by_domain") or shared.get("by_matching_names"))
 
 
+def _resolve_ad_selector(selector, accounts, servers, policy_rg_id):
+    """Active Directory selector -> (named rows, [selector rows left over]).
+    Each part is named on its own: individual accounts by name / domain,
+    shared accounts listed in the rule. A server scope no longer stops
+    naming: it is shown in plain words on every named row (and the scope's
+    servers are listed when they can be named with certainty)."""
+    scope = _ad_scope(selector, servers, policy_rg_id)
+    rows, reasons, candidates = [], [], []
+    remainder = dict(selector)
+    individual = selector.get("individual_accounts") or {}
+    if individual.get("by_condition") or individual.get("by_domain"):
+        out = _account_selector_outcome("active_directory", selector, accounts, policy_rg_id)
+        if out["rows"]:
+            rows.extend(out["rows"])
+            remainder.pop("individual_accounts", None)
+        else:
+            reasons.append(out["reason"])
+            candidates.extend(out["candidates"])
+    shared_rows = _shared_ad_account_rows(selector, accounts, policy_rg_id)
+    if shared_rows:
+        have = {r["id"] for r in rows}
+        rows.extend(r for r in shared_rows if r["id"] not in have)
+        remainder["shared_accounts"] = {k: v for k, v in (selector.get("shared_accounts") or {}).items() if k != "specific_accounts"}
+    shared = selector.get("shared_accounts") or {}
+    if shared.get("by_domain") or shared.get("by_matching_names"):
+        reasons.append(_reason("shared_selection_unsupported",
+                               "Shared accounts selected by domain or by name rules cannot be listed by name: the model cannot tell which accounts the rule treats as shared."))
+    left = []
+    if _has_unresolved_ad_part(remainder) or not rows:
+        cond = {"kind": "condition", "description": describe_dynamic_selector(None, "active_directory", remainder),
+                "unresolved_reason": _join_reasons(reasons) or _reason("unsupported_selector", "Nothing in the rule is a part the model can name.")}
+        if candidates:
+            cond["candidates"] = _cap_names(candidates)
+        if scope:
+            cond["scope_text"] = scope["text"]
+            if scope["servers"]:
+                cond["scope_servers"] = scope["servers"]
+        left.append(cond)
+    for r in rows:
+        if scope:
+            r["scope_text"] = scope["text"]
+            if scope["servers"] is not None:
+                r["scope_servers"] = scope["servers"]
+            if scope["reason"]:
+                r["scope_reason"] = scope["reason"]
+    return rows, left
+
+
 def _resolve_rule(rule, indexes, policy_rg_id=None):
     resource_type = rule.get("resource_type")
     entries = (rule.get("resource_selector") or {}).get("selectors") or []
-    resolutions = []
+    resolutions, seen = [], set()
+    selector_lists = indexes.get("selector_accounts") or {}
     for entry in entries:
         selector_type, selector = entry.get("selector_type"), entry.get("selector") or {}
-        accounts = (indexes.get("selector_accounts") or {}).get(selector_type)
+        accounts = selector_lists.get(selector_type)
+        out = None
         if selector_type == "server_label":
-            named = _resolve_server_selector(selector, accounts, policy_rg_id)
-        elif selector_type in _SELECTOR_ACCOUNT_KINDS:
-            named = _resolve_account_selector(selector_type, selector, accounts, policy_rg_id)
+            out = _server_outcome(selector, accounts, policy_rg_id)
+        elif selector_type == "database":
+            out = _account_selector_outcome(selector_type, selector, accounts, policy_rg_id)
+        if out is not None:
+            if out["rows"]:
+                new = out["rows"]
+            else:
+                cond = _resolve_selector_entry(resource_type, selector_type, selector, indexes)
+                cond["unresolved_reason"] = out["reason"]
+                if out["candidates"]:
+                    cond["candidates"] = out["candidates"]
+                new = [cond]
+        elif selector_type == "active_directory":
+            rows, left = _resolve_ad_selector(selector, accounts, selector_lists.get("server_label"), policy_rg_id)
+            new = rows + left
         else:
-            named = None
-        remainder = selector
-        # 5.45.0: a server scope on an Active Directory selector limits where
-        # its accounts apply, which a named account row cannot carry. Such a
-        # selector is resolved only when it has no scope; else the whole
-        # selector stays one row whose text lists every branch.
-        scoped = selector_type == "active_directory" and bool((selector.get("servers") or {}).get("selectors"))
-        if scoped:
-            named = None
-        if selector_type == "active_directory" and not scoped:
-            # Shared accounts named in the rule are certain from the rule
-            # itself; whatever part of the selector is still unnamed stays a
-            # selector row (described without the parts that are now rows).
-            shared = _shared_ad_account_rows(selector, accounts, policy_rg_id)
-            if named or shared:
-                remainder = dict(selector)
-                if named:
-                    remainder.pop("individual_accounts", None)
-                if shared:
-                    remainder["shared_accounts"] = {k: v for k, v in (selector.get("shared_accounts") or {}).items() if k != "specific_accounts"}
-                have = {n["id"] for n in named or []}
-                named = (named or []) + [r for r in shared if r["id"] not in have]
-        if named:
-            resolutions.extend(named)
-            if remainder is not selector and _has_unresolved_ad_part(remainder):
-                resolutions.append(_resolve_selector_entry(resource_type, selector_type, remainder, indexes))
-        else:
-            resolutions.append(_resolve_selector_entry(resource_type, selector_type, selector, indexes))
-    return resolutions or [{"kind": "condition",
-                             "description": RESOURCE_TYPE_LABELS.get(resource_type, resource_type)}]
+            res = _resolve_selector_entry(resource_type, selector_type, selector, indexes)
+            if res.get("kind") == "condition":
+                res["unresolved_reason"] = _reason("unsupported_selector_kind", "The model does not name the individual resources of this kind of selector.")
+            new = [res]
+        for r in new:
+            if r.get("kind") == "resolved":
+                key = (r.get("resource_kind"), r.get("id"), r.get("scope_text"))
+                if key in seen:
+                    continue
+                seen.add(key)
+            resolutions.append(r)
+    return resolutions or [{"kind": "condition", "description": RESOURCE_TYPE_LABELS.get(resource_type, resource_type),
+                             "unresolved_reason": _reason("no_selector", "The rule lists no resources.")}]
 
 
 def _finalize_resolutions(policies_out, assignments, indexes):

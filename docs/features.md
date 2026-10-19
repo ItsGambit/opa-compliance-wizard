@@ -283,6 +283,19 @@ group behind it (with **Remove from group** in the Users view) and its
 last access. Filters are only offered where the data can answer them
 (e.g. "No approval or MFA"; usage filters for a user).
 
+**Names instead of rule wording (since 5.44.5, widened in 5.45.1).** A
+rule that selects servers by label, or database / Active Directory
+accounts by name or domain, is shown as the named servers or accounts
+whenever that is certain. Servers: custom labels and the built-in
+`system.hostname`, `system.os_type` and `system.os` (read from the
+server's hostname, OS family and OS text; a match by normalised OS name
+is marked "inferred"). Active Directory: by name, by domain, both
+together (only if "and" and "or" agree), shared accounts named in the
+rule, and a server limit shown in plain words with its server names. A
+row that stays rule text says "Why this is not listed by name" in its
+opened view and in the exports, with the candidate names when there are
+some. The codes are listed in the 5.45.1 changelog entry.
+
 **Last used and its evidence (Users view, since 5.45.0).** "Last used"
 means the newest time the user revealed a password or secret, checked an
 account out, or was issued gateway or server credentials for it (the

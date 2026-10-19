@@ -282,3 +282,42 @@ describe('last used by account name, Active Directory rows and named servers (5.
     expect(rows[0].selectors).toEqual(['Servers labeled env=prod'])
   })
 })
+
+describe('unresolved selector rows and server scopes (5.45.1)', () => {
+  const cond = {
+    kind: 'condition' as const, description: "AD accounts where name starts with 'a1'; AD accounts in domain(s): example.test",
+    unresolved_reason: { code: 'readings_disagree', text: 'The readings of the rule disagree.' },
+    candidates: ['a1_svc', 'b2_svc', 'a1_other', 'c3_svc'],
+  }
+  const scoped = {
+    ...resolved('d1', 'a1_svc', 'individual_active_directory_account'), sub_label: 'example.test',
+    scope_text: 'Only on servers labeled system.os_type=windows', scope_servers: ['srv-example-2'], inferred: true,
+    match_note: 'Matched by OS name (inferred): example.',
+  }
+  const grants = rulesGrantedToGroupIds([policy('p1', 'Policy One', [{ id: 'g1', name: 'G' }], [
+    rule('Rule AD', 'Active Directory accounts', [cond, scoped], { resource_type: 'active_directory_based_resource' }),
+  ])], new Set(['g1']))
+  const rows = aggregateResources(grants)
+
+  it('keeps the selector tag and shows the first few candidate names after the rule text', () => {
+    const row = rows.find(r => r.resolution.kind === 'condition')!
+    expect(row.hint).toBe('selector · possibly: a1_svc, b2_svc, a1_other +1 more')
+    expect(row.candidates).toHaveLength(4)
+    expect(row.unresolvedReasons).toEqual(['The readings of the rule disagree.'])
+  })
+
+  it('collects the scope, its servers and the inferred note on the named row', () => {
+    const row = rows.find(r => r.name === 'a1_svc')!
+    expect(row.scopes).toEqual(['Only on servers labeled system.os_type=windows'])
+    expect(row.scopeServers).toEqual(['srv-example-2'])
+    expect(row.matchNotes[0]).toBe('Matched by OS name (inferred)')
+  })
+
+  it('exports the reason, the candidates, the scope and the inferred note', () => {
+    const [row] = grantRows(grants)
+    expect(row['Why Not Listed By Name']).toBe('The readings of the rule disagree.')
+    expect(row['Candidate Names']).toBe('a1_svc; b2_svc; a1_other; c3_svc')
+    expect(row['Server Scope']).toBe('Only on servers labeled system.os_type=windows (srv-example-2)')
+    expect(row['Match Note']).toBe('Matched by OS name (inferred)')
+  })
+})

@@ -54,6 +54,26 @@ export interface AccessResource {
   /** The rule selector text(s) that matched this named account (empty for
    * everything else). Searchable and shown in the opened row. */
   selectors: string[]
+  /** 5.45.1: for a selector row, why it is not listed by name and the
+   * candidate names the resolver found but could not confirm. */
+  unresolvedReasons: string[]
+  candidates: string[]
+  /** Server scopes of a named Active Directory account, and the servers
+   * they name; `scopeNotes` says why the servers could not be named. */
+  scopes: string[]
+  scopeServers: string[]
+  scopeNotes: string[]
+  /** Notes such as "Matched by OS name (inferred)". */
+  matchNotes: string[]
+}
+
+/** How many candidate names a selector row shows beside its rule text. */
+export const CANDIDATE_PREVIEW = 3
+
+export function candidatePreview(names: string[]): string {
+  if (names.length === 0) return ''
+  const shown = names.slice(0, CANDIDATE_PREVIEW).join(', ')
+  return names.length > CANDIDATE_PREVIEW ? `${shown} +${names.length - CANDIDATE_PREVIEW} more` : shown
 }
 
 /** Database and Active Directory access rules are selectors (connections or
@@ -191,10 +211,25 @@ export function aggregateResources(grants: GrantedRule[], options: AggregateOpti
             : [rowQualifier(res), res.resource_kind === 'secret_folder' ? 'folder' : null, res.project_name].filter(Boolean).join(' · ') || undefined
         item = {
           key, typeId, typeLabel, name, hint, resolution: res, lines: [], actions: [], conditions: [], risky: false, inactiveOnly: false, viaNames: [], policyNames: [], selectors: [],
+          unresolvedReasons: [], candidates: [], scopes: [], scopeServers: [], scopeNotes: [], matchNotes: [],
         }
         byKey.set(key, item)
       }
       if (res.kind === 'resolved' && res.via_selector && !item.selectors.includes(res.via_selector)) item.selectors.push(res.via_selector)
+      const addAll = (list: string[], values: (string | undefined)[]) => {
+        for (const v of values) if (v && !list.includes(v)) list.push(v)
+      }
+      if (res.kind === 'condition') {
+        addAll(item.unresolvedReasons, [res.unresolved_reason?.text])
+        addAll(item.candidates, res.candidates ?? [])
+        addAll(item.scopes, [res.scope_text])
+        addAll(item.scopeServers, res.scope_servers ?? [])
+      } else {
+        addAll(item.scopes, [res.scope_text])
+        addAll(item.scopeServers, res.scope_servers ?? [])
+        addAll(item.scopeNotes, [res.scope_reason?.text])
+        addAll(item.matchNotes, [res.inferred ? 'Matched by OS name (inferred)' : undefined, res.match_note])
+      }
       if (!item.lines.some(l => l.policy === policy && l.rule === rule)) {
         item.lines.push({ policy, rule, groups: groupsFor(policy), othersCount, inactive: !isPolicyActive(policy) })
       }
@@ -208,6 +243,9 @@ export function aggregateResources(grants: GrantedRule[], options: AggregateOpti
     item.risky = item.lines.some(l => !l.inactive && !ruleHasApprovalOrMfa(l.rule))
     item.viaNames = unique(item.lines.flatMap(l => l.groups.map(g => g.name)))
     item.policyNames = unique(item.lines.map(l => l.policy.name))
+    if (item.resolution.kind === 'condition' && item.candidates.length > 0) {
+      item.hint = [item.hint, `possibly: ${candidatePreview(item.candidates)}`].filter(Boolean).join(' · ')
+    }
     if (item.inactiveOnly) item.hint = [item.hint, 'inactive policy'].filter(Boolean).join(' · ')
   }
   // Two rows with the same name in one section (two secrets, two accounts

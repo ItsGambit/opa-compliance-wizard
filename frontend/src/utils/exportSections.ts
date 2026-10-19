@@ -36,6 +36,14 @@ function grantRow(policy: AccessPolicy, rule: PolicyRule): Record<string, string
     // The rule's own selector text where a selector was resolved to the named
     // accounts above, so the export keeps both.
     'Rule Selector': [...new Set(rule.resolutions.flatMap(r => (r.kind === 'resolved' && r.via_selector ? [r.via_selector] : [])))].join('; '),
+    'Why Not Listed By Name': [...new Set(rule.resolutions.flatMap(r => (r.kind === 'condition' && r.unresolved_reason ? [r.unresolved_reason.text] : [])))].join(' '),
+    'Candidate Names': [...new Set(rule.resolutions.flatMap(r => (r.kind === 'condition' ? r.candidates ?? [] : [])))].join('; '),
+    'Server Scope': [...new Set(rule.resolutions.flatMap(r => {
+      if (r.scope_text === undefined) return []
+      const servers = r.scope_servers?.length ? ` (${r.scope_servers.join(', ')})` : ''
+      return [`${r.scope_text}${servers}`]
+    }))].join('; '),
+    'Match Note': [...new Set(rule.resolutions.flatMap(r => (r.kind === 'resolved' && r.inferred ? ['Matched by OS name (inferred)'] : [])))].join('; '),
     'Connection or Domain': [...new Set(rule.resolutions.flatMap(r => (r.kind === 'resolved' && r.sub_label ? [r.sub_label] : [])))].join('; '),
     Privileges: rule.privileges
       .map(p => (p.flags.length ? `${p.privilege_type}: ${p.flags.join(',')}` : p.privilege_type))

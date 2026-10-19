@@ -543,8 +543,35 @@ export type PolicyRuleResolution =
        * account's username. `name` then reads "server / account". */
       server_id?: string
       server_name?: string | null
+      /** Active Directory accounts limited to some servers (5.45.1): the scope
+       * in plain words, the server names when they could be named with
+       * certainty, and why not when they could not. */
+      scope_text?: string
+      scope_servers?: string[]
+      scope_reason?: UnresolvedReason
+      /** Servers named by an OS label (5.45.1): the server's OS text, and
+       * `inferred` when only a normalised reading of the OS name matched. */
+      server_os?: string | null
+      server_os_type?: string | null
+      inferred?: boolean
+      match_note?: string
     }
-  | { kind: 'condition'; description: string }
+  | {
+      kind: 'condition'
+      description: string
+      /** 5.45.1: exactly what blocked naming (code + plain sentence). */
+      unresolved_reason?: UnresolvedReason
+      /** Names the resolver found but could not confirm. */
+      candidates?: string[]
+      scope_text?: string
+      scope_servers?: string[]
+    }
+
+export interface UnresolvedReason {
+  code: string
+  codes?: string[]
+  text: string
+}
 
 export interface PolicyRulePrivilege {
   privilege_type: string
