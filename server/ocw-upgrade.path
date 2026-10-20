@@ -7,6 +7,9 @@
 Description=Watch for OPA Compliance Wizard upgrade requests
 
 [Path]
+# deliberate limits (the service empties the inbox on every run, including entries it will not process)
+TriggerLimitIntervalSec=120
+TriggerLimitBurst=60
 DirectoryNotEmpty=__DATA_DIR__/upgrade/inbox/requests
 Unit=ocw-upgrade.service
 

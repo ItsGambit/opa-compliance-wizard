@@ -423,3 +423,45 @@ def test_a_planted_link_as_the_audit_lock_is_not_written_through(m, tmp_path):
     os.symlink(victim, m.data / ".audit_log.jsonl.lock")
     act.audit_append(m.cfg(), "x.y", {})
     assert victim.read_text() == "precious" and (m.data / "audit_log.jsonl").stat().st_size > 0
+
+
+# --- the inbox is always drained ------------------------------------------------------------------------------------
+
+
+def test_every_unprocessed_inbox_entry_is_moved_away(m):
+    inbox = m.cfg().requests
+    os.makedirs(inbox, exist_ok=True)
+    Path(inbox, "x.txt").write_text("stray")
+    os.mkdir(os.path.join(inbox, "adir"))
+    Path(inbox, "adir", "inner").write_text("x")
+    Path(inbox, "bad.json").write_text("{not json")
+    os.mkfifo(os.path.join(inbox, "pipe.json"))
+    act.run(m.cfg(), m.host)
+    assert os.listdir(inbox) == []
+    assert len(os.listdir(m.cfg().done)) == 4
+
+
+def test_the_units_set_start_and_trigger_limits_on_purpose():
+    assert "StartLimitIntervalSec=" in (REPO / "server" / "ocw-upgrade.service").read_text()
+    assert "StartLimitBurst=" in (REPO / "server" / "ocw-upgrade.service").read_text()
+    path = (REPO / "server" / "ocw-upgrade.path").read_text()
+    assert "TriggerLimitIntervalSec=" in path and "TriggerLimitBurst=" in path
+
+
+def test_no_new_upgrade_while_the_last_one_needs_an_operator_until_clear_failure(m, capsys):
+    m.host.unhealthy_versions.add("5.47.0")
+    m.env["OCW_UPDATER_FAULT"] = "rollback_fail"
+    m.build_release("5.47.0")
+    m.put_artifacts("5.47.0")
+    m.host.schema_on_start["5.47.0"] = 10
+    assert m.updater().apply(m.request("5.47.0", correlation_id="upg-00000301")) == "failed_needs_operator"
+    m.env.pop("OCW_UPDATER_FAULT")
+    m.host.unhealthy_versions.clear()
+    m.build_release("5.48.0")
+    m.put_artifacts("5.48.0")
+    m.host.schema_on_start["5.48.0"] = 10
+    assert m.updater().apply(m.request("5.48.0", correlation_id="upg-00000302")) == "rejected"
+    rej = json.loads((m.data / "upgrade" / "rejections" / "upg-00000302.json").read_text())
+    assert rej["code"] == "failed_before"
+    assert cli(m, "clear-failure") == 0
+    assert m.updater().apply(m.request("5.48.0", correlation_id="upg-00000303")) == "completed"

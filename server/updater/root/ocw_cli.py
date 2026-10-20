@@ -524,6 +524,10 @@ def cmd_clear_failure(a, cfg, host):
     f = act.read_json(cfg.failures_path, {}) or {}
     cleared = sorted((f.get("versions") or {}))
     act.write_json_atomic(cfg.failures_path, {"versions": {}, "cleared_at": act.iso(host.now())})
+    st = act.read_json(cfg.state_path)
+    if isinstance(st, dict) and st.get("result") == "failed_needs_operator":
+        st.update(result="failed", operator_cleared_at=act.iso(host.now()))  # the operator has dealt with it: new requests are allowed again
+        act.write_json_atomic(cfg.state_path, st)
     _audit(cfg, host, "upgrade.clear_failure", {"cleared": cleared, "via": "cli", "correlation_id": None})
     print("failure record cleared" + (f" ({', '.join(cleared)} may be staged and applied again)" if cleared else ""))
     return EXIT_OK

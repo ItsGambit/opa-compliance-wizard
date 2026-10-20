@@ -9,6 +9,10 @@
 [Unit]
 Description=Activate a staged OPA Compliance Wizard release (and resume after a crash)
 After=network.target local-fs.target
+# Set on purpose: the path unit can start this service often (a request, a stray file), but never in a tight loop that trips the
+# default limit and leaves the service failed. Every run drains the inbox, so a burst of starts is harmless.
+StartLimitIntervalSec=120
+StartLimitBurst=30
 
 [Service]
 Type=oneshot

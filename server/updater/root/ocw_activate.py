@@ -552,6 +552,10 @@ class Updater:
             raise StepFailed("request_invalid", "bad not_before")
         if self.in_flight():
             raise StepFailed("in_flight", "another upgrade is in progress")
+        last = read_json(self.cfg.state_path) or {}
+        if last.get("result") == "failed_needs_operator":
+            raise StepFailed("failed_before", "the last upgrade failed and could not be rolled back automatically; an operator must "
+                                              "check `ocw-updater status`, fix it, then run `ocw-updater clear-failure`")
         f = self.failures()
         rec = f["versions"].get(req["version"])
         if rec and rec.get("count", 0) >= 1:
@@ -1624,9 +1628,13 @@ def process_directory(up, directory, due_only=False):
     except OSError:
         return results
     for name in names:
-        if not name.endswith(".json"):
-            continue
         path = os.path.join(directory, name)
+        if not name.endswith(".json"):
+            # anything we will not process leaves the directory: a stray entry would otherwise keep the path unit
+            # (DirectoryNotEmpty=) starting this service in a loop
+            log("WARN", f"unexpected entry {name[:60]!r} in {os.path.basename(os.path.dirname(directory)) or directory}: moved aside")
+            _discard(path, cfg)
+            continue
         try:
             req = read_request_file(cfg, path, up.uid)
         except (StepFailed, OSError) as exc:
