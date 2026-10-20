@@ -608,8 +608,11 @@ def test_rollback_is_offered_only_inside_the_window(armed):
 
 def test_restore_from_the_page(armed):
     _applied(armed)
-    assert armed.post({"kind": "restore", "confirm": "RESTORE "}).json()["reason"] == "confirm_required"
-    _op(armed, {"kind": "restore", "confirm": "RESTORE"})
+    name = armed.status()["upgrade"]["run"]["backup"]["name"]
+    assert armed.post({"kind": "restore", "confirm": "RESTORE ", "backup": name}).json()["reason"] == "confirm_required"
+    assert armed.post({"kind": "restore", "confirm": "RESTORE"}).json()["reason"] == "backup_required"                # must name the copy
+    assert armed.post({"kind": "restore", "confirm": "RESTORE", "backup": "audit_store-pre-9.9.9-1.db"}).json()["reason"] == "target_changed"
+    _op(armed, {"kind": "restore", "confirm": "RESTORE", "backup": name})
     armed.m.host.clock = time.time()
     uf.act.run(armed.m.cfg(), armed.m.host)
     run = armed.status()["upgrade"]["run"]
@@ -618,7 +621,7 @@ def test_restore_from_the_page(armed):
 
 
 def test_restore_without_a_backup_is_refused_before_mfa(armed):
-    r = armed.post({"kind": "restore", "confirm": "RESTORE"})
+    r = armed.post({"kind": "restore", "confirm": "RESTORE", "backup": "audit_store-pre-5.47.0-20260101T000000Z.db"})
     assert r.status_code == 409 and r.json()["reason"] in ("no_backup", "updater_not_installed")
 
 
@@ -631,6 +634,9 @@ def test_clear_failure_and_bundle_rebuild_from_the_page(armed):
     assert view["run"]["result"] == "rolled_back" and view["failures"][TARGET]["count"] == 1
     assert view["run"]["bundle"]["name"]
     first = view["run"]["bundle"]["name"]
+    st = json.loads((armed.m.data / "upgrade" / "state.json").read_text())
+    st["bundle"]["at"] = iso(datetime.now(timezone.utc) - timedelta(hours=1))         # (a repeat within five minutes is refused by the updater)
+    (armed.m.data / "upgrade" / "state.json").write_text(json.dumps(st))
     _op(armed, {"kind": "bundle", "include_hosts": True})
     armed.m.host.clock = time.time()
     uf.act.run(armed.m.cfg(), armed.m.host)
@@ -644,7 +650,7 @@ def test_clear_failure_and_bundle_rebuild_from_the_page(armed):
     assert armed.post({"kind": "clear_failure"}).json()["reason"] == "nothing_to_clear"
 
 
-def test_backups_table_and_typed_delete(armed):
+def test_backups_table_and_deleting_is_a_command_line_action(armed):
     _applied(armed)
     d = armed.m.data / "upgrade" / "backups"
     old = d / "audit_store-pre-5.40.0-20250101T000000Z.db"
@@ -653,19 +659,44 @@ def test_backups_table_and_typed_delete(armed):
     armed.m.updater().publish_backups()
     rows = armed.status()["upgrade"]["backups"]["backups"]
     assert len(rows) == 2 and all("/" not in r["name"] for r in rows)
-    assert armed.post({"kind": "prune_backups", "keep_last": 1}).json()["reason"] == "confirm_required"
-    assert armed.post({"kind": "prune_backups", "confirm": "PRUNE", "keep_last": 1, "names": [old.name]}).status_code == 400
-    assert armed.post({"kind": "prune_backups", "confirm": "PRUNE", "names": ["../x.db"]}).status_code == 400
-    assert armed.post({"kind": "prune_backups", "confirm": "PRUNE", "names": ["audit_store-pre-9.9.9-1.db"]}).json()["reason"] == "target_changed"
-    _op(armed, {"kind": "prune_backups", "confirm": "PRUNE", "keep_last": 1})
-    uf.act.run(armed.m.cfg(), armed.m.host)
-    assert not old.exists()
-    assert len(armed.status()["upgrade"]["backups"]["backups"]) == 1
-    assert armed.post({"kind": "prune_backups", "confirm": "PRUNE", "keep_last": 1}).json()["reason"] == "nothing_to_delete"
+    for body in ({"kind": "prune_backups", "confirm": "PRUNE", "keep_last": 1}, {"kind": "prune_backups"},
+                 {"kind": "prune_backups", "confirm": "PRUNE", "names": [old.name]}):
+        r = armed.post(body)
+        assert r.status_code == 409 and r.json()["reason"] == "cli_only" and "ocw-updater prune-backups" in r.json()["error"]
+    assert armed.requests_written() == [] and old.exists()
+
+
+def test_clear_failure_from_the_page_is_refused_while_the_run_needs_an_operator(armed):
+    _applied(armed)
+    st = json.loads((armed.m.data / "upgrade" / "state.json").read_text())
+    st["result"] = "failed_needs_operator"
+    (armed.m.data / "upgrade" / "state.json").write_text(json.dumps(st))
+    r = armed.post({"kind": "clear_failure"})
+    assert r.status_code == 409 and r.json()["reason"] == "needs_operator" and "clear-failure" in r.json()["error"]
+    assert armed.requests_written() == []
+
+
+def test_an_old_activator_gets_a_reason_instead_of_a_request_it_would_refuse(armed, monkeypatch):
+    _applied(armed)
+    monkeypatch.setattr(upgrade, "updater_activator_version", lambda: "5.47.0")
+    for body in ({"kind": "rollback", "confirm": "ROLLBACK"}, {"kind": "clear_failure"}, {"kind": "bundle"}):
+        r = armed.post(body)
+        assert r.status_code == 409 and r.json()["reason"] == "activator_too_old" and r.json()["activator"] == "5.47.0"
+    assert armed.requests_written() == []
+
+
+def test_a_missing_backups_list_means_unknown_not_none_for_the_restore_pre_check(armed):
+    _applied(armed)
+    name = armed.status()["upgrade"]["run"]["backup"]["name"]
+    f = armed.m.data / "upgrade" / "backups-status.json"
+    if f.exists():
+        f.unlink()
+    r = armed.post({"kind": "restore", "confirm": "RESTORE", "backup": name})
+    assert r.status_code == 202                        # accepted for the MFA approval: not refused as "no backup"
 
 
 def test_operations_need_an_admin_and_the_updater(armed):
-    for body in ({"kind": "rollback", "confirm": "ROLLBACK"}, {"kind": "clear_failure"}, {"kind": "prune_backups", "confirm": "PRUNE", "keep_last": 1}):
+    for body in ({"kind": "rollback", "confirm": "ROLLBACK"}, {"kind": "clear_failure"}, {"kind": "restore", "confirm": "RESTORE", "backup": "audit_store-pre-5.47.0-20260101T000000Z.db"}):
         assert requests.post(armed.base_url + "/api/upgrade/request", json=body, headers=_who("00uUSER"), timeout=10).status_code == 403
     os.rmdir(armed.m.data / "upgrade" / "inbox" / "requests")
     assert armed.post({"kind": "clear_failure"}).json()["reason"] == "updater_not_installed"

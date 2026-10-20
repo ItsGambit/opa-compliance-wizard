@@ -403,8 +403,16 @@ def new_correlation_id():
     return "upg-" + uuid.uuid4().hex[:8]
 
 
-ACTION_KINDS = {"rollback": ("confirm",), "restore": ("confirm",), "clear_failure": (), "bundle": ("include_hosts", "for_correlation_id"),
-                "prune_backups": ("confirm", "keep_last", "names")}
+# Deleting the pre-upgrade copies is a command-line operation only (`ocw-updater prune-backups`): the root-held copies are the
+# ones a compromised web process cannot reach, so the inbox does not take a request to delete them.
+ACTION_KINDS = {"rollback": ("confirm",), "restore": ("confirm", "backup"), "clear_failure": (), "bundle": ("include_hosts", "for_correlation_id")}
+OPERATIONS_MIN_ACTIVATOR = (5, 48, 0)
+
+
+def activator_too_old(activator):
+    """True when the installed activator is known to be older than the one that takes the in-app operations (None = unknown: not refused)."""
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)$", str(activator or ""))
+    return bool(m) and tuple(int(x) for x in m.groups()) < OPERATIONS_MIN_ACTIVATOR
 BACKUP_NAME_RE = re.compile(r"^audit_store-pre-[0-9A-Za-z._-]{1,80}\.db$")
 
 
@@ -450,7 +458,7 @@ def write_request(*, correlation_id, version, sha256, action_id, actor, trigger_
 
 
 def write_action(action, *, correlation_id, action_id, actor, trigger_kind="app", now=None, **fields):
-    """Write a rollback / restore / clear_failure / bundle / prune_backups request (closed set of fields, checked here and again
+    """Write a rollback / restore / clear_failure / bundle request (closed set of fields, checked here and again
     by the updater). The typed confirmations are part of the request: the updater refuses it without them."""
     now = now or datetime.now(timezone.utc)
     if action not in ACTION_KINDS or set(fields) - set(ACTION_KINDS[action]):
@@ -458,23 +466,17 @@ def write_action(action, *, correlation_id, action_id, actor, trigger_kind="app"
     req = _base_request(action, correlation_id, action_id, actor, trigger_kind, now)
     if action == "rollback" and fields.get("confirm") != "ROLLBACK":
         raise ValueError("rollback needs the typed confirmation")
-    if action == "restore" and fields.get("confirm") != "RESTORE":
-        raise ValueError("restore needs the typed confirmation")
+    if action == "restore":
+        if fields.get("confirm") != "RESTORE":
+            raise ValueError("restore needs the typed confirmation")
+        if not isinstance(fields.get("backup"), str) or not BACKUP_NAME_RE.match(fields["backup"]):
+            raise ValueError("restore must name the backup copy")
     if action == "bundle":
         if not isinstance(fields.get("include_hosts", False), bool):
             raise ValueError("include_hosts must be true or false")
         fc = fields.get("for_correlation_id")
         if fc is not None and not CID_RE.match(str(fc)):
             raise ValueError("invalid correlation id")
-    if action == "prune_backups":
-        keep, names = fields.get("keep_last"), fields.get("names")
-        if fields.get("confirm") != "PRUNE" or (keep is None) == (names is None):
-            raise ValueError("prune needs PRUNE and exactly one of keep_last / names")
-        if keep is not None and (not isinstance(keep, int) or isinstance(keep, bool) or not 1 <= keep <= 50):
-            raise ValueError("keep_last must be 1 to 50")
-        if names is not None and (not isinstance(names, list) or not 1 <= len(names) <= 50
-                                  or not all(isinstance(n, str) and BACKUP_NAME_RE.match(n) for n in names)):
-            raise ValueError("names must be 1 to 50 backup file names")
     req.update({k: v for k, v in fields.items() if v is not None})
     path = _write_inbox(req)
     with _lock:
