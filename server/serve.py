@@ -2177,13 +2177,18 @@ class Handler(SimpleHTTPRequestHandler):
             d["pending_approval"] = None
             if eff_kind == "apply":
                 if sched:
-                    d["schedule"]["status"] = "replaced"
+                    if d["schedule"]:
+                        d["schedule"]["status"] = "replaced"
                     self._log_audit_event(actor_email, actor_sub, "upgrade.cancelled", {
                         "correlation_id": sched.get("correlation_id"), "version": sched.get("version"), "what": "schedule",
                         "reason": "the administrator chose to upgrade now instead"})
+                try:
+                    upgrade_service.write_request(correlation_id=cid, version=version, sha256=sha256, action_id=action_id,
+                                                  actor=actor_email or actor_sub, trigger_kind="app", now=now)
+                except OSError as exc:
+                    return 409, {"error": f"The upgrade inbox could not be written ({exc.strerror}). Nothing was started; re-run "
+                                          "server/install.sh or check the permissions of the upgrade directory.", "reason": "inbox_not_writable"}
                 upgrade_service.save_schedule(d)
-                upgrade_service.write_request(correlation_id=cid, version=version, sha256=sha256, action_id=action_id,
-                                              actor=actor_email or actor_sub, trigger_kind="app", now=now)
                 self._log_audit_event(actor_email, actor_sub, "upgrade.requested", {**details, "when": "now"})
                 return 200, {"kind": "apply", "correlation_id": cid, "version": version}
             d["schedule"] = {"correlation_id": cid, "version": version, "sha256": sha256, "when_utc": when_utc, "entered": entered,

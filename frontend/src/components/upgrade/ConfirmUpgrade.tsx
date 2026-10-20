@@ -191,8 +191,7 @@ export function ConfirmUpgrade({ status, preview, mode, choice, isLocal, adminEm
             <p className="text-xs text-text-dim m-0 max-w-[80ch]">
               If any health check fails, the previous code ({preview.installed_version}) is put back automatically and the service restarted; <strong>your data is not touched by that</strong>.
               {unsafe.length > 0 && <> Because migration {unsafe.map(x => x.version).join(', ')} cannot be undone, {preview.installed_version} would then run on the newer schema.</>}{' '}
-              Restoring the pre-upgrade copy is a separate action an operator chooses later, and it drops events synced after the upgrade. A redacted support bundle is prepared for you to download.{' '}
-              <a href="https://github.com/ItsGambit/opa-compliance-wizard#upgrading" target="_blank" rel="noreferrer noopener" className="text-accent-text underline">Rollback and restore, in the README</a>
+              Restoring the pre-upgrade copy is a separate action an operator chooses later, and it drops events synced after the upgrade. A redacted support bundle is prepared for you to download. (README, "Upgrading": rollback and restore)
             </p>
           </div>
         </div>

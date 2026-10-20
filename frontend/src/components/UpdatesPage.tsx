@@ -363,7 +363,7 @@ export function UpdatesPage({ onOpenKeys }: { onOpenKeys: () => void }) {
   const sched = u?.schedule && (u.schedule.status === 'scheduled' || u.schedule.status === 'missed') ? u.schedule : null
   const busy = running || sched?.status === 'scheduled' || startedWaiting
   const failureShown = !!run && isFailureResult(run)
-  const successShown = !!run && run.result === 'completed' && run.action === 'apply' && u?.rollback != null
+  const successShown = !!run && run.result === 'completed' && run.action === 'apply' && !!u?.rollback?.available   // for the 24 h rollback window
   const editing = view === 'confirm' && !!preview
   const openSchedule = (m: 'schedule' | 'reschedule') => { setScheduleMode(m); setScheduleOpen(true) }
   const pending = u?.pending_approval ?? null

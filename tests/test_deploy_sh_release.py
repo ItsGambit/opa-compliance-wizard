@@ -196,8 +196,7 @@ def test_git_ref_deploys_still_work_and_say_they_are_unsigned(d):
     assert started["details"]["source"] == "unsigned_git"
 
 
-def test_the_deprecation_notice_can_be_silenced_by_a_maintainer(d, monkeypatch):
-    monkeypatch.setenv("OPA_DEPLOY_MAINTAINER", "1")
-    proc = d.run()
+def test_the_deprecation_notice_can_be_silenced_by_a_maintainer(d):
+    proc = d.run(env={**d.env(), "OPA_DEPLOY_MAINTAINER": "1"})
     assert proc.returncode == 0, d.out
     assert "UNSIGNED source" in d.out and "DEPRECATED" not in d.out
