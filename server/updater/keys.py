@@ -349,7 +349,7 @@ def pick_signer(eff, key_id, role, signed_at=None, version=None, sha256=None):
         record = eff["revoked"].get(key_id) or {}
         pinned = (record.get("known_good") or {}).get(version)
         if not pinned or sha256 is None or pinned != sha256:
-            raise KeyListError("revoked_key", f"key {key_id} has been revoked: releases it signed are refused unless the revocation "
+            raise KeyListError("revoked_key", f"key {key_id} was revoked: releases it signed are refused unless the revocation "
                                "pins this exact file. Do not install it.")
     if entry["alg"] == "es256":
         return p256.parse_public_key(entry["public_key"])[1]
