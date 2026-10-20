@@ -347,11 +347,43 @@ def cmd_apply(a, cfg, host):
         return EXIT_OK
     _audit(cfg, host, "upgrade.requested", {"correlation_id": cid, "version": version, "sha256": info["sha256"], "via": "cli",
                                            "acknowledged": ["rollback is code-only"]})
-    os.makedirs(cfg.requests, exist_ok=True)
-    path = os.path.join(cfg.requests, f"{cid}.json")
-    act.write_json_atomic(path, req, 0o600)
+    try:
+        _write_request(cfg, cid, req)
+    except (OSError, act.StepFailed) as exc:
+        print(f"refused: cannot write the request into the inbox: {getattr(exc, 'strerror', None) or exc} (run server/install.sh)", file=sys.stderr)
+        return EXIT_REFUSED
     host.systemctl("start", "--no-block", "ocw-upgrade.service")
     return follow(a, cfg, host, cid)
+
+
+def _write_request(cfg, cid, req):
+    """Put the request file into the application-owned inbox without trusting it: each directory on the way is opened without
+    following a link (relative to the one before), its owner is checked, the file gets a random temporary name created
+    exclusively, and is renamed into place within that directory."""
+    import secrets
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    uid, _gid = cfg.ids()
+    allowed = {0, os.geteuid()} | ({uid} if uid is not None else set())
+    rel = os.path.relpath(cfg.requests, cfg.upgrade).split(os.sep)
+    fd = os.open(cfg.upgrade, flags)
+    try:
+        for part in rel:
+            nxt = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        if os.fstat(fd).st_uid not in allowed:
+            raise act.StepFailed("request_invalid", "the request inbox belongs to an unexpected account; refusing to write into it")
+        data = (json.dumps(req, indent=2, sort_keys=True, default=str)).encode("utf-8")
+        tmp = f".{cid}.{secrets.token_hex(6)}.tmp"
+        ffd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=fd)
+        with os.fdopen(ffd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.rename(tmp, f"{cid}.json", src_dir_fd=fd, dst_dir_fd=fd)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def follow(a, cfg, host, cid):

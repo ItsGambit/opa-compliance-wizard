@@ -513,3 +513,48 @@ def test_root_honours_them_only_with_a_root_owned_marker(tmp_path, monkeypatch):
 def test_the_wrapper_runs_the_root_updater_with_a_clean_environment():
     text = (REPO / "server" / "ocw-updater.sh").read_text()
     assert 'exec env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin' in text and '"$PY3" -I -B "$OPT/updater/ocw_activate.py" cli' in text
+
+
+def test_apply_writes_its_request_through_no_link_and_with_a_random_temporary_name(m, tmp_path):
+    import ocw_cli as c
+    req = {"schema": 1, "x": 1}
+    c._write_request(m.cfg(), "upg-0000aaaa", req)
+    assert json.loads((m.cfg().requests and Path(m.cfg().requests) / "upg-0000aaaa.json").read_text()) == req
+    assert not [p for p in Path(m.cfg().requests).iterdir() if p.name.endswith(".tmp")]
+    # the inbox replaced by a link to another directory is refused
+    inbox = m.data / "upgrade" / "inbox"
+    other = tmp_path / "elsewhere"
+    (other / "requests").mkdir(parents=True)
+    os.rename(inbox, tmp_path / "moved")
+    os.symlink(other, inbox)
+    with pytest.raises(OSError):
+        c._write_request(m.cfg(), "upg-0000bbbb", req)
+    assert list((other / "requests").iterdir()) == []
+
+
+def test_a_release_that_needs_install_sh_is_refused_with_a_clear_reason(m):
+    m.build_release("5.47.0", manifest_over={"requires_install_sh": True})
+    m.put_artifacts("5.47.0")
+    assert m.updater().apply(m.request("5.47.0", correlation_id="upg-00000401")) == "failed"
+    st = m.read_state()
+    assert st["reason_code"] == "needs_install_sh" and "install.sh" in st["error"]
+    assert os.readlink(m.opt / "current") == "releases/5.46.0"
+
+
+def test_requires_install_sh_is_a_real_comparison_with_the_previous_tag(tmp_path):
+    tool = _release_tool()
+    repo = tmp_path / "repo"
+    (repo / "server").mkdir(parents=True)
+    run = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True)  # noqa: E731
+    run("init", "-q")
+    run("config", "user.email", "t@example.com")
+    run("config", "user.name", "t")
+    for n in tool.INSTALL_SH_FILES:
+        (repo / n).write_text("same\n")
+    run("add", "-A")
+    run("commit", "-q", "-m", "one")
+    run("tag", "v1.0.0")
+    same = {n: (0o644, b"same\n") for n in tool.INSTALL_SH_FILES}
+    assert tool._requires_install_sh(repo, same, "1.1.0") is False
+    changed = dict(same, **{"server/ocw-upgrade.service": (0o644, b"different\n")})
+    assert tool._requires_install_sh(repo, changed, "1.1.0") is True

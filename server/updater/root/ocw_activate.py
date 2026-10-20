@@ -75,7 +75,7 @@ REASONS = {"request_invalid", "request_replayed", "request_stale", "signature_in
            "health_unit", "health_version", "health_healthz", "health_gate", "health_quick_check", "health_schema",
            "health_chain", "health_smoke", "rollback_failed", "interrupted", "failed_before", "too_many_failures",
            "version_failed_before", "in_flight", "bad_release", "bad_artifact", "revoked_key", "retired_key", "wrong_role",
-           "no_key_pinned", "keys_changed", "unknown_alg", "no_trust", "bad_trust", "internal_error"}
+           "no_key_pinned", "keys_changed", "unknown_alg", "no_trust", "bad_trust", "internal_error", "needs_install_sh"}
 HEALTH_REASON = {"unit_active": "health_unit", "version": "health_version", "healthz": "health_healthz", "gate_401": "health_gate",
                  "quick_check": "health_quick_check", "schema_version": "health_schema", "chain_heads": "health_chain",
                  "smoke_read": "health_smoke"}
@@ -714,6 +714,10 @@ class Updater:
                                                          "downtime_estimate_seconds", "nginx_template_changed", "expected_schema_version",
                                                          "migration_time_estimate_seconds", "nginx_change_required", "requires_install_sh") if k in manifest}
         self.st["downtime_estimate_seconds"] = manifest.get("downtime_estimate_seconds") or 60
+        if manifest.get("requires_install_sh"):
+            raise StepFailed("needs_install_sh", f"{ver} changes the systemd units, the ocw-updater command or server/install.sh, which the "
+                                                 "updater cannot replace by itself: unpack this release and run `sudo bash server/install.sh` "
+                                                 "from it, then apply it again", "staged")
         self.st["signed_by"] = info["key_id"]
         self.st["sha256"] = info["sha256"]
         self._adoption = (info["adoption"], info["candidate_keys"])

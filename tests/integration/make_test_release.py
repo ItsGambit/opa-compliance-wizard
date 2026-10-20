@@ -9,7 +9,10 @@ verifies a real one -- against the TEST key list that was installed as the serve
     make_test_release.py keygen <dir>
         creates <dir>/primary.key (Ed25519 seed, 0600), <dir>/standby.key (P-256), <dir>/other.key (a stranger's Ed25519
         key) and <dir>/release_keys.json (the test key list: primary + standby)
-    make_test_release.py build <checkout> <keys dir> <out dir> <version> [--break MODE] [--sign-with primary|other]
+    make_test_release.py revoke <keys dir> <out file>
+        writes a TEST revocation (serial 1) signed by the test standby key that revokes the test primary key (nothing pinned)
+        and adds one throwaway release key
+    make_test_release.py build <checkout> <keys dir> <out dir> <version> [--break MODE] [--sign-with primary|other] [--template-comment]
         MODE: none (default) | crash (the application exits at start: a crash loop) | unhealthy (/healthz says degraded)
 
 Needs the `cryptography` package (apt: python3-cryptography) and the checkout's tests/release_helpers.py.
@@ -35,7 +38,7 @@ from cryptography.hazmat.primitives import serialization  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 
-from release_helpers import TestKey, TestStandby, key_list, sign_release  # noqa: E402
+from release_helpers import TestKey, TestStandby, key_list, make_revocation, revocation_payload, sign_release  # noqa: E402
 
 SKIP_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache", "dist", "dist.new", "dist.old", ".claude"}
 SKIP_FILES = {"audit_log.jsonl", "access_control.json", "banner_config.json", "environments.json", "update_check.json",
@@ -89,11 +92,32 @@ def collect(checkout):
     return files
 
 
-def build(checkout, keys_dir, out_dir, version, mode="none", sign_with="primary"):
+def _load_standby(path):
+    st = TestStandby.__new__(TestStandby)
+    st.priv = serialization.load_pem_private_key(Path(path).read_bytes(), password=None)
+    from server.updater import p256
+    st.public_key = p256.spki_b64(st.priv.public_key())
+    st.key_id = p256.parse_public_key(st.public_key)[0]
+    st.status, st.since = "active", "5.46.0"
+    return st
+
+
+def revoke(keys_dir, out_file):
+    primary = _load_ed(Path(keys_dir) / "primary.key")
+    standby = _load_standby(Path(keys_dir) / "standby.key")
+    payload = revocation_payload(1, revoke=[primary.key_id], add_keys=[TestKey()], issued="2026-06-01T00:00:00Z")
+    make_revocation(out_file, [standby], payload)
+    print(f"test revocation written to {out_file} (revokes {primary.key_id})")
+
+
+def build(checkout, keys_dir, out_dir, version, mode="none", sign_with="primary", template_comment=False):
     files = collect(Path(checkout))
     engine = files["create_secret_folders.py"][1].decode()
     files["create_secret_folders.py"] = (0o644, re.sub(r'^SCRIPT_VERSION = "[^"]+"', f'SCRIPT_VERSION = "{version}"', engine, flags=re.M).encode())
     files["server/release_keys.json"] = (0o644, (Path(keys_dir) / "release_keys.json").read_bytes())
+    if template_comment:  # a template that differs from the live site only by a comment: exercises `nginx -t` inside the root unit
+        tpl = files["server/nginx-opa-secrets-wizard.conf"][1] + b"\n# vm test: template changed\n"
+        files["server/nginx-opa-secrets-wizard.conf"] = (0o644, tpl)
     serve = files["server/serve.py"][1].decode()
     if mode == "crash":
         # must sit BEFORE the `__main__` call: appended after it, the server would run forever and the line never be reached
@@ -136,11 +160,17 @@ def main():
     b.add_argument("version")
     b.add_argument("--break", dest="mode", default="none", choices=["none", "crash", "unhealthy"])
     b.add_argument("--sign-with", default="primary", choices=["primary", "other"])
+    b.add_argument("--template-comment", action="store_true")
+    r = sub.add_parser("revoke")
+    r.add_argument("keys")
+    r.add_argument("out")
     a = ap.parse_args()
     if a.cmd == "keygen":
         keygen(a.dir)
+    elif a.cmd == "revoke":
+        revoke(a.keys, a.out)
     else:
-        build(a.checkout, a.keys, a.out, a.version, a.mode, a.sign_with)
+        build(a.checkout, a.keys, a.out, a.version, a.mode, a.sign_with, a.template_comment)
 
 
 if __name__ == "__main__":
