@@ -235,11 +235,12 @@ chain heads are unchanged; an authenticated read works). Any failure rolls back 
   migrated the archive schema forward; the old code runs on it when the migration is *rollback-safe* (each migration says so
   in `server/schema_migrations.json` and the release manifest; `ocw-updater apply` tells you before you approve).
 * **Restore** (`sudo ocw-updater restore --confirm RESTORE`) replaces the archive with the copy taken before the last upgrade. It
-  **loses every event archived since** and is never automatic. The database it replaces is moved aside (never deleted).
+  **loses every event archived since** and is never automatic. A request from the Updates page names the exact copy that page showed and is refused if it would restore another one or an upgrade is running. The database it replaces is moved aside (never deleted).
   Only do this if the maintainers tell you to, and after you have the support bundle.
 * If the rollback itself fails the updater does not leave the service down silently: nginx shows a page that says an operator
   is needed, a `CRIT` line goes to the journal, `upgrade.failed` is written to the Audit Log, the state is `failed_needs_operator`,
-  and the bundle is written. `ocw-updater status` tells you what to do; the previous code is still on disk.
+  and the bundle is written. `ocw-updater status` tells you what to do; the previous code is still on disk. In that state only
+  `sudo ocw-updater clear-failure` on the server ends it: the Updates page does not offer to.
 * A version that failed is not tried again until `sudo ocw-updater clear-failure`; after two failures it stays off.
 
 #### The support bundle ("send to the maintainers")
@@ -276,7 +277,7 @@ covers the first install; a vendored-wheel release bundle is planned.
 | `apply <version> [--at "YYYY-MM-DD HH:MM" [--tz Europe/London]]` | install now or schedule (typed confirmation); `cancel` removes a schedule |
 | `rollback` / `restore --confirm RESTORE` | code-only rollback / archive restore, as above |
 | `bundle [--correlation ID] [--include-hosts]`, `clear-failure` | support bundle; allow a failed version again |
-| `prune-backups --keep N` or `--name FILE ...` with `--confirm PRUNE` | delete old pre-upgrade archive copies (never the newest, never the last upgrade's) |
+| `prune-backups --keep N` or `--name FILE ...` with `--confirm PRUNE` | delete old pre-upgrade archive copies (never the newest, never the last upgrade's); command line only, the Updates page cannot do this |
 | `trust list`, `trust apply <revocation.json>`, `trust add <key.json>` | the signing keys root trusts (the standby key can only change by a signed revocation; `add` takes only an active release key and a typed `TRUST`) |
 | `nginx-sync` | apply the current release's nginx template (maintenance page) |
 | `check`, `enable-check`, `disable-check`, `verify`, `audit`, `keys ...` | the 5.46.0 tools (run as the application's account automatically) |
@@ -303,9 +304,9 @@ On an install that has run `server/install.sh`, administrators can upgrade witho
 Notes:
 
 * **Two-person rule** (Update check, "Change…"; off by default): a second, different administrator must approve within 24 hours.
-* **Rollback, restore, clear failure, rebuilding the support bundle and deleting old pre-upgrade backups are buttons** on the page (typed confirmation where something is
-  lost or deleted: `ROLLBACK`, `RESTORE`, `PRUNE`; then the MFA approval), and each is also a command: `sudo ocw-updater rollback | restore --confirm RESTORE | clear-failure | bundle [--include-hosts] | prune-backups --keep N --confirm PRUNE`.
-  The updater re-checks every request and refuses what the command line would refuse; the newest backup and the one the last upgrade took are never deleted. After a failure the same
+* **Rollback, restore, clear failure and rebuilding the support bundle are buttons** on the page (typed confirmation where something is
+  lost: `ROLLBACK`, `RESTORE`; then the MFA approval), deleting old pre-upgrade backups is a command only, and each is also a command: `sudo ocw-updater rollback | restore --confirm RESTORE | clear-failure | bundle [--include-hosts] | prune-backups --keep N --confirm PRUNE`.
+  The updater re-checks every request and refuses what the command line would refuse; the newest backup and the one the last upgrade took are never deleted (by the command). After a failure the same
   version is refused until the failure is cleared; if the rollback itself failed the page says an operator must act on the server.
 * **Local (laptop) mode** does not offer this flow (no identity provider to step up with); it shows the commands `python launch.py upgrade` and
   `python launch.py upgrade --restore-previous`.
