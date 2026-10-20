@@ -7,10 +7,12 @@ import type { UpgradePreview, UpgradeRequestBody, UpgradeStatus } from '../../ty
 import { formatDateTime } from '../../utils/format'
 import { beginStepUp } from '../../utils/stepUp'
 import { rememberRequested } from '../../utils/upgradeRequested'
-import { browserZone, formatDuration, formatInZone, formatUtc, serverZoneOf, shortSha, toIsoUtc } from '../../utils/upgradeFlow'
+import { agoText, browserZone, formatDuration, formatInZone, formatUtc, serverZoneOf, shortSha, toIsoUtc } from '../../utils/upgradeFlow'
+import { README_ROLLBACK_URL } from '../../utils/links'
+import { useEnvironments } from '../../api/hooks'
 import { formatBytes } from '../../utils/upgrade'
 import type { ScheduleChoice } from './ScheduleDialog'
-import { Badge, CARD_TITLE, KeyId, KV, Row, SEC_LABEL } from './parts'
+import { Badge, CARD_TITLE, Excerpt, KeyId, KV, Row, SEC_LABEL } from './parts'
 
 export type ConfirmMode = 'apply' | 'schedule' | 'reschedule' | 'second'
 
@@ -34,6 +36,7 @@ const SEC = 'border-t border-border-sub pt-3 mt-3'
  * then the step-up MFA approval bound to this version, hash and time. */
 export function ConfirmUpgrade({ status, preview, mode, choice, isLocal, adminEmail, onBack, onDone, onDecline }: Props) {
   const queryClient = useQueryClient()
+  const { data: envs } = useEnvironments()
   const [ack, setAck] = useState(false)
   const u = status.upgrade
   const pending = u?.pending_approval ?? null
@@ -97,7 +100,8 @@ export function ConfirmUpgrade({ status, preview, mode, choice, isLocal, adminEm
 
   return (
     <div className="flex flex-col gap-5">
-      <div>
+      <div className="flex items-start justify-between gap-4 flex-wrap">
+       <div>
         <nav aria-label="Breadcrumb" className="text-xs text-muted mb-1">
           <button type="button" className="bg-transparent border-0 p-0 cursor-pointer text-accent-text underline" onClick={onBack}>Updates</button> › Confirm upgrade
         </nav>
@@ -105,8 +109,13 @@ export function ConfirmUpgrade({ status, preview, mode, choice, isLocal, adminEm
         <p className="text-xs text-muted mt-1 mb-0 max-w-[72ch]">
           {second
             ? 'This install requires two admins. The first approval is recorded; the request runs only after a different admin approves the same artifact with MFA.'
-            : 'Everything below is read from the signed release information and checked live on this server. Approving binds your MFA to exactly this artifact.'}
+            : 'Everything below is read from the release manifest and checked live on this server. Approving binds your MFA to exactly this artifact.'}
         </p>
+       </div>
+       <div className="flex items-center gap-3 text-xs text-muted">
+         {envs?.active && <span>Connected: <span className="text-text-dim font-medium">{envs.active}</span></span>}
+         {adminEmail && <span className="text-text-dim font-medium">{adminEmail}</span>}
+       </div>
       </div>
 
       {second && pending && (
@@ -127,7 +136,7 @@ export function ConfirmUpgrade({ status, preview, mode, choice, isLocal, adminEm
       <section className="card p-4" aria-labelledby="t-what">
         <h3 className={CARD_TITLE} id="t-what">{second ? 'What the first admin approved — review it yourself' : 'You are approving'}</h3>
         <div className={KV}>
-          <Row label="Upgrade"><strong className="text-text text-sm">{preview.installed_version} → {preview.version}</strong></Row>
+          <Row label="Upgrade"><strong className="text-text text-sm">{preview.installed_version} → {preview.version}</strong>{preview.crosses && preview.crosses.length > 0 && <> (crosses {preview.crosses.join(', ')})</>}</Row>
           <Row label="When">
             {isScheduled && whenMs != null ? (
               <><Badge tone="warn">Scheduled</Badge>{' '}{serverZone ? formatInZone(whenMs, serverZone) : formatInZone(whenMs, browserZone())} · UTC {formatUtc(whenMs)} · about {formatDuration(approxDown)} of downtime</>
@@ -140,7 +149,7 @@ export function ConfirmUpgrade({ status, preview, mode, choice, isLocal, adminEm
           <Row label="Signature">
             <Badge tone="ok"><CheckCircle2 size={12} aria-hidden="true" />Verified</Badge> minisign Ed25519, key <KeyId id={preview.key_id} />
             {' '}({preview.key_role === 'release' ? 'primary' : preview.key_role}, {preview.key_status}{preview.key_since ? ` since ${preview.key_since}` : ''}).
-            {' '}The updater verifies the archive against this same signed hash, independently, before anything is installed.
+            The updater verifies it again, independently, before anything is installed.
           </Row>
           <Row label="Approver">
             {adminEmail ?? 'you'} · {isLocal ? 'no identity provider in local mode' : 'fresh MFA required'} · two-person rule: {status.check.second_approval ? 'on for this install' : 'off for this install'}
@@ -151,7 +160,7 @@ export function ConfirmUpgrade({ status, preview, mode, choice, isLocal, adminEm
           <div>
             <h4 className={`${SEC_LABEL} m-0 mb-2`}>What changes</h4>
             {m.changelog_excerpt
-              ? <p className="text-xs text-text-dim m-0 whitespace-pre-line max-w-[80ch]">{m.changelog_excerpt}</p>
+              ? <Excerpt text={m.changelog_excerpt} />
               : <p className="text-xs text-text-dim m-0">The release carries no change summary.</p>}
             <p className="text-[11px] text-muted mt-1.5 mb-0">{preview.manifest_source}.</p>
           </div>
@@ -164,7 +173,7 @@ export function ConfirmUpgrade({ status, preview, mode, choice, isLocal, adminEm
                     {x.rollback_safe
                       ? <CheckCircle2 size={14} className="text-win shrink-0 mt-px" aria-hidden="true" />
                       : <AlertTriangle size={14} className="text-warn shrink-0 mt-px" aria-hidden="true" />}
-                    <span><strong className="text-text">{x.version}</strong>{x.summary ? ` ${x.summary}` : ''} — {x.rollback_safe ? 'rollback-safe.' : <><strong>not rollback-safe</strong>. A code rollback after it keeps the new schema.</>}</span>
+                    <span><strong className="text-text">{x.version}</strong> {x.description ? x.description.charAt(0).toLowerCase() + x.description.slice(1) : `(since ${x.since ?? 'an earlier release'})`} — {x.rollback_safe ? 'rollback-safe.' : <><strong>not rollback-safe</strong>. A code rollback after it keeps the new schema.</>}</span>
                   </li>
                 ))}
               </ul>
@@ -182,8 +191,9 @@ export function ConfirmUpgrade({ status, preview, mode, choice, isLocal, adminEm
             <h4 className={`${SEC_LABEL} m-0 mb-2`}>Backup before the switch</h4>
             <p className="text-xs text-text-dim m-0 max-w-[80ch]">
               A copy of the archive (<code className="font-mono">audit_store.db</code>{preview.db_bytes ? `, ${formatBytes(preview.db_bytes)}` : ''}, taken with SQLite's online backup and integrity-checked),{' '}
-              <code className="font-mono">audit_log.jsonl</code> and <code className="font-mono">access_control.json</code> is written to the updater's backup directory
-              (<code className="font-mono">upgrade/backups/</code> in the data directory). Backups are never deleted automatically.
+              <code className="font-mono">audit_log.jsonl</code> and <code className="font-mono">access_control.json</code> is written to{' '}
+              <code className="font-mono break-all">{preview.backup_dir ? `${preview.backup_dir}/` : 'the upgrade/backups directory in the data directory'}</code>. Backups are never deleted automatically.
+              {preview.free_bytes?.data != null && <> Free space was checked {agoText(preview.checked_at) || 'just now'}: {formatBytes(preview.free_bytes.data)} on the data volume{preview.free_bytes.opt != null ? `, ${formatBytes(preview.free_bytes.opt)} on the code volume` : ''}.</>}
             </p>
           </div>
           <div>
@@ -191,7 +201,8 @@ export function ConfirmUpgrade({ status, preview, mode, choice, isLocal, adminEm
             <p className="text-xs text-text-dim m-0 max-w-[80ch]">
               If any health check fails, the previous code ({preview.installed_version}) is put back automatically and the service restarted; <strong>your data is not touched by that</strong>.
               {unsafe.length > 0 && <> Because migration {unsafe.map(x => x.version).join(', ')} cannot be undone, {preview.installed_version} would then run on the newer schema.</>}{' '}
-              Restoring the pre-upgrade copy is a separate action an operator chooses later, and it drops events synced after the upgrade. A redacted support bundle is prepared for you to download. (README, "Upgrading": rollback and restore)
+              Restoring the pre-upgrade copy is a separate action you would choose later, and it drops events synced after the upgrade. A redacted support bundle is prepared for you to download.{' '}
+              <a href={README_ROLLBACK_URL} target="_blank" rel="noreferrer noopener" className="text-accent-text underline">Rollback and restore, in the README</a>
             </p>
           </div>
         </div>
@@ -199,7 +210,7 @@ export function ConfirmUpgrade({ status, preview, mode, choice, isLocal, adminEm
         <div className={SEC}>
           <h4 className={`${SEC_LABEL} m-0 mb-2`}>Downtime</h4>
           <p className="text-xs text-text-dim m-0 max-w-[80ch]">
-            About {formatDuration(approxDown)} (manifest estimate {downtime} s{lastRun?.seconds != null ? `; the last upgrade here took ${Math.round(lastRun.seconds)} s` : ''}).
+            About {formatDuration(approxDown)} (manifest estimate {downtime} s{lastRun?.seconds != null ? `; last upgrade here took ${Math.round(lastRun.seconds)} s` : ''}).
             Signed-in users stay signed in and see a short "upgrading" page; a report being generated during the switch fails and must be re-run; a running sync finishes first and no new sync starts.
           </p>
         </div>

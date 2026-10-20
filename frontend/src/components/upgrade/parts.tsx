@@ -46,3 +46,15 @@ export function CommandBlock({ children, label }: { children: string; label: str
     <code aria-label={label} className="block p-2 rounded bg-bg-elevated text-text break-all select-all font-mono text-xs">{children}</code>
   )
 }
+
+/** A release's change summary ("5.48.0 — title\nparagraph…") with the version in bold, as the mockups show it. */
+export function Excerpt({ text }: { text: string }) {
+  const lines = text.split('\n')
+  const m = /^(\d+\.\d+\.\d+)( — )(.*)$/.exec(lines[0] ?? '')
+  const rest = lines.slice(1).join('\n').trim()
+  return (
+    <p className="m-0 text-xs text-text-dim whitespace-pre-line max-w-[80ch]">
+      {m ? <><strong className="text-text">{m[1]}</strong>{m[2]}{m[3]}{rest ? '\n' + rest : ''}</> : text}
+    </p>
+  )
+}

@@ -1,4 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
+import type { AuditLogEntry } from '../types'
 import {
   fetchAccessControl,
   fetchAdConnectionDiscoveryConfig,
@@ -16,6 +17,7 @@ import {
   fetchServiceAccountsReport,
   fetchSharedPermissions,
   fetchSyncStatus,
+  fetchAuditLog,
   fetchUpgradeNotice,
   fetchUpgradeStatus,
   fetchUserResourceAccess,
@@ -319,5 +321,16 @@ export function useAdConnectionDiscoveryConfig(connectionId: string | undefined)
     queryKey: ['ad_connection_discovery_config', connectionId],
     queryFn: () => fetchAdConnectionDiscoveryConfig(connectionId!),
     enabled: !!connectionId,
+  })
+}
+
+/** 5.48.0: the audit entries of one upgrade (same correlation id), from the most recent 200 entries. Admin-only (the audit log is). */
+export function useRunAudit(correlationId: string | null | undefined, enabled = true) {
+  return useQuery({
+    queryKey: ['audit_log', 'run', correlationId],
+    queryFn: async () => (await fetchAuditLog(200, 0)).entries,
+    select: (entries: AuditLogEntry[]) => entries.filter(e => (e.details as { correlation_id?: unknown } | undefined)?.correlation_id === correlationId),
+    enabled: enabled && !!correlationId,
+    staleTime: 15_000,
   })
 }

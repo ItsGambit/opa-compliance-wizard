@@ -28,3 +28,19 @@ export function readRequested(now = Date.now()): RequestedUpgrade | null {
 export function clearRequested(): void {
   try { sessionStorage.removeItem(KEY) } catch { /* nothing to clear */ }
 }
+
+const AUDIT_SEARCH_KEY = 'opa.auditSearch'
+
+/** "View the N audit entries": leave the search text for the Audit Log page to pick up (once) and go there. */
+export function openAuditLogFor(text: string, go: () => void = () => { window.location.hash = '#/audit_log' }): void {
+  try { sessionStorage.setItem(AUDIT_SEARCH_KEY, text) } catch { /* the page just opens unfiltered */ }
+  go()
+}
+
+export function takeAuditSearch(): string {
+  try {
+    const v = sessionStorage.getItem(AUDIT_SEARCH_KEY)
+    if (v) sessionStorage.removeItem(AUDIT_SEARCH_KEY)
+    return v ?? ''
+  } catch { return '' }
+}

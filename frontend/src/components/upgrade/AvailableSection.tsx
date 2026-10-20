@@ -2,8 +2,8 @@ import { AlertTriangle, CalendarClock, CheckCircle2, Download, RefreshCw, Shield
 import type { UpgradeStatus } from '../../types'
 import { formatDateTime } from '../../utils/format'
 import { activeReleaseKey, formatBytes } from '../../utils/upgrade'
-import { blockReason, formatDuration, shortSha } from '../../utils/upgradeFlow'
-import { Badge, CARD_TITLE, CommandBlock, KeyId, KV, Row } from './parts'
+import { agoText, blockReason, formatDuration, shortSha } from '../../utils/upgradeFlow'
+import { Badge, CARD_TITLE, CommandBlock, Excerpt, KV, Row } from './parts'
 
 interface Props {
   status: UpgradeStatus
@@ -43,7 +43,7 @@ export function AvailableSection({ status, isLocal, reviewing, reviewError, onRe
                   ? <Badge tone="ok"><ShieldCheck size={12} aria-hidden="true" />Signed download attached</Badge>
                   : <Badge tone="warn"><AlertTriangle size={12} aria-hidden="true" />No signed download</Badge>}
               {(preview?.key_id ?? key?.key_id) && (
-                <span className="text-xs text-muted font-normal">key <KeyId id={(preview?.key_id ?? key!.key_id)} /> (primary, active)</span>
+                <span className="text-xs text-muted font-normal">key <code className="font-mono text-xs font-bold text-text">{preview?.key_id ?? key!.key_id}</code> (primary, active)</span>
               )}
             </h2>
             <div className={KV}>
@@ -55,7 +55,10 @@ export function AvailableSection({ status, isLocal, reviewing, reviewError, onRe
                 {preview && <> · sha256 <code className="font-mono text-xs">{shortSha(preview.sha256)}</code></>}
                 {latest.release_url && <> · <a href={latest.release_url} target="_blank" rel="noreferrer noopener" className="text-accent-text underline">release notes</a></>}
               </Row>
-              {m?.min_upgrade_from && (
+              {preview?.crosses && preview.crosses.length > 0 && (
+                <Row label="Crosses">{preview.crosses.join(', ')} ({preview.crosses.length === 1 ? 'skipped release' : 'skipped releases'}){m?.min_upgrade_from && <> — allowed: the manifest's <code className="font-mono text-xs">min_upgrade_from</code> is {m.min_upgrade_from}</>}</Row>
+              )}
+              {!(preview?.crosses && preview.crosses.length > 0) && m?.min_upgrade_from && (
                 <Row label="Upgrade path">Allowed: the manifest's <code className="font-mono text-xs">min_upgrade_from</code> is {m.min_upgrade_from}</Row>
               )}
               <Row label="Downloaded">
@@ -68,17 +71,17 @@ export function AvailableSection({ status, isLocal, reviewing, reviewError, onRe
               )}
             </div>
           </div>
-          {hosted && (
-            <div className="flex gap-2 flex-wrap items-center shrink-0">
-              <button type="button" className="btn-primary" disabled={!!reason} onClick={onUpgradeNow} aria-describedby={reason ? 'upgrade-block' : undefined}>
-                <Download size={14} aria-hidden="true" />Upgrade now
-              </button>
-              <button type="button" className="btn-secondary !text-text-dim" disabled={!!reason} onClick={onSchedule} aria-describedby={reason ? 'upgrade-block' : undefined}>
-                <CalendarClock size={14} aria-hidden="true" />Schedule…
-              </button>
-            </div>
-          )}
         </div>
+        {hosted && (
+          <div className="flex gap-2 flex-wrap items-center mt-3.5">
+            <button type="button" className="btn-primary" disabled={!!reason} onClick={onUpgradeNow} aria-describedby={reason ? 'upgrade-block' : undefined}>
+              <Download size={14} aria-hidden="true" />Upgrade now
+            </button>
+            <button type="button" className="btn-secondary !text-text-dim" disabled={!!reason} onClick={onSchedule} aria-describedby={reason ? 'upgrade-block' : undefined}>
+              <CalendarClock size={14} aria-hidden="true" />Schedule…
+            </button>
+          </div>
+        )}
         {hosted && reason && (
           <p id="upgrade-block" className="text-xs text-muted mt-3 mb-0" role="status">{reason}</p>
         )}
@@ -136,9 +139,7 @@ export function AvailableSection({ status, isLocal, reviewing, reviewError, onRe
             <section className="card p-4" aria-labelledby="t-new">
               <h2 className={CARD_TITLE} id="t-new">What's new (from the release manifest)</h2>
               {m?.changelog_excerpt ? (
-                <div className="border-l-2 border-border pl-3">
-                  <p className="m-0 text-xs text-text-dim whitespace-pre-line">{m.changelog_excerpt}</p>
-                </div>
+                <div className="border-l-2 border-border pl-3"><Excerpt text={m.changelog_excerpt} /></div>
               ) : <p className="text-xs text-text-dim m-0">The release carries no change summary.</p>}
               <p className="text-xs text-muted mt-2.5 mb-0">{preview.manifest_source}.</p>
             </section>
@@ -148,14 +149,14 @@ export function AvailableSection({ status, isLocal, reviewing, reviewError, onRe
                 <table className="w-full text-xs border-collapse">
                   <thead><tr className="text-left">
                     <th scope="col" className="section-label pb-1 pr-3">#</th>
-                    <th scope="col" className="section-label pb-1 pr-3">Since</th>
+                    <th scope="col" className="section-label pb-1 pr-3">What it does</th>
                     <th scope="col" className="section-label pb-1">Rollback-safe</th>
                   </tr></thead>
                   <tbody>
                     {migrations.map(x => (
                       <tr key={x.version} className="border-t border-border-sub">
                         <td className="py-1.5 pr-3 text-text">{x.version}</td>
-                        <td className="py-1.5 pr-3 text-text-dim">{x.since ?? '—'}</td>
+                        <td className="py-1.5 pr-3 text-text-dim">{x.description ?? (x.since ? `Added in ${x.since}` : '—')}</td>
                         <td className="py-1.5">{x.rollback_safe
                           ? <><Badge tone="ok">Yes</Badge> <span className="text-text-dim">{status.installed_version} runs on it unchanged</span></>
                           : <Badge tone="warn"><AlertTriangle size={12} aria-hidden="true" />No</Badge>}</td>
@@ -191,7 +192,7 @@ export function AvailableSection({ status, isLocal, reviewing, reviewError, onRe
             <section className="card p-4" aria-labelledby="t-pre">
               <h2 className={`${CARD_TITLE} !mb-2.5`} id="t-pre">
                 Preflight {preview.preflight_ok ? <Badge tone="ok">All passed</Badge> : <Badge tone="warn">Needs attention</Badge>}
-                <span className="text-xs text-muted font-normal">checked {formatDateTime(preview.checked_at)}</span>
+                <span className="text-xs text-muted font-normal">checked {agoText(preview.checked_at) || formatDateTime(preview.checked_at)}</span>
                 <button type="button" className="btn-secondary !text-text-dim !text-xs !py-1 !px-2.5 ml-auto" onClick={onReview} disabled={reviewing}>
                   <RefreshCw size={12} aria-hidden="true" className={reviewing ? 'animate-spin' : ''} />Re-check
                 </button>

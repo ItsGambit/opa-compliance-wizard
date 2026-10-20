@@ -394,7 +394,9 @@ export interface UpgradeRun {
   bundle: { name: string; size: number; sha256: string } | null
   schema_before: number | null
   schema_after: number | null
-  steps_done?: { step: string; at: string; seconds: number }[] | null
+  steps_done?: { step: string; at: string; seconds: number; detail?: Record<string, string | number | boolean | string[]> }[] | null
+  chain_heads_recorded?: number | null
+  step_started_at?: string | null
   health?: UpgradeHealthCheck[] | null
   rollback_health?: UpgradeHealthCheck[] | null
   rolled_back_to?: string | null
@@ -408,7 +410,7 @@ export interface UpgradeRun {
   downtime_estimate_seconds?: number | null
 }
 
-export interface UpgradeMigration { version: number; since: string | null; rollback_safe: boolean; summary?: string | null }
+export interface UpgradeMigration { version: number; since: string | null; rollback_safe: boolean; description?: string | null }
 
 export interface UpgradePreflightItem { id: string; ok: boolean; text: string }
 
@@ -437,6 +439,11 @@ export interface UpgradePreview {
   manifest_source: string
   checked_at: string
   db_bytes?: number | null
+  /** Where the updater keeps the pre-upgrade copies, and the free space the preflight saw. */
+  backup_dir?: string
+  free_bytes?: { opt: number | null; data: number | null }
+  /** Releases between the installed one and the target, when the server knows them (not sent today). */
+  crosses?: string[]
   preflight: UpgradePreflightItem[]
   preflight_ok: boolean
 }
@@ -517,7 +524,7 @@ export type UpgradeRequestBody =
   | { kind: 'cancel' }
   | { kind: 'approve_second' }
   | { kind: 'rollback'; confirm: string }
-  | { kind: 'restore'; confirm: string }
+  | { kind: 'restore'; confirm: string; backup?: string }
   | { kind: 'clear_failure' }
   | { kind: 'bundle'; include_hosts: boolean; for_correlation_id?: string }
   | { kind: 'prune_backups'; confirm: string; keep_last?: number; names?: string[] }

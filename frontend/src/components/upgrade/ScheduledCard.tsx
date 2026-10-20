@@ -7,7 +7,9 @@ import { toast } from '../../hooks/useToast'
 import type { UpgradeStatus } from '../../types'
 import { formatDateTime } from '../../utils/format'
 import { beginStepUp } from '../../utils/stepUp'
-import { browserZone, formatInZone, formatUtc, serverZoneOf, shortSha, untilText } from '../../utils/upgradeFlow'
+import { browserZone, formatInZone, formatUtc, serverZoneOf, shortSha, untilText, zoneAbbrev } from '../../utils/upgradeFlow'
+import { useRunAudit } from '../../api/hooks'
+import { openAuditLogFor } from '../../utils/upgradeRequested'
 import { Badge, CARD_TITLE, KeyId, KV, Row } from './parts'
 
 interface Props {
@@ -19,6 +21,43 @@ interface Props {
 
 /** Artboard 07: the schedule, in the server's zone, the admin's and UTC; what happens at the time; cancel / reschedule / run it now.
  * A missed schedule (the application was not running at the time) is shown instead, never run late. */
+function bigWhen(ms: number, zone: string): string {
+  const full = formatInZone(ms, zone).replace(/\s*\(UTC[^)]*\)\s*$/, '')          // "Wed 21 Oct 2026, 03:30 BST"
+  return /[A-Z]{3,5}$/.test(full) || !zoneAbbrev(ms, zone) ? full : `${full} ${zoneAbbrev(ms, zone)}`
+}
+
+function enteredAs(tz: string | null, serverZone: string | null): string {
+  if (!tz) return 'UTC'
+  return tz === serverZone ? 'Server time' : `${tz} time`
+}
+
+/** Artboard 07, "Events for this upgrade": the audit entries that carry this request's correlation id. */
+export function EventsCard({ correlationId }: { correlationId: string }) {
+  const { data = [], isLoading } = useRunAudit(correlationId)
+  return (
+    <section className="card p-4" aria-labelledby="t-ev">
+      <h2 className={CARD_TITLE} id="t-ev">Events for this upgrade</h2>
+      {isLoading ? <p className="text-xs text-muted m-0">Loading…</p> : data.length === 0 ? <p className="text-xs text-text-dim m-0">No audit entries with this correlation id yet.</p> : (
+        <table className="w-full text-xs border-collapse">
+          <thead><tr className="text-left">{['When', 'Event', 'By'].map(h => <th key={h} scope="col" className="section-label pb-1 pr-3">{h}</th>)}</tr></thead>
+          <tbody>
+            {data.slice(0, 8).map((e, i) => (
+              <tr key={`${e.timestamp}-${e.action}-${i}`} className="border-t border-border-sub align-top">
+                <td className="py-1.5 pr-3 text-text-dim whitespace-nowrap">{formatDateTime(e.timestamp)}</td>
+                <td className="py-1.5 pr-3 text-text-dim"><code className="font-mono">{e.action}</code></td>
+                <td className="py-1.5 text-text-dim">{e.actor_email ?? (e.details?.trigger === 'ocw-updater' ? 'ocw-updater' : 'scheduler')}{e.details?.step_up_verified ? ' (MFA)' : ''}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      <p className="text-xs text-muted mt-2 mb-0">
+        <button type="button" className="underline bg-transparent border-0 p-0 cursor-pointer text-accent-text" onClick={() => openAuditLogFor(correlationId)}>Open in the audit log</button>
+      </p>
+    </section>
+  )
+}
+
 export function ScheduledCard({ status, onReschedule, onRunNow, now = Date.now }: Props) {
   const queryClient = useQueryClient()
   const [confirmCancel, setConfirmCancel] = useState(false)
@@ -46,14 +85,14 @@ export function ScheduledCard({ status, onReschedule, onRunNow, now = Date.now }
         {missed ? `The scheduled upgrade to ${sched.version} was missed` : `Upgrade to ${sched.version} scheduled`}
         {missed ? <Badge tone="err">Missed</Badge> : <Badge tone="warn">{untilText(whenMs, now())}</Badge>}
       </h2>
-      <div className="text-xl font-semibold text-text mb-1">
-        {formatInZone(whenMs, serverZone ?? local)} <span className="text-sm font-normal text-muted">({serverZone ? `server time, ${serverZone}` : `your time, ${local}`})</span>
+      <div className="text-xl font-semibold text-text mb-2">
+        {bigWhen(whenMs, serverZone ?? local)} <span className="text-sm font-normal text-muted">({serverZone ? `server time, ${serverZone}` : `your time, ${local}`})</span>
       </div>
-      <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs mb-3 items-baseline">
+      <div className="rounded-lg border border-border bg-bg-elevated px-3 py-2.5 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs mb-3 items-baseline">
         {serverZone && <><span className="section-label">Your local</span><span className="text-text-dim">{formatInZone(whenMs, local)}</span></>}
-        <span className="section-label">UTC</span><span className="text-text-dim">{formatUtc(whenMs)}</span>
+        <span className="section-label">UTC</span><span className="text-text-dim font-mono">{formatUtc(whenMs)}</span>
         <span className="section-label">Entered as</span>
-        <span className="text-text-dim">{sched.entered ?? 'UTC'}, by {sched.actor_email ?? 'an admin'} · {formatDateTime(sched.approved_at)} · step-up MFA verified · audit <code className="font-mono">upgrade.scheduled</code></span>
+        <span className="text-text-dim">{enteredAs(sched.entered_tz, serverZone)}, by {sched.actor_email ?? 'an admin'} · {formatDateTime(sched.approved_at)} · step-up MFA verified · audit <code className="font-mono">upgrade.scheduled</code></span>
       </div>
       <div className={KV}>
         <Row label="Release">

@@ -134,7 +134,7 @@ export function ScheduleDialog({ open, onOpenChange, status, version, initialMs,
               </label>
             ))}
           </fieldset>
-          <div className="mt-3 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs items-baseline" aria-live="polite" data-testid="sched-times">
+          <div className="mt-3 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs items-baseline rounded-lg border border-border bg-bg-elevated px-3 py-2.5" aria-live="polite" data-testid="sched-times">
             {valid ? (
               <>
                 {serverZone && <><span className="section-label">Server</span><span className="text-text-dim">{formatInZone(whenMs, serverZone)}</span></>}
