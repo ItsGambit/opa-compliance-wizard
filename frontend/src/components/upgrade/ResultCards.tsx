@@ -1,15 +1,18 @@
 import { useState } from 'react'
-import { AlertTriangle, CheckCircle2, Download, Undo2 } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, Download, RefreshCw, Undo2 } from 'lucide-react'
 import { upgradeBundleUrl } from '../../api/client'
 import type { UpgradeRun, UpgradeStatus } from '../../types'
 import { formatDateTime } from '../../utils/format'
 import { formatBytes } from '../../utils/upgrade'
 import { HEALTH_CHECK_LABELS, HEALTH_CHECK_ORDER, describeReason, formatDuration, shortSha } from '../../utils/upgradeFlow'
-import { Badge, CARD_TITLE, CommandBlock, KV, Row, SEC_LABEL } from './parts'
+import { Badge, CARD_TITLE, KV, Row, SEC_LABEL } from './parts'
+import { TypedConfirmDialog } from './TypedConfirmDialog'
+import { useUpgradeRequest } from './useUpgradeRequest'
 
 /** Artboard 09: success. */
 export function SuccessCards({ run, status }: { run: UpgradeRun; status: UpgradeStatus }) {
-  const [showRollback, setShowRollback] = useState(false)
+  const [rollbackOpen, setRollbackOpen] = useState(false)
+  const rollback = useUpgradeRequest(`Roll back to ${status.upgrade?.rollback?.to ?? 'the previous version'}`, () => setRollbackOpen(false))
   const u = status.upgrade
   const crossed = (run.manifest?.migrations ?? [])
   const checks = run.health ?? []
@@ -56,12 +59,16 @@ export function SuccessCards({ run, status }: { run: UpgradeRun; status: Upgrade
             The pre-upgrade copy stays available for the separate restore action.
           </p>
           <div className="flex gap-2 items-center flex-wrap mt-3">
-            <button type="button" className="btn-secondary !text-text-dim" aria-expanded={showRollback} onClick={() => setShowRollback(v => !v)} disabled={!rb.available}>
+            <button type="button" className="btn-secondary !text-text-dim" onClick={() => setRollbackOpen(true)} disabled={!rb.available}>
               <Undo2 size={14} aria-hidden="true" />Roll back to {rb.to}…
             </button>
-            <span className="text-xs text-muted">Rolling back is done from the server's command line (typed confirmation), so it works even when the web app is down.</span>
+            <span className="text-xs text-muted">Typed confirmation, then a step-up MFA approval. From the server's command line: <code className="font-mono">sudo ocw-updater rollback</code></span>
           </div>
-          {showRollback && <div className="mt-2.5"><CommandBlock label="Rollback command">sudo ocw-updater rollback</CommandBlock></div>}
+          <TypedConfirmDialog open={rollbackOpen} onOpenChange={setRollbackOpen} title={`Roll back to ${rb.to}?`} word="ROLLBACK" confirmLabel={`Roll back to ${rb.to}`}
+            busy={rollback.isPending} onConfirm={() => rollback.mutate({ kind: 'rollback', confirm: 'ROLLBACK' })}>
+            <p className="m-0">The previous code ({rb.to}) is put back and the service restarted. This is <strong>code only</strong>: the archive keeps schema {run.schema_after ?? 'its current version'} and no data is touched.
+              It is the only case where a lower version is allowed, and it is logged under a new correlation id.</p>
+          </TypedConfirmDialog>
         </section>
       )}
     </>
@@ -72,7 +79,11 @@ export function SuccessCards({ run, status }: { run: UpgradeRun; status: Upgrade
  * could not complete (an operator must act). */
 export function FailureCards({ run, status }: { run: UpgradeRun; status: UpgradeStatus }) {
   const [typed, setTyped] = useState('')
-  const [showClear, setShowClear] = useState(false)
+  const [clearOpen, setClearOpen] = useState(false)
+  const [hosts, setHosts] = useState(false)
+  const clear = useUpgradeRequest('Clear the recorded failure', () => setClearOpen(false))
+  const rebuild = useUpgradeRequest('Rebuild the support bundle')
+  const restore = useUpgradeRequest('Restore the pre-upgrade archive copy')
   const u = status.upgrade
   const rolled = run.result === 'rolled_back'
   const operator = run.result === 'failed_needs_operator'
@@ -141,16 +152,25 @@ export function FailureCards({ run, status }: { run: UpgradeRun; status: Upgrade
                   <Row label="sha256"><code className="font-mono text-xs">{shortSha(bundle.sha256)}</code></Row>
                   <Row label="Built by">the updater on the server, before anyone asked — no shell access needed to get it</Row>
                 </div>
+                <label className="flex gap-2.5 items-start mt-3 text-xs text-text-dim cursor-pointer">
+                  <input type="checkbox" className="mt-0.5 w-[15px] h-[15px] accent-[var(--color-accent)]" checked={hosts} onChange={e => setHosts(e.target.checked)} />
+                  <span>Include host names and environment names unredacted (off: they appear as <code className="font-mono">host-a1b2c3</code>, <code className="font-mono">env-d4e5f6</code>). Re-builds the bundle; needs a step-up approval.</span>
+                </label>
                 <div className="flex gap-2 flex-wrap items-center mt-3">
                   <a className="btn-primary no-underline" href={upgradeBundleUrl(bundle.name)} download={bundle.name}><Download size={14} aria-hidden="true" />Download support bundle</a>
-                  <button type="button" className="btn-secondary !text-text-dim" aria-expanded={showClear} onClick={() => setShowClear(v => !v)}>Clear failure…</button>
+                  {hosts && (
+                    <button type="button" className="btn-secondary !text-text-dim" disabled={rebuild.isPending}
+                      onClick={() => rebuild.mutate({ kind: 'bundle', include_hosts: true, for_correlation_id: run.correlation_id ?? undefined })}>
+                      <RefreshCw size={14} aria-hidden="true" />Rebuild with host names…
+                    </button>
+                  )}
+                  <button type="button" className="btn-secondary !text-text-dim" onClick={() => setClearOpen(true)}>Clear failure…</button>
                 </div>
-                {showClear && (
-                  <div className="mt-2.5">
-                    <p className="text-xs text-muted mt-0 mb-1.5">Clearing a failure allows {run.version_to} to be tried again, for example after a fixed release is out. It is done on the server:</p>
-                    <CommandBlock label="Clear failure command">sudo ocw-updater clear-failure</CommandBlock>
-                  </div>
-                )}
+                <p className="text-xs text-muted mt-2 mb-0">Clearing (step-up) allows {run.version_to} to be tried again, for example after a fixed release is out. From the server: <code className="font-mono">sudo ocw-updater clear-failure</code></p>
+                <TypedConfirmDialog open={clearOpen} onOpenChange={setClearOpen} title="Clear the recorded failure?" confirmLabel="Clear failure"
+                  busy={clear.isPending} onConfirm={() => clear.mutate({ kind: 'clear_failure' })}>
+                  <p className="m-0">The updater forgets that {run.version_to} failed, so it can be approved again. Nothing is installed by this. If the same release fails again it is recorded again (after two failures the Upgrade button stays off).</p>
+                </TypedConfirmDialog>
               </>
             ) : <p className="text-xs text-text-dim m-0">No support bundle could be built for this run. The journal on the server has the details (correlation id above).</p>}
             <p className="text-xs text-text-dim mt-3 mb-0"><strong>Email this file to the security contact in SECURITY.md</strong> with the correlation id in the subject. <strong>Nothing is sent automatically.</strong></p>
@@ -180,12 +200,12 @@ export function FailureCards({ run, status }: { run: UpgradeRun; status: Upgrade
             <strong> Every event archived since then would disappear from the archive.</strong> The current database is moved aside, never deleted. Only do this if the maintainers tell you to, and after you have the support bundle.
           </p>
           <div className="flex gap-2 flex-wrap items-center mt-3">
-            <label htmlFor="restore-typed" className={SEC_LABEL}>Type <code className="font-mono normal-case">RESTORE</code> to show the command</label>
+            <label htmlFor="restore-typed" className={SEC_LABEL}>Type <code className="font-mono normal-case">RESTORE</code> to confirm</label>
             <input id="restore-typed" className="text-input w-40" autoComplete="off" spellCheck={false} value={typed} onChange={e => setTyped(e.target.value)} />
+            <button type="button" className="btn-primary !bg-loss" disabled={typed !== 'RESTORE' || restore.isPending}
+              onClick={() => restore.mutate({ kind: 'restore', confirm: 'RESTORE' })}>Restore pre-upgrade copy…</button>
+            <span className="text-xs text-muted">Then a step-up MFA approval. Logged as <code className="font-mono">upgrade.restore_requested</code>. From the server: <code className="font-mono">sudo ocw-updater restore --confirm RESTORE</code></span>
           </div>
-          {typed === 'RESTORE'
-            ? <div className="mt-2.5"><CommandBlock label="Restore command">sudo ocw-updater restore --confirm RESTORE</CommandBlock></div>
-            : <p className="text-xs text-muted mt-2.5 mb-0">Restoring is done from the server's command line and logged as <code className="font-mono">upgrade.restore_requested</code>.</p>}
         </section>
       )}
     </>

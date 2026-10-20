@@ -454,6 +454,8 @@ export interface UpgradeScheduleEntry {
   key_id: string | null
 }
 
+export interface UpgradeBackup { name: string; size: number | null; taken_at: string; taken_before: string | null; integrity: string | null }
+
 export interface UpgradeHistoryRow {
   correlation_id: string | null
   action: string | null
@@ -489,6 +491,8 @@ export interface UpgradeView {
   settings: { second_approval: boolean }
   rejection: { correlation_id: string; code: string; message: string; at: string | null } | null
   rollback: { available: boolean; until: string; to: string | null } | null
+  /** The updater's published list of pre-upgrade copies (names, sizes, dates, integrity; no paths). */
+  backups?: { backups: UpgradeBackup[]; updated_at: string; total_bytes: number | null } | null
   failures: Record<string, { count: number; last_code: string | null }>
   history: UpgradeHistoryRow[]
   zone: { iana: string | null }
@@ -512,6 +516,11 @@ export type UpgradeRequestBody =
   | { kind: 'schedule' | 'reschedule'; version: string; sha256: string; acknowledged: boolean; when_utc: string; entered_tz?: string; entered_local?: string }
   | { kind: 'cancel' }
   | { kind: 'approve_second' }
+  | { kind: 'rollback'; confirm: string }
+  | { kind: 'restore'; confirm: string }
+  | { kind: 'clear_failure' }
+  | { kind: 'bundle'; include_hosts: boolean; for_correlation_id?: string }
+  | { kind: 'prune_backups'; confirm: string; keep_last?: number; names?: string[] }
 
 export interface UpgradeRequestResult {
   kind: string

@@ -11,6 +11,7 @@ import { formatDateTime } from '../utils/format'
 import { describeCheckFailure, frequencyLabel, updateState } from '../utils/upgrade'
 import { UpdateCheckForm } from './UpdateCheckForm'
 import { AvailableSection } from './upgrade/AvailableSection'
+import { BackupsCard } from './upgrade/BackupsCard'
 import { ConfirmUpgrade, type ConfirmMode } from './upgrade/ConfirmUpgrade'
 import { Badge, CARD_TITLE, CommandBlock, KeyId, KV, Row } from './upgrade/parts'
 import { ProgressCard } from './upgrade/ProgressCard'
@@ -302,7 +303,13 @@ export function UpdatesPage({ onOpenKeys }: { onOpenKeys: () => void }) {
 
   const run = status?.upgrade?.run ?? null
   const running = isRunning(run)
-  const startedWaiting = !!requested && !(run && run.correlation_id === requested.correlationId) && !(status?.upgrade?.rejection?.correlation_id === requested.correlationId)
+  const received = (r: RequestedUpgrade) => {
+    if (!run) return false
+    if (r.kind === 'rollback' || r.kind === 'restore') return run.action === r.kind && Date.parse(run.started_at ?? '') >= Date.parse(r.approvedAt) - 60_000
+    if (r.kind) return Date.now() - Date.parse(r.approvedAt) > 20_000      // bundle / clear / delete: done in seconds; the cards above show the result
+    return run.correlation_id === r.correlationId
+  }
+  const startedWaiting = !!requested && !received(requested) && !(status?.upgrade?.rejection?.correlation_id === requested.correlationId)
   const restarting = isError && isTransient(error) && !!status
 
   // Poll every 2 s while an upgrade is starting or running (the server restarts underneath; failed polls just wait for the next tick).
@@ -329,7 +336,8 @@ export function UpdatesPage({ onOpenKeys }: { onOpenKeys: () => void }) {
 
   // Once the updater has the request, the "starting" card has done its job.
   useEffect(() => {
-    if (requested && run && run.correlation_id === requested.correlationId) { clearRequested(); setRequested(null) }
+    if (requested && run && received(requested)) { clearRequested(); setRequested(null) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requested, run])
 
   const review = useMutation({
@@ -421,6 +429,7 @@ export function UpdatesPage({ onOpenKeys }: { onOpenKeys: () => void }) {
         </section>
       )}
       {!status.check.prompt_needed && !running && <CheckSettingsCard status={status} isLocal={isLocal} />}
+      {!status.check.prompt_needed && !running && !isLocal && <BackupsCard status={status} />}
       {!status.check.prompt_needed && !running && !isLocal && <HistoryCard status={status} />}
       {!status.check.prompt_needed && <KeysSummaryCard status={status} onOpenKeys={onOpenKeys} />}
 

@@ -276,6 +276,7 @@ covers the first install; a vendored-wheel release bundle is planned.
 | `apply <version> [--at "YYYY-MM-DD HH:MM" [--tz Europe/London]]` | install now or schedule (typed confirmation); `cancel` removes a schedule |
 | `rollback` / `restore --confirm RESTORE` | code-only rollback / archive restore, as above |
 | `bundle [--correlation ID] [--include-hosts]`, `clear-failure` | support bundle; allow a failed version again |
+| `prune-backups --keep N` or `--name FILE ...` with `--confirm PRUNE` | delete old pre-upgrade archive copies (never the newest, never the last upgrade's) |
 | `trust list`, `trust apply <revocation.json>`, `trust add <key.json>` | the signing keys root trusts (the standby key can only change by a signed revocation; `add` takes only an active release key and a typed `TRUST`) |
 | `nginx-sync` | apply the current release's nginx template (maintenance page) |
 | `check`, `enable-check`, `disable-check`, `verify`, `audit`, `keys ...` | the 5.46.0 tools (run as the application's account automatically) |
@@ -302,8 +303,10 @@ On an install that has run `server/install.sh`, administrators can upgrade witho
 Notes:
 
 * **Two-person rule** (Update check, "Change…"; off by default): a second, different administrator must approve within 24 hours.
-* **Rollback, restore, clear-failure and building a bundle on demand are command-line actions** (`sudo ocw-updater rollback | restore --confirm RESTORE | clear-failure | bundle`); the page shows
-  the exact command. After a failure the same version is refused until `clear-failure`; if the rollback itself failed the page says an operator must act.
+* **Rollback, restore, clear failure, rebuilding the support bundle and deleting old pre-upgrade backups are buttons** on the page (typed confirmation where something is
+  lost or deleted: `ROLLBACK`, `RESTORE`, `PRUNE`; then the MFA approval), and each is also a command: `sudo ocw-updater rollback | restore --confirm RESTORE | clear-failure | bundle [--include-hosts] | prune-backups --keep N --confirm PRUNE`.
+  The updater re-checks every request and refuses what the command line would refuse; the newest backup and the one the last upgrade took are never deleted. After a failure the same
+  version is refused until the failure is cleared; if the rollback itself failed the page says an operator must act on the server.
 * **Local (laptop) mode** does not offer this flow (no identity provider to step up with); it shows the commands `python launch.py upgrade` and
   `python launch.py upgrade --restore-previous`.
 * `server/deploy.sh --ref` (unsigned source) is deprecated for operators; use the Updates page or `ocw-updater`.

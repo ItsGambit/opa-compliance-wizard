@@ -327,8 +327,18 @@ describe('09 success and 10 failure', () => {
     expect(await screen.findByText('Upgraded to 5.48.0 in 52 s')).toBeTruthy()
     expect(screen.getByText('8 of 8 passed')).toBeTruthy()
     expect(screen.getByText(/Migrations 10 and 11 applied \(schema 9 → 11\)/)).toBeTruthy()
+    expect(screen.getByText('sudo ocw-updater rollback')).toBeTruthy()             // the command stays visible as secondary text
     fireEvent.click(screen.getByRole('button', { name: /Roll back to 5.46.0/ }))
-    expect(screen.getByLabelText('Rollback command').textContent).toBe('sudo ocw-updater rollback')
+    const dlg = await screen.findByRole('dialog')
+    const go = within(dlg).getByRole('button', { name: 'Roll back to 5.46.0' }) as HTMLButtonElement
+    expect(go.disabled).toBe(true)
+    fireEvent.change(within(dlg).getByLabelText(/Type ROLLBACK/), { target: { value: 'rollback' } })
+    expect(go.disabled).toBe(true)
+    fireEvent.change(within(dlg).getByLabelText(/Type ROLLBACK/), { target: { value: 'ROLLBACK' } })
+    vi.mocked(requestUpgrade).mockResolvedValue(STEP_UP)
+    fireEvent.click(go)
+    await waitFor(() => expect(requestUpgrade).toHaveBeenCalledWith({ kind: 'rollback', confirm: 'ROLLBACK' }))
+    await waitFor(() => expect(beginStepUp).toHaveBeenCalledWith('act_example_0123456789', expect.objectContaining({ action: 'upgrade.request', label: 'Roll back to 5.46.0' })))
   })
 
   const ROLLED = makeRun({
@@ -348,15 +358,27 @@ describe('09 success and 10 failure', () => {
     const link = screen.getByRole('link', { name: /Download support bundle/ }) as HTMLAnchorElement
     expect(link.getAttribute('href')).toBe('/api/upgrade/bundle?name=ocw-support-5.46.0-to-5.48.0-20261021T023158Z-k4q9.tar.gz')
     expect(screen.getByText(/Nothing is sent automatically/)).toBeTruthy()
+    expect(screen.getByText('sudo ocw-updater clear-failure')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /Rebuild with host names/ })).toBeNull()
+    vi.mocked(requestUpgrade).mockResolvedValue(STEP_UP)
+    // rebuild with host names: only after the opt-in is ticked
+    fireEvent.click(screen.getByRole('checkbox', { name: /Include host names and environment names unredacted/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Rebuild with host names/ }))
+    await waitFor(() => expect(requestUpgrade).toHaveBeenCalledWith({ kind: 'bundle', include_hosts: true, for_correlation_id: 'upg-7f3a9c2e' }))
+    // clear failure: a confirmation, then the MFA step
     fireEvent.click(screen.getByRole('button', { name: /Clear failure/ }))
-    expect(screen.getByLabelText('Clear failure command').textContent).toBe('sudo ocw-updater clear-failure')
-    // restore: typed confirmation reveals the command, nothing is sent from here
-    expect(screen.queryByLabelText('Restore command')).toBeNull()
+    fireEvent.click(await screen.findByRole('button', { name: 'Clear failure', hidden: false }))
+    await waitFor(() => expect(requestUpgrade).toHaveBeenCalledWith({ kind: 'clear_failure' }))
+    // restore: typed RESTORE enables the button, then the MFA step
+    const restoreBtn = await screen.findByRole('button', { name: /Restore pre-upgrade copy/, hidden: true }) as HTMLButtonElement
+    expect(restoreBtn.disabled).toBe(true)
     fireEvent.change(screen.getByLabelText(/Type RESTORE/), { target: { value: 'RESTOR' } })
-    expect(screen.queryByLabelText('Restore command')).toBeNull()
+    expect(restoreBtn.disabled).toBe(true)
     fireEvent.change(screen.getByLabelText(/Type RESTORE/), { target: { value: 'RESTORE' } })
-    expect(screen.getByLabelText('Restore command').textContent).toBe('sudo ocw-updater restore --confirm RESTORE')
-    expect(requestUpgrade).not.toHaveBeenCalled()
+    expect(restoreBtn.disabled).toBe(false)
+    expect(screen.getByText('sudo ocw-updater restore --confirm RESTORE')).toBeTruthy()
+    fireEvent.click(restoreBtn)
+    await waitFor(() => expect(requestUpgrade).toHaveBeenCalledWith({ kind: 'restore', confirm: 'RESTORE' }))
   })
 
   it('needs an operator: says so, offers no upgrade, no restore', async () => {
@@ -446,5 +468,55 @@ describe('the notice banner (every signed-in user)', () => {
     await show({ kind: 'available', version: '5.48.0' }, true)
     await waitFor(() => expect(fetchUpgradeNotice).toHaveBeenCalled())
     expect(screen.queryByRole('status')).toBeNull()
+  })
+})
+
+
+describe('backups table (artboard 01) and operations in flight', () => {
+  const ROWS = [
+    { name: 'audit_store-pre-5.46.0-20261012T030100Z.db', size: 1_100_000_000, taken_at: '2026-10-12T03:01:00Z', taken_before: '5.46.0', integrity: 'ok' },
+    { name: 'audit_store-pre-5.45.1-20261004T025800Z.db', size: 1_000_000_000, taken_at: '2026-10-04T02:58:00Z', taken_before: '5.45.1', integrity: 'ok' },
+    { name: 'audit_store-pre-5.45.0-20260920T025800Z.db', size: 900_000_000, taken_at: '2026-09-20T02:58:00Z', taken_before: '5.45.0', integrity: null },
+  ]
+  const withBackups = (backups = ROWS) => makeStatus({ upgrade: makeUpgrade({ backups: { backups, updated_at: '2026-10-19T00:00:00Z', total_bytes: 3e9 } }) })
+
+  it('lists the copies newest first with size and integrity, and never offers a delete for a single copy', async () => {
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(withBackups([ROWS[0]]))
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    expect(await screen.findByText('Pre-upgrade backups')).toBeTruthy()
+    expect(screen.getAllByText(/5.46.0 ·/).length).toBeGreaterThan(0)
+    expect((screen.getByRole('button', { name: /Delete older backups/ }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('deleting is typed, shows what goes, keeps the newest, and then asks for MFA', async () => {
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(withBackups())
+    vi.mocked(requestUpgrade).mockResolvedValue(STEP_UP)
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    const rows = (await screen.findAllByText(/·/)).filter(el => el.tagName === 'TD')
+    expect(rows[0].textContent).toMatch(/^5\.46\.0/)                   // newest first
+    expect(screen.getByText('not recorded')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /Delete older backups/ }))
+    const dlg = await screen.findByRole('dialog')
+    expect(within(dlg).getByText(/This deletes 2 backups/)).toBeTruthy()
+    const del = within(dlg).getByRole('button', { name: 'Delete' }) as HTMLButtonElement
+    expect(del.disabled).toBe(true)
+    fireEvent.change(within(dlg).getByLabelText(/Type PRUNE/), { target: { value: 'PRUNE' } })
+    fireEvent.change(within(dlg).getByLabelText('Number of newest backups to keep'), { target: { value: '2' } })
+    expect(within(dlg).getByText(/This deletes 1 backup /)).toBeTruthy()
+    fireEvent.click(del)
+    await waitFor(() => expect(requestUpgrade).toHaveBeenCalledWith({ kind: 'prune_backups', confirm: 'PRUNE', keep_last: 2 }))
+    await waitFor(() => expect(beginStepUp).toHaveBeenCalled())
+    expect(within(dlg).getByLabelText('Number of newest backups to keep')).toBeTruthy()
+  })
+
+  it('a rollback the browser just asked for shows as "Rolling back", and a refusal of it as a refusal', async () => {
+    rememberRequested({ correlationId: 'upg-aaaa0001', version: '', approvedAt: new Date().toISOString(), email: null, stepUp: true, kind: 'rollback' })
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE())
+    const { unmount } = renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    expect(await screen.findByText('Rolling back to the previous version')).toBeTruthy()
+    unmount()
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ rejection: { correlation_id: 'upg-aaaa0001', code: 'rollback_unavailable', message: 'the 24-hour window', at: null } }))
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    expect(await screen.findByText('The updater refused: the rollback')).toBeTruthy()
   })
 })
