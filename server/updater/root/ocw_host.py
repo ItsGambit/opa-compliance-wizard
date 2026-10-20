@@ -159,12 +159,12 @@ class SystemHost:
         """Runs `ocw_activate.py _dbtool ...` as the application user (never as
         root: a root SQLite connection could leave root-owned -wal/-shm files
         the application cannot open). Returns the parsed JSON it prints."""
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocw_activate.py")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocw_activate.py")  # run with -B: no .pyc written
         kwargs = {}
         if hasattr(os, "geteuid") and os.geteuid() == 0 and self.app_uid is not None:
             kwargs = {"user": self.app_uid, "group": self.app_gid, "extra_groups": []}
         try:
-            p = subprocess.run([sys.executable, "-I", script, "_dbtool", *args], stdout=subprocess.PIPE,
+            p = subprocess.run([sys.executable, "-I", "-B", script, "_dbtool", *args], stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True, timeout=3600, stdin=subprocess.DEVNULL, **kwargs)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise HostError(f"database tool failed to run: {exc}")

@@ -644,7 +644,7 @@ class Updater:
         manifest = info["manifest"]
         self.st["manifest"] = {k: manifest.get(k) for k in ("version", "min_upgrade_from", "migrations",
                                                          "downtime_estimate_seconds", "nginx_template_changed", "expected_schema_version",
-                                                         "migration_time_estimate_seconds") if k in manifest}
+                                                         "migration_time_estimate_seconds", "nginx_change_required", "requires_install_sh") if k in manifest}
         self.st["downtime_estimate_seconds"] = manifest.get("downtime_estimate_seconds") or 60
         self.st["signed_by"] = info["key_id"]
         self.st["sha256"] = info["sha256"]
@@ -839,23 +839,36 @@ class Updater:
         self.st["backup"] = record
 
     # --- nginx -------------------------------------------------------------------------------------
+    def _nginx_skip(self, why, step="preflight"):
+        """The server's nginx site cannot take this release's template. Unless the manifest says the new site is required,
+        that is not a reason to refuse the upgrade: leave nginx alone, say so in the journal and the audit log."""
+        self._nginx_baked = self._nginx_live = None
+        if (self.st.get("manifest") or {}).get("nginx_change_required"):
+            raise StepFailed("nginx_invalid", why, step)
+        log("WARN", f"nginx left unchanged: {why}")
+        self.audit("upgrade.step", {"step": "nginx_skipped", "detail": why[:300]})
+
     def nginx_prepare(self):
-        """Bake the release's template with this server's values (refuses a site with another layout)."""
+        """Bake the release's template with this server's values. A missing or differently laid out site is skipped with a
+        warning (the maintenance page then simply does not show), unless the manifest says the change is required."""
         import nginx_bake
         c = self.cfg
+        self._nginx_baked = self._nginx_live = None
         template = os.path.join(c.releases, self.st["version_to"], "server", "nginx-opa-secrets-wizard.conf")
         if os.path.islink(c.nginx_site) or (os.path.exists(c.nginx_site) and not os.path.isfile(c.nginx_site)):
-            raise StepFailed("nginx_invalid", f"{c.nginx_site} is a link or not a regular file: refusing to read or replace it", "preflight")
+            return self._nginx_skip(f"{c.nginx_site} is a link or not a regular file: not reading or replacing it")
+        if not os.path.exists(c.nginx_site):
+            return self._nginx_skip(f"there is no nginx site at {c.nginx_site}")
         try:
             with open(c.nginx_site, encoding="utf-8") as fh:
                 live = fh.read()
             with open(template, encoding="utf-8") as fh:
                 tpl = fh.read()
-        except OSError as exc:
-            raise StepFailed("nginx_invalid", f"cannot read the nginx files: {exc.strerror}", "preflight")
+        except (OSError, UnicodeDecodeError) as exc:
+            return self._nginx_skip(f"cannot read the nginx files: {getattr(exc, 'strerror', None) or exc}")
         baked, problems = nginx_bake.bake(live, tpl)
         if problems:
-            raise StepFailed("nginx_invalid", "the nginx site cannot take this release's template: " + "; ".join(problems), "preflight")
+            return self._nginx_skip("the nginx site cannot take this release's template: " + "; ".join(problems))
         self._nginx_baked = baked
         self._nginx_live = live
 
@@ -875,7 +888,13 @@ class Updater:
         self._write_site(baked)
         rc, out = self.host.nginx_test()
         if rc != 0:
-            self.nginx_restore()
+            if not self.nginx_restore():
+                # `nginx -t` fails on the ORIGINAL site too: the test cannot run here (or nginx was already broken), so it
+                # says nothing about this release. Not the release's fault: no version is marked failed.
+                f = StepFailed("internal_error", "`nginx -t` fails on the original site as well, so it cannot judge this release: " + out[-300:],
+                               "restarting")
+                f.no_blame = True
+                raise f
             raise StepFailed("nginx_invalid", "the new nginx configuration failed `nginx -t`: " + out[-300:], "restarting")
         if not self.host.nginx_reload():
             self.nginx_restore()
@@ -1226,7 +1245,7 @@ class Updater:
         self.st.update(result="rolled_back", step="rolled_back", rolled_back_to=target, rollback_seconds=secs,
                        reason_code=(self.st.get("failure") or {}).get("reason_code") if failure else "operator")
         self.persist()
-        if failure is not None and self.st["version_to"]:
+        if failure is not None and self.st["version_to"] and not getattr(failure, "no_blame", False):
             self.record_failure(self.st["version_to"], self.st["reason_code"])
         self.make_bundle()
         self._history()
@@ -1337,7 +1356,7 @@ class Updater:
         os.makedirs(tmp, mode=0o755)
         for name, path in files.items():
             safe_copy(path, os.path.join(tmp, name), 0o755 if name == "ocw_activate.py" else 0o644)
-        rc, out = self.host.run([sys.executable, "-I", os.path.join(tmp, "ocw_activate.py"), "selftest"], 60)
+        rc, out = self.host.run([sys.executable, "-I", "-B", os.path.join(tmp, "ocw_activate.py"), "selftest"], 60)
         if rc != 0:
             shutil.rmtree(tmp, ignore_errors=True)
             log("WARN", "the new updater failed its self-test; keeping the current one: " + out[-200:])

@@ -237,3 +237,65 @@ def test_a_per_serial_revocation_location_is_polled_next_to_the_fixed_one(monkey
     assert names["release_assets_next"].endswith("/releases/download/revocation-3/revocation.json")
     assert names["release_assets"].endswith("/releases/download/revocation/revocation.json")
     assert "release_assets_next" not in dict(service.revocation_sources())
+
+
+# --- nginx: skip when absent, and a failing `nginx -t` that fails on the restored site too is not the release's fault ---
+
+
+def test_a_missing_nginx_site_skips_the_nginx_step_and_the_upgrade_completes(m):
+    os.unlink(m.site)
+    m.build_release("5.47.0", nginx_changed=True)
+    m.put_artifacts("5.47.0")
+    m.host.schema_on_start["5.47.0"] = 10
+    assert m.updater().apply(m.request("5.47.0", correlation_id="upg-00000201")) == "completed"
+    assert not m.site.exists() and m.host.reloads == 0
+    assert any(e["details"].get("step") == "nginx_skipped" for e in m.audit_actions() if e["action"] == "upgrade.step")
+
+
+def test_nginx_t_failing_on_the_restored_site_too_is_an_internal_error_and_blames_no_version(m):
+    m.host.nginx_t_results = [1, 1]  # the new site fails, and so does the restored original: the test itself cannot run
+    m.build_release("5.47.0", nginx_changed=True)
+    m.put_artifacts("5.47.0")
+    m.host.schema_on_start["5.47.0"] = 10
+    assert m.updater().apply(m.request("5.47.0", correlation_id="upg-00000202")) == "rolled_back"
+    assert m.read_state()["reason_code"] == "internal_error"
+    assert not (act.read_json(m.cfg().failures_path, {}) or {}).get("versions")
+
+
+def test_the_manifest_flag_is_a_real_comparison_with_the_previous_tag(tmp_path):
+    tool = _release_tool()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True)  # noqa: E731
+    run("init", "-q")
+    run("config", "user.email", "t@example.com")
+    run("config", "user.name", "t")
+    (repo / "server").mkdir()
+    (repo / "server" / "nginx-opa-secrets-wizard.conf").write_text("a\n")
+    run("add", "-A")
+    run("commit", "-q", "-m", "one")
+    run("tag", "v1.0.0")
+    same = {"server/nginx-opa-secrets-wizard.conf": (0o644, b"a\n")}
+    other = {"server/nginx-opa-secrets-wizard.conf": (0o644, b"b\n")}
+    assert tool._nginx_template_changed(repo, same, "1.1.0") is False
+    assert tool._nginx_template_changed(repo, other, "1.1.0") is True
+    assert tool._nginx_template_changed(repo, other, "1.0.0") is True  # no earlier tag: nothing to compare with
+
+
+def _release_tool():
+    import importlib.util
+    import sys
+    sys.path.insert(0, str(REPO / "tools"))
+    spec = importlib.util.spec_from_file_location("release_tool", REPO / "tools" / "release.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_the_root_unit_can_run_nginx_t(tmp_path):
+    unit = (REPO / "server" / "ocw-upgrade.service").read_text()
+    rw = next(line for line in unit.splitlines() if line.startswith("ReadWritePaths="))
+    assert " /run" in rw and "/var/log/nginx" in rw
+    caps = next(line for line in unit.splitlines() if line.startswith("CapabilityBoundingSet="))
+    assert "CAP_NET_BIND_SERVICE" in caps and "CAP_KILL" in caps
+    assert "python3 -I -B " in unit

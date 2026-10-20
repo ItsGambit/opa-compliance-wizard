@@ -187,11 +187,16 @@ def test_nginx_template_is_baked_applied_and_rolled_back_on_failure(m):
     assert m2.host.reloads == 1
 
 
-def test_unlisted_layout_nginx_refuses_before_switching(m):
+def test_unlisted_layout_nginx_is_skipped_with_a_warning_unless_the_release_requires_it(m):
     m.site.write_text("server { listen 80; }\n")
     up, result = run_apply(m, cid="upg-aaaa0016", release={"nginx_changed": True})
-    assert result == "failed" and m.read_state()["reason_code"] == "nginx_invalid"
-    assert os.readlink(m.opt / "current") == "releases/5.46.0"
+    assert result == "completed" and m.site.read_text() == "server { listen 80; }\n"
+    assert any(e["action"] == "upgrade.step" and e["details"].get("step") == "nginx_skipped" for e in m.audit_actions())
+    m2 = uf.Machine(m.root / "two")
+    m2.site.write_text("server { listen 80; }\n")
+    up, result = run_apply(m2, cid="upg-aaaa0017", release={"nginx_changed": True, "manifest_over": {"nginx_change_required": True}})
+    assert result == "failed" and m2.read_state()["reason_code"] == "nginx_invalid"
+    assert os.readlink(m2.opt / "current") == "releases/5.46.0"
 
 
 def test_request_validation(m):

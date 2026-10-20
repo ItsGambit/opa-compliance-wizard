@@ -655,7 +655,7 @@ def cmd_nginx_sync(a, cfg, host):
     def go():
         up = _updater(cfg, host)
         cur = act.installed_version(cfg)
-        up.st = {"correlation_id": cid, "version_to": cur, "version_from": cur, "manifest": {"nginx_template_changed": True}}
+        up.st = {"correlation_id": cid, "version_to": cur, "version_from": cur, "manifest": {"nginx_template_changed": True, "nginx_change_required": True}}
         try:
             up.nginx_prepare()
             changed = up.nginx_apply()
