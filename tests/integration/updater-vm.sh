@@ -518,12 +518,12 @@ audit_has() { grep -q "\"action\":\"$1\"" "$DATA/audit_log.jsonl"; }
 # the quiesce file covers the whole run: its end time is renewed at every step (poll it while 98.0.12 is applied)
 check "stage 98.0.12" "$UPDATER_CMD" stage "$REL/ocw-98.0.12.tar.gz"   # (before 7e: that step revokes the test signing key)
 : > "$WORK/quiesce-seen.txt"
-( while [ ! -e "$WORK/quiesce-stop" ]; do python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["until"])' "$DATA/upgrade/quiesce.json" >> "$WORK/quiesce-seen.txt" 2>/dev/null; sleep 0.2; done ) &
+( while [ ! -e "$WORK/quiesce-stop" ]; do grep -h '"until"' "$DATA/upgrade/quiesce.json" >> "$WORK/quiesce-seen.txt" 2>>"$WORK/quiesce-poll.err" || true; sleep 0.1; done ) &
 POLL_PID=$!
 "$UPDATER_CMD" apply 98.0.12 --confirm-text 98.0.12 > "$WORK/apply12.txt" 2>&1 && RC=0 || RC=$?
 touch "$WORK/quiesce-stop"; wait "$POLL_PID" 2>/dev/null || true; rm -f "$WORK/quiesce-stop"
 check "98.0.12 applies" bash -c "test $RC -eq 0 || { cat $WORK/apply12.txt; exit 1; }"
-check "the quiesce file was seen during the run and its end time was renewed (two or more different values)" test "$(sort -u "$WORK/quiesce-seen.txt" | grep -c .)" -ge 2
+check "the quiesce file was seen during the run and its end time was renewed (two or more different values)" bash -c "test \$(sort -u $WORK/quiesce-seen.txt | grep -c .) -ge 2 || { sort -u $WORK/quiesce-seen.txt; tail -n 3 $WORK/quiesce-poll.err; exit 1; }"
 check "the quiesce file is gone when the run is over" test ! -e "$DATA/upgrade/quiesce.json"
 
 # a bundle for another run must leave state.json byte-identical; a rollback outside the 24 hours is refused
@@ -578,8 +578,8 @@ run_updater && RC=0 || RC=$?
 check "the burst was processed within 5 minutes and the service did not fail" bash -c "test $RC -eq 0 && test $((SECONDS - T0)) -lt 300 && ! systemctl is-failed --quiet ocw-upgrade.service"
 check "the inbox is empty after the burst" bash -c "test -z \"\$(ls -A $INBOX)\""
 check "at most 10 support bundles remain" bash -c "test \$(ls $DATA/upgrade/bundles/ocw-support-*.tar.gz | wc -l) -le 10"
-check "at most 200 handled-request files remain" bash -c "test \$(ls $DATA/upgrade/requests-done | wc -l) -le 200"
-check "at most 200 refusal records remain" bash -c "test \$(ls $DATA/upgrade/rejections | wc -l) -le 200"
+check "at most 200 handled-request files remain" bash -c "test \$(find $DATA/upgrade/requests-done -maxdepth 1 -type f | wc -l) -le 200"
+check "at most 200 refusal records remain" bash -c "test \$(find $DATA/upgrade/rejections -maxdepth 1 -type f | wc -l) -le 200"
 
 # deleting pre-upgrade backups is the command line's alone
 NBK_BEFORE="$(ls "$DATA"/upgrade/backups/audit_store-pre-*.db | wc -l)"
