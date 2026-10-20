@@ -247,7 +247,7 @@ chain heads are unchanged; an authenticated read works). Any failure rolls back 
 When an upgrade fails, the updater builds a redacted bundle (`ocw-support-<from>-to-<to>-<time>-<id>.tar.gz`, at most 5 MB) before anyone asks.
 An **app administrator without shell access can download it**: `GET /api/upgrade/bundle?name=...` (admin-only; it is linked from the
 failed upgrade's Audit Log entry, which records `bundle.name`, size and sha256; the Audit Log offers the download button). From a shell: `sudo ocw-updater bundle`
-(`--include-hosts` keeps host and environment names). Email it yourself to the address in SECURITY.md; **nothing is ever sent automatically.**
+(`--include-hosts` keeps host and environment names). Attach it to a private report as SECURITY.md describes (GitHub Security Advisories); **nothing is ever sent automatically.**
 
 * **In it:** `summary.json` (versions, reason code, failed step, timings, OS / Python / SQLite / systemd versions, free space, the
   manifest, the health results, `pip freeze`, schema before and after, the chain-head comparison, the run's history), the last 500 journal lines of each
@@ -290,23 +290,26 @@ On an install that has run `server/install.sh`, administrators can upgrade witho
 
 1. The page reads the new release's signature file and manifest (a few KB), checks the signature's trusted comment against the pinned keys and runs a
    **preflight** (free disk space, Python and SQLite versions, no sync running, the updater present). **Re-check** repeats it.
-2. A **confirmation screen** shows exactly what is approved: versions, artifact, sha256, signing key, what changes, schema migrations (and which of them a code
-   rollback cannot undo), the backup, the rollback policy and the downtime. You tick the acknowledgement and **Approve with MFA**: a fresh Okta challenge that is
+2. A **confirmation screen** shows exactly what is approved: versions, artifact, sha256, signing key, what changes, schema migrations (what each does, and which of them a code
+   rollback cannot undo), the backup and where it goes, the rollback policy and the downtime. You tick the acknowledgement and **Approve with MFA**: a fresh Okta challenge that is
    bound to *this* version, hash and time. Nothing is installed before you return from it.
-3. **Now** writes the request to the updater, which downloads, verifies, backs up, switches, restarts and health-checks (README above). The page shows the nine
-   steps live and keeps waiting through the restart (other users see the maintenance page; your session survives); when the new version answers it reloads once.
-   **Scheduled** upgrades are held by the application and handed to the updater at the chosen time; if the application is not running then, the upgrade is marked
-   **missed** and is never run late. Cancelling or rescheduling needs MFA too.
-4. The result is a card: success (with the eight health checks and a 24-hour rollback window), or failure (what happened, where you are now, and the redacted
-   **support bundle to download**, also linked from the failed upgrade's Audit Log entry). Every step of the run is in the Audit Log under one correlation id.
+3. **Now** writes the request to the updater, which downloads, verifies, backs up, switches, restarts and health-checks (README above). Right after the approval the page shows
+   **Starting** (with Follow progress), then the nine steps live, and keeps waiting through the restart (other users see the maintenance page; your session survives); when the new
+   version answers it reloads once. **Scheduled** upgrades are held by the application and handed to the updater at the chosen time; if the application is not running then, the
+   upgrade is marked **missed** and is never run late. Cancelling or rescheduling needs MFA too.
+4. The result is a page: success (who approved it, how it ran, the eight health checks and a 24-hour rollback window), or failure (what happened and when, where you are now, and the redacted
+   **support bundle to download**, also linked from the failed upgrade's Audit Log entry). "View the N audit entries" opens the Audit Log filtered to that upgrade; every step of the run is there under one correlation id.
 
 Notes:
 
+* **One banner at a time** tells every signed-in user what is going on: an upgrade running or failed, then a key revocation (admins), then a scheduled window, then "an update is available" (admins).
 * **Two-person rule** (Update check, "Change…"; off by default): a second, different administrator must approve within 24 hours.
-* **Rollback, restore, clear failure, rebuilding the support bundle and deleting old pre-upgrade backups are buttons** on the page (typed confirmation where something is
-  lost or deleted: `ROLLBACK`, `RESTORE`, `PRUNE`; then the MFA approval), and each is also a command: `sudo ocw-updater rollback | restore --confirm RESTORE | clear-failure | bundle [--include-hosts] | prune-backups --keep N --confirm PRUNE`.
-  The updater re-checks every request and refuses what the command line would refuse; the newest backup and the one the last upgrade took are never deleted. After a failure the same
-  version is refused until the failure is cleared; if the rollback itself failed the page says an operator must act on the server.
+* **Rollback, restore, clear failure and rebuilding the support bundle with host names are buttons** on the page (typed word where something is lost: `ROLLBACK`, `RESTORE`; then the MFA approval), and each is also a
+  command: `sudo ocw-updater rollback | restore --confirm RESTORE | clear-failure | bundle [--include-hosts]`. Restore is tied to the backup file the page shows. The updater re-checks every request and
+  refuses what the command line would refuse. After a failure the same version is refused until the failure is cleared; while an operator must act (the rollback itself failed) the page shows the command
+  instead of a button. If the server's updater is older than this release the buttons stay off and the page shows `sudo server/install.sh --refresh-updater`.
+* **Deleting pre-upgrade backups is command-line only**: `sudo ocw-updater prune-backups --keep N --confirm PRUNE` (never the newest copy, never the last upgrade's). The page lists the copies (version, date, size, integrity) but
+  has no delete button: they are the only copies of the archive the web application cannot touch, so removing them needs a shell on the server.
 * **Local (laptop) mode** does not offer this flow (no identity provider to step up with); it shows the commands `python launch.py upgrade` and
   `python launch.py upgrade --restore-previous`.
 * `server/deploy.sh --ref` (unsigned source) is deprecated for operators; use the Updates page or `ocw-updater`.

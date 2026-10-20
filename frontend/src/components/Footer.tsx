@@ -1,3 +1,4 @@
+import { REPO_CHANGELOG_URL, REPO_README_URL } from '../utils/links'
 import { useEffect, useRef } from 'react'
 import { RefreshCw } from 'lucide-react'
 import { useEnvironments, useSyncStatus, useUpgradeStatus, useVersion, useWhoami } from '../api/hooks'
@@ -17,8 +18,6 @@ import { AFFILIATION } from '../utils/brand'
 // a standalone CHANGELOG.md (public-consumption rewrite) -- the
 // Changelog link now points at that file directly instead of a
 // #changelog anchor inside README.md, which no longer exists there.
-const REPO_README_URL = 'https://github.com/ItsGambit/opa-compliance-wizard/blob/main/README.md'
-const REPO_CHANGELOG_URL = 'https://github.com/ItsGambit/opa-compliance-wizard/blob/main/CHANGELOG.md'
 
 export function Footer() {
   const { data: version } = useVersion()

@@ -1,7 +1,7 @@
 /** 5.46.0: the Updates page (artboards 01-03), the Keys page (12), the banners, the nav count and the brand surfaces. */
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
-import { checkUpgradeNow, fetchAuditLog, fetchUpgradeStatus, fetchVersion, fetchWhoami, saveUpgradeSettings } from '../api/client'
+import { checkUpgradeNow, fetchAuditLog, fetchUpgradeNotice, fetchUpgradeStatus, fetchVersion, fetchWhoami, saveUpgradeSettings } from '../api/client'
 import { renderWithClient } from '../test/renderWithClient'
 import { makeStatus, makeUpgrade, NEWER, RELEASE_KEY, STANDBY_KEY } from '../test/upgradeFixtures'
 import type { AuditLogEntry } from '../types'
@@ -11,14 +11,14 @@ import { AboutDialog } from './AboutDialog'
 import { AuditLogPage } from './AuditLogPage'
 import { Brand, BrandMark } from './Brand'
 import { SideNav } from './SideNav'
-import { UpdateBanner } from './UpdateBanner'
+import { UpgradeNoticeBanner } from './UpgradeNoticeBanner'
 import { describeKeyEvent, UpdateKeysPage } from './UpdateKeysPage'
 import { UpdatesPage } from './UpdatesPage'
 
 vi.mock('../api/client', async importOriginal => ({
   ...(await importOriginal<typeof import('../api/client')>()),
   fetchUpgradeStatus: vi.fn(), saveUpgradeSettings: vi.fn(), checkUpgradeNow: vi.fn(), fetchAuditLog: vi.fn(), backfillMfaLogEvents: vi.fn(),
-  fetchWhoami: vi.fn(), fetchVersion: vi.fn(), reviewUpgrade: vi.fn(), requestUpgrade: vi.fn(), isStepUpRequired: (v: unknown) => typeof v === 'object' && v !== null && (v as { step_up_required?: boolean }).step_up_required === true,
+  fetchWhoami: vi.fn(), fetchVersion: vi.fn(), reviewUpgrade: vi.fn(), requestUpgrade: vi.fn(), fetchUpgradeNotice: vi.fn(), isStepUpRequired: (v: unknown) => typeof v === 'object' && v !== null && (v as { step_up_required?: boolean }).step_up_required === true,
 }))
 vi.mock('../hooks/useToast', () => ({ toast: vi.fn() }))
 vi.mock('../utils/stepUp', () => ({ beginStepUp: vi.fn() }))
@@ -216,27 +216,41 @@ describe('Keys page (artboard 12)', () => {
   })
 })
 
-describe('Banners (artboards 03 and 12)', () => {
-  it('info banner for admins when a newer release exists, dismissible per version; red banner after a revocation', async () => {
+describe('The one banner (artboards 03, 07, 08a, 10 and 12)', () => {
+  it('available for admins, dismissible; a revocation (red) takes the place of it and stays; one banner at a time', async () => {
     vi.mocked(fetchUpgradeStatus).mockResolvedValue({ ...makeStatus({ ...NEWER }), revocation: REVOKED.revocation })
+    vi.mocked(fetchUpgradeNotice).mockResolvedValue({ kind: 'available', version: '5.48.0' })
     const open = vi.fn()
-    renderWithClient(<UpdateBanner canAdmin onOpenUpdates={open} />)
-    expect(await screen.findByText(/Version 5.48.0 of OPA Compliance Wizard is available/)).toBeTruthy()
-    expect(screen.getByRole('alert').textContent).toContain('revoked')
-    fireEvent.click(screen.getByRole('button', { name: 'Review it on the Updates page' }))
+    renderWithClient(<UpgradeNoticeBanner canAdmin onOpenUpdates={open} />)
+    expect((await screen.findByRole('alert')).textContent).toContain('revoked')
+    expect(screen.queryByText(/is available/)).toBeNull()                       // never two
+    fireEvent.click(screen.getByRole('button', { name: 'Review on the Updates page' }))
     expect(open).toHaveBeenCalled()
-    fireEvent.click(screen.getByRole('button', { name: 'Dismiss update notice' }))
-    expect(screen.queryByText(/is available/)).toBeNull()
-    expect(screen.getByRole('alert')).toBeTruthy()    // the red one is not dismissible
   })
 
-  it('no banner for non-admins (and no request), when the check is off, or when up to date', async () => {
-    renderWithClient(<UpdateBanner canAdmin={false} onOpenUpdates={() => {}} />)
+  it('available, in the mockup words, when there is no revocation; dismissed for the session', async () => {
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({ ...NEWER }))
+    vi.mocked(fetchUpgradeNotice).mockResolvedValue({ kind: 'available', version: '5.48.0' })
+    renderWithClient(<UpgradeNoticeBanner canAdmin onOpenUpdates={() => {}} />)
+    expect(await screen.findByText('Version 5.48.0 of OPA Compliance Wizard is available. Admins can review and upgrade from the Updates page.')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss announcement' }))
+    expect(screen.queryByText(/is available/)).toBeNull()
+  })
+
+  it('a running or failed upgrade beats a revocation notice', async () => {
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue({ ...makeStatus({ ...NEWER }), revocation: REVOKED.revocation })
+    vi.mocked(fetchUpgradeNotice).mockResolvedValue({ kind: 'running', version: '5.48.0', started_at: '2026-10-21T02:30:00Z' })
+    renderWithClient(<UpgradeNoticeBanner canAdmin onOpenUpdates={() => {}} />)
+    expect(await screen.findByText(/Upgrade to 5.48.0 in progress/)).toBeTruthy()
+    expect(screen.queryByText(/revoked/)).toBeNull()
+  })
+
+  it('no status request for non-admins, and nothing when there is nothing to say', async () => {
+    vi.mocked(fetchUpgradeNotice).mockResolvedValue({ kind: 'none' })
+    const r = renderWithClient(<UpgradeNoticeBanner canAdmin={false} />)
+    await waitFor(() => expect(fetchUpgradeNotice).toHaveBeenCalled())
     expect(fetchUpgradeStatus).not.toHaveBeenCalled()
-    vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({ ...NEWER, check: { ...makeStatus().check, enabled: false } }))
-    const off = renderWithClient(<UpdateBanner canAdmin onOpenUpdates={() => {}} />)
-    await waitFor(() => expect(fetchUpgradeStatus).toHaveBeenCalled())
-    expect(off.container.textContent).toBe('')
+    expect(r.container.textContent).toBe('')
   })
 })
 

@@ -6,6 +6,9 @@ import { toast } from '../hooks/useToast'
 import { AuditLogShiftedError, fetchAuditPage, nextAuditPageParam, type AuditPageParam } from '../utils/auditPaging'
 import { cellValue, formatDateTime, labelize } from '../utils/format'
 import { formatBytes } from '../utils/upgrade'
+import { takeAuditSearch } from '../utils/upgradeRequested'
+import { REPO_SECURITY_URL } from '../utils/links'
+import { shortSha } from '../utils/upgradeFlow'
 import { HighlightedText, useFuzzyFilter } from '../utils/fuzzySearch'
 
 /** Every write action across every environment and user, admin-only, for
@@ -18,7 +21,7 @@ import { HighlightedText, useFuzzyFilter } from '../utils/fuzzySearch'
  * log_audit_event) -- shown as "—" on any entry written before that
  * change, since neither was ever captured for those. */
 export function AuditLogPage() {
-  const [query, setQuery] = useState('')
+  const [query, setQuery] = useState(takeAuditSearch)
   // UI-13: Refresh first runs the MFA backfill (Okta lookups) -- guarded
   // by its own flag so repeated clicks can't queue several of them.
   const [refreshing, setRefreshing] = useState(false)
@@ -204,7 +207,7 @@ export function AuditLogPage() {
                 : 'update check (server)'
             const isDeployEvent = entry.action.startsWith('deploy.') || isSystemUpgradeEvent
             const isDeployFailure = entry.action === 'deploy.failed' || entry.action === 'upgrade.verify_failed'
-              || entry.action === 'upgrade.failed' || entry.action === 'upgrade.rolled_back' || entry.action === 'upgrade.missed'
+              || entry.action === 'upgrade.failed' || entry.action === 'upgrade.missed'
               || entry.action === 'upgrade.key_revocation_rejected'
               || (entry.action === 'upgrade.check' && entry.details?.outcome === 'failed')
             const deployBorderColor = isDeployFailure ? 'border-l-loss' : 'border-l-accent'
@@ -235,9 +238,11 @@ export function AuditLogPage() {
                       <span className="text-text-dim break-all">{entry.user_agent ?? '—'}</span>
                     </>
                   )}
-                  {(isSystemUpgradeEvent ? [...detailEntries].sort(([a], [b]) => (a === 'correlation_id' ? -1 : b === 'correlation_id' ? 1 : 0)) : detailEntries).map(([key, value]) => (
-                    <FieldRow key={key} label={key} value={value} />
-                  ))}
+                  {(isSystemUpgradeEvent ? [...detailEntries].sort(([a], [b]) => (a === 'correlation_id' ? -1 : b === 'correlation_id' ? 1 : 0)) : detailEntries)
+                    .filter(([key, value]) => !(key === 'trigger' && value === 'ocw-updater'))   // the Actor row already says it
+                    .map(([key, value]) => (
+                      <FieldRow key={key} label={key} value={key === 'bundle' ? bundleText(value) : value} />
+                    ))}
                 </div>
                 <BundleDownload entry={entry} />
               </div>
@@ -272,10 +277,17 @@ function BundleDownload({ entry }: { entry: { action: string; details?: Record<s
         <Download size={12} aria-hidden="true" />Download support bundle{size && ` (${size})`}
       </a>
       <span className="text-[0.6875rem] px-1.5 py-0.5 rounded border border-border text-text-dim">Redacted · e-mails, subjects, hosts, env names, secrets</span>
-      <span className="text-[0.6875rem] text-text-faint">Email it to the security contact in SECURITY.md. Nothing is sent automatically.</span>
+      <span className="text-[0.6875rem] text-text-faint">Attach it to a private report (<a href={REPO_SECURITY_URL} target="_blank" rel="noreferrer noopener" className="underline">SECURITY.md</a>). Nothing is sent automatically.</span>
       <a href="#/updates" className="text-[0.6875rem] text-accent-text underline ml-auto">Open on the Updates page</a>
     </div>
   )
+}
+
+/** The bundle field of an upgrade.failed entry as one line (name, size, short hash) instead of its raw JSON. */
+function bundleText(value: unknown): string {
+  const b = value as { name?: unknown; size?: unknown; sha256?: unknown } | null
+  if (!b || typeof b !== 'object' || typeof b.name !== 'string') return cellValue(value)
+  return [b.name, typeof b.size === 'number' ? formatBytes(b.size) : null, typeof b.sha256 === 'string' ? `sha256 ${shortSha(b.sha256)}` : null].filter(Boolean).join(' · ')
 }
 
 function FieldRow({ label, value }: { label: string; value: unknown }) {
