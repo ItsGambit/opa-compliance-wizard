@@ -185,7 +185,7 @@ STEPUP_PREPARE_TTL_SECONDS = 15 * 60
 ENV_CHANGE_ACTION_TYPES = (
     "environment.upsert", "environment.share", "environment.delete",
     "sync_schedule.update", "sync.reset_watermark", "sync.import_csv",
-    "archive.purge", "shared_permissions.update",
+    "archive.purge", "shared_permissions.update", "upgrade.settings",
 )
 
 # The environment form's two secrets never go into pending_admin_actions
@@ -1286,6 +1286,7 @@ _ENV_CHANGE_EXECUTORS = {
     "sync.import_csv": "_exec_sync_import_csv",
     "archive.purge": "_exec_archive_purge",
     "shared_permissions.update": "_exec_shared_permissions_update",
+    "upgrade.settings": "_exec_upgrade_settings_update",
 }
 assert set(_ENV_CHANGE_EXECUTORS) == set(ENV_CHANGE_ACTION_TYPES)
 
@@ -1896,6 +1897,31 @@ class Handler(SimpleHTTPRequestHandler):
             details["step_up_verified"] = True
         self._log_audit_event(actor_email, actor_sub, "archive.purge", details)
         return 200, {"purged": archive_id, **counts}
+
+    def _exec_upgrade_settings_update(self, params, dry_run, via_step_up):
+        """5.46.0: the update check's frequency (daily / manual / off) and the share-version
+        switch. Admin-only; in hosted mode it needs a fresh MFA approval like every other
+        configuration change (the Updates screen says so). Audit-logged."""
+        owner_key, _engine_owner_, actor_email, actor_sub = self._caller()
+        if not _can_admin(owner_key, self.headers):
+            return 403, {"error": "Admin access required to change update settings."}
+        payload = params.get("body") or {}
+        problem = update_service.validate_settings_payload(payload)
+        if problem:
+            return 400, {"error": problem}
+        switch, _bad = update_service.env_switch()
+        wants_on = payload.get("frequency", "on" if payload.get("enabled") else "off") != "off"
+        if wants_on and switch == "off":
+            return 409, {"error": "The update check is switched off by OPA_UPDATE_CHECK=off in this server's environment, "
+                                  "which always wins. Remove that setting (and restart) to allow it.", "reason": "env_locked"}
+        if dry_run:
+            return None, None
+
+        def audit(action, details):
+            extra = {"step_up_verified": True} if via_step_up else {}
+            self._log_audit_event(actor_email, actor_sub, action, {**details, **extra})
+
+        return update_service.apply_settings_request(payload, engine.SCRIPT_VERSION, audit)
 
     def _exec_shared_permissions_update(self, params, dry_run, via_step_up):
         """Admin-only: the global defaults (no environment_id), one
@@ -2654,9 +2680,14 @@ class Handler(SimpleHTTPRequestHandler):
                 # GitHub for the latest release number).
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to change update settings."})
-                status, body = update_service.apply_settings_request(
-                    payload, engine.SCRIPT_VERSION,
-                    lambda action, details: self._log_audit_event(actor_email, actor_sub, action, details))
+                return self._environment_change("upgrade.settings", {"body": payload})
+
+            if path == "/api/upgrade/check":
+                # 5.46.0: the Updates screen's "Check now" -- one request to the release server (never
+                # installs anything), admin-only, at most once a minute, recorded in the audit log.
+                if not _can_admin(owner_key, self.headers):
+                    return self._send_json(403, {"error": "Admin access required to check for updates."})
+                status, body = update_service.check_now(engine.SCRIPT_VERSION, actor_email, actor_sub)
                 return self._send_json(status, body)
 
             if path == "/api/access_control/prepare":

@@ -19,6 +19,7 @@ import type {
   IntegrityResult,
   NamedRef,
   OrphanedArchive,
+  UpdateFrequency,
   UpgradeStatus,
   OpaGroup,
   PreviewResponse,
@@ -162,8 +163,16 @@ export function fetchUpgradeStatus(): Promise<UpgradeStatus> {
   return apiFetch('/api/upgrade/status')
 }
 
-export function saveUpgradeSettings(settings: { enabled?: boolean; share_version?: boolean }): Promise<UpgradeStatus> {
+/** Changes the update check's frequency / share-version switch. In hosted mode this is a
+ * step-up change like the other settings: the answer is a StepUpRequired the caller hands to
+ * beginStepUp; in local mode it applies at once and returns the new status. */
+export function saveUpgradeSettings(settings: { frequency?: UpdateFrequency; share_version?: boolean }): Promise<UpgradeStatus | StepUpRequired> {
   return apiFetch('/api/upgrade/settings', { method: 'POST', body: JSON.stringify(settings) })
+}
+
+/** "Check now": one request to the release server, at most once a minute. Never installs anything. */
+export function checkUpgradeNow(): Promise<UpgradeStatus> {
+  return apiFetch('/api/upgrade/check', { method: 'POST', body: JSON.stringify({}) })
 }
 
 export function fetchAccessControl(): Promise<AccessControlConfig> {

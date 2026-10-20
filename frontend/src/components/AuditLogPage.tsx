@@ -196,13 +196,13 @@ export function AuditLogPage() {
             // system events too (actor "update check"/"deploy.sh"), unless an
             // admin or the CLI changed a setting (those carry an actor).
             // Failures and refusals use the same red as a failed deploy.
-            const isSystemUpgradeEvent = (entry.action.startsWith('upgrade.') || entry.action.startsWith('release_keys.')) && !actor
+            const isSystemUpgradeEvent = entry.action.startsWith('upgrade.') && !actor
             const isDeployEvent = entry.action.startsWith('deploy.') || isSystemUpgradeEvent
             const isDeployFailure = entry.action === 'deploy.failed' || entry.action === 'upgrade.verify_failed'
-              || entry.action === 'release_keys.revocation_rejected'
-              || (entry.action === 'upgrade.check' && entry.details?.result === 'failed')
+              || entry.action === 'upgrade.key_revocation_rejected'
+              || (entry.action === 'upgrade.check' && entry.details?.outcome === 'failed')
             const deployBorderColor = isDeployFailure ? 'border-l-loss' : 'border-l-accent'
-            const deployTextColor = isDeployFailure ? 'text-loss' : 'text-accent'
+            const deployTextColor = isDeployFailure ? 'text-loss' : 'text-accent-text'
             return (
               <div
                 // UI-13: timestamp+action collided for entries written in the
@@ -219,12 +219,17 @@ export function AuditLogPage() {
                 </div>
                 <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[0.6875rem]">
                   <span className="section-label">Actor</span>
-                  <span className="text-text-dim">{isDeployEvent ? (isSystemUpgradeEvent ? 'server (updates)' : 'deploy.sh (server)') : actor ?? 'local / CLI'}</span>
-                  <span className="section-label">Client IP</span>
-                  <span className="text-text-dim">{entry.client_ip ?? '—'}</span>
-                  <span className="section-label">User Agent</span>
-                  <span className="text-text-dim break-all">{entry.user_agent ?? '—'}</span>
-                  {detailEntries.map(([key, value]) => (
+                  <span className="text-text-dim">{isDeployEvent ? (isSystemUpgradeEvent ? (entry.action === 'upgrade.check' ? 'scheduler (server)' : 'update check (server)') : 'deploy.sh (server)') : actor ?? 'local / CLI'}</span>
+                  {/* A server-side update event has no browser behind it: leave out the empty IP / agent rows. */}
+                  {!(isSystemUpgradeEvent && !entry.client_ip && !entry.user_agent) && (
+                    <>
+                      <span className="section-label">Client IP</span>
+                      <span className="text-text-dim">{entry.client_ip ?? '—'}</span>
+                      <span className="section-label">User Agent</span>
+                      <span className="text-text-dim break-all">{entry.user_agent ?? '—'}</span>
+                    </>
+                  )}
+                  {(isSystemUpgradeEvent ? [...detailEntries].sort(([a], [b]) => (a === 'correlation_id' ? -1 : b === 'correlation_id' ? 1 : 0)) : detailEntries).map(([key, value]) => (
                     <FieldRow key={key} label={key} value={value} />
                   ))}
                 </div>

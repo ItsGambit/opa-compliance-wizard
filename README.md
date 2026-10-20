@@ -1,4 +1,13 @@
+<p><img src="frontend/public/logo.svg" alt="OPA Compliance Wizard" height="40"></p>
+
 # OPA Compliance Wizard
+
+*Evidence for OPA audits.*
+
+OPA Compliance Wizard produces audit evidence for Okta Privileged Access
+(OPA) tenants. *An independent open-source tool. Not affiliated with or
+endorsed by Okta, Inc. Okta and Okta Privileged Access are trademarks of
+Okta, Inc.*
 
 **A compliance evidence helper for Okta Privileged Access (OPA) and core
 Okta.** Okta's own System Log only keeps 90 days of history; most audits
@@ -9,9 +18,8 @@ PAM admins the underlying evidence their auditors ask for without
 needing to know Okta's System Log event-type names or write a query. It
 doesn't produce a finished SOC 2/SOX/ISO 27001 report on its own — it
 gets you most of the way there, and that's the direction this project is
-headed. It also includes the tool this project started as: building and
-managing OPA vault secret folders, resource groups, projects, and access
-policies.
+headed. It also includes Folder Builder, for creating OPA vault folders,
+resource groups, projects, and access policies from a CSV or a visual tree.
 
 Ships as both an interactive dashboard for everyday use and a CLI for
 scripting — same underlying engine, no logic duplicated between them.
@@ -322,7 +330,7 @@ install directory with the app's Python (`.venv/bin/python -m server.updater ...
 | `enable-check` / `disable-check` | Same switch as the screen, same audit entry (actor recorded as `cli:<os user>`). |
 | `verify <tar.gz> <.minisig>` | Verify a download (see below). |
 | `keys list` / `keys apply-revocation <revocation.json>` | Show or update the pinned signing keys. |
-| `audit [--since DATE] [--json]` | List the upgrade-related Audit Log entries (`upgrade.*`, `release_keys.*`, `deploy.*`). |
+| `audit [--since DATE] [--json]` | List the upgrade-related Audit Log entries (`upgrade.*`, `deploy.*`). |
 
 Exit codes: `0` ok, `1` a newer release is available (`check`), `2` usage error, `3` failure
 (the message says what to do).
@@ -365,7 +373,7 @@ not install it"*). Releases the old key signed **before** the revocation stay va
 
 What to do:
 1. **Online:** with the update check on, the server fetches and applies the revocation by itself
-   (recorded in the Audit Log as `release_keys.revocation_applied`); `deploy.sh --release` also
+   (recorded in the Audit Log as `upgrade.key_revoked`); `deploy.sh --release` also
    applies a published revocation before it verifies. Nothing to do.
 2. **Offline:** on a trusted computer download `revocation.json` from the project's `revocation`
    release; copy it to the server; run

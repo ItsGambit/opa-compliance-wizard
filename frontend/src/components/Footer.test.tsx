@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { fetchEnvironments, fetchSyncStatus, fetchUpgradeStatus, fetchVersion, fetchWhoami } from '../api/client'
 import { renderWithClient } from '../test/renderWithClient'
 import type { Environment } from '../types'
+import { makeStatus, NEWER } from '../test/upgradeFixtures'
 import { Footer } from './Footer'
 
 vi.mock('../api/client', () => ({
@@ -54,16 +55,9 @@ describe('Footer', () => {
   it('tells an admin about a newer release (only when the opt-in check found one)', async () => {
     vi.mocked(fetchEnvironments).mockResolvedValue({ environments: [env({ is_own: true, shared: false })], active: 'team', active_id: 'e1' })
     vi.mocked(fetchWhoami).mockResolvedValue({ email: 'a@example.com', is_local: false, is_admin: true, can_admin: true })
-    vi.mocked(fetchUpgradeStatus).mockResolvedValue({
-      installed_version: '5.40.7',
-      check: { enabled: true, source: 'setting', env_locked: false, env_invalid_value: null, prompt_needed: false, share_version: false, mirror: false },
-      latest: { version: '5.47.0', published_at: null, release_url: null, signed_artifact: true },
-      update_available: true,
-      last_check: { at: null, status: 'ok', code: 'ok', next_at: null, consecutive_failures: 0, failing_since: null },
-      signing_keys: { pinned: true, serial: 0, error: null },
-    })
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({ ...NEWER, installed_version: '5.40.7' }))
     renderWithClient(<Footer />)
-    expect(await screen.findByText('Update available: v5.47.0')).toBeTruthy()
+    expect(await screen.findByText('Update available: v5.48.0')).toBeTruthy()
   })
 
   it('a non-admin is never asked about updates', async () => {

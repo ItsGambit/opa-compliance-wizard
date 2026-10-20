@@ -118,13 +118,13 @@ def cmd_check(a):
     if a.json:
         print(json.dumps({"result": out, "status": s}, indent=2))
     else:
-        if out["result"] == "failed":
+        if out["outcome"] == "failed":
             print(f"The check failed: {out['reason']}. See `status`; the check retries later.", file=sys.stderr)
         else:
             _print_status(s)
-    if out["result"] == "failed":
+    if out["outcome"] == "failed":
         return EXIT_FAILURE
-    return EXIT_NEWER if out["result"] == "update_available" else EXIT_OK
+    return EXIT_NEWER if out["outcome"] == "update_available" else EXIT_OK
 
 
 def _set(enabled):

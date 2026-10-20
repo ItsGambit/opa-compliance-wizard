@@ -110,7 +110,9 @@ ROUTES = {
     ("GET", "path == '/api/upgrade/status'"): Route("GET", "/api/upgrade/status", "admin", None, 200),
     # 5.47.0: a redacted support bundle the root-owned updater built (admin-only, read-only); no such file here -> 404.
     ("GET", "path == '/api/upgrade/bundle'"): Route("GET", "/api/upgrade/bundle?name=ocw-support-1.0.0-to-1.0.1-20260101T000000Z-ab12.tar.gz", "admin", None, 404),
-    ("POST", "path == '/api/upgrade/settings'"): Route("POST", "/api/upgrade/settings", "admin", {"share_version": False}, 200),
+    ("POST", "path == '/api/upgrade/settings'"):
+        Route("POST", "/api/upgrade/settings", "admin", {"share_version": True}, 200, stepup="upgrade.settings"),
+    ("POST", "path == '/api/upgrade/check'"): Route("POST", "/api/upgrade/check", "admin", {}, 409),
     ("GET", "path == '/api/shared_permissions'"): Route("GET", "/api/shared_permissions", "admin", None, 200),
     ("POST", "path == '/api/banner'"):
         Route("POST", "/api/banner", "admin", {"enabled": True, "message": "Maintenance tonight", "variant": "info"}, 200),
@@ -1480,7 +1482,7 @@ def _stepup_case(serve, route):
         conn.execute("INSERT INTO sync_state (environment_id, total_events_ingested) VALUES (?, 0)", (ORPHAN,))
         conn.commit()
         who, admin = ADMIN, True
-    elif route.stepup == "shared_permissions.update":
+    elif route.stepup in ("shared_permissions.update", "upgrade.settings"):
         who, admin = ADMIN, True
     elif route.stepup == "environment.share":
         body = {"shared": False}

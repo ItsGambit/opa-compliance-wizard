@@ -299,9 +299,33 @@ export interface BannerConfig {
   dismissible: boolean
 }
 
-/** GET /api/upgrade/status (5.46.0): the opt-in, notify-only update check. */
+/** GET /api/upgrade/status (5.46.0): the opt-in, notify-only update check and the pinned signing keys. */
+export type UpdateFrequency = 'daily' | 'manual' | 'off'
+
+export interface UpgradeKey {
+  key_id: string
+  role: 'release' | 'standby'
+  alg: string
+  status: 'active' | 'retired' | 'revoked'
+  since: string
+  revoked_at: string | null
+}
+
+export interface UpgradeRevocation {
+  serial: number | null
+  issued_at: string | null
+  applied_at: string | null
+  reason: string | null
+  advisory_url: string | null
+  revoked: string[]
+  added: string[]
+  signed_by: string | null
+  source: string | null
+}
+
 export interface UpgradeStatus {
   installed_version: string
+  installed_at: string | null
   check: {
     enabled: boolean
     source: 'env_off' | 'env_on' | 'setting' | 'default_off'
@@ -310,8 +334,20 @@ export interface UpgradeStatus {
     prompt_needed: boolean
     share_version: boolean
     mirror: boolean
+    /** null until an admin has answered the one-time question. */
+    frequency: UpdateFrequency | null
+    /** The release-check URL this server uses (the default, or a configured mirror). */
+    url?: string
   }
-  latest: { version: string; published_at: string | null; release_url: string | null; signed_artifact: boolean | null } | null
+  latest: {
+    version: string
+    published_at: string | null
+    release_url: string | null
+    signed_artifact: boolean | null
+    size: number | null
+    notes_title: string | null
+    notes: string | null
+  } | null
   update_available: boolean
   last_check: {
     at: string | null
@@ -320,8 +356,12 @@ export interface UpgradeStatus {
     next_at: string | null
     consecutive_failures: number
     failing_since: string | null
+    by: string | null
   }
-  signing_keys: { pinned: boolean; serial: number | null; error: string | null }
+  signing_keys: { pinned: boolean; serial: number | null; error: string | null; keys: UpgradeKey[] }
+  /** The revocation applied in the last 30 days, if any (drives the red notice). */
+  revocation: UpgradeRevocation | null
+  server: { time: string; zone: string | null; utc_offset_minutes: number }
 }
 
 // Okta group IDs (not names) that gate login/admin rights across the whole

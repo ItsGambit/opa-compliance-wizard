@@ -210,4 +210,4 @@ compromised", step 3). Keep the standby's identity locked down and alerted for e
 ## What each audience sees
 
 Maintainers: the tools' errors name what to do. Operators: every refusal is an `upgrade.verify_failed` Audit Log entry with a reason code;
-key-list changes are `release_keys.updated` / `release_keys.revocation_applied` / `release_keys.revocation_rejected`.
+key-list changes are `upgrade.key_list_installed` / `upgrade.key_revoked` / `upgrade.key_added` / `upgrade.key_revocation_rejected`.

@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
+import { Brand } from './Brand'
 import {
   Archive,
   ClipboardCheck,
-  Download,
+  CircleArrowUp,
   FolderTree,
   Info,
   KeyRound,
@@ -108,10 +109,8 @@ interface Props {
   onOpenOrphanedArchives?: () => void
   /** Admin-only (canAdmin, 5.42.0): what shared users may do by default. */
   onOpenSharedPermissions?: () => void
-  /** Admin-only (canAdmin, 5.46.0): the notify-only Updates screen. */
-  onOpenUpdates?: () => void
-  /** A newer release was found by the update check. */
-  updateAvailable?: boolean
+  /** Admin-only (5.46.0): how many updates the (opt-in) check found, shown as a count badge on the Updates item. */
+  updateCount?: number
 }
 
 const TOP_LEVEL_ICON: Record<string, typeof FolderTree> = {
@@ -119,6 +118,7 @@ const TOP_LEVEL_ICON: Record<string, typeof FolderTree> = {
   access: Search,
   builder: FolderTree,
   audit_log: ListChecks,
+  updates: CircleArrowUp,
 }
 
 const TOP_LEVEL_LABEL: Record<string, string> = {
@@ -126,6 +126,7 @@ const TOP_LEVEL_LABEL: Record<string, string> = {
   access: 'Access Explorer',
   builder: 'Folder Builder',
   audit_log: 'Audit Log',
+  updates: 'Updates',
 }
 
 /** One top-level nav row. When `collapsed`, renders icon-only (centered,
@@ -138,12 +139,15 @@ function NavItem({
   icon,
   onClick,
   collapsed,
+  count,
 }: {
   active: boolean
   label: string
   icon?: typeof FolderTree
   onClick: () => void
   collapsed?: boolean
+  /** A count badge (e.g. 1 available update). */
+  count?: number
 }) {
   const Icon = icon
   if (collapsed) {
@@ -152,13 +156,14 @@ function NavItem({
         type="button"
         onClick={onClick}
         title={label}
-        aria-label={label}
+        aria-label={count ? `${label} (${count} available)` : label}
         aria-current={active ? 'page' : undefined}
-        className={`w-9 h-9 mx-auto flex items-center justify-center rounded-md transition-colors ${
+        className={`relative w-9 h-9 mx-auto flex items-center justify-center rounded-md transition-colors ${
           active ? 'bg-accent text-white' : 'text-text-faint hover:bg-bg-hover hover:text-text-dim'
         }`}
       >
         {Icon && <Icon size={16} />}
+        {!!count && <span aria-hidden="true" className="absolute top-1 right-1 h-2 w-2 rounded-full bg-accent" />}
       </button>
     )
   }
@@ -168,11 +173,14 @@ function NavItem({
       onClick={onClick}
       aria-current={active ? 'page' : undefined}
       className={`w-full flex items-center gap-2.5 px-2.5 py-2 rounded-md text-sm text-left transition-colors ${
-        active ? 'bg-accent-dim text-accent font-medium' : 'text-text-dim hover:bg-bg-hover'
+        active ? 'bg-accent-dim text-accent-text font-medium' : 'text-text-dim hover:bg-bg-hover'
       }`}
     >
       {Icon && <Icon size={15} className="shrink-0" />}
       <span className="truncate">{label}</span>
+      {!!count && (
+        <span className="ml-auto text-[11px] font-semibold bg-accent text-white rounded-full px-[7px] py-px" aria-label={`${count} available`}>{count}</span>
+      )}
     </button>
   )
 }
@@ -188,14 +196,11 @@ function UtilityPill({
   icon,
   onClick,
   collapsed,
-  badge,
 }: {
   label: string
   icon: typeof FolderTree
   onClick: () => void
   collapsed?: boolean
-  /** A small dot: something here needs attention (an update is available). */
-  badge?: boolean
 }) {
   const Icon = icon
   if (collapsed) {
@@ -204,13 +209,12 @@ function UtilityPill({
         type="button"
         onClick={onClick}
         title={label}
-        aria-label={badge ? `${label} (update available)` : label}
-        className="relative w-9 h-9 mx-auto flex items-center justify-center rounded-full text-text-dim
+        aria-label={label}
+        className="w-9 h-9 mx-auto flex items-center justify-center rounded-full text-text-dim
           bg-[color-mix(in_srgb,var(--color-text)_6%,transparent)]
           hover:bg-[color-mix(in_srgb,var(--color-text)_10%,transparent)] transition-colors"
       >
         <Icon size={14} />
-        {badge && <span aria-hidden="true" className="absolute top-1 right-1 h-2 w-2 rounded-full bg-accent" />}
       </button>
     )
   }
@@ -224,7 +228,6 @@ function UtilityPill({
     >
       <Icon size={14} />
       {label}
-      {badge && <span className="h-2 w-2 rounded-full bg-accent" role="img" aria-label="update available" />}
     </button>
   )
 }
@@ -245,8 +248,7 @@ export function SideNav({
   onOpenAbout,
   onOpenOrphanedArchives,
   onOpenSharedPermissions,
-  onOpenUpdates,
-  updateAvailable,
+  updateCount,
 }: Props) {
   const { theme, toggle } = useTheme()
 
@@ -301,7 +303,7 @@ export function SideNav({
           bg-bg-elevated border-r border-border flex-col p-3 fixed md:relative top-0 left-0 h-full z-40 transition-[width] duration-150`}
       >
         <div className={`flex items-center mb-3 ${collapsed ? 'md:justify-center' : 'justify-between'} px-2`}>
-          {!collapsed && <div className="text-sm font-semibold text-text truncate">OPA Compliance Wizard</div>}
+          {!collapsed && <Brand />}
           <button
             type="button"
             onClick={() => setCollapsedPref(c => !c)}
@@ -315,7 +317,7 @@ export function SideNav({
         {/* Mobile drawer always shows the full title -- collapsed only
             ever applies at md and above (mobile has its own always-full
             drawer state, distinct from this desktop toggle). */}
-        {collapsed && <div className="md:hidden text-sm font-semibold text-text px-2 mb-3">OPA Compliance Wizard</div>}
+        {collapsed && <div className="md:hidden px-2 mb-3"><Brand /></div>}
 
         <div className="flex flex-col gap-0.5">
           <NavItem
@@ -376,6 +378,16 @@ export function SideNav({
               collapsed={collapsed}
             />
           )}
+          {canAdmin && (
+            <NavItem
+              active={activeTab === 'updates' || activeTab === 'update_keys'}
+              label={TOP_LEVEL_LABEL.updates}
+              icon={TOP_LEVEL_ICON.updates}
+              onClick={() => { onTabChange('updates'); closeDrawer() }}
+              collapsed={collapsed}
+              count={updateCount}
+            />
+          )}
         </div>
 
         <div className="flex-1" />
@@ -405,9 +417,6 @@ export function SideNav({
           )}
           {canAdmin && onOpenOrphanedArchives && (
             <UtilityPill label="Orphaned archives" icon={Archive} onClick={() => { onOpenOrphanedArchives(); closeDrawer() }} collapsed={collapsed} />
-          )}
-          {canAdmin && onOpenUpdates && (
-            <UtilityPill label="Updates" icon={Download} badge={updateAvailable} onClick={() => { onOpenUpdates(); closeDrawer() }} collapsed={collapsed} />
           )}
           <UtilityPill label="About" icon={Info} onClick={() => { onOpenAbout(); closeDrawer() }} collapsed={collapsed} />
           <UtilityPill

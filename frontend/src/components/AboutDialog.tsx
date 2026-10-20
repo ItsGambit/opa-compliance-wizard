@@ -1,4 +1,6 @@
 import * as Dialog from '@radix-ui/react-dialog'
+import { AFFILIATION, BRAND_BLURB, BRAND_TAGLINE } from '../utils/brand'
+import { Brand } from './Brand'
 import { DialogCloseButton } from './DialogCloseButton'
 
 interface Props {
@@ -13,18 +15,17 @@ export function AboutDialog({ open, onOpenChange: setOpen }: Props) {
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
         <Dialog.Content aria-describedby={undefined} className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[26rem] p-5">
-          <div className="flex items-center justify-between mb-3">
-            <Dialog.Title className="text-sm font-semibold text-text">About OPA Compliance Wizard</Dialog.Title>
+          <div className="flex items-start justify-between mb-3">
+            <Dialog.Title asChild>
+              <h2 className="m-0"><Brand variant="lockup" tagline={BRAND_TAGLINE} /></h2>
+            </Dialog.Title>
             <DialogCloseButton />
           </div>
 
           <div className="flex flex-col gap-3 text-xs text-text-dim leading-relaxed">
             <p>
-              An unofficial, community tool that helps PAM admins pull the audit
-              evidence their auditors ask for (SOC 2, SOX, ISO 27001, and similar
-              frameworks) out of Okta Privileged Access (OPA) and core Okta audit
-              history — plus building and managing OPA secret folders, resource
-              groups, projects, groups, and security policies.
+              {BRAND_BLURB} It also includes Folder Builder, for creating OPA vault folders, resource groups,
+              projects, groups and security policies.
             </p>
             <div className="card p-3 bg-bg-hover border-warn text-text-dim">
               <p className="font-medium text-text mb-1">No warranty</p>
@@ -39,7 +40,8 @@ export function AboutDialog({ open, onOpenChange: setOpen }: Props) {
                 and comes with no support commitment.
               </p>
             </div>
-            <p className="text-text-faint">
+            <p className="text-muted">{AFFILIATION}</p>
+            <p className="text-muted">
               Licensed under MIT. Feedback and issues are welcome via the project's
               GitHub repository.
             </p>

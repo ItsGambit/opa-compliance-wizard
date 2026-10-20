@@ -15,6 +15,13 @@
   --color-text-faint:   #7c7c86;
   --color-accent:       #1662DD;
   --color-accent-dim:   #1d3a5c;
+  /* 5.46.0 contrast fixes, used by the Updates screens and the active nav item:
+     lighter muted text and accent text that reach 4.5:1 on their backgrounds. */
+  --color-muted:        #9a9aa4;
+  --color-accent-text:  #8ab4f8;
+  /* Logo B (ledger shield): shield and tick, per theme. */
+  --color-brand-shield: #E2E8F0;
+  --color-brand-tick:   #F59E0B;
   --color-win:          #34d399;
   --color-loss:         #f87171;
   --color-warn:         #fb923c;
@@ -40,6 +47,10 @@ html[data-theme="light"] {
   --color-text-faint:   #71778A;
   --color-accent:       #1662DD;
   --color-accent-dim:   #EEF3FC;
+  --color-muted:        #5a6173;
+  --color-accent-text:  #1662DD;
+  --color-brand-shield: #1E293B;
+  --color-brand-tick:   #B45309;
   --color-win:          #1E7A34;
   --color-loss:         #C1272D;
   --color-warn:         #8A5A00;

@@ -296,7 +296,7 @@ def main(argv=None):
                 merged = keylib.merged_with(key_list, info.candidate_keys)
                 keylib.persist_effective(merged)
                 if info.key_list_action == "adopt" and args.audit:
-                    keylib.record_change("release_keys.updated", {
+                    keylib.record_change("upgrade.key_list_installed", {
                         "version": info.version, "signed_by": info.key_id,
                         "keys_before": len(key_list["keys"]), "keys_after": len(merged["keys"])})
         return 0
