@@ -331,8 +331,10 @@ export function UpdatesPage({ onOpenKeys }: { onOpenKeys: () => void }) {
   const state = updateState(status)
   return (
     <div className="flex flex-col gap-5">
-      <StatusCard status={status} onCheckNow={() => checkNow.mutate()} checking={checkNow.isPending} />
-      {state === 'update_available' && status.latest && <AvailableCard status={status} />}
+      {/* Mockup 03: when an update is available, its card leads the page and replaces the installed-version card (owner, 2026-10-20). */}
+      {state === 'update_available' && status.latest
+        ? <AvailableCard status={status} />
+        : <StatusCard status={status} onCheckNow={() => checkNow.mutate()} checking={checkNow.isPending} />}
       {status.check.prompt_needed && !notNow && <FirstRunCard status={status} onNotNow={() => setNotNow(true)} />}
       {status.check.prompt_needed && notNow && (
         <section className="card p-4 flex items-center justify-between gap-3 flex-wrap">

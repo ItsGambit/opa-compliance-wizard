@@ -105,6 +105,8 @@ describe('Updates page', () => {
     vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({ ...NEWER }))
     renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
     expect(await screen.findByText('5.48.0 is available')).toBeTruthy()
+    // Mockup 03 (owner, 2026-10-20): the available card replaces the installed-version card.
+    expect(screen.queryByText('Installed version')).toBeNull()
     expect(screen.getByText('Signed download attached')).toBeTruthy()
     expect(screen.getAllByText(RELEASE_KEY.key_id).length).toBeGreaterThan(0)
     expect(screen.getByText(/14\.8 MB/)).toBeTruthy()
