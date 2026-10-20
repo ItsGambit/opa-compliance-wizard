@@ -36,6 +36,10 @@
 #   6  power loss: the updater is killed at a step boundary by fault injection (a systemd drop-in, only honoured with
 #      OCW_TEST_MODE=1), then resumed by starting ocw-upgrade.service; no reboot is needed (--reboot-test also does a real one)
 #   7  rollback (typed) and restore (typed) work; a scheduled upgrade (--at) runs from the timer
+#   7f the requests the web application may leave in the inbox, written as its account: a bundle for another run leaves
+#      state.json byte-identical, a rollback outside 24 hours and a restore naming the wrong copy are refused, a 200-request
+#      burst leaves bounded files, the quiesce file is renewed at every step, deleting backups is refused through the inbox
+#      and works from the command line
 #   8  records `systemctl show` for the root unit's sandbox so the capability set can be tightened from what actually ran
 #
 # CLEAN UP: the script removes everything it created when it ends (also on failure or Ctrl-C), in reverse order: units,
@@ -211,6 +215,7 @@ python3 "$CHECKOUT/tests/integration/make_test_release.py" build "$CHECKOUT" "$K
 python3 "$CHECKOUT/tests/integration/make_test_release.py" build "$CHECKOUT" "$KEYS" "$REL" 98.0.9
 python3 "$CHECKOUT/tests/integration/make_test_release.py" build "$CHECKOUT" "$KEYS" "$REL" 98.0.10 --break unhealthy
 python3 "$CHECKOUT/tests/integration/make_test_release.py" build "$CHECKOUT" "$KEYS" "$REL" 98.0.11
+python3 "$CHECKOUT/tests/integration/make_test_release.py" build "$CHECKOUT" "$KEYS" "$REL" 98.0.12
 python3 "$CHECKOUT/tests/integration/make_test_release.py" revoke "$KEYS" "$REL/revocation.json"
 umask 022
 
@@ -505,6 +510,96 @@ check "trust apply of the test revocation succeeds" test "$RC" -eq 0
 check "a release signed by the revoked key (with an old timestamp) is refused (exit 2)" test "$RC" -eq 2
 check "the refusal says the key is revoked" bash -c "grep -qi 'revoked' $WORK/stage9c.txt"
 check "the applied revocation was not copied into the application's directory" test ! -e "$DATA/upgrade/revocations/1.json"
+
+say "7f. Requests from the web application (the inbox), written as the application account"
+INBOX="$DATA/upgrade/inbox/requests"
+state_field() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")' "$DATA/upgrade/state.json" "$1"; }
+send_req() { # send_req <name> <json body, without schema/requested_at/origin>: dropped as the application account, mode 0600
+  local body
+  body="$(python3 -c 'import json,sys,time; d=json.loads(sys.argv[1]); d.update(schema=1, origin="app", actor="vm-test", requested_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())); print(json.dumps(d))' "$2")"
+  runuser -u "$TEST_USER" -- bash -c "umask 077; printf '%s' '$body' > '$INBOX/$1.json'"
+}
+run_updater() { timeout 300 systemctl start ocw-upgrade.service; }
+rejection_code() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["code"])' "$DATA/upgrade/rejections/$1.json" 2>/dev/null; }
+audit_has() { grep -q "\"action\":\"$1\"" "$DATA/audit_log.jsonl"; }
+
+# the quiesce file covers the whole run: its end time is renewed at every step (poll it while 98.0.12 is applied)
+"$UPDATER_CMD" stage "$REL/ocw-98.0.12.tar.gz" >/dev/null 2>&1 || bad "stage 98.0.12"
+: > "$WORK/quiesce-seen.txt"
+( while [ ! -e "$WORK/quiesce-stop" ]; do python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["until"])' "$DATA/upgrade/quiesce.json" >> "$WORK/quiesce-seen.txt" 2>/dev/null; sleep 0.2; done ) &
+POLL_PID=$!
+"$UPDATER_CMD" apply 98.0.12 --confirm-text 98.0.12 > "$WORK/apply12.txt" 2>&1 && RC=0 || RC=$?
+touch "$WORK/quiesce-stop"; wait "$POLL_PID" 2>/dev/null || true; rm -f "$WORK/quiesce-stop"
+check "98.0.12 applies" test "$RC" -eq 0
+check "the quiesce file was seen during the run and its end time was renewed (two or more different values)" test "$(sort -u "$WORK/quiesce-seen.txt" | grep -c .)" -ge 2
+check "the quiesce file is gone when the run is over" test ! -e "$DATA/upgrade/quiesce.json"
+
+# a bundle for another run must leave state.json byte-identical; a rollback outside the 24 hours is refused
+LAST_CID="$(state_field correlation_id)"
+cp -p "$DATA/upgrade/state.json" "$WORK/state-good.json"
+BEFORE="$(sha256sum "$DATA/upgrade/state.json" | cut -d' ' -f1)"
+send_req upg-f0000001 '{"action":"bundle","correlation_id":"upg-f0000001","action_id":"aid_vmtest_foreign_0001","for_correlation_id":"upg-00000009"}'
+run_updater || true
+check "a bundle request for another run's id was refused" test "$(rejection_code upg-f0000001)" = request_invalid
+check "state.json is byte-identical after it" test "$(sha256sum "$DATA/upgrade/state.json" | cut -d' ' -f1)" = "$BEFORE"
+python3 - "$DATA/upgrade/state.json" <<'PY'
+import json, sys, time
+p = sys.argv[1]
+d = json.load(open(p))
+d["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3 * 86400))
+json.dump(d, open(p, "w"))
+PY
+CUR_BEFORE="$(readlink "$OPT/current")"
+send_req upg-f0000002 '{"action":"rollback","correlation_id":"upg-f0000002","action_id":"aid_vmtest_window_0002","confirm":"ROLLBACK"}'
+run_updater || true
+check "a rollback request three days after the upgrade is refused (rollback_unavailable)" test "$(rejection_code upg-f0000002)" = rollback_unavailable
+check "the code was not switched" test "$(readlink "$OPT/current")" = "$CUR_BEFORE"
+cp -p "$WORK/state-good.json" "$DATA/upgrade/state.json"
+
+# in the window: the bundle for the last run, clear_failure, rollback, then restore naming the copy that upgrade took
+send_req upg-f0000003 '{"action":"bundle","correlation_id":"upg-f0000003","action_id":"aid_vmtest_bundle_0003"}'
+run_updater || true
+check "a bundle request for the last run builds a bundle and the audit log says so" bash -c "$(declare -f audit_has); DATA=$DATA; audit_has upgrade.bundle_created"
+check "state.json still describes the same upgrade" test "$(state_field correlation_id)" = "$LAST_CID"
+send_req upg-f0000004 '{"action":"clear_failure","correlation_id":"upg-f0000004","action_id":"aid_vmtest_clear_0004"}'
+run_updater || true
+check "clear_failure from the inbox is audited as coming from the web application" bash -c "grep -q 'upgrade.clear_failure.*web application' $DATA/audit_log.jsonl"
+BACKUP_NAME="$(python3 -c 'import json,os,sys; l=[json.loads(x) for x in open(sys.argv[1])]; print(os.path.basename([h for h in l if h.get("action")=="apply" and h.get("backup")][-1]["backup"]))' "$DATA/upgrade/history.jsonl")"
+PREV="$(readlink "$OPT/previous" | sed 's#.*/##')"
+send_req upg-f0000005 '{"action":"rollback","correlation_id":"upg-f0000005","action_id":"aid_vmtest_rollback_0005","confirm":"ROLLBACK"}'
+run_updater || true
+check "an in-window rollback from the inbox switched the code back" wait_version "$PREV"
+send_req upg-f0000006 '{"action":"restore","correlation_id":"upg-f0000006","action_id":"aid_vmtest_restore_0006","confirm":"RESTORE","backup":"audit_store-pre-98.9.9-20000101T000000Z.db"}'
+run_updater || true
+check "a restore naming another copy than the one it would restore is refused (target_changed)" test "$(rejection_code upg-f0000006)" = target_changed
+send_req upg-f0000007 "{\"action\":\"restore\",\"correlation_id\":\"upg-f0000007\",\"action_id\":\"aid_vmtest_restore_0007\",\"confirm\":\"RESTORE\",\"backup\":\"$BACKUP_NAME\"}"
+run_updater || true
+check "a restore naming the right copy is carried out" bash -c "test \"\$(grep -c '\"action\":\"upgrade.restored\"' $DATA/audit_log.jsonl)\" -ge 1 && ls $DATA/audit_store.db.pre-restore-* >/dev/null"
+check "the site answers after the restore" wait_version "$PREV"
+
+# a hostile burst: 200 bundle requests at once leave a bounded number of files behind
+for n in $(seq 1 15); do touch -d "2020-01-01 00:00:$((n + 10))" "$DATA/upgrade/bundles/ocw-support-98.0.1-to-98.0.2-2020010100000${n}Z-aaaa.tar.gz"; done
+runuser -u "$TEST_USER" -- bash -c 'umask 077; now=$(date -u +%Y-%m-%dT%H:%M:%SZ); for i in $(seq 1 200); do
+  cid=$(printf "upg-%08x" $((0xb0000000 + i))); printf "{\"schema\":1,\"action\":\"bundle\",\"correlation_id\":\"%s\",\"action_id\":\"aid_vmtest_burst_%08d\",\"origin\":\"app\",\"requested_at\":\"%s\"}" "$cid" "$i" "$now" > '"$INBOX"'/$cid.json; done'
+T0=$SECONDS
+run_updater && RC=0 || RC=$?
+check "the burst was processed within 5 minutes and the service did not fail" bash -c "test $RC -eq 0 && test $((SECONDS - T0)) -lt 300 && ! systemctl is-failed --quiet ocw-upgrade.service"
+check "the inbox is empty after the burst" bash -c "test -z \"\$(ls -A $INBOX)\""
+check "at most 10 support bundles remain" bash -c "test \$(ls $DATA/upgrade/bundles/ocw-support-*.tar.gz | wc -l) -le 10"
+check "at most 200 handled-request files remain" bash -c "test \$(ls $DATA/upgrade/requests-done | wc -l) -le 200"
+check "at most 200 refusal records remain" bash -c "test \$(ls $DATA/upgrade/rejections | wc -l) -le 200"
+
+# deleting pre-upgrade backups is the command line's alone
+NBK_BEFORE="$(ls "$DATA"/upgrade/backups/audit_store-pre-*.db | wc -l)"
+send_req upg-f0000008 '{"action":"prune_backups","correlation_id":"upg-f0000008","action_id":"aid_vmtest_prune_0008","confirm":"PRUNE","keep_last":1}'
+run_updater || true
+check "a prune request through the inbox is refused as an unknown kind" test "$(rejection_code upg-f0000008)" = request_invalid
+check "no backup was deleted by it" test "$(ls "$DATA"/upgrade/backups/audit_store-pre-*.db | wc -l)" -eq "$NBK_BEFORE"
+check "backups-status.json is 0644 and readable by the application account" bash -c "test \"\$(stat -c %a $DATA/upgrade/backups-status.json)\" = 644 && runuser -u $TEST_USER -- cat $DATA/upgrade/backups-status.json >/dev/null"
+check "the backups directory stays root-only (0700)" test "$(stat -c %a "$DATA/upgrade/backups")" = 700
+"$UPDATER_CMD" prune-backups --keep 1 --confirm PRUNE > "$WORK/prune.txt" 2>&1 && RC=0 || RC=$?
+check "the command-line prune works" test "$RC" -eq 0
+check "it kept the newest copy" test "$(ls "$DATA"/upgrade/backups/audit_store-pre-*.db | wc -l)" -eq 1
 
 say "8. The root unit's sandbox (for tightening CapabilityBoundingSet)"
 systemctl show ocw-upgrade.service -p CapabilityBoundingSet -p ProtectSystem -p IPAddressDeny -p IPAddressAllow > "$WORK/sandbox.txt" || true
