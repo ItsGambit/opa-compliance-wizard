@@ -79,11 +79,41 @@ done
 say() { printf '\n==> %s\n' "$*"; }
 ok() { PASS=$((PASS + 1)); printf '  ok    %s\n' "$*"; }
 bad() { FAIL=$((FAIL + 1)); FAILED_NAMES+=("$*"); printf '  FAIL  %s\n' "$*"; }
-check() { # check "description" command...
-  local d="$1"; shift
-  if "$@" >/dev/null 2>&1; then ok "$d"; else bad "$d"; fi
+DIAG_N=0
+diag() { # what to look at when a check failed (printed, and kept in $WORK/diag-N.txt): the updater's own view of the run
+  DIAG_N=$((DIAG_N + 1))
+  [ "$DIAG_N" -le 8 ] || return 0
+  {
+    echo "---- diagnostics #$DIAG_N ----"
+    echo "-- ocw-updater status --json"; /usr/local/bin/ocw-updater status --json 2>&1 | tail -n 60
+    echo "-- state.json"; cat "$DATA/upgrade/state.json" 2>&1 | tail -n 60
+    echo "-- journal: ocw-upgrade.service (last 50)"; journalctl -u ocw-upgrade.service --no-pager -o cat -n 50 2>&1
+    echo "-- journal: opa-compliance-wizard (last 50)"; journalctl -u opa-compliance-wizard --no-pager -o cat -n 50 2>&1
+    echo "-- ls releases / staging"; ls -la "$OPT/releases" "$OPT/staging" 2>&1
+  } 2>&1 | tee "$WORK/diag-$DIAG_N.txt" | sed 's/^/        /'
 }
-check_not() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then bad "$d"; else ok "$d"; fi; }
+check() { # check "description" command...   (on failure: the exit status, the command's output tail, and the diagnostics above)
+  local d="$1" out rc
+  shift
+  out="$("$@" 2>&1)" && rc=0 || rc=$?
+  if [ "$rc" -eq 0 ]; then ok "$d"; else
+    bad "$d"
+    printf '        exit status %s; command: %s\n' "$rc" "$*"
+    printf '%s\n' "$out" | tail -n 15 | sed 's/^/        | /'
+    diag
+  fi
+}
+check_not() {
+  local d="$1" out rc
+  shift
+  out="$("$@" 2>&1)" && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ]; then ok "$d"; else
+    bad "$d"
+    printf '        unexpectedly succeeded; command: %s\n' "$*"
+    printf '%s\n' "$out" | tail -n 15 | sed 's/^/        | /'
+    diag
+  fi
+}
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -282,16 +312,27 @@ poll_site() { # poll_site <seconds> <outfile>: record the HTTP status of /health
   done
 }
 
+watch_page() { # watch_page <seconds>: did the updater ever create the maintenance file? (separates "not written" from "not served")
+  local end=$((SECONDS + $1))
+  rm -f "$WORK/page-seen"
+  while [ $SECONDS -lt $end ]; do [ ! -e "$OPT/maintenance/active.html" ] || cp "$OPT/maintenance/active.html" "$WORK/page-seen" 2>/dev/null; sleep 0.05; done
+}
+
 say "3. A good signed release (98.0.2), with the site polled during the switch"
+check "the live nginx site carries the maintenance-page block" grep -q ocw_maintenance_page "$NGINX_SITE"
 "$UPDATER_CMD" stage "$REL/ocw-98.0.2.tar.gz" > "$WORK/stage2.txt" 2>&1 || { cat "$WORK/stage2.txt"; bad "stage 98.0.2"; }
-check "98.0.2 is staged and its tree is root-owned" bash -c "test -f $OPT/releases/98.0.2/.staged && test \"\$(stat -c %U $OPT/releases/98.0.2/create_secret_folders.py)\" = root"
+check "98.0.2 is staged under staging/, still owned by the staging account, and not yet in releases/" bash -c "test -f $OPT/staging/98.0.2/.staged && test \"\$(stat -c %U $OPT/staging/98.0.2/create_secret_folders.py)\" = ocw-updater && test ! -e $OPT/releases/98.0.2"
 poll_site 150 "$WORK/poll2.txt" &
 POLL=$!
+watch_page 150 &
+WATCH=$!
 "$UPDATER_CMD" apply 98.0.2 --confirm-text 98.0.2 > "$WORK/apply2.txt" 2>&1 && RC=0 || RC=$?
 sleep 3
-kill "$POLL" 2>/dev/null || true
-wait "$POLL" 2>/dev/null || true
+kill "$POLL" "$WATCH" 2>/dev/null || true
+wait "$POLL" "$WATCH" 2>/dev/null || true
+cat "$WORK/apply2.txt" | sed 's/^/        apply: /'
 check "apply 98.0.2 exits 0" test "$RC" -eq 0
+check "the updater wrote the maintenance page while switching" test -s "$WORK/page-seen"
 check "98.0.2 is live" wait_version 98.0.2
 check "the maintenance page (503 with the 'Upgrading' text) was served while switching" grep -q '^503 [1-9]' "$WORK/poll2.txt"
 check "the page contains no version number" bash -c "test -s $WORK/maintenance-page.html && ! grep -qE '[0-9]+\\.[0-9]+\\.[0-9]+' $WORK/maintenance-page.html"
@@ -307,7 +348,7 @@ say "4. A release whose application crashes at start (98.0.3): automatic rollbac
 "$UPDATER_CMD" apply 98.0.3 --confirm-text 98.0.3 > "$WORK/apply3.txt" 2>&1 && RC=0 || RC=$?
 check "apply 98.0.3 exits 3 (rolled back)" test "$RC" -eq 3
 check "98.0.2 is serving again" wait_version 98.0.2
-BUNDLE="$(ls -1 "$DATA"/upgrade/bundles/ocw-support-98.0.2-to-98.0.3-*.tar.gz 2>/dev/null | head -1)"
+BUNDLE="$(ls -1 "$DATA"/upgrade/bundles/ocw-support-98.0.2-to-98.0.3-*.tar.gz 2>/dev/null | head -1 || true)"
 check "a support bundle was written" test -n "$BUNDLE"
 if [ -n "$BUNDLE" ]; then
   mkdir -p "$WORK/bundle" && tar -xzf "$BUNDLE" -C "$WORK/bundle"

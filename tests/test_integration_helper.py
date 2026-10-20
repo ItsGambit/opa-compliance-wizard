@@ -63,3 +63,10 @@ def test_the_broken_variants_are_broken_and_the_good_one_is_not(built):
         names = t.getnames()
         assert "manifest.json" in names and "server/updater/root/ocw_activate.py" in names and "frontend/dist/index.html" in names
         assert not [n for n in names if n.endswith((".db", ".pyc")) or ".git/" in n or n.startswith(".venv")]
+
+
+def test_the_crash_release_exits_instead_of_starting_the_server(built):
+    with tarfile.open(built / "out" / "ocw-98.0.3.tar.gz") as t:
+        text = t.extractfile("server/serve.py").read().decode()
+    block = text[text.rindex('if __name__ == "__main__":'):]
+    assert "deliberately refuses to start" in block and "main()" not in block

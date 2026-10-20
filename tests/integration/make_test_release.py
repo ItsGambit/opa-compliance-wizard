@@ -96,7 +96,10 @@ def build(checkout, keys_dir, out_dir, version, mode="none", sign_with="primary"
     files["server/release_keys.json"] = (0o644, (Path(keys_dir) / "release_keys.json").read_bytes())
     serve = files["server/serve.py"][1].decode()
     if mode == "crash":
-        serve += "\n\nimport sys as _s\n_s.exit('test release: deliberately refuses to start')\n"
+        # must sit BEFORE the `__main__` call: appended after it, the server would run forever and the line never be reached
+        tail = 'if __name__ == "__main__":\n    main()'
+        assert tail in serve
+        serve = serve.replace(tail, 'if __name__ == "__main__":\n    import sys as _s\n    _s.exit("test release: deliberately refuses to start")')
     elif mode == "unhealthy":
         serve = serve.replace('status = "ok" if all(v == "ok" for v in checks.values()) else "degraded"',
                               'status = "degraded"  # test release: deliberately unhealthy')
