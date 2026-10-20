@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "keys": [
+    {
+      "key_id": "6109790661049DE7",
+      "alg": "es256",
+      "public_key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEV3BF/Tz88y1B1lQOe9NGiaVmzt8bEDY7HlcllO8qXpleRt2c1fHc5GYbXcHhsKRQpIH7/ztkscqrMsc5Zvuj1A==",
+      "role": "standby",
+      "status": "active",
+      "since": "5.46.0"
+    },
+    {
+      "key_id": "8C150FD64AF15E0D",
+      "alg": "ed25519-minisign",
+      "public_key": "9o5uic1rZjn3MJLzZeaUijF9guh+Mbw2IhhqpYoTeUo=",
+      "role": "release",
+      "status": "active",
+      "since": "5.46.0"
+    }
+  ]
+}

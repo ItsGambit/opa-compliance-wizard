@@ -4,7 +4,19 @@
 # app's deploy user -- whichever user owns the install directory and the
 # systemd services), not from your own machine:
 #
+#   <install dir>/server/deploy.sh --release <version> [--from-dir <dir>] [--reinstall]
 #   <install dir>/server/deploy.sh [--ref <branch | tag | 40-char commit>]
+#
+# --release (5.46.0, recommended for production) installs a SIGNED release:
+# it downloads ocw-<version>.tar.gz and its .minisig from the project's GitHub
+# release (or reads them from --from-dir for an offline server), verifies
+# them with the installed copy's pinned signing key (python -m
+# server.updater.verify), and refuses anything unsigned, damaged, mismatched,
+# signed by a revoked key or not newer than what is installed (--reinstall
+# allows the same version again). It needs no Node.js: the release carries
+# the built frontend. --ref (and a bare run) installs UNSIGNED source from
+# git and says so; it is for maintainers. OPA_RELEASE_BASE_URL and
+# OPA_REVOCATION_URL_BASE point --release at a mirror (still verified).
 #
 # The install directory is the one this script lives in (its parent's
 # parent), so nothing in this file needs editing for a different path or
@@ -106,18 +118,42 @@ set -euo pipefail
 # deploy.sh it is about to run as phase 2; see the --ref check below. Keep it.)
 
 _usage() {
-  echo "usage: $0 [--ref <branch | tag | 40-character commit>]" >&2
+  echo "usage: $0 --release <version> [--from-dir <dir>] [--reinstall]    (signed release; recommended)" >&2
+  echo "       $0 [--ref <branch | tag | 40-character commit>]            (UNSIGNED source; maintainers only)" >&2
   echo "       settings: see the comment at the top of this file" >&2
 }
 _ARG_REF=""
+_ARG_RELEASE=""
+_ARG_FROM_DIR=""
+_ARG_REINSTALL=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --ref) [ $# -ge 2 ] || { _usage; exit 2; }; _ARG_REF="$2"; shift 2 ;;
     --ref=*) _ARG_REF="${1#--ref=}"; shift ;;
+    --release) [ $# -ge 2 ] || { _usage; exit 2; }; _ARG_RELEASE="$2"; shift 2 ;;
+    --release=*) _ARG_RELEASE="${1#--release=}"; shift ;;
+    --from-dir) [ $# -ge 2 ] || { _usage; exit 2; }; _ARG_FROM_DIR="$2"; shift 2 ;;
+    --from-dir=*) _ARG_FROM_DIR="${1#--from-dir=}"; shift ;;
+    --reinstall) _ARG_REINSTALL=1; shift ;;
     -h | --help) _usage; exit 0 ;;
     *) echo "ERROR: unknown argument: $1" >&2; _usage; exit 2 ;;
   esac
 done
+if [ -n "$_ARG_RELEASE" ] && [ -n "$_ARG_REF" ]; then
+  echo "ERROR: --release (signed) and --ref (unsigned source) cannot be combined." >&2
+  exit 2
+fi
+if { [ -n "$_ARG_FROM_DIR" ] || [ -n "$_ARG_REINSTALL" ]; } && [ -z "$_ARG_RELEASE" ]; then
+  echo "ERROR: --from-dir and --reinstall only go with --release <version>." >&2
+  exit 2
+fi
+if [ -n "$_ARG_RELEASE" ]; then
+  # Phases 1 and 2 re-exec without arguments; the choice travels in the environment.
+  OPA_DEPLOY_RELEASE="$_ARG_RELEASE"
+  export OPA_DEPLOY_RELEASE
+  [ -z "$_ARG_FROM_DIR" ] || { OPA_DEPLOY_RELEASE_DIR="$_ARG_FROM_DIR"; export OPA_DEPLOY_RELEASE_DIR; }
+  [ -z "$_ARG_REINSTALL" ] || { OPA_DEPLOY_REINSTALL=1; export OPA_DEPLOY_REINSTALL; }
+fi
 
 # FIX (external review, 2026-10-02, "will run on servers neither of us
 # administers"): preflight-check every external tool this script calls
@@ -126,8 +162,12 @@ done
 # is strictly worse than failing here. 5.41.0: GNU `grep -P` is no longer
 # needed (the two PCRE extractions are plain sed now), so BusyBox/non-GNU
 # grep hosts work too.
+_node_cmds="npm npx"
+# A signed release carries the built frontend: no Node on the server needed.
+if [ -n "${OPA_DEPLOY_RELEASE:-}" ]; then _node_cmds=""; fi
+# shellcheck disable=SC2086  # $_node_cmds is a deliberate word list
 for _cmd in git rsync curl grep awk sed diff find mktemp cp mv chmod rm sleep seq \
-    head tail tr date df du id realpath dirname basename npm npx sudo systemctl nginx; do
+    head tail tr date df du id realpath dirname basename $_node_cmds sudo systemctl nginx; do
   command -v "$_cmd" >/dev/null 2>&1 || {
     echo "ERROR: required command not found on PATH: $_cmd" >&2
     exit 1
@@ -151,7 +191,7 @@ esac
 if [ -z "${DEPLOY_SH_PHASE:-}" ]; then
   # Phase 0: nothing inherited from the caller is handoff state.
   unset DEPLOY_SH_PHASE1_FROZEN_DIR DEPLOY_SH_PHASE1_TMP_DIR DEPLOY_COMMIT DEPLOY_VERSION \
-    DEPLOY_APP_DIR DEPLOY_LOCK_HELD DEPLOY_PREFLIGHT_DONE DEPLOY_STARTED_LOGGED
+    DEPLOY_APP_DIR DEPLOY_LOCK_HELD DEPLOY_PREFLIGHT_DONE DEPLOY_STARTED_LOGGED DEPLOY_RELEASE_MODE
 fi
 # FIX (4th independent review, 2026-10-02): every variable each phase's own
 # later logic depends on is required up front.
@@ -165,7 +205,7 @@ if [ "${DEPLOY_SH_PHASE:-}" = "2" ]; then
   : "${DEPLOY_COMMIT:?DEPLOY_SH_PHASE=2 requires DEPLOY_COMMIT to be set -- this is internal phase-handoff state, not meant to be set by a caller}"
   : "${DEPLOY_VERSION:?DEPLOY_SH_PHASE=2 requires DEPLOY_VERSION to be set -- this is internal phase-handoff state, not meant to be set by a caller}"
 fi
-for _flag in DEPLOY_LOCK_HELD DEPLOY_PREFLIGHT_DONE DEPLOY_STARTED_LOGGED; do
+for _flag in DEPLOY_LOCK_HELD DEPLOY_PREFLIGHT_DONE DEPLOY_STARTED_LOGGED DEPLOY_RELEASE_MODE; do
   case "${!_flag:-}" in
     "" | 1) ;;
     *) echo "ERROR: $_flag must be unset or 1 -- internal phase-handoff state" >&2; exit 2 ;;
@@ -207,7 +247,8 @@ if [ -f "$DEPLOY_CONF" ]; then
     [ "$_key" != "$_line" ] || { echo "ERROR: $DEPLOY_CONF: not KEY=VALUE: $_line" >&2; exit 1; }
     case "$_val" in \"*\") _val="${_val#\"}"; _val="${_val%\"}" ;; \'*\') _val="${_val#\'}"; _val="${_val%\'}" ;; esac
     case "$_key" in
-      OPA_REPO_URL | OPA_DEPLOY_REF | OPA_BACKEND_PORT | OPA_DEPLOY_BACKUP_DIR | OPA_NGINX_SITE)
+      OPA_REPO_URL | OPA_DEPLOY_REF | OPA_BACKEND_PORT | OPA_DEPLOY_BACKUP_DIR | OPA_NGINX_SITE \
+        | OPA_RELEASE_BASE_URL | OPA_REVOCATION_URL_BASE)
         # The environment wins over the file.
         if [ -z "${!_key:-}" ]; then
           printf -v "$_key" '%s' "$_val"
@@ -245,6 +286,36 @@ if [ -n "$DEPLOY_REF" ]; then
   case "$DEPLOY_REF" in
     -* | *..* | *[!A-Za-z0-9._/-]*) echo "ERROR: --ref / OPA_DEPLOY_REF must be a branch, tag or commit (letters, digits, . _ / -), got '$DEPLOY_REF'" >&2; exit 1 ;;
   esac
+fi
+RELEASE_VERSION="${OPA_DEPLOY_RELEASE:-}"
+RELEASE_DIR="${OPA_DEPLOY_RELEASE_DIR:-}"
+RELEASE_BASE_URL="${OPA_RELEASE_BASE_URL:-https://github.com/ItsGambit/opa-compliance-wizard/releases/download}"
+REVOCATION_BASE_URL="${OPA_REVOCATION_URL_BASE:-https://github.com/ItsGambit/opa-compliance-wizard/releases/download/revocation}"
+if [ -n "$RELEASE_VERSION" ]; then
+  case "$RELEASE_VERSION" in
+    [0-9]*.[0-9]*.[0-9]* ) ;;
+    *) echo "ERROR: --release must be a version like 5.46.0 (got '$RELEASE_VERSION')" >&2; exit 2 ;;
+  esac
+  case "$RELEASE_VERSION" in
+    *[!0-9.]* | *..* | .* | *.) echo "ERROR: --release must be a version like 5.46.0 (got '$RELEASE_VERSION')" >&2; exit 2 ;;
+  esac
+  for _u in "$RELEASE_BASE_URL" "$REVOCATION_BASE_URL"; do
+    case "$_u" in
+      https://* | http://127.0.0.1[:/]* | http://localhost[:/]*) ;;
+      *) echo "ERROR: OPA_RELEASE_BASE_URL / OPA_REVOCATION_URL_BASE must start with https:// (got '$_u')" >&2; exit 1 ;;
+    esac
+    case "$_u" in
+      *[[:space:]]* | -*) echo "ERROR: a release URL contains whitespace or starts with '-'" >&2; exit 1 ;;
+    esac
+  done
+  if [ -n "$RELEASE_DIR" ]; then
+    case "$RELEASE_DIR" in
+      /*) ;;
+      *) echo "ERROR: --from-dir must be an absolute path (got '$RELEASE_DIR')" >&2; exit 2 ;;
+    esac
+  fi
+  # A signed release replaces whatever ref a .deploy.conf names.
+  DEPLOY_REF=""
 fi
 case "$BACKEND_PORT" in
   "" | *[!0-9]*) echo "ERROR: OPA_BACKEND_PORT must be a number (got '$BACKEND_PORT')" >&2; exit 1 ;;
@@ -495,6 +566,75 @@ _nginx_layout_check() {
   "$APP_DIR/.venv/bin/python" "$_baker" --check "$NGINX_LIVE" "$_template"
 }
 
+# 5.46.0: --release. Downloads (or takes from --from-dir) the signed tarball and
+# its .minisig, verifies them with the INSTALLED copy's verifier and pinned keys
+# (the root of trust is what is already here, never the file being checked),
+# and unpacks the verified tree into $TMP_DIR/repo -- from where the normal
+# install carries on exactly as for a git checkout. Unsigned, damaged,
+# mismatched, downgrading or wrongly-signed input stops here, before anything
+# on disk has changed.
+_curl_get() {
+  curl -fsSL --connect-timeout 20 --max-time 900 --max-filesize 314572800 -o "$2" "$1"
+}
+_fetch_signed_release() {
+  local _dl="$TMP_DIR/download" _py="$APP_DIR/.venv/bin/python" _tar _sig _installed _extra=""
+  if [ ! -f "$APP_DIR/server/updater/verify.py" ]; then
+    echo "ERROR: this install predates signed releases (it has no server/updater). Update once with" >&2
+    echo "       server/deploy.sh --ref <tag or commit of release 5.46.0 or later> (unsigned; this first" >&2
+    echo "       step trusts GitHub as the old deploy always did), then use --release from then on." >&2
+    exit 1
+  fi
+  mkdir -p "$_dl"
+  _tar="$_dl/ocw-$RELEASE_VERSION.tar.gz"
+  _sig="$_tar.minisig"
+  if [ -n "$RELEASE_DIR" ]; then
+    echo "==> Using the release files in $RELEASE_DIR"
+    if [ ! -f "$RELEASE_DIR/ocw-$RELEASE_VERSION.tar.gz" ] || [ ! -f "$RELEASE_DIR/ocw-$RELEASE_VERSION.tar.gz.minisig" ]; then
+      echo "ERROR: $RELEASE_DIR must contain ocw-$RELEASE_VERSION.tar.gz and ocw-$RELEASE_VERSION.tar.gz.minisig" >&2
+      exit 1
+    fi
+    cp -- "$RELEASE_DIR/ocw-$RELEASE_VERSION.tar.gz" "$_tar"
+    cp -- "$RELEASE_DIR/ocw-$RELEASE_VERSION.tar.gz.minisig" "$_sig"
+    [ ! -f "$RELEASE_DIR/revocation.json" ] || cp -- "$RELEASE_DIR/revocation.json" "$_dl/revocation.json"
+  else
+    echo "==> Downloading release $RELEASE_VERSION from $RELEASE_BASE_URL"
+    if ! _curl_get "$RELEASE_BASE_URL/v$RELEASE_VERSION/ocw-$RELEASE_VERSION.tar.gz" "$_tar" ||
+      ! _curl_get "$RELEASE_BASE_URL/v$RELEASE_VERSION/ocw-$RELEASE_VERSION.tar.gz.minisig" "$_sig"; then
+      echo "ERROR: could not download release $RELEASE_VERSION (tarball and .minisig). Check the version exists" >&2
+      echo "       and that this server can reach the release host (proxy: https_proxy), or download the files" >&2
+      echo "       elsewhere and use  --from-dir <dir>. Nothing has been changed." >&2
+      exit 1
+    fi
+    # A published key revocation is applied BEFORE the release is checked, so a
+    # release signed by a stolen key cannot be installed on a server that has
+    # not yet heard about the theft. Best effort: none published, or no
+    # network, is fine; a revocation that fails verification stops the deploy.
+    _curl_get "$REVOCATION_BASE_URL/revocation.json" "$_dl/revocation.json" >/dev/null 2>&1 || rm -f "$_dl/revocation.json"
+    # The second source (an owner-controlled static URL), if the operator configured one.
+    if [ -n "${OPA_REVOCATION_URL:-}" ] && [ ! -f "$_dl/revocation.json" ]; then
+      _curl_get "$OPA_REVOCATION_URL" "$_dl/revocation.json" >/dev/null 2>&1 || rm -f "$_dl/revocation.json"
+    fi
+  fi
+  if [ -f "$_dl/revocation.json" ]; then
+    echo "==> Checking the published signing-key revocation"
+    if ! (cd "$APP_DIR" && "$_py" -m server.updater.keys apply-revocation "$_dl/revocation.json"); then
+      echo "ERROR: a signing-key revocation is published but could not be applied (see above). Nothing has been" >&2
+      echo "       changed. Do not install until this is resolved (README, 'If the signing key is compromised')." >&2
+      exit 1
+    fi
+  fi
+  _installed="$(grep -m1 'SCRIPT_VERSION = ' "$APP_DIR/create_secret_folders.py" | sed -E 's/.*"([^"]+)".*/\1/')"
+  [ -z "${OPA_DEPLOY_REINSTALL:-}" ] || _extra="--allow-same-version"
+  echo "==> Verifying the signature against the pinned release key"
+  # shellcheck disable=SC2086  # $_extra is empty or one flag
+  if ! (cd "$APP_DIR" && "$_py" -m server.updater.verify "$_tar" "$_sig" --installed-version "$_installed" \
+      --audit --extract "$TMP_DIR/repo" $_extra); then
+    echo "ERROR: the release was REFUSED (reason above). Nothing has been changed. Do not work around this" >&2
+    echo "       by deploying an unsigned ref on a production server." >&2
+    exit 1
+  fi
+}
+
 if [ "$DEPLOY_SH_PHASE" = "1" ]; then
   TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/opa-deploy-source.XXXXXXXX")"
   _P1_STAGE="fetch"
@@ -524,16 +664,22 @@ if [ "$DEPLOY_SH_PHASE" = "1" ]; then
   fi
   export DEPLOY_PREFLIGHT_DONE=1
 
-  echo "==> Fetching ${DEPLOY_REF:-the default branch} from $REPO_URL"
-  # OPS-06: an explicit ref deploys exactly that branch, tag or commit
-  # instead of whatever the default branch's tip is at that moment.
-  if [ -z "$DEPLOY_REF" ]; then
-    git clone --depth 1 -- "$REPO_URL" "$TMP_DIR/repo"
-  elif printf '%s' "$DEPLOY_REF" | grep -Eq '^[0-9a-f]{40}$'; then
-    git clone -- "$REPO_URL" "$TMP_DIR/repo"
-    git -C "$TMP_DIR/repo" checkout --quiet --detach "$DEPLOY_REF"
+  if [ -n "$RELEASE_VERSION" ]; then
+    _fetch_signed_release
   else
-    git clone --depth 1 --branch "$DEPLOY_REF" -- "$REPO_URL" "$TMP_DIR/repo"
+    echo "WARNING: deploying UNSIGNED source (a git ref, not a signed release). Not for production:" >&2
+    echo "         use  server/deploy.sh --release <version>  (README, 'Upgrading')." >&2
+    echo "==> Fetching ${DEPLOY_REF:-the default branch} from $REPO_URL"
+    # OPS-06: an explicit ref deploys exactly that branch, tag or commit
+    # instead of whatever the default branch's tip is at that moment.
+    if [ -z "$DEPLOY_REF" ]; then
+      git clone --depth 1 -- "$REPO_URL" "$TMP_DIR/repo"
+    elif printf '%s' "$DEPLOY_REF" | grep -Eq '^[0-9a-f]{40}$'; then
+      git clone -- "$REPO_URL" "$TMP_DIR/repo"
+      git -C "$TMP_DIR/repo" checkout --quiet --detach "$DEPLOY_REF"
+    else
+      git clone --depth 1 --branch "$DEPLOY_REF" -- "$REPO_URL" "$TMP_DIR/repo"
+    fi
   fi
 
   SRC="$TMP_DIR/repo"
@@ -574,10 +720,24 @@ if [ "$DEPLOY_SH_PHASE" = "1" ]; then
 
   # Phase 8 follow-up (2026-10-02): record exactly which commit got deployed
   # -- SCRIPT_VERSION is bumped by hand and can lag.
-  DEPLOY_COMMIT="$(git -C "$SRC" rev-parse HEAD)"
+  if [ -n "$RELEASE_VERSION" ]; then
+    if [ "$DEPLOY_VERSION" != "$RELEASE_VERSION" ]; then
+      echo "ERROR: the verified release says version $DEPLOY_VERSION, not the requested $RELEASE_VERSION." >&2
+      exit 1
+    fi
+    DEPLOY_COMMIT="$("$APP_DIR/.venv/bin/python" -c 'import json,sys; print(json.load(open(sys.argv[1]))["commit"])' "$SRC/manifest.json" 2>/dev/null || true)"
+    case "$DEPLOY_COMMIT" in
+      [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+      *) DEPLOY_COMMIT="release-$DEPLOY_VERSION" ;;
+    esac
+    DEPLOY_SOURCE="signed_release"
+  else
+    DEPLOY_COMMIT="$(git -C "$SRC" rev-parse HEAD)"
+    DEPLOY_SOURCE="unsigned_git"
+  fi
   echo "    Version $DEPLOY_VERSION, commit $DEPLOY_COMMIT"
 
-  _log_deploy_event "deploy.started" '{"trigger": "deploy.sh"}'
+  _log_deploy_event "deploy.started" "{\"trigger\": \"deploy.sh\", \"source\": \"$DEPLOY_SOURCE\"}"
   _P1_STARTED=1
   _P1_STAGE="rsync"
 
@@ -613,6 +773,8 @@ if [ "$DEPLOY_SH_PHASE" = "1" ]; then
     --exclude 'audit_store.db-shm' \
     --exclude 'audit_store.db.*' \
     --exclude '.env' \
+    --exclude 'update_check.json' \
+    --exclude 'release_keys.local.json' \
     --exclude '.deploy.conf' \
     --exclude '.deploy.lock' \
     --exclude '.nginx-deploy-backup' \
@@ -629,6 +791,15 @@ if [ "$DEPLOY_SH_PHASE" = "1" ]; then
   # crash-loop (start-headless.sh). Belt-and-suspenders with the tracked
   # modes (fixed in 5.41.0). MUST happen before the phase-2 exec below.
   find "$APP_DIR" -maxdepth 3 -name '*.sh' -exec chmod +x {} +
+
+  # A signed release carries the already-built frontend (verified against the
+  # signed manifest above); the rsync excludes frontend/dist/, so stage it as
+  # dist.new for phase 2 to swap in. No Node on the server.
+  if [ -n "$RELEASE_VERSION" ]; then
+    rm -rf "$APP_DIR/frontend/dist.new"
+    cp -R "$SRC/frontend/dist" "$APP_DIR/frontend/dist.new"
+    export DEPLOY_RELEASE_MODE=1
+  fi
 
   # Phase 2 exec (see "ONE-VERSION-LAG FIX" above): $APP_DIR/server/
   # deploy.sh is now THIS run's freshly-rsynced copy. Passes phase 1's temp
@@ -691,9 +862,20 @@ fi
 
 _STAGE="pip_install"
 echo "==> Reinstalling Python dependencies"
-"$APP_DIR/.venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
+# 5.46.0: hash-pinned install when the release ships requirements.lock (every
+# package must match a recorded sha256, so a tampered PyPI upload is refused
+# instead of installed). Older refs have no lock: requirements.txt, as before.
+if [ -f "$APP_DIR/requirements.lock" ]; then
+  "$APP_DIR/.venv/bin/pip" install -q --require-hashes -r "$APP_DIR/requirements.lock"
+else
+  echo "WARNING: no requirements.lock in this version; installing from requirements.txt (not hash-checked)." >&2
+  "$APP_DIR/.venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
+fi
 
 _STAGE="frontend_build"
+if [ "${DEPLOY_RELEASE_MODE:-}" = "1" ]; then
+echo "==> Installing the release's built frontend (no Node needed)"
+else
 echo "==> Rebuilding frontend"
 # OPS-06: --ignore-scripts -- no package this frontend needs runs an install
 # script (the lockfile's only one is fsevents, a macOS-only optional
@@ -707,6 +889,7 @@ echo "==> Rebuilding frontend"
   npm ci --ignore-scripts --silent
   npx vite build --outDir dist.new
 )
+fi
 if [ ! -f "$APP_DIR/frontend/dist.new/index.html" ]; then
   echo "ERROR: the frontend build produced no dist.new/index.html" >&2
   exit 1

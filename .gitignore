@@ -70,3 +70,14 @@ Thumbs.db
 
 # Local-only internal review notes -- never published (see CONTRIBUTING.md on local-only docs)
 OPA_APP_REVIEW.md
+
+# Update check (5.46.0): this install's own settings/state and any signing-key
+# revocation it applied -- local to each server, never committed. Secret
+# signing keys (tools/release.py keygen) are created OUTSIDE the repository;
+# these patterns are a second line of defence.
+update_check.json
+release_keys.local.json
+release-out/
+*.key
+*.secret
+minisign.key

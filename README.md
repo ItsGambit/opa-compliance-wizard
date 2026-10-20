@@ -45,6 +45,8 @@ worth reporting privately.
 | Host it for a team, with Okta login | [docs/hosting.md](docs/hosting.md) |
 | Use the CLI instead of the dashboard | [docs/hosting.md](docs/hosting.md#running-it-as-a-cli-instead) |
 | See a live-verified API quirk or gotcha | [docs/api-notes.md](docs/api-notes.md) |
+| Upgrade a server (signed releases, the update check) | [Upgrading](#upgrading) |
+| Publish a release (maintainers) | [docs/releasing.md](docs/releasing.md) |
 | See what changed between versions | [CHANGELOG.md](CHANGELOG.md) |
 | Contribute a fix or feature | [CONTRIBUTING.md](CONTRIBUTING.md) |
 | Report a security issue privately | [SECURITY.md](SECURITY.md) |
@@ -132,6 +134,146 @@ the dashboard does.
 
 Want to run it as a CLI instead, or host it for a team? See
 [docs/hosting.md](docs/hosting.md).
+
+## Upgrading
+
+**Nothing changes for you unless you choose it.** Upgrading to 5.46.0 changes no
+behaviour of an existing install: the update check is **off**, `server/deploy.sh`
+and `--ref` work as before (with a warning that they install unsigned source), and
+no key has to be pinned. What 5.46.0 adds is a way to install **signed releases**
+and to learn that one exists.
+
+### Where your install stands
+
+| State | What it means |
+|---|---|
+| *No release signing key pinned* (only a fork or self-built copy whose `server/release_keys.json` is empty; 5.46.0 ships with the project's keys) | `deploy.sh --release` refuses with "no release key pinned"; the Updates screen says so. Everything else works exactly as before. |
+| *Key pinned* | `deploy.sh --release <version>` verifies every download against it. |
+| *Key revoked* (see below) | Releases signed by the old key after the revocation are refused; you apply the published revocation, then install the new release. |
+
+### The update check (off by default)
+
+When you turn it on, the server makes **one HTTPS request a day to `api.github.com`**
+and nothing else leaves the machine. GitHub sees the server's egress IP address and
+a fixed User-Agent (`opa-compliance-wizard-update-check`); **nothing about your
+tenant, users, data or host name is sent**, and the installed version is not sent
+unless you tick "share my version". It only reports that a newer release exists; it
+never downloads or installs anything. The only things stored are the latest version
+seen, its publish date and link, whether a signed download is attached, and when
+the check last ran (file `update_check.json` next to the app, owner-only).
+
+- Turn it on or off: **Updates** (admins, sidebar) or `python -m server.updater enable-check` / `disable-check`.
+- `OPA_UPDATE_CHECK=off` in the server's environment always wins and cannot be
+  overridden from the screen; `OPA_UPDATE_CHECK=on` turns it on without an admin action.
+- Behind a proxy: set `https_proxy` / `no_proxy` in the service's environment file.
+  A mirror inside your network: `OPA_RELEASE_API_URL`, `OPA_REVOCATION_URL_BASE`
+  (https; redirects only to the mirror). Without a mirror, redirects are followed
+  only to GitHub's own hosts.
+- A failed check (no network, rate limit, bad answer) is shown in plain words on the
+  Updates screen and recorded in the **Audit Log**; an identical failure is not
+  logged again, and the next success says how many failed and since when.
+
+### Installing a signed release
+
+On the server, as the account that owns the installation:
+
+```bash
+server/deploy.sh --release 5.47.0
+```
+
+It downloads `ocw-5.47.0.tar.gz` and its `.minisig` from the project's GitHub
+release, checks them against the signing key pinned in `server/release_keys.json`
+(the **installed** copy is the root of trust, never the file being checked) and
+refuses, before changing anything, if the file is unsigned, altered, renamed,
+signed by a standby or revoked key, built for a different version than it claims,
+not newer than what is installed (no downgrades), or needs a newer starting
+version. The release carries the built frontend, so **Node.js is not needed**
+on the server. Then it installs exactly like the unsigned path: backup (if
+`OPA_DEPLOY_BACKUP_DIR` is set), file sync, `pip install --require-hashes -r
+requirements.lock`, restarts with health checks, nginx validation.
+
+- **No internet on the server:** download the two files (and, if published,
+  `revocation.json` + `revocation.json.sig`) elsewhere, carry them over, run
+  `server/deploy.sh --release 5.47.0 --from-dir /path/to/dir`.
+- **Re-run the same version** (for example after a failed run): add `--reinstall`.
+- **Going back:** a signed `--release` never installs an older version. To return to
+  an earlier version, restore your backup of the installation and archive, or
+  `deploy.sh --ref <previous tag>` (unsigned; maintainers). There is no automatic
+  code rollback in 5.46.0.
+- **Take a backup first.** Set `OPA_DEPLOY_BACKUP_DIR` (see [docs/hosting.md](docs/hosting.md)).
+- Every refusal is recorded in the Audit Log as `upgrade.verify_failed` with a reason code.
+
+### From the command line
+
+Everything on the Updates screen is also available from a shell. Run from the
+install directory with the app's Python (`.venv/bin/python -m server.updater ...`).
+
+| Command | What it does |
+|---|---|
+| `status [--json]` | The same data as `GET /api/upgrade/status`: installed version, check on/off and why, latest release, last check, signing-key state. |
+| `check [--force] [--json]` | Run the check now. Respects off unless `--force` (which is recorded). Exit 1 when a newer release exists. |
+| `enable-check` / `disable-check` | Same switch as the screen, same audit entry (actor recorded as `cli:<os user>`). |
+| `verify <tar.gz> <.minisig>` | Verify a download (see below). |
+| `keys list` / `keys apply-revocation <revocation.json>` | Show or update the pinned signing keys. |
+| `audit [--since DATE] [--json]` | List the upgrade-related Audit Log entries (`upgrade.*`, `release_keys.*`, `deploy.*`). |
+
+Exit codes: `0` ok, `1` a newer release is available (`check`), `2` usage error, `3` failure
+(the message says what to do).
+
+### Verify a download by hand
+
+With this project's own verifier (no extra software, works offline):
+
+```bash
+python -m server.updater.verify ocw-5.47.0.tar.gz ocw-5.47.0.tar.gz.minisig --installed-version none
+```
+
+It prints one `OK` line per fact (signature, version, hashes) or `ERROR:` and what to
+do. With the reference tool [minisign](https://jedisct1.github.io/minisign/), using
+the minisign public-key line the project publishes with each release (it is the key in
+`server/release_keys.json` with role `release`; the file lists it as 32 raw bytes, minisign
+wants `base64("Ed" || id || key)`, which `tools/release.py pubkey` prints):
+
+```bash
+minisign -Vm ocw-5.47.0.tar.gz -P <public key> -H
+```
+
+(`-H` requires the prehashed signature format the project uses.) `minisign` checks the
+signature and the signed comment; the project's verifier additionally checks the
+version, file name and the manifest of every file inside, and that the key is a current
+release key. Prefer the project's verifier.
+
+### If the signing key is compromised
+
+The project holds two keys in different places: a **primary** that signs releases and a
+**standby** (a different kind of key, in a different cloud) that can only sign a *revocation*. If the primary is ever lost or stolen the
+maintainers publish a signed `revocation.json` that revokes it and installs a new release key (and,
+if needed, a new standby), with a link to a security advisory. It is published in two places: as an
+asset of the GitHub release tagged `revocation`, and (optional, `OPA_REVOCATION_URL`) at an
+owner-controlled static URL, so one outage or one compromised account cannot hide it.
+
+What you will see: a release signed by a key you do not know (*"signed by key ... which is not
+pinned ... apply the published revocation"*), or by a key marked revoked (*"was revoked ... Do
+not install it"*). Releases the old key signed **before** the revocation stay valid.
+
+What to do:
+1. **Online:** with the update check on, the server fetches and applies the revocation by itself
+   (recorded in the Audit Log as `release_keys.revocation_applied`); `deploy.sh --release` also
+   applies a published revocation before it verifies. Nothing to do.
+2. **Offline:** on a trusted computer download `revocation.json` from the project's `revocation`
+   release; copy it to the server; run
+   `.venv/bin/python -m server.updater keys apply-revocation revocation.json`
+   (or `python -m server.updater.verify --apply-revocation revocation.json`, or put the file next to the
+   release files for `--from-dir`). It checks the standby key's signature and that the revocation's serial
+   is newer than anything applied before. Then install the new release as usual.
+3. **If you suspect your copy of the keys itself:** compare the key ids with the project's security
+   advisory over a second channel before applying anything. If both of the project's keys were lost, the
+   advisory will tell you to re-pin a new key by hand (replace `server/release_keys.json` with the
+   published list after checking its key ids through two independent channels).
+
+Applying a revocation writes `release_keys.local.json` next to the app (kept across deploys, owner-only):
+the install remembers every key, its status and the highest revocation serial, so no later release can
+bring a revoked key back.
 
 ## No warranty
 

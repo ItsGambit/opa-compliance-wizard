@@ -190,6 +190,16 @@ def npx(state, argv):
 
 
 def curl(state, argv):
+    url = next(a for a in argv if a.startswith(("http://", "https://")))
+    if "-o" in argv and argv[argv.index("-o") + 1] != "/dev/null":
+        # 5.46.0 release downloads: state["release_files"] maps a URL suffix to
+        # a local file; anything else is a 404 (curl -f exits 22).
+        dest = argv[argv.index("-o") + 1]
+        for suffix, source in state.get("release_files", {}).items():
+            if url.endswith(suffix):
+                shutil.copyfile(source, dest)
+                return 0
+        return 22
     url = next(a for a in argv if a.startswith("http://"))
     if url.endswith("/api/version"):
         version = state.get("backend_version")

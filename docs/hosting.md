@@ -74,9 +74,10 @@ before the numbered steps below:
   nodejs.org or NodeSource).
 - The code, as the app user (no sudo): `git clone
   https://github.com/ItsGambit/opa-compliance-wizard.git ~/opa-compliance-wizard`,
-  then in it `python3 -m venv .venv && .venv/bin/pip install -r
-  requirements.txt` and `cd frontend && npm ci --ignore-scripts && npx
-  vite build`.
+  then in it `python3 -m venv .venv && .venv/bin/pip install
+  --require-hashes -r requirements.lock` (5.46.0: every package must match
+  a recorded sha256; `requirements.txt` is the source it is generated from)
+  and `cd frontend && npm ci --ignore-scripts && npx vite build`.
 - The app user's systemd "user manager" must keep running without a login
   session, because the keyring daemon lives in `/run/user/<uid>`: `sudo
   loginctl enable-linger <app-user>`. The units name that directory as
@@ -369,8 +370,15 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    — most commonly the username, or a binary path that doesn't match
    step 7a's `which` output exactly.
 
-**Redeploying: `server/deploy.sh`.** Run it on the server as the app user:
-`<install dir>/server/deploy.sh`. It works out the install directory from
+**Redeploying: `server/deploy.sh`.** Run it on the server as the app user.
+For production use a signed release: `<install dir>/server/deploy.sh
+--release <version>` (README, "Upgrading": it checks the download against the
+project's pinned signing key, refuses anything unsigned, altered or older than
+what is installed, and needs no Node.js on the server; `--from-dir <dir>`
+installs from files you carried in, for a server without internet access;
+`--reinstall` allows the same version again). A bare run, or `--ref`, installs
+**unsigned** source straight from the repository, prints a warning, and is
+meant for maintainers and test servers. Everything below applies to both. It works out the install directory from
 its own location (5.41.0; nothing to edit), takes a lock so two deploys
 can't overlap, checks the sudo grants and that it can read the live nginx
 site, and only then clones, syncs, rebuilds, restarts and applies the
@@ -388,10 +396,15 @@ past the clone writes one `deploy.started` and one `deploy.completed` or
 `deploy.failed` (with the stage that failed) to the Audit Log.
 Optional settings, from the environment or from `<install dir>/.deploy.conf`
 (`KEY=VALUE` lines; read, never executed; kept across deploys):
-- `OPA_REPO_URL` — deploy from your fork instead of upstream.
+- `OPA_REPO_URL` — deploy from your fork instead of upstream (unsigned
+  `--ref` installs only).
+- `OPA_RELEASE_BASE_URL` / `OPA_REVOCATION_URL_BASE` — where `--release`
+  downloads from, e.g. a mirror inside your network (https only). A mirror
+  can delay an upgrade but cannot alter one: the signature is still checked.
 - `OPA_DEPLOY_REF` (or `--ref <x>`) — a branch, tag or full commit to
-  deploy instead of the default branch's tip. `--ref <previous commit>`
-  is also the quickest way back after a bad deploy, to 5.41.0 or later: an
+  deploy instead of the default branch's tip (unsigned). `--ref <previous
+  commit>` is also the quickest way back after a bad deploy (a signed
+  `--release` refuses to install an older version), to 5.41.0 or later: an
   older release's `deploy.sh` only works in its own hardcoded directory, so
   it is refused anywhere else.
 - `OPA_BACKEND_PORT` — if `serve.py` doesn't listen on 8766.

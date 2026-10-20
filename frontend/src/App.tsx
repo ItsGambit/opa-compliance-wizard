@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { useEnvironments, useWhoami } from './api/hooks'
+import { useEnvironments, useUpgradeStatus, useWhoami } from './api/hooks'
 import { isSessionExpiredError, saveAccessControl, saveEnvironmentChange, type ApiError } from './api/client'
 import { useHashRoute } from './hooks/useHashRoute'
 import { toast } from './hooks/useToast'
@@ -22,6 +22,8 @@ import { SecretsAccessDashboard } from './components/SecretsAccessDashboard'
 import { ServiceAccountsDashboard } from './components/ServiceAccountsDashboard'
 import { REPORTS_SUB_TABS, SideNav } from './components/SideNav'
 import { UserMenu } from './components/UserMenu'
+import { UpdateBanner } from './components/UpdateBanner'
+import { UpdatesDialog } from './components/UpdatesDialog'
 import { environmentScopeKey } from './utils/environmentRows'
 import { canAdminFrom } from './utils/whoami'
 import { SharedPermissionsDialog } from './components/SharedPermissionsDialog'
@@ -49,6 +51,7 @@ export default function App() {
   const [aboutOpen, setAboutOpen] = useState(false)
   const [orphansOpen, setOrphansOpen] = useState(false)
   const [sharedPermissionsOpen, setSharedPermissionsOpen] = useState(false)
+  const [updatesOpen, setUpdatesOpen] = useState(false)
   // 5.42.0: an Environments change whose step-up approval didn't complete --
   // its screen reopens with the user's input (see utils/stepUp.ts).
   const [restore, setRestore] = useState<Extract<PendingStepUp, { kind: 'environment_change' }> | null>(null)
@@ -58,6 +61,7 @@ export default function App() {
   // actually serve this caller (verified admin, or a local-mode operator).
   const canAdmin = canAdminFrom(whoami)
   const isConfigured = !!environments?.active
+  const { data: upgradeStatus } = useUpgradeStatus(canAdmin)
   const queryClient = useQueryClient()
 
   // UI-05: the content below is scoped to the active tenant (see
@@ -217,6 +221,7 @@ export default function App() {
   return (
     <div className="flex flex-col h-dvh">
       <AnnouncementBanner />
+      <UpdateBanner canAdmin={canAdmin} onOpenUpdates={() => setUpdatesOpen(true)} />
       <div className="flex flex-1 min-h-0">
         <SideNav
           activeTab={activeTab}
@@ -234,6 +239,8 @@ export default function App() {
           onOpenAbout={() => setAboutOpen(true)}
           onOpenOrphanedArchives={() => setOrphansOpen(true)}
           onOpenSharedPermissions={() => setSharedPermissionsOpen(true)}
+          onOpenUpdates={() => setUpdatesOpen(true)}
+          updateAvailable={!!upgradeStatus?.check.enabled && !!upgradeStatus?.update_available}
         />
 
         <EnvironmentScope scopeKey={scopeKey}>
@@ -308,6 +315,7 @@ export default function App() {
       <BannerSettingsDialog open={bannerOpen} onOpenChange={setBannerOpen} />
       <AccessControlDialog open={accessControlOpen} onOpenChange={setAccessControlOpen} />
       <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />
+      {canAdmin && <UpdatesDialog open={updatesOpen} onOpenChange={setUpdatesOpen} />}
     </div>
   )
 }

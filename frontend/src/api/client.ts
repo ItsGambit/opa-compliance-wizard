@@ -19,6 +19,7 @@ import type {
   IntegrityResult,
   NamedRef,
   OrphanedArchive,
+  UpgradeStatus,
   OpaGroup,
   PreviewResponse,
   Project,
@@ -155,6 +156,14 @@ export function fetchBanner(): Promise<BannerConfig> {
 
 export function saveBanner(config: BannerConfig): Promise<BannerConfig> {
   return apiFetch('/api/banner', { method: 'POST', body: JSON.stringify(config) })
+}
+
+export function fetchUpgradeStatus(): Promise<UpgradeStatus> {
+  return apiFetch('/api/upgrade/status')
+}
+
+export function saveUpgradeSettings(settings: { enabled?: boolean; share_version?: boolean }): Promise<UpgradeStatus> {
+  return apiFetch('/api/upgrade/settings', { method: 'POST', body: JSON.stringify(settings) })
 }
 
 export function fetchAccessControl(): Promise<AccessControlConfig> {

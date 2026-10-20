@@ -106,6 +106,9 @@ ROUTES = {
     ("GET", "path == '/api/csv'"): Route("GET", "/api/csv?file=folders_template.csv", "open", None, 200),
     ("GET", "path == '/api/audit_log'"): Route("GET", "/api/audit_log", "admin", None, 200),
     ("GET", "path == '/api/access_control'"): Route("GET", "/api/access_control", "admin", None, 200),
+    # 5.46.0: update-check status (read-only) and its on/off switch.
+    ("GET", "path == '/api/upgrade/status'"): Route("GET", "/api/upgrade/status", "admin", None, 200),
+    ("POST", "path == '/api/upgrade/settings'"): Route("POST", "/api/upgrade/settings", "admin", {"share_version": False}, 200),
     ("GET", "path == '/api/shared_permissions'"): Route("GET", "/api/shared_permissions", "admin", None, 200),
     ("POST", "path == '/api/banner'"):
         Route("POST", "/api/banner", "admin", {"enabled": True, "message": "Maintenance tonight", "variant": "info"}, 200),

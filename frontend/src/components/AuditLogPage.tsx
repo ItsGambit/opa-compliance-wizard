@@ -192,8 +192,15 @@ export function AuditLogPage() {
             // every other failure state), NOT the neutral accent color the
             // other two deploy.* actions get -- a failed deploy is a real
             // problem, not just "a different shape of event."
-            const isDeployEvent = entry.action.startsWith('deploy.')
-            const isDeployFailure = entry.action === 'deploy.failed'
+            // 5.46.0: the update check and signing-key changes are server-side
+            // system events too (actor "update check"/"deploy.sh"), unless an
+            // admin or the CLI changed a setting (those carry an actor).
+            // Failures and refusals use the same red as a failed deploy.
+            const isSystemUpgradeEvent = (entry.action.startsWith('upgrade.') || entry.action.startsWith('release_keys.')) && !actor
+            const isDeployEvent = entry.action.startsWith('deploy.') || isSystemUpgradeEvent
+            const isDeployFailure = entry.action === 'deploy.failed' || entry.action === 'upgrade.verify_failed'
+              || entry.action === 'release_keys.revocation_rejected'
+              || (entry.action === 'upgrade.check' && entry.details?.result === 'failed')
             const deployBorderColor = isDeployFailure ? 'border-l-loss' : 'border-l-accent'
             const deployTextColor = isDeployFailure ? 'text-loss' : 'text-accent'
             return (
@@ -212,7 +219,7 @@ export function AuditLogPage() {
                 </div>
                 <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[0.6875rem]">
                   <span className="section-label">Actor</span>
-                  <span className="text-text-dim">{isDeployEvent ? 'deploy.sh (server)' : actor ?? 'local / CLI'}</span>
+                  <span className="text-text-dim">{isDeployEvent ? (isSystemUpgradeEvent ? 'server (updates)' : 'deploy.sh (server)') : actor ?? 'local / CLI'}</span>
                   <span className="section-label">Client IP</span>
                   <span className="text-text-dim">{entry.client_ip ?? '—'}</span>
                   <span className="section-label">User Agent</span>

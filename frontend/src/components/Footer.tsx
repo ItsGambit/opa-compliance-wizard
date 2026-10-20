@@ -1,11 +1,12 @@
 import { useEffect, useRef } from 'react'
 import { RefreshCw } from 'lucide-react'
-import { useEnvironments, useSyncStatus, useVersion } from '../api/hooks'
+import { useEnvironments, useSyncStatus, useUpgradeStatus, useVersion, useWhoami } from '../api/hooks'
 import { useSyncJob } from '../hooks/useSyncJob'
 import { toast } from '../hooks/useToast'
 import { formatDateTime } from '../utils/format'
 import { getSyncProgressPercent } from '../utils/syncProgress'
 import { activeRow, can, permissionReason } from '../utils/environmentRows'
+import { canAdminFrom } from '../utils/whoami'
 
 // This project split out of the ItsGambit/Okta monorepo into its own
 // standalone repo 2026-09-30 -- these were left pointing at the old
@@ -21,6 +22,9 @@ const REPO_CHANGELOG_URL = 'https://github.com/ItsGambit/opa-compliance-wizard/b
 export function Footer() {
   const { data: version } = useVersion()
   const { data: environments } = useEnvironments()
+  const { data: whoami } = useWhoami()
+  // 5.46.0: admins see a newer release (when the opt-in check found one) here too.
+  const { data: upgrade } = useUpgradeStatus(canAdminFrom(whoami))
   const activeEnv = environments?.active ?? undefined  // null (no active env) -> undefined, which the hooks treat as "disabled"
   const { data: syncStatus } = useSyncStatus(activeEnv)
   // 5.42.0: "Sync now" on an environment shared with this user follows what
@@ -57,6 +61,9 @@ export function Footer() {
   return (
     <footer className="max-w-4xl mx-auto w-full mt-4 pt-3 border-t border-border text-xs text-text-faint flex flex-wrap items-center justify-center gap-3">
       <span>OPA Compliance Wizard{version && ` v${version.version}`}</span>
+      {upgrade?.check.enabled && upgrade.update_available && upgrade.latest && (
+        <span className="text-accent">Update available: v{upgrade.latest.version}</span>
+      )}
       {activeEnv && (
         <>
           <span aria-hidden="true">·</span>

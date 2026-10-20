@@ -252,4 +252,4 @@ def test_several_reasons_are_joined_and_every_code_is_known():
 
 def test_version_header_and_constant_agree():
     head = open(engine.__file__, encoding="utf-8").read(4000)
-    assert f"# Version     : {engine.SCRIPT_VERSION}" in head and engine.SCRIPT_VERSION == "5.45.1"
+    assert f"# Version     : {engine.SCRIPT_VERSION}" in head

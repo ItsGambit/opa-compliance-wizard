@@ -43,6 +43,7 @@ from urllib.parse import urlparse, parse_qs, unquote, urlencode
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 import create_secret_folders as engine  # noqa: E402
+from server.updater import service as update_service  # noqa: E402
 
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 
@@ -973,6 +974,9 @@ def _scheduler_loop():
         except Exception as exc:
             engine.log("ERROR", f"[scheduler] Unexpected error in scheduler loop: {exc}")
             engine.log_audit_event(None, None, "sync.scheduler_error", {"error": str(exc)})
+        # 5.46.0: the opt-in update check (own thread; a failure here never
+        # affects syncs, and update_service.maybe_start never raises).
+        update_service.maybe_start(engine.SCRIPT_VERSION)
         _scheduler_stop_event.wait(SCHEDULER_POLL_INTERVAL_SECS)
 
 
@@ -2501,6 +2505,14 @@ class Handler(SimpleHTTPRequestHandler):
                     rows = list(_csv.DictReader(f))
                 return self._send_json(200, {"rows": rows})
 
+            if path == "/api/upgrade/status":
+                # 5.46.0: read-only update-check status (notify-only). Admin
+                # only, like the audit log: what a server runs and whether it
+                # is out of date is for the people who operate it.
+                if not _can_admin(owner_key, self.headers):
+                    return self._send_json(403, {"error": "Admin access required to view update status."})
+                return self._send_json(200, update_service.status(update_service.load(), engine.SCRIPT_VERSION))
+
             if path == "/api/audit_log":
                 # Admin-only -- this is every user's activity across every
                 # environment, for compliance visibility, not a per-user
@@ -2602,6 +2614,19 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 self._log_audit_event(actor_email, actor_sub, "banner.update", config)
                 return self._send_json(200, config)
+
+            if path == "/api/upgrade/settings":
+                # 5.46.0: switch the update check on/off and choose whether it
+                # shares the installed version. Admin-only and audited; not
+                # step-up protected (it changes no tenant or access
+                # configuration; it only decides whether this server may ask
+                # GitHub for the latest release number).
+                if not _can_admin(owner_key, self.headers):
+                    return self._send_json(403, {"error": "Admin access required to change update settings."})
+                status, body = update_service.apply_settings_request(
+                    payload, engine.SCRIPT_VERSION,
+                    lambda action, details: self._log_audit_event(actor_email, actor_sub, action, details))
+                return self._send_json(status, body)
 
             if path == "/api/access_control/prepare":
                 # Phase 3: validates the PROPOSED config and stores it

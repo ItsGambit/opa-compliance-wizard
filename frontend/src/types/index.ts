@@ -299,6 +299,31 @@ export interface BannerConfig {
   dismissible: boolean
 }
 
+/** GET /api/upgrade/status (5.46.0): the opt-in, notify-only update check. */
+export interface UpgradeStatus {
+  installed_version: string
+  check: {
+    enabled: boolean
+    source: 'env_off' | 'env_on' | 'setting' | 'default_off'
+    env_locked: boolean
+    env_invalid_value: string | null
+    prompt_needed: boolean
+    share_version: boolean
+    mirror: boolean
+  }
+  latest: { version: string; published_at: string | null; release_url: string | null; signed_artifact: boolean | null } | null
+  update_available: boolean
+  last_check: {
+    at: string | null
+    status: 'ok' | 'error' | 'rate_limited' | null
+    code: string | null
+    next_at: string | null
+    consecutive_failures: number
+    failing_since: string | null
+  }
+  signing_keys: { pinned: boolean; serial: number | null; error: string | null }
+}
+
 // Okta group IDs (not names) that gate login/admin rights across the whole
 // dashboard -- see server/auth_gate.py + create_secret_folders.py's
 // get/set_access_control_config. null means "not configured yet."

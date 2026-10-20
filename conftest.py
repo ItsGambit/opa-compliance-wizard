@@ -177,3 +177,15 @@ def reset_serve_module_state(monkeypatch):
             mod._access_jobs.clear()
         with mod._sync_jobs_lock:
             mod._sync_jobs.clear()
+
+
+@pytest.fixture(autouse=True)
+def isolate_update_check(tmp_path, monkeypatch):
+    """5.46.0: the update check's state file, key-list overrides and switches
+    live in the test's own temp dir -- no test may read or write the
+    developer's real update_check.json / release_keys.local.json, make a
+    network request, or inherit OPA_UPDATE_CHECK from the shell."""
+    monkeypatch.setenv("OPA_UPDATE_STATE_PATH", str(tmp_path / "update_check.json"))
+    monkeypatch.setenv("OPA_RELEASE_KEYS_LOCAL", str(tmp_path / "release_keys.local.json"))
+    for name in ("OPA_UPDATE_CHECK", "OPA_RELEASE_API_URL", "OPA_REVOCATION_URL_BASE"):
+        monkeypatch.delenv(name, raising=False)

@@ -199,7 +199,7 @@ def test_full_deploy_into_a_relocated_install(d):
     assert proc.returncode == 0, d.out
     d.assert_one_terminal("deploy.completed")
     # phase 2 ran THIS install's pip, not a hardcoded path (OPS-02)
-    assert d.state["pip_argv"] == ["install", "-q", "-r", str(d.app / "requirements.txt")]
+    assert d.state["pip_argv"] == ["install", "-q", "--require-hashes", "-r", str(d.app / "requirements.lock")]  # 5.46.0
     assert ["ci", "--ignore-scripts", "--silent"] in d.calls("npm")  # OPS-06
     assert ["vite", "build", "--outDir", "dist.new"] in d.calls("npx")
     assert (d.app / "frontend" / "dist" / "index.html").read_text() == "new build"

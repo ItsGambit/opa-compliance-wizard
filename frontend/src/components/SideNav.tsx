@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import {
   Archive,
   ClipboardCheck,
+  Download,
   FolderTree,
   Info,
   KeyRound,
@@ -107,6 +108,10 @@ interface Props {
   onOpenOrphanedArchives?: () => void
   /** Admin-only (canAdmin, 5.42.0): what shared users may do by default. */
   onOpenSharedPermissions?: () => void
+  /** Admin-only (canAdmin, 5.46.0): the notify-only Updates screen. */
+  onOpenUpdates?: () => void
+  /** A newer release was found by the update check. */
+  updateAvailable?: boolean
 }
 
 const TOP_LEVEL_ICON: Record<string, typeof FolderTree> = {
@@ -183,11 +188,14 @@ function UtilityPill({
   icon,
   onClick,
   collapsed,
+  badge,
 }: {
   label: string
   icon: typeof FolderTree
   onClick: () => void
   collapsed?: boolean
+  /** A small dot: something here needs attention (an update is available). */
+  badge?: boolean
 }) {
   const Icon = icon
   if (collapsed) {
@@ -196,12 +204,13 @@ function UtilityPill({
         type="button"
         onClick={onClick}
         title={label}
-        aria-label={label}
-        className="w-9 h-9 mx-auto flex items-center justify-center rounded-full text-text-dim
+        aria-label={badge ? `${label} (update available)` : label}
+        className="relative w-9 h-9 mx-auto flex items-center justify-center rounded-full text-text-dim
           bg-[color-mix(in_srgb,var(--color-text)_6%,transparent)]
           hover:bg-[color-mix(in_srgb,var(--color-text)_10%,transparent)] transition-colors"
       >
         <Icon size={14} />
+        {badge && <span aria-hidden="true" className="absolute top-1 right-1 h-2 w-2 rounded-full bg-accent" />}
       </button>
     )
   }
@@ -215,6 +224,7 @@ function UtilityPill({
     >
       <Icon size={14} />
       {label}
+      {badge && <span className="h-2 w-2 rounded-full bg-accent" role="img" aria-label="update available" />}
     </button>
   )
 }
@@ -235,6 +245,8 @@ export function SideNav({
   onOpenAbout,
   onOpenOrphanedArchives,
   onOpenSharedPermissions,
+  onOpenUpdates,
+  updateAvailable,
 }: Props) {
   const { theme, toggle } = useTheme()
 
@@ -393,6 +405,9 @@ export function SideNav({
           )}
           {canAdmin && onOpenOrphanedArchives && (
             <UtilityPill label="Orphaned archives" icon={Archive} onClick={() => { onOpenOrphanedArchives(); closeDrawer() }} collapsed={collapsed} />
+          )}
+          {canAdmin && onOpenUpdates && (
+            <UtilityPill label="Updates" icon={Download} badge={updateAvailable} onClick={() => { onOpenUpdates(); closeDrawer() }} collapsed={collapsed} />
           )}
           <UtilityPill label="About" icon={Info} onClick={() => { onOpenAbout(); closeDrawer() }} collapsed={collapsed} />
           <UtilityPill

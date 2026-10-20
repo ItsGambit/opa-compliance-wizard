@@ -16,6 +16,7 @@ import {
   fetchServiceAccountsReport,
   fetchSharedPermissions,
   fetchSyncStatus,
+  fetchUpgradeStatus,
   fetchUserResourceAccess,
   fetchVersion,
   fetchWhoami,
@@ -33,6 +34,19 @@ export function useEnvironments() {
     // scope (UI-05) -- an exception to the app-wide no-focus-refetch rule.
     refetchOnWindowFocus: true,
     staleTime: 0,
+  })
+}
+
+/** 5.46.0: the update-check status. Admin-only on the server, so it is only
+ * asked for when the caller can admin; refreshed gently (the check itself
+ * runs once a day on the server). */
+export function useUpgradeStatus(enabled: boolean) {
+  return useQuery({
+    queryKey: ['upgrade_status'],
+    queryFn: fetchUpgradeStatus,
+    enabled,
+    staleTime: 60_000,
+    refetchInterval: 10 * 60_000,
   })
 }
 
