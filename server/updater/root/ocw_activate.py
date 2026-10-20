@@ -1283,12 +1283,19 @@ class Updater:
             cid = correlation_id or self.st.get("correlation_id")
             secrets = [v for k, v in c.env_values().items() if ocw_bundle.SENSITIVE_NAME.search(k)]
             entries = audit_entries_for(c, cid) if cid else []
-            red = ocw_bundle.Redactor(secret_values=secrets, include_hosts=include_hosts, env_names=ocw_bundle.collect_env_names(entries))
+            env_names = set(ocw_bundle.collect_env_names(entries))
+            try:  # the tenant / environment names the archive holds, so the application's own log lines can be scrubbed of them
+                env_names.update(self.host.db_tool(["snapshot", c.db_path()]).get("env_names") or [])
+            except (OSError, ocw_host.HostError):
+                pass
+            red = ocw_bundle.Redactor(secret_values=secrets, include_hosts=include_hosts, env_names=env_names)
             since = self.st.get("started_at")
             texts = {}
             names = list(dict.fromkeys(self.units() + ["ocw-upgrade"]))
             for u in names:
-                texts[f"journal-{u}.txt"] = self.host.journal(u, 500, since)
+                raw = self.host.journal(u, 500, since)
+                # the updater's own journal is ours and stays whole; the application's is filtered (WARN and above, or this run)
+                texts[f"journal-{u}.txt"] = raw if u == "ocw-upgrade" else ocw_bundle.filter_app_journal(raw, cid)
                 texts[f"status-{u}.txt"] = self.host.status_text(u)
             texts["journal-ocw-stage.txt"] = self.host.journal("ocw-stage@*", 500, since)
             rc, out = self.host.nginx_test()

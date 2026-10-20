@@ -234,6 +234,7 @@ def snapshot(db, since=None):
             except sqlite3.OperationalError:
                 running = False
         out["sync_running"] = running
+        out["env_names"] = environment_names(conn, db)
         out["sync_after"] = False
         if since:
             try:
@@ -244,6 +245,38 @@ def snapshot(db, since=None):
         return out
     finally:
         conn.close()
+
+
+def environment_names(conn, db):
+    """Distinct tenant / environment names and hosts the application knows (so a support bundle can hide them)."""
+    names = set()
+    try:
+        for row in conn.execute("SELECT display_name, team_name, base_domain, okta_url FROM app_environments"):
+            names.update(v for v in row if isinstance(v, str))
+    except sqlite3.Error:
+        pass
+    try:  # the legacy environments file next to the archive: opened as the application account, plain files only
+        import stat as _stat
+        path = os.path.join(os.path.dirname(os.path.abspath(db)), "environments.json")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as fh:
+            if _stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                def walk(o, depth=0):
+                    if depth > 5:
+                        return
+                    if isinstance(o, dict):
+                        for k, v in o.items():
+                            if k in ("display_name", "name", "team_name", "base_domain", "okta_url", "org_url") and isinstance(v, str):
+                                names.add(v)
+                            else:
+                                walk(v, depth + 1)
+                    elif isinstance(o, list):
+                        for v in o[:500]:
+                            walk(v, depth + 1)
+                walk(json.loads(fh.read(4 << 20).decode("utf-8")))
+    except (OSError, ValueError):
+        pass
+    return sorted(n for n in names if 3 <= len(n) <= 200)[:500]
 
 
 def backup(db, dst):
