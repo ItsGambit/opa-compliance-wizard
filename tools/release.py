@@ -141,7 +141,7 @@ def _read_dist(dist):
 
 
 def _migrations_from(files):
-    """([{version, since, rollback_safe}], highest migration) from the tagged audit_store.py and
+    """([{version, since, rollback_safe, description?}], highest migration) from the tagged audit_store.py and
     server/schema_migrations.json. A tree without audit_store.py (a test fixture) has none; a real one must declare every
     migration, so a release cannot ship a migration nobody judged for rollback safety."""
     store = files.get("audit_store.py")
@@ -159,8 +159,14 @@ def _migrations_from(files):
     missing = [n for n in numbers if str(n) not in declared]
     if missing:
         raise ReleaseError(f"server/schema_migrations.json does not declare migration(s) {missing}: decide rollback_safe for each")
-    return ([{"version": n, "since": declared[str(n)]["since"], "rollback_safe": bool(declared[str(n)]["rollback_safe"])} for n in numbers],
-            numbers[-1])
+    out = []
+    for n in numbers:
+        entry = {"version": n, "since": declared[str(n)]["since"], "rollback_safe": bool(declared[str(n)]["rollback_safe"])}
+        text = declared[str(n)].get("description")
+        if isinstance(text, str) and text.strip():
+            entry["description"] = text.strip()[:200]   # shown on the Updates page; optional
+        out.append(entry)
+    return out, numbers[-1]
 
 
 NGINX_TEMPLATE = "server/nginx-opa-secrets-wizard.conf"

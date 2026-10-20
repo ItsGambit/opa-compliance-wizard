@@ -948,7 +948,13 @@ def _upgrade_context():
         db_bytes = os.path.getsize(audit_store._audit_db_path())
     except OSError:
         db_bytes = 0
-    return {"sync_running": running, "db_bytes": db_bytes, "run": update_service.upgrade_run()}
+    try:
+        log_bytes = os.path.getsize(engine._audit_log_path())
+    except OSError:
+        log_bytes = 0
+    backups = upgrade_service.backups_view() or {}
+    return {"sync_running": running, "db_bytes": db_bytes, "audit_log_bytes": log_bytes, "backups_total": backups.get("total_bytes") or 0,
+            "sync_hint": Handler._upgrade_sync_hint(), "run": update_service.upgrade_run()}
 
 
 def _scheduler_loop():

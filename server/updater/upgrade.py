@@ -290,7 +290,7 @@ def _manifest_view(raw, version):
         if isinstance(item, dict) and isinstance(item.get("version"), int) and not isinstance(item["version"], bool):
             migrations.append({"version": item["version"], "since": _cap_text(item.get("since"), 20),
                                "rollback_safe": item.get("rollback_safe") is True,
-                               "summary": _cap_text(item.get("summary"), 200)})
+                               "description": _cap_text(item.get("description") or item.get("summary"), 200)})
     num = lambda v: v if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 10 ** 6 else None  # noqa: E731
     excerpt = _cap_text(m.get("changelog_excerpt"), 2000)
     return {"min_upgrade_from": _cap_text(m.get("min_upgrade_from"), 20), "downtime_estimate_seconds": num(m.get("downtime_estimate_seconds")),
@@ -307,37 +307,80 @@ def _vtuple(text, default):
         return default
 
 
+def _size(n):
+    """Sizes as the Updates page shows them: GB with one decimal from 1 GB, else whole MB (or KB)."""
+    n = int(n or 0)
+    if n >= 10 ** 9:
+        return f"{n / 10 ** 9:.1f} GB"
+    if n >= 10 ** 6:
+        return f"{round(n / 10 ** 6)} MB"
+    return f"{max(1, round(n / 10 ** 3))} KB"
+
+
+def _utc_hm(text):
+    try:
+        return datetime.strptime(str(text)[:19], "%Y-%m-%dT%H:%M:%S").strftime("%H:%M")
+    except ValueError:
+        return None
+
+
 def preflight(manifest, size, ctx, now):
-    """[{id, ok, text}]: what the Updates page shows as 'Preflight'. `ctx`: sync_running (bool), db_bytes (int), run (state.json
-    fields or None)."""
+    """[{id, ok, text}]: what the Updates page shows as 'Preflight'. `ctx` (all optional): sync_running (bool), db_bytes, audit_log_bytes,
+    backups_total (bytes of the updater's published pre-upgrade copies), sync_hint ({last_sync_completed_at, daily_run_times_utc}),
+    run (state.json fields or None)."""
     items = []
     opt = opt_dir() or Path(keylib.REPO_ROOT)
     data = data_dir()
+    db = ctx.get("db_bytes") or 0
     need_opt = 3 * (size or 20 * 2**20) + 100 * 2**20
-    need_data = 3 * (ctx.get("db_bytes") or 0) + 100 * 2**20
-    for ident, label, path, need in (("disk_opt", "Disk, code volume", opt, need_opt), ("disk_data", "Disk, data volume", data, need_data)):
-        try:
-            free = shutil.disk_usage(str(path)).free
-            items.append({"id": ident, "ok": free >= need, "text": f"{label}: {free / 2**30:.1f} GB free; {need / 2**30:.1f} GB needed."})
-        except OSError:
-            items.append({"id": ident, "ok": False, "text": f"{label}: could not read free space."})
+    need_data = 3 * db + 100 * 2**20
+    try:
+        free = shutil.disk_usage(str(opt)).free
+        items.append({"id": "disk_opt", "ok": free >= need_opt, "text": f"Disk, code volume: {_size(free)} free; {_size(need_opt)} needed (3× the archive file + its environment). "
+                      + ("Passed." if free >= need_opt else "Not enough.")})
+    except OSError:
+        items.append({"id": "disk_opt", "ok": False, "text": "Disk, code volume: could not read the free space."})
+    try:
+        free = shutil.disk_usage(str(data)).free
+        items.append({"id": "disk_data", "ok": free >= need_data, "text": f"Disk, data volume: {_size(free)} free; {_size(need_data)} needed"
+                      + (f" for a {_size(db)} archive backup with headroom" if db else "") + ". " + ("Passed." if free >= need_data else "Not enough.")})
+    except OSError:
+        items.append({"id": "disk_data", "ok": False, "text": "Disk, data volume: could not read the free space."})
+    if db:
+        parts = [f"{_size(db)} audit_store.db"]
+        if ctx.get("audit_log_bytes"):
+            parts.append(f"{_size(ctx['audit_log_bytes'])} audit_log.jsonl")
+        parts.append("access_control.json")
+        extra = f" Existing pre-upgrade backups: {_size(ctx['backups_total'])} (kept; never deleted automatically)." if ctx.get("backups_total") else ""
+        items.append({"id": "backup", "ok": True, "text": "Backup size: " + " + ".join(parts) + "." + extra})
     want_py = _vtuple((manifest or {}).get("min_python"), _PY_MIN)
     have_py = sys.version_info[:3]
-    items.append({"id": "python", "ok": have_py >= want_py,
-                  "text": f"Python {'.'.join(map(str, have_py))} (needs {'.'.join(map(str, want_py))} or newer)."})
+    items.append({"id": "python", "ok": have_py >= want_py, "text": f"Python {'.'.join(map(str, have_py))} ≥ {'.'.join(map(str, want_py[:2]))}."
+                  + ("" if have_py >= want_py else " Too old.")})
     want_sql = _vtuple((manifest or {}).get("min_sqlite"), _SQLITE_MIN)
     have_sql = tuple(int(p) for p in sqlite3.sqlite_version.split("."))
-    items.append({"id": "sqlite", "ok": have_sql >= want_sql,
-                  "text": f"SQLite {sqlite3.sqlite_version} (needs {'.'.join(map(str, want_sql))} or newer)."})
+    items.append({"id": "sqlite", "ok": have_sql >= want_sql, "text": f"SQLite {sqlite3.sqlite_version} ≥ {'.'.join(map(str, want_sql))}."
+                  + ("" if have_sql >= want_sql else " Too old.")})
+    hint = ctx.get("sync_hint") or {}
+    last = _utc_hm(hint.get("last_sync_completed_at"))
+    runs = hint.get("daily_run_times_utc") or []
+    when = (f" Last sync finished {last} UTC." if last else "") + (f" Next scheduled {', '.join(runs)} UTC." if runs else "")
     items.append({"id": "sync", "ok": not ctx.get("sync_running"),
-                  "text": "No sync is running." if not ctx.get("sync_running")
-                  else "A sync is running: the upgrade waits up to 10 minutes for it to finish, then refuses to start."})
+                  "text": ("No sync running." + when) if not ctx.get("sync_running")
+                  else "A sync is running: the upgrade waits up to 10 minutes for it to finish, then refuses to start." + when})
     run = ctx.get("run") or {}
     busy = bool(run) and run.get("result") is None and bool(run.get("step"))
-    items.append({"id": "in_flight", "ok": not busy, "text": "No other upgrade is in flight." if not busy else "Another upgrade is in progress."})
+    if busy:
+        items.append({"id": "in_flight", "ok": False, "text": "Another upgrade is in progress."})
     st = updater_state()
-    items.append({"id": "updater", "ok": st["ready"],
-                  "text": (f"Updater present{' (activator ' + st['activator'] + ')' if st['activator'] else ''}." if st["ready"] else st["message"])})
+    if st["ready"]:
+        act = st["activator"]
+        newer = bool(act and (manifest or {}).get("activator_version") and (manifest or {}).get("activator_version") != act)
+        items.append({"id": "updater", "ok": True,
+                      "text": "Updater present" + (f": ocw-updater {act}, activator {act}" if act else "") + (" (will update itself after this release verifies)" if newer else "")
+                      + ("." if busy else ". No other upgrade in flight.")})
+    else:
+        items.append({"id": "updater", "ok": False, "text": st["message"]})
     return items
 
 

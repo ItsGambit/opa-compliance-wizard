@@ -117,7 +117,10 @@ def test_preview_verifies_the_signed_comment_and_reports_the_preflight(armed):
     assert [m["rollback_safe"] for m in p["manifest"]["migrations"]] == [True, False]
     assert p["manifest"]["changelog_excerpt"].startswith(f"{TARGET} — Test release")
     ids = {i["id"]: i["ok"] for i in p["preflight"]}
-    assert ids["python"] and ids["sqlite"] and ids["updater"] and ids["in_flight"]
+    assert ids["python"] and ids["sqlite"] and ids["updater"] and "in_flight" not in ids     # only listed when it fails
+    texts = {i["id"]: i["text"] for i in p["preflight"]}
+    assert "No other upgrade in flight." in texts["updater"] and texts["python"].startswith("Python ") and "≥" in texts["python"]
+    assert texts["disk_data"].startswith("Disk, data volume:") and "No sync running." in texts["sync"]
     st = armed.status()
     assert st["upgrade"]["preview"]["sha256"] == armed.sha
     assert [e["action"] for e in armed.audit() if e["action"] == "upgrade.preview"] == ["upgrade.preview"]
