@@ -527,7 +527,6 @@ export type UpgradeRequestBody =
   | { kind: 'restore'; confirm: string; backup?: string }
   | { kind: 'clear_failure' }
   | { kind: 'bundle'; include_hosts: boolean; for_correlation_id?: string }
-  | { kind: 'prune_backups'; confirm: string; keep_last?: number; names?: string[] }
 
 export interface UpgradeRequestResult {
   kind: string

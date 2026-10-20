@@ -11,7 +11,6 @@ const WHAT: Record<string, { ing: string; noun: string }> = {
   restore: { ing: 'Restoring the pre-upgrade archive copy', noun: 'the restore' },
   clear_failure: { ing: 'Clearing the recorded failure', noun: 'clearing the failure' },
   bundle: { ing: 'Rebuilding the support bundle', noun: 'rebuilding the bundle' },
-  prune_backups: { ing: 'Deleting the older backups', noun: 'deleting the backups' },
 }
 
 /** Artboard 06, the explainer: how an approval travels (the app's existing step-up pattern, unchanged). */

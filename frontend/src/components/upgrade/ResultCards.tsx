@@ -9,7 +9,7 @@ import { formatBytes } from '../../utils/upgrade'
 import {
   HEALTH_CHECK_LABELS, HEALTH_CHECK_ORDER, HEALTH_CHECK_SHORT, clockIn, dateTimeIn, describeReason, formatDuration, serverZoneOf, shortSha, stampFromName, browserZone,
 } from '../../utils/upgradeFlow'
-import { openAuditLogFor } from '../../utils/upgradeRequested'
+import { bundleCoolingDown, openAuditLogFor } from '../../utils/upgradeRequested'
 import { Badge, CARD_TITLE, CommandBlock, KV, Row, SEC_LABEL } from './parts'
 import { TypedConfirmDialog } from './TypedConfirmDialog'
 import { useOperationsBlock, useUpgradeRequest } from './useUpgradeRequest'
@@ -33,6 +33,7 @@ export function SuccessCards({ run, status }: { run: UpgradeRun; status: Upgrade
   const block = useOperationsBlock(status)
   const rollback = useUpgradeRequest(`Roll back to ${status.upgrade?.rollback?.to ?? 'the previous version'}`, () => setRollbackOpen(false))
   const bundle = useUpgradeRequest('Create a support bundle')
+  const cooling = bundleCoolingDown()
   const { data: rows = [] } = useRunAudit(run.correlation_id)
   const zone = zoneOf(status)
   const u = status.upgrade
@@ -87,7 +88,7 @@ export function SuccessCards({ run, status }: { run: UpgradeRun; status: Upgrade
           <button type="button" className="btn-secondary !text-text-dim" onClick={() => run.correlation_id && openAuditLogFor(run.correlation_id)}>
             <ListChecks size={14} aria-hidden="true" />View the {rows.length || ''} audit entries for this upgrade
           </button>
-          <button type="button" className="btn-secondary !text-text-dim" disabled={bundle.isPending || !!block}
+          <button type="button" className="btn-secondary !text-text-dim" disabled={bundle.isPending || !!block || cooling} title={cooling ? 'A bundle was requested a moment ago; wait five minutes' : undefined}
             onClick={() => bundle.mutate({ kind: 'bundle', include_hosts: false, for_correlation_id: run.correlation_id ?? undefined })}>
             <Download size={14} aria-hidden="true" />Create a support bundle…
           </button>
@@ -217,7 +218,7 @@ export function FailureCards({ run, status }: { run: UpgradeRun; status: Upgrade
                 <div className="flex gap-2 flex-wrap items-center mt-3">
                   <a className="btn-primary no-underline" href={upgradeBundleUrl(bundle.name)} download={bundle.name}><Download size={14} aria-hidden="true" />Download support bundle</a>
                   {hosts && (
-                    <button type="button" className="btn-secondary !text-text-dim" disabled={rebuild.isPending || !!block}
+                    <button type="button" className="btn-secondary !text-text-dim" disabled={rebuild.isPending || !!block || bundleCoolingDown()} title={bundleCoolingDown() ? 'A bundle was requested a moment ago; wait five minutes' : undefined}
                       onClick={() => rebuild.mutate({ kind: 'bundle', include_hosts: true, for_correlation_id: run.correlation_id ?? undefined })}>
                       <RefreshCw size={14} aria-hidden="true" />Rebuild with host names…
                     </button>

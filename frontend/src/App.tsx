@@ -23,7 +23,7 @@ import { ServiceAccountsDashboard } from './components/ServiceAccountsDashboard'
 import { REPORTS_SUB_TABS, SideNav } from './components/SideNav'
 import { UserMenu } from './components/UserMenu'
 import { UpgradeNoticeBanner } from './components/UpgradeNoticeBanner'
-import { rememberRequested } from './utils/upgradeRequested'
+import { markBundleRequested, rememberRequested } from './utils/upgradeRequested'
 import { UpdatesPage, type UpdatesHeader } from './components/UpdatesPage'
 import { UpdateKeysPage } from './components/UpdateKeysPage'
 import { environmentScopeKey } from './utils/environmentRows'
@@ -126,14 +126,15 @@ export default function App() {
         // 5.48.0: an upgrade request the gate just approved (now / schedule / reschedule / cancel / second approval).
         const kind = String(resp.kind ?? '')
         const version = typeof resp.version === 'string' ? resp.version : null
-        const OPS: Record<string, string> = { rollback: 'Rollback', restore: 'Restore', clear_failure: 'Clear failure', bundle: 'Support bundle', prune_backups: 'Delete backups' }
+        const OPS: Record<string, string> = { rollback: 'Rollback', restore: 'Restore', clear_failure: 'Clear failure', bundle: 'Support bundle' }
         const label = OPS[kind] ? 'requested' : kind === 'cancel' ? 'cancelled' : resp.awaiting_second_approval ? 'waiting for a second admin'
           : kind === 'schedule' ? 'scheduled' : kind === 'reschedule' ? 'rescheduled' : 'requested'
         if ((kind === 'apply' || kind === 'approve_second') && typeof resp.correlation_id === 'string' && !resp.awaiting_second_approval) {
           rememberRequested({ correlationId: resp.correlation_id, version: version ?? '', approvedAt: new Date().toISOString(), email: whoami?.email ?? null, stepUp: true })
-        } else if (['rollback', 'restore', 'clear_failure', 'bundle', 'prune_backups'].includes(kind) && typeof resp.correlation_id === 'string') {
+        } else if (['rollback', 'restore', 'clear_failure', 'bundle'].includes(kind) && typeof resp.correlation_id === 'string') {
           rememberRequested({ correlationId: resp.correlation_id, version: '', approvedAt: new Date().toISOString(), email: whoami?.email ?? null, stepUp: true,
-            kind: kind as 'rollback' | 'restore' | 'clear_failure' | 'bundle' | 'prune_backups' })
+            kind: kind as 'rollback' | 'restore' | 'clear_failure' | 'bundle' })
+          if (kind === 'bundle') markBundleRequested()
         }
         toast({
           title: OPS[kind] ? `${OPS[kind]}: requested` : kind === 'cancel' ? 'Upgrade request cancelled' : `Upgrade${version ? ` to ${version}` : ''}: ${label}`,

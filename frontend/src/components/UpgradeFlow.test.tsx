@@ -6,7 +6,7 @@ import { renderWithClient } from '../test/renderWithClient'
 import { makePreview, makeRun, makeStatus, makeUpgrade, NEWER, TARGET_SHA } from '../test/upgradeFixtures'
 import { toast } from '../hooks/useToast'
 import { beginStepUp } from '../utils/stepUp'
-import { rememberRequested } from '../utils/upgradeRequested'
+import { markBundleRequested, rememberRequested } from '../utils/upgradeRequested'
 import { UpdatesPage } from './UpdatesPage'
 import { UpgradeNoticeBanner } from './UpgradeNoticeBanner'
 
@@ -668,5 +668,18 @@ describe('mockup fidelity (round 3)', () => {
     await waitFor(() => expect(requestUpgrade).toHaveBeenCalled())
     await waitFor(() => expect((screen.getByRole('button', { name: /Create a support bundle/ }) as HTMLButtonElement).disabled).toBe(true))
     expect(screen.getAllByText(/Update the server's updater first/).length).toBeGreaterThan(0)
+  })
+})
+
+describe('bundle rebuild cool-down', () => {
+  it('the rebuild and the on-demand bundle buttons stay off for five minutes after a request', async () => {
+    markBundleRequested()
+    const run = makeRun({ result: 'rolled_back', step: 'rolled_back', reason_code: 'health_healthz', rolled_back_to: '5.46.0', failure: { step: 'health_check', reason_code: 'health_healthz', detail: '', at: null },
+      bundle: { name: 'ocw-support-5.46.0-to-5.48.0-20261021T023158Z-k4q9.tar.gz', size: 1_800_000, sha256: 'ab'.repeat(32) } })
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ run, failures: { '5.48.0': { count: 1, last_code: 'x' } } }))
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    await screen.findByText('The upgrade to 5.48.0 failed and was rolled back automatically')
+    fireEvent.click(screen.getByRole('checkbox', { name: /Include host names and environment names unredacted/ }))
+    expect((screen.getByRole('button', { name: /Rebuild with host names/ }) as HTMLButtonElement).disabled).toBe(true)
   })
 })
