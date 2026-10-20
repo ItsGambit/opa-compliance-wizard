@@ -427,6 +427,9 @@ Optional settings, from the environment or from `<install dir>/.deploy.conf`
 - `OPA_RELEASE_BASE_URL` / `OPA_REVOCATION_URL_BASE` — where `--release`
   downloads from, e.g. a mirror inside your network (https only). A mirror
   can delay an upgrade but cannot alter one: the signature is still checked.
+- `OPA_REVOCATION_URL` — an owner-controlled https URL that serves the current `revocation.json`
+  (checked in addition to the project's GitHub releases). Set it on every install: it is the
+  one channel for a second revocation that does not depend on GitHub's release tags.
 - `OPA_DEPLOY_REF` (or `--ref <x>`) — a branch, tag or full commit to
   deploy instead of the default branch's tip (unsigned). `--ref <previous
   commit>` is also the quickest way back after a bad deploy (a signed

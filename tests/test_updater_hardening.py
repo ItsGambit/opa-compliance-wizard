@@ -200,3 +200,40 @@ def test_trust_apply_writes_nothing_through_a_link_planted_in_the_application_di
     assert cli(m, "trust", "apply", str(rev)) == 0
     assert victim.read_text() == "precious"
     assert [p.name for p in revdir.iterdir()] == ["1.json"] and os.path.islink(revdir / "1.json")
+
+
+# --- revocation: tool output, per-serial source ------------------------------------------------------------------
+
+
+def _revoke_tool():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("revoke_tool", REPO / "tools" / "revoke.py")
+    mod = importlib.util.module_from_spec(spec)
+    import sys
+    sys.path.insert(0, str(REPO / "tools"))
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_revoke_tool_pins_known_good_releases_by_digest_and_a_bare_revoke_is_allowed():
+    from release_helpers import TestKey, TestStandby, key_list
+    from server.updater import keys as keylib
+    p, sb = TestKey(), TestStandby()
+    eff = keylib.effective_from(keylib.validate_key_list(key_list([p, sb])))
+    tool = _revoke_tool()
+    assert tool.parse_revoke(p.key_id, eff) == p.key_id
+    sha = "ab" * 32
+    assert tool.parse_revoke(p.key_id, eff, [f"{p.key_id}:5.46.0:{sha}"]) == {"key_id": p.key_id, "known_good": {"5.46.0": sha}}
+    for bad in (f"{p.key_id}:5.46.0:XYZ", f"{p.key_id}:nonsense:{sha}"):
+        with pytest.raises(Exception):
+            tool.parse_revoke(p.key_id, eff, [bad])
+
+
+def test_a_per_serial_revocation_location_is_polled_next_to_the_fixed_one(monkeypatch):
+    from server.updater import service
+    monkeypatch.delenv("OPA_REVOCATION_URL", raising=False)
+    monkeypatch.delenv("OPA_REVOCATION_URL_BASE", raising=False)
+    names = dict(service.revocation_sources(2))
+    assert names["release_assets_next"].endswith("/releases/download/revocation-3/revocation.json")
+    assert names["release_assets"].endswith("/releases/download/revocation/revocation.json")
+    assert "release_assets_next" not in dict(service.revocation_sources())

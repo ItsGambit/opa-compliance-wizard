@@ -364,12 +364,13 @@ The project holds two keys in different places: a **primary** that signs release
 **standby** (a different kind of key, in a different cloud) that can only sign a *revocation*. If the primary is ever lost or stolen the
 maintainers publish a signed `revocation.json` that revokes it and installs a new release key (and,
 if needed, a new standby), with a link to a security advisory. It is published in two places: as an
-asset of the GitHub release tagged `revocation`, and (optional, `OPA_REVOCATION_URL`) at an
+asset of a GitHub release (`revocation`, or `revocation-<serial>` for later ones), and (optional, `OPA_REVOCATION_URL`) at an
 owner-controlled static URL, so one outage or one compromised account cannot hide it.
 
 What you will see: a release signed by a key you do not know (*"signed by key ... which is not
 pinned ... apply the published revocation"*), or by a key marked revoked (*"was revoked ... Do
-not install it"*). Releases the old key signed **before** the revocation stay valid.
+not install it"*). A revoked key's releases are refused, except the ones the revocation names
+by version and file digest as known good.
 
 What to do:
 1. **Online:** with the update check on, the server fetches and applies the revocation by itself

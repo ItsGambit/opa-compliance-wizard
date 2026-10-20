@@ -567,7 +567,8 @@ def cmd_trust(a, cfg, host):
             try:
                 st = json.loads(open(a.local_state, encoding="utf-8").read(70000))
                 extra = [ocw_trust._check_entry(e) for e in st.get("keys", []) if e["key_id"] not in {k["key_id"] for k in keys}]
-                revoked = [{"key_id": r["key_id"], "revoked_at": r["revoked_at"], "last_good_version": r.get("last_good_version")}
+                revoked = [{"key_id": r["key_id"], "revoked_at": r["revoked_at"], "last_good_version": r.get("last_good_version"),
+                            **({"known_good": ocw_trust._check_known_good(r["known_good"])} if r.get("known_good") else {})}
                            for r in st.get("revoked", [])]
                 if extra and not a.import_local_keys:
                     print("refused: this install's key state holds key(s) that are not in the release's key list ("

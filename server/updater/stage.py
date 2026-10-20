@@ -110,7 +110,8 @@ def key_list_from_trust(path):
     try:
         obj = json.loads(Path(path).read_text(encoding="utf-8"))
         entries = keylib._validate_entries(obj["keys"])
-        revoked = {r["key_id"]: {"key_id": r["key_id"], "revoked_at": r["revoked_at"], "last_good_version": r.get("last_good_version")}
+        revoked = {r["key_id"]: {"key_id": r["key_id"], "revoked_at": r["revoked_at"], "last_good_version": r.get("last_good_version"),
+                                 **({"known_good": keylib.parse_known_good(r["known_good"])} if r.get("known_good") else {})}
                    for r in obj.get("revoked", [])}
         return {"schema": 1, "serial": int(obj.get("serial", 0)), "keys": entries, "revoked": revoked}
     except (OSError, ValueError, KeyError, keylib.KeyListError) as exc:
@@ -133,7 +134,7 @@ def _download(version, art_dir):
         os.replace(tmp, art_dir / name)
 
 
-def _fetch_revocations(art_dir):
+def _fetch_revocations(art_dir, kl_serial=None):
     """Best effort, like the update check: a published revocation (the `revocation` release, and the owner's static URL if
     one is configured) goes into <artifacts>/revocations/. Root re-verifies it itself before the install and applies it
     if it is genuine, so a release signed by a stolen key cannot be installed on a server that has not heard of the
@@ -141,7 +142,7 @@ def _fetch_revocations(art_dir):
     from . import service  # noqa: PLC0415 - the same source list the update check uses
     try:
         hosts = service._allowed_hosts()
-        for name, url in service.revocation_sources():
+        for name, url in service.revocation_sources(kl_serial):
             got = check.fetch(url, hosts, None, check.USER_AGENT, max_bytes=keylib.MAX_JSON_BYTES, accept="application/octet-stream")
             if got.status == "ok" and got.body:
                 d = art_dir / "revocations"
@@ -165,7 +166,11 @@ def stage(version):
         pass
     _adopt_handoff(opt, art_dir, version)
     if not (tar_path.exists() and sig_path.exists()):
-        _fetch_revocations(art_dir)
+        try:
+            serial = key_list_from_trust(trust_path)["serial"]
+        except StageError:
+            serial = None
+        _fetch_revocations(art_dir, serial)
         _download(version, art_dir)
     installed = verifylib.installed_version_from_tree(keylib.REPO_ROOT)
     kl = key_list_from_trust(trust_path)

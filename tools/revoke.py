@@ -2,7 +2,8 @@
 """Standby operator tool: build and sign a key revocation. NEVER automated.
 
     revoke.py --azure-key https://<vault>/keys/<name>/<version> \\
-              --revoke <key id>:<last good version> [--revoke ...] \\
+              --revoke <key id> [--revoke ...] \\
+              [--known-good <key id>:<version>:<sha256 of the tarball> ...] \\
               [--add-key entry.json ...] --reason "..." --advisory-url https://... \\
               [--serial N] [--keys server/release_keys.json] [--out DIR]
 
@@ -36,16 +37,35 @@ from server.updater import keys as keylib  # noqa: E402
 from server.updater import p256  # noqa: E402
 
 
-def parse_revoke(item, eff):
+def parse_revoke(item, eff, known_good=()):
+    """A revoked key verifies NOTHING, except the releases listed in `known_good` (key:version:sha256), which the
+    verifiers match by version and tarball digest. A time or a version number inside a signature proves nothing: the thief
+    writes it. `key_id:version` is still accepted and kept as a note, but it trusts no release."""
     key_id, _, lgv = item.partition(":")
     entry = next((k for k in eff["keys"] if k["key_id"] == key_id), None)
     if entry is None:
         raise ReleaseError(f"{key_id} is not a pinned key")
-    if entry["role"] == "release" and not lgv:
-        raise ReleaseError(f"revoking the release key {key_id} needs its last good version: --revoke {key_id}:<version> "
-                           "(the newest release you are certain was signed before the key was exposed; a thief can back-date "
-                           "a time but cannot lower a version number)")
-    return {"key_id": key_id, "last_good_version": lgv} if lgv else key_id
+    pins = {}
+    for kg in known_good:
+        k, _, rest = kg.partition(":")
+        version, _, digest = rest.partition(":")
+        if k != key_id:
+            continue
+        try:
+            keylib.parse_version(version)
+        except keylib.KeyListError:
+            raise ReleaseError(f"--known-good {kg}: {version!r} is not a version")
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ReleaseError(f"--known-good {kg}: the sha256 must be 64 lower-case hex digits (sha256sum of the published tarball)")
+        pins[version] = digest
+    if not lgv and not pins:
+        return key_id
+    item_out = {"key_id": key_id}
+    if lgv:
+        item_out["last_good_version"] = lgv
+    if pins:
+        item_out["known_good"] = pins
+    return item_out
 
 
 def build_envelope(payload, signer):
@@ -65,7 +85,7 @@ def run(args, signer, confirm):
     standby = next((k for k in eff["keys"] if k["key_id"] == signer.key_id), None)
     if standby is None or not keylib.usable(standby, "standby"):
         raise ReleaseError(f"the signing key {signer.key_id} is not an active standby key in {keys_path}; check --azure-key")
-    revoke = [parse_revoke(item, eff) for item in args.revoke]
+    revoke = [parse_revoke(item, eff, getattr(args, "known_good", None) or []) for item in args.revoke]
     add_keys = [json.loads(Path(p).read_text(encoding="utf-8")) for p in args.add_key or []]
     serial = args.serial or eff["serial"] + 1
     issued = args.issued or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -100,7 +120,9 @@ def run(args, signer, confirm):
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--azure-key", required=True, help="Azure Key Vault key identifier URL of the standby key")
-    p.add_argument("--revoke", action="append", required=True, metavar="KEY_ID[:LAST_GOOD_VERSION]")
+    p.add_argument("--revoke", action="append", required=True, metavar="KEY_ID")
+    p.add_argument("--known-good", action="append", metavar="KEY_ID:VERSION:SHA256",
+                   help="keep one release of the revoked key installable (pinned by its tarball sha256); repeat per release")
     p.add_argument("--add-key", action="append", metavar="ENTRY_JSON", help="key entry to add (from release.py pubkey --out)")
     p.add_argument("--reason", required=True)
     p.add_argument("--advisory-url", required=True)

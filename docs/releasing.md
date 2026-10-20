@@ -179,15 +179,18 @@ of use once the new one has shipped. Rotating the **standby** is done by a revoc
 
 ## If the release key is compromised (or lost)
 
-1. Disable the old KMS key's use immediately (deny `kms:Sign`), and decide the **last good version**: the newest release you are
-   certain was signed before the key was exposed.
+1. Disable the old KMS key's use immediately (deny `kms:Sign`), and decide which already-published releases you are certain were
+   signed before the key was exposed. Those can stay installable on servers that are behind: you pin each one by its version and the
+   sha256 of its published tarball (`sha256sum ocw-X.Y.Z.tar.gz`). A time or a version number inside a signature proves nothing, because
+   whoever holds the stolen key writes it; only the digest of the exact file does. Pin nothing if in doubt: a revoked key then verifies
+   no release at all.
 2. Create the replacements: a new KMS key (the new release key) and, if the standby was ever online with the release key or you want to
    rotate it anyway, a new Key Vault key (the new standby). Export their entries with `pubkey --out`.
 3. On a **clean computer**, signed in to the standby's Azure account with MFA, run the interactive tool (it refuses to run without a
    terminal and asks you to type `REVOKE`):
    ```bash
    python tools/revoke.py --azure-key https://<vault>/keys/<name>/<version> \
-       --revoke <release key id>:5.47.0 --revoke <old standby id> \
+       --revoke <release key id> --known-good <release key id>:5.47.0:<sha256 of ocw-5.47.0.tar.gz> --revoke <old standby id> \
        --add-key new-release-key.json --add-key new-standby-key.json \
        --reason "release key exposed" --advisory-url https://<advisory link> --out release-out
    az logout
@@ -195,12 +198,20 @@ of use once the new one has shipped. Rotating the **standby** is done by a revoc
    (Leave out the old standby and the new standby to keep the standby as it is.) The tool signs the digest through Key Vault, runs the
    app's verifier on the result against the pinned keys, and refuses to write a file that installs would refuse. It writes
    `revocation.json` and `release_keys.next.json`.
-4. Publish `revocation.json` in **both** places: replace the asset on the release tagged `revocation`, and upload it to the
-   owner-controlled static URL that operators may set as `OPA_REVOCATION_URL`. Publish the security advisory.
+4. Publish `revocation.json` in **both** places and publish the security advisory:
+   - a GitHub release named for the serial, `revocation-<serial>` (for example `revocation-1`, marked pre-release): installs look for
+     `revocation-<their applied serial + 1>` as well as the fixed `revocation` tag, because once immutable releases are on, a published
+     tag can never be changed, so a fixed `revocation` tag can carry one file for ever. Use the fixed tag only for the first revocation
+     if you left it mutable (step 2 of "Publishing"), and a new `revocation-<serial>` tag for every later one;
+   - the **owner-controlled static URL** that operators set as `OPA_REVOCATION_URL` (a file you can replace at any time). **Before
+     go-live** the maintainer must own this URL, serve it over https from a host that is not the repository's, and tell operators to set
+     `OPA_REVOCATION_URL` (in `<install dir>/.deploy.conf` or the environment of the update check, and in `/etc/ocw-updater.env` for the
+     staging step). Without it a second revocation has no distribution channel that does not depend on GitHub.
 5. Copy `release_keys.next.json` over `server/release_keys.json`, commit, and release the next version **signed by the new release
    key** (its key list must be that file).
-6. After it, a release signed by the revoked key is accepted only if its signed time is earlier than the revocation **and** its version is
-   not above the named last good version (a thief can back-date a time but cannot lower a version number). Releases signed before stay valid.
+6. After it, the revoked key verifies **nothing** on a server that has applied the revocation, except the releases the revocation pins in
+   `known_good` (checked by version and file digest, never by a time). A revocation made with the older `key:last_good_version` form is
+   still understood but no longer trusts any release: pin the ones you want with `--known-good`.
 
 **A stolen standby key is as serious as a stolen release key**, because whoever holds it can sign a revocation that installs keys of
 their choosing. By design a release cannot replace the standby, so there is no automatic recovery from it. If the standby was exposed, or both
