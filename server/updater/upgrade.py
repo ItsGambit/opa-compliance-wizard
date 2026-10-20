@@ -403,36 +403,98 @@ def new_correlation_id():
     return "upg-" + uuid.uuid4().hex[:8]
 
 
-def write_request(*, correlation_id, version, sha256, action_id, actor, trigger_kind, entered=None, now=None):
-    """Write the advisory request into the updater's inbox (atomic: written beside it, then renamed in). NEVER carries a
-    `not_before`: the updater treats the inbox as 'now', scheduling is this module's job. Returns the path."""
-    now = now or datetime.now(timezone.utc)
-    if not CID_RE.match(correlation_id) or not VERSION_RE.match(version) or not SHA_RE.match(sha256):
-        raise ValueError("invalid request fields")
-    if action_id is not None and not ACTION_ID_RE.match(str(action_id)):
-        action_id = None
-    req = {"schema": 1, "action": "apply", "correlation_id": correlation_id, "version": version, "sha256": sha256,
-           "action_id": action_id, "requested_at": _iso(now), "not_before": None, "origin": "app",
-           "actor": (actor or "")[:120] or None, "trigger_kind": trigger_kind}
-    if entered:
-        req["entered"] = str(entered)[:80]
+ACTION_KINDS = {"rollback": ("confirm",), "restore": ("confirm",), "clear_failure": (), "bundle": ("include_hosts", "for_correlation_id"),
+                "prune_backups": ("confirm", "keep_last", "names")}
+BACKUP_NAME_RE = re.compile(r"^audit_store-pre-[0-9A-Za-z._-]{1,80}\.db$")
+
+
+def _write_inbox(req):
+    """Write one advisory request into the updater's inbox: created beside it and renamed in (atomic), mode 0600, never
+    through a link. The updater re-validates everything."""
     inbox = inbox_dir()
-    stage = inbox.parent / f".{correlation_id}.tmp"
+    cid = req["correlation_id"]
+    stage = inbox.parent / f".{cid}.tmp"
     fd = os.open(str(stage), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(req, fh)
         fh.flush()
         os.fsync(fh.fileno())
-    final = inbox / f"{correlation_id}.json"
+    final = inbox / f"{cid}.json"
     os.replace(str(stage), str(final))
-    with _lock:
-        _quiesce_until[0] = now + QUIESCE
     return final
 
 
+def _base_request(action, correlation_id, action_id, actor, trigger_kind, now):
+    if not CID_RE.match(correlation_id):
+        raise ValueError("invalid correlation id")
+    if action_id is not None and not ACTION_ID_RE.match(str(action_id)):
+        action_id = None
+    return {"schema": 1, "action": action, "correlation_id": correlation_id, "action_id": action_id, "requested_at": _iso(now),
+            "origin": "app", "actor": (actor or "")[:120] or None, "trigger_kind": trigger_kind}
+
+
+def write_request(*, correlation_id, version, sha256, action_id, actor, trigger_kind, entered=None, now=None):
+    """Write an 'apply' request. NEVER carries a `not_before`: the updater treats the inbox as 'now'; scheduling is this
+    module's job. Returns the path."""
+    now = now or datetime.now(timezone.utc)
+    if not VERSION_RE.match(version) or not SHA_RE.match(sha256):
+        raise ValueError("invalid request fields")
+    req = _base_request("apply", correlation_id, action_id, actor, trigger_kind, now)
+    req.update(version=version, sha256=sha256, not_before=None)
+    if entered:
+        req["entered"] = str(entered)[:80]
+    path = _write_inbox(req)
+    with _lock:
+        _quiesce_until[0] = now + QUIESCE
+    return path
+
+
+def write_action(action, *, correlation_id, action_id, actor, trigger_kind="app", now=None, **fields):
+    """Write a rollback / restore / clear_failure / bundle / prune_backups request (closed set of fields, checked here and again
+    by the updater). The typed confirmations are part of the request: the updater refuses it without them."""
+    now = now or datetime.now(timezone.utc)
+    if action not in ACTION_KINDS or set(fields) - set(ACTION_KINDS[action]):
+        raise ValueError("invalid request kind or fields")
+    req = _base_request(action, correlation_id, action_id, actor, trigger_kind, now)
+    if action == "rollback" and fields.get("confirm") != "ROLLBACK":
+        raise ValueError("rollback needs the typed confirmation")
+    if action == "restore" and fields.get("confirm") != "RESTORE":
+        raise ValueError("restore needs the typed confirmation")
+    if action == "bundle":
+        if not isinstance(fields.get("include_hosts", False), bool):
+            raise ValueError("include_hosts must be true or false")
+        fc = fields.get("for_correlation_id")
+        if fc is not None and not CID_RE.match(str(fc)):
+            raise ValueError("invalid correlation id")
+    if action == "prune_backups":
+        keep, names = fields.get("keep_last"), fields.get("names")
+        if fields.get("confirm") != "PRUNE" or (keep is None) == (names is None):
+            raise ValueError("prune needs PRUNE and exactly one of keep_last / names")
+        if keep is not None and (not isinstance(keep, int) or isinstance(keep, bool) or not 1 <= keep <= 50):
+            raise ValueError("keep_last must be 1 to 50")
+        if names is not None and (not isinstance(names, list) or not 1 <= len(names) <= 50
+                                  or not all(isinstance(n, str) and BACKUP_NAME_RE.match(n) for n in names)):
+            raise ValueError("names must be 1 to 50 backup file names")
+    req.update({k: v for k, v in fields.items() if v is not None})
+    path = _write_inbox(req)
+    with _lock:
+        _quiesce_until[0] = now + QUIESCE
+    return path
+
+
 def quiesced(now=None):
+    """No new sync starts: for ten minutes after this application handed the updater a request, or while the updater's own
+    quiesce file (upgrade/quiesce.json, root-written) says so."""
+    now = now or datetime.now(timezone.utc)
     until = _quiesce_until[0]
-    return bool(until and (now or datetime.now(timezone.utc)) < until)
+    if until and now < until:
+        return True
+    try:
+        with open(service.upgrade_dir() / "quiesce.json", encoding="utf-8") as fh:
+            until = _parse(json.load(fh).get("until"))
+    except (OSError, ValueError, AttributeError):
+        return False
+    return bool(until and now < until < now + timedelta(minutes=15))
 
 
 def rejection(correlation_id):
@@ -583,6 +645,22 @@ def failures_view():
                 if isinstance(x, dict)} if isinstance(v, dict) else {}
     except (OSError, ValueError, TypeError):
         return {}
+
+
+def backups_view():
+    """The updater's published list of pre-upgrade copies (upgrade/backups-status.json): names, sizes, dates, integrity. No paths."""
+    try:
+        with open(service.upgrade_dir() / "backups-status.json", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    rows = []
+    for r in (data.get("backups") if isinstance(data, dict) else None) or []:
+        if isinstance(r, dict) and isinstance(r.get("name"), str) and BACKUP_NAME_RE.match(r["name"]):
+            rows.append({"name": r["name"], "size": r.get("size") if isinstance(r.get("size"), int) else None,
+                         "taken_at": str(r.get("taken_at"))[:20], "taken_before": str(r.get("taken_before"))[:20] if r.get("taken_before") else None,
+                         "integrity": str(r.get("integrity"))[:20] if r.get("integrity") else None})
+    return {"backups": rows[-100:], "updated_at": str(data.get("updated_at"))[:20], "total_bytes": data.get("total_bytes")}
 
 
 def rollback_view(run, now=None):

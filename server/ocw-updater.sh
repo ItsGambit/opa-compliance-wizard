@@ -33,6 +33,7 @@ ocw-updater rollback                                put the previous CODE back (
 ocw-updater restore --confirm RESTORE               put the pre-upgrade ARCHIVE copy back (loses newer data) [root]
 ocw-updater bundle [--correlation ID] [--include-hosts]   build a redacted support bundle                    [root]
 ocw-updater clear-failure                           allow a version that failed to be tried again            [root]
+ocw-updater prune-backups --keep N | --name FILE ... --confirm PRUNE   delete old pre-upgrade copies (never the newest) [root]
 ocw-updater trust list | seed | add FILE | apply FILE   the signing keys root trusts                          [root to change]
 ocw-updater nginx-sync                              apply the current release's nginx template (maintenance page) [root]
 ocw-updater check [--force] | enable-check | disable-check | verify TAR SIG | audit | keys list | keys apply-revocation FILE
@@ -52,7 +53,7 @@ as_app() {
 cmd="${1:-status}"
 [ $# -gt 0 ] || set -- status
 case "$cmd" in
-  status | stage | apply | cancel | rollback | restore | bundle | clear-failure | trust | nginx-sync)
+  status | stage | apply | cancel | rollback | restore | bundle | clear-failure | prune-backups | trust | nginx-sync)
     # A CLEAN environment: whatever the caller exported (or sudo was told to keep) never reaches the root-run updater, which
     # also ignores OCW_* test and path overrides unless a root-owned marker file exists. This wrapper is the only supported
     # sudo target.

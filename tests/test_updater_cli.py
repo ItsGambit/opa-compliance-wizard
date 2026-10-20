@@ -284,3 +284,22 @@ def test_app_side_audit_command_filters_by_correlation_and_count(capsys):
     rows = json.loads(capsys.readouterr().out)
     assert [r["details"]["n"] for r in rows] == [4, 3]
     assert appcli.main(["apply", "5.48.0"]) == 2 and "sudo ocw-updater apply" in capsys.readouterr().err
+
+
+def test_prune_backups_from_the_command_line_is_typed_and_keeps_the_newest(m, capsys):
+    prepare_release(m)
+    m.put_artifacts("5.47.0")
+    assert cli(m, "apply", "5.47.0", "--yes", "--confirm-text", "5.47.0") == 0
+    d = m.data / "upgrade" / "backups"
+    old = d / "audit_store-pre-5.40.0-20250101T000000Z.db"
+    old.write_bytes(b"x")
+    os.utime(old, (1, 1))
+    capsys.readouterr()
+    assert cli(m, "prune-backups", "--keep", "1") == 2                                    # not typed
+    assert cli(m, "prune-backups", "--keep", "1", "--name", "x.db", "--confirm", "PRUNE") == 2   # both
+    assert cli(m, "prune-backups", "--confirm", "PRUNE") == 2                             # neither
+    assert old.exists()
+    assert cli(m, "prune-backups", "--keep", "1", "--confirm", "PRUNE") == 0
+    assert not old.exists() and len(list(d.glob("*.db"))) == 1
+    assert any(e["action"] == "upgrade.backups_pruned" for e in m.audit_actions())
+    assert cli(m, "prune-backups", "--name", old.name, "--confirm", "PRUNE") == 2         # already gone

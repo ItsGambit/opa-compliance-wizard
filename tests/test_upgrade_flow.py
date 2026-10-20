@@ -565,3 +565,107 @@ def test_server_zone_and_local_time_conversion():
         with pytest.raises(Exception):
             upgrade.convert_local(*bad)
     assert upgrade.server_zone() is None or isinstance(upgrade.server_zone(), str)
+
+
+# --- rollback, restore, clear failure, bundle and backups, from the page (through the real updater) -----------------------
+def _applied(a):
+    take_preview(a)
+    a.request(a.apply_body())
+    run_updater(a)
+    assert a.status()["upgrade"]["run"]["result"] == "completed"
+
+
+def _op(a, body, status=200, who=ADMIN):
+    return a.request(body, who=who, status=status)
+
+
+def test_rollback_from_the_page_is_typed_step_up_and_runs_in_the_updater(armed):
+    _applied(armed)
+    assert armed.post({"kind": "rollback"}).status_code == 400                                   # not typed
+    assert armed.post({"kind": "rollback", "confirm": "rollback"}).json()["reason"] == "confirm_required"
+    assert armed.post({"kind": "rollback", "confirm": "ROLLBACK", "version": "1.0.0"}).status_code == 400
+    done = _op(armed, {"kind": "rollback", "confirm": "ROLLBACK"})
+    assert done.json()["kind"] == "rollback" and done.json()["step_up_verified"] is True
+    armed.m.host.clock = time.time()
+    uf.act.run(armed.m.cfg(), armed.m.host)
+    run = armed.status()["upgrade"]["run"]
+    assert run["action"] == "rollback" and run["result"] == "rolled_back" and run["rolled_back_to"] == "5.46.0"
+    ev = [e for e in armed.audit() if e["action"] == "upgrade.requested" and e["details"].get("kind") == "rollback"]
+    assert len(ev) == 1 and ev[0]["details"]["step_up_verified"] is True
+    # nothing left to roll back to / the window is over
+    assert armed.post({"kind": "rollback", "confirm": "ROLLBACK"}).json()["reason"] == "rollback_unavailable"
+
+
+def test_rollback_is_offered_only_inside_the_window(armed):
+    _applied(armed)
+    st = json.loads((armed.m.data / "upgrade" / "state.json").read_text())
+    st["updated_at"] = iso(datetime.now(timezone.utc) - timedelta(hours=30))
+    (armed.m.data / "upgrade" / "state.json").write_text(json.dumps(st))
+    r = armed.post({"kind": "rollback", "confirm": "ROLLBACK"})
+    assert r.status_code == 409 and r.json()["reason"] == "rollback_unavailable"
+    assert armed.requests_written() == []
+
+
+def test_restore_from_the_page(armed):
+    _applied(armed)
+    assert armed.post({"kind": "restore", "confirm": "RESTORE "}).json()["reason"] == "confirm_required"
+    _op(armed, {"kind": "restore", "confirm": "RESTORE"})
+    armed.m.host.clock = time.time()
+    uf.act.run(armed.m.cfg(), armed.m.host)
+    run = armed.status()["upgrade"]["run"]
+    assert run["action"] == "restore" and run["result"] == "completed"
+    assert any(e["action"] == "upgrade.restored" for e in armed.m.audit_actions())
+
+
+def test_restore_without_a_backup_is_refused_before_mfa(armed):
+    r = armed.post({"kind": "restore", "confirm": "RESTORE"})
+    assert r.status_code == 409 and r.json()["reason"] in ("no_backup", "updater_not_installed")
+
+
+def test_clear_failure_and_bundle_rebuild_from_the_page(armed):
+    take_preview(armed)
+    armed.m.host.unhealthy_versions.add(TARGET)
+    armed.request(armed.apply_body())
+    run_updater(armed)
+    view = armed.status()["upgrade"]
+    assert view["run"]["result"] == "rolled_back" and view["failures"][TARGET]["count"] == 1
+    assert view["run"]["bundle"]["name"]
+    first = view["run"]["bundle"]["name"]
+    _op(armed, {"kind": "bundle", "include_hosts": True})
+    armed.m.host.clock = time.time()
+    uf.act.run(armed.m.cfg(), armed.m.host)
+    run = armed.status()["upgrade"]["run"]
+    assert run["bundle"]["name"] != first
+    assert armed.post({"kind": "bundle", "include_hosts": "yes"}).status_code == 400
+    assert armed.post({"kind": "bundle", "for_correlation_id": "upg-0000dead"}).json()["reason"] == "target_changed"
+    _op(armed, {"kind": "clear_failure"})
+    uf.act.run(armed.m.cfg(), armed.m.host)
+    assert armed.status()["upgrade"]["failures"] == {}
+    assert armed.post({"kind": "clear_failure"}).json()["reason"] == "nothing_to_clear"
+
+
+def test_backups_table_and_typed_delete(armed):
+    _applied(armed)
+    d = armed.m.data / "upgrade" / "backups"
+    old = d / "audit_store-pre-5.40.0-20250101T000000Z.db"
+    old.write_bytes(b"x" * 10)
+    os.utime(old, (1, 1))
+    armed.m.updater().publish_backups()
+    rows = armed.status()["upgrade"]["backups"]["backups"]
+    assert len(rows) == 2 and all("/" not in r["name"] for r in rows)
+    assert armed.post({"kind": "prune_backups", "keep_last": 1}).json()["reason"] == "confirm_required"
+    assert armed.post({"kind": "prune_backups", "confirm": "PRUNE", "keep_last": 1, "names": [old.name]}).status_code == 400
+    assert armed.post({"kind": "prune_backups", "confirm": "PRUNE", "names": ["../x.db"]}).status_code == 400
+    assert armed.post({"kind": "prune_backups", "confirm": "PRUNE", "names": ["audit_store-pre-9.9.9-1.db"]}).json()["reason"] == "target_changed"
+    _op(armed, {"kind": "prune_backups", "confirm": "PRUNE", "keep_last": 1})
+    uf.act.run(armed.m.cfg(), armed.m.host)
+    assert not old.exists()
+    assert len(armed.status()["upgrade"]["backups"]["backups"]) == 1
+    assert armed.post({"kind": "prune_backups", "confirm": "PRUNE", "keep_last": 1}).json()["reason"] == "nothing_to_delete"
+
+
+def test_operations_need_an_admin_and_the_updater(armed):
+    for body in ({"kind": "rollback", "confirm": "ROLLBACK"}, {"kind": "clear_failure"}, {"kind": "prune_backups", "confirm": "PRUNE", "keep_last": 1}):
+        assert requests.post(armed.base_url + "/api/upgrade/request", json=body, headers=_who("00uUSER"), timeout=10).status_code == 403
+    os.rmdir(armed.m.data / "upgrade" / "inbox" / "requests")
+    assert armed.post({"kind": "clear_failure"}).json()["reason"] == "updater_not_installed"

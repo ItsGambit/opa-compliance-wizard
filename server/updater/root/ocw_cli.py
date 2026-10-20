@@ -9,6 +9,7 @@
     ocw-updater bundle [--correlation ID] [--include-hosts]
     ocw-updater trust list | seed | add <entry.json> | apply <revocation.json>
     ocw-updater clear-failure
+    ocw-updater prune-backups --keep N | --name FILE ... --confirm PRUNE   delete old pre-upgrade copies (never the newest)
 
 The read-only commands of the update check (check, verify, enable-check,
 audit, keys list) are `python -m server.updater ...`, run as the application
@@ -565,6 +566,32 @@ def cmd_clear_failure(a, cfg, host):
     return EXIT_OK
 
 
+def cmd_prune_backups(a, cfg, host):
+    if not _need_root(cfg):
+        return EXIT_REFUSED
+    if a.confirm != "PRUNE":
+        print("refused: pass --confirm PRUNE. This deletes pre-upgrade archive copies; the newest one and the one the last upgrade "
+              "took are always kept.", file=sys.stderr)
+        return EXIT_REFUSED
+    if (a.keep is None) == (not a.name):
+        print("refused: give exactly one of --keep N (keep the newest N) and --name FILE (repeatable).", file=sys.stderr)
+        return EXIT_REFUSED
+    req = {"confirm": a.confirm, "keep_last": a.keep, "names": list(a.name) if a.name else None}
+
+    def go():
+        up = _updater(cfg, host)
+        up.st = {"correlation_id": None}
+        try:
+            up.validate_other({"action": "prune_backups", **req}, "prune_backups")
+            up.prune_backups(req, _actor())
+        except act.StepFailed as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return EXIT_REFUSED
+        print("done: " + ", ".join(f"{n} {s / 1e6:.1f} MB" for n, s, _m in up.backup_files()) + " remain")
+        return EXIT_OK
+    return _locked(cfg, go)
+
+
 # --- trust -------------------------------------------------------------------------------------------------------
 
 
@@ -744,6 +771,12 @@ def build_parser():
     s = sub.add_parser("clear-failure")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_clear_failure)
+    s = sub.add_parser("prune-backups")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--keep", type=int)
+    s.add_argument("--name", action="append")
+    s.add_argument("--confirm")
+    s.set_defaults(fn=cmd_prune_backups)
     s = sub.add_parser("nginx-sync")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_nginx_sync)

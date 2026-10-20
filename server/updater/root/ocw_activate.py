@@ -63,7 +63,7 @@ import ocw_bundle  # noqa: E402
 import ocw_host  # noqa: E402
 import ocw_trust  # noqa: E402
 
-ACTIVATOR_VERSION = "5.47.0"
+ACTIVATOR_VERSION = "5.48.0"
 STEP_ORDER = ["validated", "downloaded", "staged", "preflight", "backup", "switching", "restarting", "health_check", "completed"]
 STEP_LABEL = {"validated": "Received and validated", "downloaded": "Downloaded", "staged": "Verified and staged",
               "preflight": "Preflight", "backup": "Backup", "switching": "Switching", "restarting": "Restarting",
@@ -75,7 +75,19 @@ REASONS = {"request_invalid", "request_replayed", "request_stale", "signature_in
            "health_unit", "health_version", "health_healthz", "health_gate", "health_quick_check", "health_schema",
            "health_chain", "health_smoke", "rollback_failed", "interrupted", "failed_before", "too_many_failures",
            "version_failed_before", "in_flight", "bad_release", "bad_artifact", "revoked_key", "retired_key", "wrong_role",
-           "no_key_pinned", "keys_changed", "unknown_alg", "no_trust", "bad_trust", "internal_error", "needs_install_sh"}
+           "no_key_pinned", "keys_changed", "unknown_alg", "no_trust", "bad_trust", "internal_error", "needs_install_sh",
+           "confirm_required", "rollback_unavailable", "no_backup", "action_unsupported", "prune_refused"}
+# What the web application may ask for through the request inbox (5.48.0). Each is advisory: the application has checked the
+# administrator's step-up approval, root re-validates everything here. Scheduling stays in the application (it never sends a time).
+APP_ACTIONS = ("apply", "rollback", "restore", "clear_failure", "bundle", "prune_backups")
+_COMMON_FIELDS = {"schema", "action", "correlation_id", "requested_at", "action_id", "origin", "actor", "trigger_kind", "_file"}
+_ACTION_FIELDS = {"apply": {"version", "sha256", "not_before", "entered"}, "rollback": {"confirm"}, "restore": {"confirm"},
+                  "clear_failure": set(), "bundle": {"include_hosts", "for_correlation_id"},
+                  "prune_backups": {"confirm", "keep_last", "names"}}
+_STR_LIMITS = {"actor": 120, "trigger_kind": 80, "entered": 80, "origin": 8, "confirm": 16, "not_before": 24, "requested_at": 24}
+ROLLBACK_WINDOW = 24 * 3600
+QUIESCE_SECONDS = 600
+_BACKUP_NAME = re.compile(r"^audit_store-pre-[0-9A-Za-z._-]{1,80}\.db$")
 HEALTH_REASON = {"unit_active": "health_unit", "version": "health_version", "healthz": "health_healthz", "gate_401": "health_gate",
                  "quick_check": "health_quick_check", "schema_version": "health_schema", "chain_heads": "health_chain",
                  "smoke_read": "health_smoke"}
@@ -85,6 +97,7 @@ _CID = re.compile(r"^(upg|sched)-[0-9a-f]{8}$")
 _VER = re.compile(r"^\d+\.\d+\.\d+$")
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _ACTION_ID = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+_ACTOR = re.compile(r"[^\x20-\x7e]")
 
 
 class Killed(BaseException):
@@ -164,6 +177,9 @@ class Cfg:
         self.backups = os.path.join(self.upgrade, "backups")
         self.schedule = os.path.join(self.upgrade, "schedule")
         self.rejections = os.path.join(self.upgrade, "rejections")
+        self.actions_path = os.path.join(self.upgrade, "actions.jsonl")          # approval ids already used by the non-apply kinds
+        self.quiesce_path = os.path.join(self.upgrade, "quiesce.json")           # "start no new sync until ..." (read by the application)
+        self.backups_status = os.path.join(self.upgrade, "backups-status.json")  # names, sizes, dates, integrity (no paths)
         self.work = os.path.join(self.upgrade, "work")
         self.done = os.path.join(self.upgrade, "requests-done")
         self.lock_path = os.path.join(self.upgrade, "lock")
@@ -515,6 +531,7 @@ class Updater:
             log("WARN", f"could not write the maintenance page: {exc.strerror}")
 
     def page_off(self):
+        self.unquiesce()
         try:
             os.unlink(self.cfg.maintenance_page)
         except FileNotFoundError:
@@ -552,11 +569,21 @@ class Updater:
     # --- request validation (the request is advisory) ---------------------------------------------
     def validate_request(self, req, origin_trusted):
         c = self.cfg
-        if not isinstance(req, dict) or req.get("schema") != 1 or req.get("action") != "apply":
+        if not isinstance(req, dict) or req.get("schema") != 1 or req.get("action") not in APP_ACTIONS:
             raise StepFailed("request_invalid", "unsupported request")
+        action = req["action"]
+        # closed set of fields, plain types, bounded lengths: anything else is refused, never ignored
+        if set(req) - _COMMON_FIELDS - _ACTION_FIELDS[action]:
+            raise StepFailed("request_invalid", "unexpected field in the request")
+        for key, limit in _STR_LIMITS.items():
+            v = req.get(key)
+            if v is not None and (not isinstance(v, str) or len(v) > limit):
+                raise StepFailed("request_invalid", f"{key} must be text of at most {limit} characters")
+        if req.get("origin") not in (None, "cli", "app"):
+            raise StepFailed("request_invalid", "bad origin")
         if not _CID.match(str(req.get("correlation_id", ""))):
             raise StepFailed("request_invalid", "bad correlation id")
-        if not _VER.match(str(req.get("version", ""))) or not _SHA.match(str(req.get("sha256", ""))):
+        if action == "apply" and (not _VER.match(str(req.get("version", ""))) or not _SHA.match(str(req.get("sha256", "")))):
             raise StepFailed("request_invalid", "bad version or sha256")
         aid = req.get("action_id")
         if aid is not None and not _ACTION_ID.match(str(aid)):
@@ -565,10 +592,11 @@ class Updater:
         now = self.host.now()
         if at is None or at > now + 300 or now - at > REQUEST_MAX_AGE:
             raise StepFailed("request_stale", "the request is older than 24 hours or dated in the future")
-        if aid:
-            for line in self._history_lines():
-                if line.get("action_id") == aid:
-                    raise StepFailed("request_replayed", "this approval was already used")
+        if aid and self.action_id_used(aid):
+            raise StepFailed("request_replayed", "this approval was already used")
+        if action != "apply":
+            self.validate_other(req, action)
+            return
         nb = req.get("not_before")
         if nb is not None and parse_iso(nb) is None:
             raise StepFailed("request_invalid", "bad not_before")
@@ -586,15 +614,58 @@ class Updater:
         if sum(v.get("count", 0) for v in f["versions"].values()) >= 2:
             raise StepFailed("too_many_failures", "two upgrades have failed; contact the maintainers with the support bundle, then clear-failure")
 
+    def validate_other(self, req, action):
+        """Field rules of the kinds other than apply (the common ones were checked already)."""
+        if action == "rollback" and req.get("confirm") != "ROLLBACK":
+            raise StepFailed("confirm_required", "a rollback request must carry the typed confirmation ROLLBACK")
+        if action == "restore" and req.get("confirm") != "RESTORE":
+            raise StepFailed("confirm_required", "a restore request must carry the typed confirmation RESTORE")
+        if action == "bundle":
+            if not isinstance(req.get("include_hosts", False), bool):
+                raise StepFailed("request_invalid", "include_hosts must be true or false")
+            fc = req.get("for_correlation_id")
+            if fc is not None and not _CID.match(str(fc)):
+                raise StepFailed("request_invalid", "bad for_correlation_id")
+        if action == "prune_backups":
+            if req.get("confirm") != "PRUNE":
+                raise StepFailed("confirm_required", "a backup clean-up request must carry the typed confirmation PRUNE")
+            keep, names = req.get("keep_last"), req.get("names")
+            if (keep is None) == (names is None):
+                raise StepFailed("request_invalid", "send exactly one of keep_last and names")
+            if keep is not None and (not isinstance(keep, int) or isinstance(keep, bool) or not 1 <= keep <= 50):
+                raise StepFailed("request_invalid", "keep_last must be a whole number from 1 to 50")
+            if names is not None and (not isinstance(names, list) or not 1 <= len(names) <= 50
+                                      or not all(isinstance(n, str) and _BACKUP_NAME.match(n) for n in names)):
+                raise StepFailed("request_invalid", "names must be 1 to 50 backup file names")
+
+    def action_id_used(self, aid):
+        for line in self._history_lines():
+            if line.get("action_id") == aid:
+                return True
+        try:
+            return aid in read_regular(self.cfg.actions_path, 4 * 1024 * 1024).decode("utf-8", "replace").split()
+        except OSError:
+            return False
+
+    def remember_action_id(self, aid):
+        """Record a used approval id (root-owned directory; the file is opened without following links)."""
+        if not aid:
+            return
+        fd = os.open(self.cfg.actions_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.write(fd, (aid + "\n").encode("ascii"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
     def _history_lines(self):
         out = []
         try:
-            with open(self.cfg.history_path, encoding="utf-8") as fh:
-                for line in fh:
-                    try:
-                        out.append(json.loads(line))
-                    except ValueError:
-                        pass
+            for line in read_regular(self.cfg.history_path, 8 * 1024 * 1024).decode("utf-8", "replace").splitlines():
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    pass
         except OSError:
             pass
         return out
@@ -738,6 +809,10 @@ class Updater:
         self.backup()
         b = self.st.get("backup") or {}
         self.finish("backup", **{k: b[k] for k in ("name", "size", "integrity") if k in b})
+        try:
+            self.publish_backups()
+        except OSError as exc:
+            log("WARN", f"could not publish the backups status: {exc.strerror}")
         self.audit("upgrade.started", {"version_from": installed, "version_to": ver, "trigger_kind": req.get("trigger_kind", "request"),
                                        "backup": (self.st.get("backup") or {}).get("name"),
                                        "schema_before": self.st.get("schema_before"),
@@ -820,6 +895,7 @@ class Updater:
                              {"free_opt": free_opt, "free_data": free_data, "need_opt": need_opt, "need_data": need_data})
         waited = 0
         limit = 0 if c.fast else 600
+        self.quiesce()
         while snap.get("sync_running"):
             if waited >= limit:
                 raise StepFailed("sync_in_progress", "an archive sync is running; the upgrade waited 10 minutes and did not start", "preflight")
@@ -1152,6 +1228,7 @@ class Updater:
         _cid[0] = req.get("correlation_id")
         try:
             self.validate_request(req, True)
+            self.remember_action_id(req.get("action_id"))
         except StepFailed as f:
             reject(self, str(req.get("correlation_id", "upg-00000000")), f.code, str(f))
             return "rejected"
@@ -1257,6 +1334,8 @@ class Updater:
                                             "started_at", "updated_at", "action_id", "seconds")}
         line["backup"] = (self.st.get("backup") or {}).get("path")
         line["bundle"] = (self.st.get("bundle") or {}).get("name")
+        b = self.st.get("backup") or {}
+        line["backup_size"], line["backup_integrity"] = b.get("size"), b.get("integrity")
         fd = os.open(self.cfg.history_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         with os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(line) + "\n")
@@ -1469,6 +1548,147 @@ class Updater:
             removed.append(d)
         return removed
 
+    # --- requests from the web application (5.48.0) --------------------------------------------------------------
+    @staticmethod
+    def clean_actor(value):
+        """The requester as the application named them: advisory text for the audit trail, printable ASCII, bounded."""
+        return _ACTOR.sub("?", str(value or ""))[:120] or "web application"
+
+    def quiesce(self):
+        """Tell the application to start no new sync for ten minutes: a root-owned file it reads before every sync start
+        (nothing to call, nothing to authenticate). The preflight still waits for a running sync."""
+        try:
+            write_json_atomic(self.cfg.quiesce_path, {"until": iso(self.host.now() + QUIESCE_SECONDS), "correlation_id": _cid[0]})
+        except OSError as exc:
+            log("WARN", f"could not write the quiesce file: {exc.strerror}")
+
+    def unquiesce(self):
+        try:
+            os.unlink(self.cfg.quiesce_path)
+        except OSError:
+            pass
+
+    def rollback_allowed(self):
+        """The same rules as `ocw-updater rollback`: a previous release exists, and the last upgrade finished under 24 hours ago."""
+        c = self.cfg
+        cur, prev = installed_version(c), link_version(c.previous)
+        if not prev or prev == cur:
+            raise StepFailed("rollback_unavailable", "there is no previous release to roll back to")
+        st = read_json(c.state_path) or {}
+        done = parse_iso(st.get("updated_at"))
+        if st.get("result") == "completed" and done and self.host.now() - done > ROLLBACK_WINDOW:
+            raise StepFailed("rollback_unavailable", "the 24-hour rollback window after the last upgrade has passed")
+        if self.in_flight():
+            raise StepFailed("in_flight", "another upgrade is in progress")
+
+    def backup_files(self):
+        """[(name, size, mtime)] of the pre-upgrade copies, oldest first. Plain files only, matched by name."""
+        out = []
+        try:
+            names = os.listdir(self.cfg.backups)
+        except OSError:
+            return out
+        for n in names:
+            if not _BACKUP_NAME.match(n):
+                continue
+            try:
+                st = os.lstat(os.path.join(self.cfg.backups, n))
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                out.append((n, st.st_size, st.st_mtime))
+        return sorted(out, key=lambda t: (t[2], t[0]))
+
+    def publish_backups(self):
+        """upgrade/backups-status.json: what the Updates page shows as 'Pre-upgrade backups'. Names, sizes, dates, the integrity
+        result recorded when it was taken and the version it was taken before; no paths. The backup directory itself is root-only."""
+        info = {}
+        for h in self._history_lines():
+            if h.get("backup"):
+                info[os.path.basename(str(h["backup"]))] = h
+        rows = []
+        for n, size, mtime in self.backup_files():
+            h = info.get(n) or {}
+            rows.append({"name": n, "size": size, "taken_at": iso(mtime), "taken_before": h.get("version_to"),
+                         "integrity": h.get("backup_integrity")})
+        total = sum(r["size"] for r in rows)
+        write_json_atomic(self.cfg.backups_status, {"schema": 1, "updated_at": iso(self.host.now()), "backups": rows, "total_bytes": total})
+
+    def prune_backups(self, req, actor):
+        """Delete pre-upgrade copies the administrator chose (explicit names, or everything but the newest N). The newest copy
+        and the one the last upgrade took are never deleted: they are what `restore` needs."""
+        files = self.backup_files()
+        protected = {files[-1][0]} if files else set()
+        for h in reversed(self._history_lines()):
+            if h.get("action") == "apply" and h.get("backup"):
+                protected.add(os.path.basename(str(h["backup"])))
+                break
+        have = {n for n, _s, _m in files}
+        if req.get("names") is not None:
+            chosen = list(dict.fromkeys(req["names"]))
+            unknown = [n for n in chosen if n not in have]
+            if unknown:
+                raise StepFailed("prune_refused", f"{len(unknown)} of the named backups do not exist")
+        else:
+            chosen = [n for n, _s, _m in files[:-req["keep_last"]]] if len(files) > req["keep_last"] else []
+        refused = [n for n in chosen if n in protected]
+        if req.get("names") is not None and refused:
+            raise StepFailed("prune_refused", "the newest backup and the one the last upgrade took cannot be deleted (restore needs them)")
+        chosen = [n for n in chosen if n not in protected]
+        freed = 0
+        for n in chosen:
+            path = os.path.join(self.cfg.backups, n)
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                continue
+            freed += os.lstat(path).st_size
+            os.unlink(path)
+        self.publish_backups()
+        self.audit("upgrade.backups_pruned", {"deleted": chosen, "bytes_freed": freed, "kept": len(have) - len(chosen), "requested_by": actor})
+        return "backups_pruned"
+
+    def app_action(self, req):
+        """rollback / restore / clear_failure / bundle / prune_backups, asked for through the inbox. The application has checked the
+        administrator's step-up approval and the typed confirmation; the validation and the checks here are root's own."""
+        c = self.cfg
+        cid = str(req.get("correlation_id", "upg-00000000"))
+        _cid[0] = cid
+        action = req.get("action")
+        actor = self.clean_actor(req.get("actor"))
+        try:
+            self.validate_request(req, True)
+            self.remember_action_id(req.get("action_id"))
+            if action == "clear_failure":
+                f = self.failures()
+                cleared = sorted(f["versions"])
+                write_json_atomic(c.failures_path, {"versions": {}, "cleared_at": iso(self.host.now())})
+                self.st = {"correlation_id": cid}
+                self.audit("upgrade.clear_failure", {"cleared": cleared, "via": "web application", "requested_by": actor}, actor_email=actor)
+                self.st = None
+                return "failure_cleared"
+            if action == "bundle":
+                st = read_json(c.state_path) or {}
+                want = req.get("for_correlation_id") or st.get("correlation_id")
+                self.st = dict(st) if st.get("correlation_id") == want else {"correlation_id": want}
+                info = self.make_bundle(include_hosts=bool(req.get("include_hosts")), correlation_id=want)
+                if not info:
+                    raise StepFailed("internal_error", "could not build the support bundle")
+                return "bundle_created"
+            if action == "prune_backups":
+                self.st = {"correlation_id": cid}
+                try:
+                    return self.prune_backups(req, actor)
+                finally:
+                    self.st = None
+            if action == "rollback":
+                self.rollback_allowed()
+                return self.rollback_action(actor)
+            if action == "restore":
+                return self.restore_action(actor)
+        except StepFailed as f:
+            reject(self, cid, f.code, str(f))
+            return "rejected"
+        return "rejected"
+
     # --- resume after a crash / power loss ------------------------------------------------------------------------------
     def resume(self):
         c = self.cfg
@@ -1667,14 +1887,25 @@ def process_directory(up, directory, due_only=False):
             reject(up, name[:-5], getattr(exc, "code", "request_invalid"), str(exc), name)
             _discard(path, cfg)
             continue
-        if due_only and req.get("not_before"):
+        if due_only and isinstance(req, dict) and req.get("not_before"):
             nb = parse_iso(req["not_before"])
             if nb is None or nb > up.host.now():
                 continue
         _discard(path, cfg)
+        if not isinstance(req, dict):  # valid JSON, wrong shape (a list, a number): refuse it, never crash the run
+            reject(up, name[:-5], "request_invalid", "not a request object", name)
+            continue
         req["_file"] = name
         up.t0 = up.host.now()
-        results.append(up.apply(req))
+        if due_only or req.get("action") == "apply":
+            if not due_only and req.get("not_before") is not None:  # the inbox means "now"; scheduling is the application's or the CLI's
+                reject(up, str(req.get("correlation_id", name[:-5])), "request_invalid", "an inbox request cannot carry a start time", name)
+                continue
+            results.append(up.apply(req))
+        elif req.get("action") in APP_ACTIONS:
+            results.append(up.app_action(req))
+        else:
+            reject(up, str(req.get("correlation_id", name[:-5])), "request_invalid", "unsupported request", name)
         up.st = None
     return results
 
@@ -1749,6 +1980,10 @@ def run(cfg, host):
         up.st = None
         process_directory(up, cfg.requests)
         process_directory(up, cfg.schedule, due_only=True)
+        try:
+            up.publish_backups()
+        except OSError as exc:
+            log("WARN", f"could not publish the backups status: {exc.strerror}")
         return 0
     finally:
         os.close(fd)

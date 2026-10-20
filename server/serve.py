@@ -1974,6 +1974,7 @@ class Handler(SimpleHTTPRequestHandler):
             "rollback": upgrade_service.rollback_view(run, now),
             "failures": upgrade_service.failures_view(),
             "history": hist,
+            "backups": upgrade_service.backups_view(),
             "zone": {"iana": upgrade_service.server_zone()},
             "sync_hint": self._upgrade_sync_hint(),
             "step_up_required": _step_up_required_for_changes(),
@@ -2016,7 +2017,72 @@ class Handler(SimpleHTTPRequestHandler):
             "signed_by": preview["key_id"], "preflight": {i["id"]: i["ok"] for i in preview["preflight"]}})
         return 200, {"preview": preview}
 
-    UPGRADE_BODY_FIELDS = {"kind": 16, "version": 20, "sha256": 64, "when_utc": 24, "entered_tz": 64, "entered_local": 20, "target": 16}
+    UPGRADE_BODY_FIELDS = {"kind": 16, "version": 20, "sha256": 64, "when_utc": 24, "entered_tz": 64, "entered_local": 20, "target": 16,
+                           "confirm": 16, "for_correlation_id": 16}
+    UPGRADE_KINDS = ("apply", "schedule", "reschedule", "cancel", "approve_second",
+                     "rollback", "restore", "clear_failure", "bundle", "prune_backups")
+
+    def _exec_upgrade_operation(self, kind, body, dry_run, via_step_up):
+        """5.48.0: rollback / restore / clear a failure / rebuild the support bundle / delete old backups. Each is typed where it
+        loses or deletes something, needs a fresh MFA approval, and is handed to the root-owned updater, which re-validates it."""
+        owner_key, _e, actor_email, actor_sub = self._caller()
+        now = datetime.now(timezone.utc)
+        allowed = {"rollback": {"kind", "confirm"}, "restore": {"kind", "confirm"}, "clear_failure": {"kind"},
+                   "bundle": {"kind", "include_hosts", "for_correlation_id"}, "prune_backups": {"kind", "confirm", "keep_last", "names"}}[kind]
+        if set(body) - allowed:
+            return 400, {"error": "Unexpected field for this request."}
+        typed = {"rollback": "ROLLBACK", "restore": "RESTORE", "prune_backups": "PRUNE"}.get(kind)
+        if typed and body.get("confirm") != typed:
+            return 400, {"error": f"Type {typed} to confirm.", "reason": "confirm_required"}
+        state = upgrade_service.updater_state()
+        if not state["ready"]:
+            return 409, {"error": state["message"], "reason": state["reason"]}
+        run = upgrade_service.run_view()
+        if run and run.get("result") is None and run.get("step"):
+            return 409, {"error": "An upgrade is in progress.", "reason": "in_flight"}
+        backups = (upgrade_service.backups_view() or {}).get("backups", [])
+        if kind == "rollback":
+            rb = upgrade_service.rollback_view(run, now)
+            if not rb or not rb["available"]:
+                return 409, {"error": "Rolling back is only offered for 24 hours after an upgrade completes.", "reason": "rollback_unavailable"}
+        elif kind == "restore":
+            if not backups or not (run and run.get("backup")):
+                return 409, {"error": "There is no pre-upgrade copy of the archive to restore.", "reason": "no_backup"}
+        elif kind == "clear_failure":
+            if not upgrade_service.failures_view() and not (run and run.get("result") == "failed_needs_operator"):
+                return 409, {"error": "There is no recorded failure to clear.", "reason": "nothing_to_clear"}
+        elif kind == "bundle":
+            if not run or not run.get("correlation_id"):
+                return 409, {"error": "There is no upgrade run to build a support bundle for.", "reason": "no_run"}
+            fc = body.get("for_correlation_id")
+            if fc is not None and (not upgrade_service.CID_RE.match(fc) or fc != run.get("correlation_id")):
+                return 409, {"error": "A bundle can only be built for the last upgrade run.", "reason": "target_changed"}
+        elif kind == "prune_backups":
+            have = {b["name"] for b in backups}
+            if len(have) < 2:
+                return 409, {"error": "There is nothing to delete: the newest backup is always kept.", "reason": "nothing_to_delete"}
+            if body.get("names") is not None and not set(body["names"]) <= have:
+                return 409, {"error": "One of the named backups no longer exists. Reload the page.", "reason": "target_changed"}
+            if (body.get("keep_last") is None) == (body.get("names") is None):
+                return 400, {"error": "Send exactly one of keep_last and names."}
+        if dry_run:
+            return None, {"kind": kind}
+        cid = upgrade_service.new_correlation_id()
+        action_id = self.headers.get("X-Auth-Action-Id") if via_step_up else None
+        fields = {k: v for k, v in body.items() if k != "kind"}
+        try:
+            upgrade_service.write_action(kind, correlation_id=cid, action_id=action_id, actor=actor_email or actor_sub, now=now, **fields)
+        except OSError as exc:
+            return 409, {"error": f"The upgrade inbox could not be written ({exc.strerror}). Nothing was started.", "reason": "inbox_not_writable"}
+        details = {"correlation_id": cid, "kind": kind}
+        if via_step_up:
+            details.update(step_up_verified=True, action_id=action_id)
+        if kind == "bundle":
+            details["include_hosts"] = bool(body.get("include_hosts"))
+        if kind == "prune_backups":
+            details.update(keep_last=body.get("keep_last"), names=body.get("names"))
+        self._log_audit_event(actor_email, actor_sub, "upgrade.requested", details)
+        return 200, {"kind": kind, "correlation_id": cid}
 
     def _exec_upgrade_request(self, params, dry_run, via_step_up):
         """5.48.0: upgrade now (apply) / schedule / reschedule / cancel / the second administrator's approval. Every check
@@ -2028,14 +2094,23 @@ class Handler(SimpleHTTPRequestHandler):
         if not isinstance(body, dict):
             return 400, {"error": "Send a JSON object."}
         for key, value in body.items():
-            if key == "acknowledged":
+            if key in ("acknowledged", "include_hosts"):
                 if not isinstance(value, bool):
-                    return 400, {"error": "acknowledged must be true or false."}
+                    return 400, {"error": f"{key} must be true or false."}
+            elif key == "keep_last":
+                if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 50:
+                    return 400, {"error": "keep_last must be a whole number from 1 to 50."}
+            elif key == "names":
+                if not isinstance(value, list) or not 1 <= len(value) <= 50 \
+                        or not all(isinstance(n, str) and upgrade_service.BACKUP_NAME_RE.match(n) for n in value):
+                    return 400, {"error": "names must be 1 to 50 backup file names."}
             elif key not in self.UPGRADE_BODY_FIELDS or not isinstance(value, str) or len(value) > self.UPGRADE_BODY_FIELDS[key]:
                 return 400, {"error": f"Unexpected or oversized field '{key}'."}
         kind = body.get("kind")
-        if kind not in ("apply", "schedule", "reschedule", "cancel", "approve_second"):
-            return 400, {"error": "kind must be apply, schedule, reschedule, cancel or approve_second."}
+        if kind not in self.UPGRADE_KINDS:
+            return 400, {"error": "kind must be one of: " + ", ".join(self.UPGRADE_KINDS) + "."}
+        if kind in ("rollback", "restore", "clear_failure", "bundle", "prune_backups"):
+            return self._exec_upgrade_operation(kind, body, dry_run, via_step_up)
         now = datetime.now(timezone.utc)
         stamp = lambda dt: dt.strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
         sched_data = upgrade_service.load_schedule()

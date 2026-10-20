@@ -204,7 +204,7 @@ def test_request_validation(m):
     m.put_artifacts("5.47.0")
     up = m.updater()
     cases = [({"schema": 2}, "request_invalid"), ({"correlation_id": "bad"}, "request_invalid"), ({"version": "5.47"}, "request_invalid"),
-             ({"requested_at": act.iso(m.host.now() - 90000)}, "request_stale"), ({"action": "restore"}, "request_invalid")]
+             ({"requested_at": act.iso(m.host.now() - 90000)}, "request_stale"), ({"action": "format_disk"}, "request_invalid")]
     for i, (over, code) in enumerate(cases):
         req = m.request("5.47.0", correlation_id=f"upg-bbbb00{i:02d}")
         req.update(over)
