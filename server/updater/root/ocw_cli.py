@@ -9,6 +9,7 @@
     ocw-updater bundle [--correlation ID] [--include-hosts]
     ocw-updater trust list | seed | add <entry.json> | apply <revocation.json>
     ocw-updater clear-failure
+    ocw-updater prune-backups --keep N | --name FILE ... --confirm PRUNE   delete old pre-upgrade copies (never the newest)
 
 The read-only commands of the update check (check, verify, enable-check,
 audit, keys list) are `python -m server.updater ...`, run as the application
@@ -27,7 +28,6 @@ import getpass
 import json
 import os
 import re
-import shutil
 import sys
 import time
 import uuid
@@ -101,9 +101,9 @@ def collect_status(cfg):
     cur, prev = act.installed_version(cfg), act.link_version(cfg.previous)
     staged = []
     try:
-        for d in sorted(os.listdir(cfg.releases)):
-            m = act.read_json(os.path.join(cfg.releases, d, ".staged"))
-            if m and d not in (cur, prev):
+        for d in sorted(os.listdir(cfg.staging)):
+            m = act.read_json(os.path.join(cfg.staging, d, ".staged"))
+            if isinstance(m, dict) and d not in (cur, prev):
                 staged.append({"version": d, "sha256": m.get("sha256"), "key_id": m.get("key_id"), "staged_at": m.get("staged_at")})
     except OSError:
         pass
@@ -186,7 +186,10 @@ def cmd_status(a, cfg, host):
 # --- stage -----------------------------------------------------------------------------------------
 
 
-def _drop_in_artifacts(cfg, tar_path):
+def _drop_in_handoff(cfg, tar_path):
+    """Give the operator's file to the staging step WITHOUT touching anything that account owns: root writes fresh copies
+    into the root-owned handoff directory (exclusive create, no links followed, group-readable by the staging account)
+    and the staging step copies them from there."""
     base = os.path.basename(tar_path)
     m = re.match(r"^ocw-(\d+\.\d+\.\d+)\.tar\.gz$", base)
     if not m:
@@ -194,28 +197,31 @@ def _drop_in_artifacts(cfg, tar_path):
     sig = tar_path + ".minisig"
     if not os.path.exists(sig):
         raise act.StepFailed("signature_invalid", f"{sig} is missing: bring the .minisig file next to the tarball")
-    os.makedirs(cfg.artifacts, exist_ok=True)
+    gid = _stage_gid(cfg)
+    os.makedirs(cfg.handoff, mode=0o750, exist_ok=True)
+    if os.geteuid() == 0:  # this directory is root's: it is created and fixed by install.sh; correct it if someone loosened it
+        os.chown(cfg.handoff, 0, gid if gid is not None else 0)
+        os.chmod(cfg.handoff, 0o750)
     for src in (tar_path, sig):
-        dst = os.path.join(cfg.artifacts, os.path.basename(src))
-        shutil.copyfile(src, dst)
+        dst = os.path.join(cfg.handoff, os.path.basename(src))
+        act.safe_copy(src, dst, 0o640, 0 if gid is not None and os.geteuid() == 0 else None, gid)
     return m.group(1)
 
 
-def _chown_artifacts(cfg, host, version):
+def _stage_gid(cfg):
     import pwd
     try:
-        uid = pwd.getpwnam(cfg.stage_user).pw_uid
+        return pwd.getpwnam(cfg.stage_user).pw_gid
     except KeyError:
-        return
-    if os.geteuid() != 0:
-        return
-    os.chown(cfg.artifacts, uid, uid)
-    os.chmod(cfg.artifacts, 0o750)
+        return None
+
+
+def _clear_handoff(cfg, version):
     for n in (f"ocw-{version}.tar.gz", f"ocw-{version}.tar.gz.minisig"):
-        p = os.path.join(cfg.artifacts, n)
-        if os.path.exists(p):
-            os.chown(p, uid, uid)
-            os.chmod(p, 0o640)
+        try:
+            os.unlink(os.path.join(cfg.handoff, n))
+        except OSError:
+            pass
 
 
 def cmd_stage(a, cfg, host):
@@ -239,9 +245,11 @@ def cmd_stage(a, cfg, host):
             tar = os.path.abspath(target)
             checked = ocw_trust.verify_release(tar, tar + ".minisig", trust, installed)  # root's own check first
             version = checked["version"]
-            _drop_in_artifacts(cfg, tar)
-            _chown_artifacts(cfg, host, version)
-            ok, out = host.start(f"ocw-stage@{version}.service")
+            _drop_in_handoff(cfg, tar)
+            try:
+                ok, out = host.start(f"ocw-stage@{version}.service")
+            finally:
+                _clear_handoff(cfg, version)
             err = act.read_json(os.path.join(cfg.artifacts, f"{version}.stage-error.json"))
             if not ok:
                 raise act.StepFailed((err or {}).get("code", "stage_failed"), (err or {}).get("message") or out[-300:])
@@ -250,7 +258,7 @@ def cmd_stage(a, cfg, host):
         _audit(cfg, host, "upgrade.verify_failed", {"correlation_id": cid, "reason_code": code, "message": str(exc)[:300], "via": "cli"})
         print(f"refused: {exc}", file=sys.stderr)
         return EXIT_REFUSED
-    marker = act.read_json(os.path.join(cfg.releases, version, ".staged"), {}) or {}
+    marker = act.read_json(os.path.join(cfg.staging, version, ".staged"), {}) or {}
     _audit(cfg, host, "upgrade.staged", {"correlation_id": cid, "version": version, "sha256": marker.get("sha256"),
                                         "signed_by": marker.get("key_id"), "via": "cli"})
     print(f"staged {version}: signature verified, venv built, sha256 {str(marker.get('sha256'))[:8]}…")
@@ -306,7 +314,7 @@ def cmd_apply(a, cfg, host):
     version = a.version
     installed = act.installed_version(cfg)
     artifact = os.path.join(cfg.artifacts, f"ocw-{version}.tar.gz")
-    staged_ok = os.path.exists(os.path.join(cfg.releases, version, ".staged")) and os.path.exists(artifact)
+    staged_ok = os.path.isfile(os.path.join(cfg.staging, version, ".staged")) and os.path.exists(artifact)
     if not staged_ok:
         _say(a, f"{version} is not staged yet: staging it now (verify, unpack, build the environment)...")
         s = argparse.Namespace(target=version, json=a.json)
@@ -340,11 +348,43 @@ def cmd_apply(a, cfg, host):
         return EXIT_OK
     _audit(cfg, host, "upgrade.requested", {"correlation_id": cid, "version": version, "sha256": info["sha256"], "via": "cli",
                                            "acknowledged": ["rollback is code-only"]})
-    os.makedirs(cfg.requests, exist_ok=True)
-    path = os.path.join(cfg.requests, f"{cid}.json")
-    act.write_json_atomic(path, req, 0o600)
+    try:
+        _write_request(cfg, cid, req)
+    except (OSError, act.StepFailed) as exc:
+        print(f"refused: cannot write the request into the inbox: {getattr(exc, 'strerror', None) or exc} (run server/install.sh)", file=sys.stderr)
+        return EXIT_REFUSED
     host.systemctl("start", "--no-block", "ocw-upgrade.service")
     return follow(a, cfg, host, cid)
+
+
+def _write_request(cfg, cid, req):
+    """Put the request file into the application-owned inbox without trusting it: each directory on the way is opened without
+    following a link (relative to the one before), its owner is checked, the file gets a random temporary name created
+    exclusively, and is renamed into place within that directory."""
+    import secrets
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    uid, _gid = cfg.ids()
+    allowed = {0, os.geteuid()} | ({uid} if uid is not None else set())
+    rel = os.path.relpath(cfg.requests, cfg.upgrade).split(os.sep)
+    fd = os.open(cfg.upgrade, flags)
+    try:
+        for part in rel:
+            nxt = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        if os.fstat(fd).st_uid not in allowed:
+            raise act.StepFailed("request_invalid", "the request inbox belongs to an unexpected account; refusing to write into it")
+        data = (json.dumps(req, indent=2, sort_keys=True, default=str)).encode("utf-8")
+        tmp = f".{cid}.{secrets.token_hex(6)}.tmp"
+        ffd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=fd)
+        with os.fdopen(ffd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.rename(tmp, f"{cid}.json", src_dir_fd=fd, dst_dir_fd=fd)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def follow(a, cfg, host, cid):
@@ -517,9 +557,39 @@ def cmd_clear_failure(a, cfg, host):
     f = act.read_json(cfg.failures_path, {}) or {}
     cleared = sorted((f.get("versions") or {}))
     act.write_json_atomic(cfg.failures_path, {"versions": {}, "cleared_at": act.iso(host.now())})
+    st = act.read_json(cfg.state_path)
+    if isinstance(st, dict) and st.get("result") == "failed_needs_operator":
+        st.update(result="failed", operator_cleared_at=act.iso(host.now()))  # the operator has dealt with it: new requests are allowed again
+        act.write_json_atomic(cfg.state_path, st)
     _audit(cfg, host, "upgrade.clear_failure", {"cleared": cleared, "via": "cli", "correlation_id": None})
     print("failure record cleared" + (f" ({', '.join(cleared)} may be staged and applied again)" if cleared else ""))
     return EXIT_OK
+
+
+def cmd_prune_backups(a, cfg, host):
+    if not _need_root(cfg):
+        return EXIT_REFUSED
+    if a.confirm != "PRUNE":
+        print("refused: pass --confirm PRUNE. This deletes pre-upgrade archive copies; the newest one and the one the last upgrade "
+              "took are always kept.", file=sys.stderr)
+        return EXIT_REFUSED
+    if (a.keep is None) == (not a.name):
+        print("refused: give exactly one of --keep N (keep the newest N) and --name FILE (repeatable).", file=sys.stderr)
+        return EXIT_REFUSED
+    req = {"confirm": a.confirm, "keep_last": a.keep, "names": list(a.name) if a.name else None}
+
+    def go():
+        up = _updater(cfg, host)
+        up.st = {"correlation_id": None}
+        try:
+            up.validate_other({"action": "prune_backups", **req}, "prune_backups")
+            up.prune_backups(req, _actor())
+        except act.StepFailed as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return EXIT_REFUSED
+        print("done: " + ", ".join(f"{n} {s / 1e6:.1f} MB" for n, s, _m in up.backup_files()) + " remain")
+        return EXIT_OK
+    return _locked(cfg, go)
 
 
 # --- trust -------------------------------------------------------------------------------------------------------
@@ -560,7 +630,8 @@ def cmd_trust(a, cfg, host):
             try:
                 st = json.loads(open(a.local_state, encoding="utf-8").read(70000))
                 extra = [ocw_trust._check_entry(e) for e in st.get("keys", []) if e["key_id"] not in {k["key_id"] for k in keys}]
-                revoked = [{"key_id": r["key_id"], "revoked_at": r["revoked_at"], "last_good_version": r.get("last_good_version")}
+                revoked = [{"key_id": r["key_id"], "revoked_at": r["revoked_at"], "last_good_version": r.get("last_good_version"),
+                            **({"known_good": ocw_trust._check_known_good(r["known_good"])} if r.get("known_good") else {})}
                            for r in st.get("revoked", [])]
                 if extra and not a.import_local_keys:
                     print("refused: this install's key state holds key(s) that are not in the release's key list ("
@@ -592,8 +663,6 @@ def cmd_trust(a, cfg, host):
             print(f"ERROR: {exc}", file=sys.stderr)
             return EXIT_REFUSED
         act.write_json_atomic(cfg.trust_path, new, 0o644)
-        os.makedirs(os.path.join(cfg.upgrade, "revocations"), exist_ok=True)
-        shutil.copyfile(a.file, os.path.join(cfg.upgrade, "revocations", f"{d['to_serial']}.json"))
         _audit(cfg, host, "release_keys.revocation_applied", {**d, "source": "ocw-updater trust apply", "via": "cli", "correlation_id": None})
         print(f"Revocation applied: serial {d['from_serial']} → {d['to_serial']}. Reason: {d['reason']}")
         print("  revoked: " + (", ".join(d["revoked"]) or "none") + "   new keys: " + (", ".join(d["added"]) or "none"))
@@ -649,7 +718,7 @@ def cmd_nginx_sync(a, cfg, host):
     def go():
         up = _updater(cfg, host)
         cur = act.installed_version(cfg)
-        up.st = {"correlation_id": cid, "version_to": cur, "version_from": cur, "manifest": {"nginx_template_changed": True}}
+        up.st = {"correlation_id": cid, "version_to": cur, "version_from": cur, "manifest": {"nginx_template_changed": True, "nginx_change_required": True}}
         try:
             up.nginx_prepare()
             changed = up.nginx_apply()
@@ -702,6 +771,12 @@ def build_parser():
     s = sub.add_parser("clear-failure")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_clear_failure)
+    s = sub.add_parser("prune-backups")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--keep", type=int)
+    s.add_argument("--name", action="append")
+    s.add_argument("--confirm")
+    s.set_defaults(fn=cmd_prune_backups)
     s = sub.add_parser("nginx-sync")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_nginx_sync)

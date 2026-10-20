@@ -289,8 +289,10 @@ def test_delete_with_archive_purge_is_denied_at_server_level(site):
     # Server level (not inside a location): it runs before any location is chosen.
     for _path, blk in _location_blocks(site):
         assert "opa_second_site_delete" not in blk
-    # two server-level ifs: this site's delete rule and (5.47.0) the maintenance-page flag file
-    assert structure.count("if (") == 2 and "-f $ocw_maintenance_page" in site
+    # four server-level ifs: this site's delete rule and (5.47.0) the three of the maintenance-page check
+    # (flag file present, not the page's own internal URI, then return 503)
+    assert structure.count("if (") == 4 and "-f $ocw_maintenance_page" in site
+    assert "if ($uri = /__ocw_maintenance)" in site
 
 
 @pytest.mark.parametrize("prefix,shadow", [

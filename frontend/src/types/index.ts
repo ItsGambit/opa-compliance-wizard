@@ -334,6 +334,11 @@ export interface UpgradeStatus {
     prompt_needed: boolean
     share_version: boolean
     mirror: boolean
+    /** 5.48.0: the optional two-person rule for upgrades (off by default). */
+    second_approval?: boolean
+    /** 5.49.0: the release channel and who set it (absent on servers without channels). */
+    channel?: 'stable' | 'prerelease'
+    channel_source?: 'env' | 'setting' | 'default'
     /** null until an admin has answered the one-time question. */
     frequency: UpdateFrequency | null
     /** The release-check URL this server uses (the default, or a configured mirror). */
@@ -344,6 +349,8 @@ export interface UpgradeStatus {
     published_at: string | null
     release_url: string | null
     signed_artifact: boolean | null
+    /** 5.49.0: the newest release is a pre-release (only when the prerelease channel is on). */
+    prerelease?: boolean
     size: number | null
     notes_title: string | null
     notes: string | null
@@ -362,6 +369,165 @@ export interface UpgradeStatus {
   /** The revocation applied in the last 30 days, if any (drives the red notice). */
   revocation: UpgradeRevocation | null
   server: { time: string; zone: string | null; utc_offset_minutes: number }
+  /** 5.48.0: the in-app upgrade flow (absent in older servers and in fixtures that predate it). */
+  upgrade_run?: UpgradeRun | null
+  upgrade?: UpgradeView
+}
+
+/** 5.48.0: one health check of the updater (fixed ids, plain-text detail). */
+export interface UpgradeHealthCheck { id: string; ok: boolean; detail: string }
+
+/** The root-owned updater's current or last run (state.json, fields only). */
+export interface UpgradeRun {
+  correlation_id: string | null
+  action: 'apply' | 'rollback' | 'restore' | string | null
+  version_from: string | null
+  version_to: string | null
+  step: string | null
+  result: 'completed' | 'rolled_back' | 'failed' | 'failed_needs_operator' | null
+  reason_code: string | null
+  started_at: string | null
+  updated_at: string | null
+  seconds: number | null
+  failed_step: string | null
+  operator_reason: string | null
+  bundle: { name: string; size: number; sha256: string } | null
+  schema_before: number | null
+  schema_after: number | null
+  steps_done?: { step: string; at: string; seconds: number }[] | null
+  health?: UpgradeHealthCheck[] | null
+  rollback_health?: UpgradeHealthCheck[] | null
+  rolled_back_to?: string | null
+  rollback_seconds?: number | null
+  failure?: { step: string | null; reason_code: string | null; detail: string | null; at: string | null } | null
+  signed_by?: string | null
+  sha256?: string | null
+  requested_by?: string | null
+  backup?: { name: string; size: number; integrity: string } | null
+  manifest?: { migrations?: UpgradeMigration[]; expected_schema_version?: number | null } | null
+  downtime_estimate_seconds?: number | null
+}
+
+export interface UpgradeMigration { version: number; since: string | null; rollback_safe: boolean; summary?: string | null }
+
+export interface UpgradePreflightItem { id: string; ok: boolean; text: string }
+
+/** The signed release information the admin reviews before approving (server/updater/upgrade.py build_preview). */
+export interface UpgradePreview {
+  version: string
+  installed_version: string
+  sha256: string
+  file: string
+  size: number | null
+  key_id: string
+  key_status: string | null
+  key_since: string | null
+  key_role: string | null
+  signed_at: string | null
+  manifest: {
+    min_upgrade_from: string | null
+    downtime_estimate_seconds: number | null
+    migrations: UpgradeMigration[]
+    expected_schema_version: number | null
+    changelog_excerpt: string | null
+    nginx_template_changed: boolean
+    activator_version: string | null
+    built_at: string | null
+  }
+  manifest_source: string
+  checked_at: string
+  db_bytes?: number | null
+  preflight: UpgradePreflightItem[]
+  preflight_ok: boolean
+}
+
+export interface UpgradeScheduleEntry {
+  correlation_id: string
+  version: string
+  sha256: string
+  when_utc: string
+  entered: string | null
+  entered_tz: string | null
+  status: 'scheduled' | 'started' | 'missed' | 'cancelled' | 'replaced'
+  actor_email: string | null
+  approved_at: string
+  key_id: string | null
+}
+
+export interface UpgradeBackup { name: string; size: number | null; taken_at: string; taken_before: string | null; integrity: string | null }
+
+export interface UpgradeHistoryRow {
+  correlation_id: string | null
+  action: string | null
+  version_from: string | null
+  version_to: string | null
+  result: string | null
+  reason_code: string | null
+  started_at: string | null
+  updated_at: string | null
+  seconds: number | null
+  backup: string | null
+  bundle: string | null
+}
+
+export interface UpgradeView {
+  run: UpgradeRun | null
+  updater: { ready: boolean; reason: string | null; activator: string | null; message: string }
+  preview: UpgradePreview | null
+  schedule: UpgradeScheduleEntry | null
+  last: { kind: string; version: string | null; at: string; correlation_id: string | null; message?: string } | null
+  pending_approval: {
+    kind: 'apply' | 'schedule' | 'reschedule'
+    version: string
+    sha256: string
+    when_utc: string | null
+    entered: string | null
+    first_email: string | null
+    created_at: string
+    expires_at: string
+    correlation_id: string
+    mine: boolean
+  } | null
+  settings: { second_approval: boolean }
+  rejection: { correlation_id: string; code: string; message: string; at: string | null } | null
+  rollback: { available: boolean; until: string; to: string | null } | null
+  /** The updater's published list of pre-upgrade copies (names, sizes, dates, integrity; no paths). */
+  backups?: { backups: UpgradeBackup[]; updated_at: string; total_bytes: number | null } | null
+  failures: Record<string, { count: number; last_code: string | null }>
+  history: UpgradeHistoryRow[]
+  zone: { iana: string | null }
+  sync_hint: { last_sync_completed_at: string | null; daily_run_times_utc: string[] }
+  step_up_required: boolean
+  now: string
+}
+
+/** The one-line banner every signed-in user may see (GET /api/upgrade/notice). */
+export type UpgradeNotice =
+  | { kind: 'none' }
+  | { kind: 'available'; version: string }
+  | { kind: 'scheduled'; version: string; when_utc: string; downtime_estimate_seconds: number | null }
+  | { kind: 'running'; version: string | null; started_at: string | null }
+  | { kind: 'failed'; result: string; version: string | null; rolled_back_to: string | null; at: string | null }
+
+export type StepUpRequiredOrResult = StepUpRequired | UpgradeRequestResult
+
+export type UpgradeRequestBody =
+  | { kind: 'apply'; version: string; sha256: string; acknowledged: boolean }
+  | { kind: 'schedule' | 'reschedule'; version: string; sha256: string; acknowledged: boolean; when_utc: string; entered_tz?: string; entered_local?: string }
+  | { kind: 'cancel' }
+  | { kind: 'approve_second' }
+  | { kind: 'rollback'; confirm: string }
+  | { kind: 'restore'; confirm: string }
+  | { kind: 'clear_failure' }
+  | { kind: 'bundle'; include_hosts: boolean; for_correlation_id?: string }
+  | { kind: 'prune_backups'; confirm: string; keep_last?: number; names?: string[] }
+
+export interface UpgradeRequestResult {
+  kind: string
+  correlation_id: string
+  version?: string
+  when_utc?: string
+  awaiting_second_approval?: boolean
 }
 
 // Okta group IDs (not names) that gate login/admin rights across the whole

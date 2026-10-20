@@ -191,6 +191,7 @@ def test_git_ref_deploys_still_work_and_say_they_are_unsigned(d):
     proc = d.run()
     assert proc.returncode == 0, d.out
     assert "UNSIGNED source" in d.out and "--release" in d.out
+    assert "DEPRECATED (5.48.0)" in d.out and "OPA_DEPLOY_MAINTAINER=1" in d.out
     started = [e for e in d.events() if e["action"] == "deploy.started"][0]
     assert started["details"]["source"] == "unsigned_git"
 
@@ -240,3 +241,9 @@ def test_a_damaged_or_hostile_offline_bundle_changes_nothing(d, pinned, kwargs):
     assert proc.returncode != 0 and "offline bundle was refused" in d.out
     assert snapshot(d) == before
     assert not (d.tmp / "evil").exists()
+
+
+def test_the_deprecation_notice_can_be_silenced_by_a_maintainer(d):
+    proc = d.run(env={**d.env(), "OPA_DEPLOY_MAINTAINER": "1"})
+    assert proc.returncode == 0, d.out
+    assert "UNSIGNED source" in d.out and "DEPRECATED" not in d.out

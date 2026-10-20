@@ -348,7 +348,7 @@ def test_real_revocation_flow(real):
     expected = real_eff("release_keys.next.json")
     assert [(k["key_id"], k["status"]) for k in eff2["keys"]] == [(k["key_id"], k["status"]) for k in expected["keys"]]
     assert details["to_serial"] == 1 and len(details["revoked"]) == 2 and len(details["added"]) == 2
-    assert check(real / "ocw-9.9.9.tar.gz", real / "ocw-9.9.9.tar.gz.minisig", eff2).version == "9.9.9"   # signed BEFORE: valid
+    refused("revoked_key", real / "ocw-9.9.9.tar.gz", real / "ocw-9.9.9.tar.gz.minisig", eff2)   # old-format revocation pins nothing
     assert check(real / "ocw-9.9.10.tar.gz", real / "ocw-9.9.10.tar.gz.minisig", eff2).version == "9.9.10"
     assert "revocation" in refused("unknown_key", real / "ocw-9.9.10.tar.gz", real / "ocw-9.9.10.tar.gz.minisig", eff1)
     assert "Do not install" in refused("revoked_key", real / "ocw-9.9.11.tar.gz", real / "ocw-9.9.11.tar.gz.minisig", eff2)
@@ -415,18 +415,53 @@ def test_two_signatures_one_valid_is_enough(tmp_path, keys_and_list):
     apply_rev(tmp_path, eff, [TestStandby(), standby], payload)
 
 
-def test_backdated_release_from_a_revoked_key_is_refused(tmp_path, keys_and_list):
+def test_backdated_release_from_a_revoked_key_is_refused_by_both_verifiers(tmp_path, keys_and_list):
+    import hashlib
+    import updater_fakes  # noqa: F401 - sys.path for the root modules
+    import ocw_trust
     primary, standby, eff = keys_and_list
-    payload = revocation_payload(1, [{"key_id": primary.key_id, "last_good_version": "5.47.0"}], [TestKey(), TestStandby()],
-                                 issued="2026-02-01T00:00:00Z")
+    bare = revocation_payload(1, [primary.key_id], [TestKey(), TestStandby()], issued="2026-02-01T00:00:00Z")
+    state, _ = apply_rev(tmp_path, eff, [standby], bare)
+    eff2 = keylib.effective_from(keylib.validate_key_list(key_list([primary, standby])), keylib.validate_state(state))
+    trust2 = ocw_trust.apply_revocation(
+        {"schema": 1, "serial": 0, "keys": ocw_trust.parse_key_list(json.dumps(key_list([primary, standby])).encode()), "revoked": []},
+        Path(make_revocation(tmp_path / "rb.json", [standby], bare)).read_bytes())[0]
+    # signed "before" the revocation by the stolen key: a bare revocation refuses it, in both implementations
+    forged = release(tmp_path, eff, primary, version="5.48.0", timestamp="2026-01-20T00:00:00Z", built_at="2026-01-20T00:00:00Z")
+    refused("revoked_key", *forged, eff2)
+    with pytest.raises(ocw_trust.TrustError) as e:
+        ocw_trust.verify_release(str(forged[0]), str(forged[1]), trust2, "5.46.0")
+    assert e.value.code == "revoked_key"
+    notime = release(tmp_path, eff, primary, version="5.47.0", timestamp=None)
+    refused("revoked_key", *notime, eff2)
+
+
+def test_a_revocation_can_pin_known_good_releases_by_digest(tmp_path, keys_and_list):
+    import hashlib
+    import updater_fakes  # noqa: F401 - sys.path for the root modules
+    import ocw_trust
+    primary, standby, eff = keys_and_list
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    good = release(tmp_path / "a", eff, primary, version="5.47.0", timestamp="2026-01-20T00:00:00Z", built_at="2026-01-20T00:00:00Z")
+    forged = release(tmp_path / "b", eff, primary, version="5.47.0", timestamp="2026-01-20T00:00:00Z", built_at="2026-01-21T00:00:00Z")
+    sha = hashlib.sha256(Path(good[0]).read_bytes()).hexdigest()
+    assert sha != hashlib.sha256(Path(forged[0]).read_bytes()).hexdigest()
+    payload = revocation_payload(1, [{"key_id": primary.key_id, "known_good": {"5.47.0": sha}}], [TestKey(), TestStandby()])
     state, _ = apply_rev(tmp_path, eff, [standby], payload)
     eff2 = keylib.effective_from(keylib.validate_key_list(key_list([primary, standby])), keylib.validate_state(state))
-    ok = release(tmp_path, eff, primary, version="5.47.0", timestamp="2026-01-20T00:00:00Z", built_at="2026-01-20T00:00:00Z")
-    assert check(*ok, eff2, installed="5.46.0").version == "5.47.0"
-    forged = release(tmp_path, eff, primary, version="5.48.0", timestamp="2026-01-20T00:00:00Z", built_at="2026-01-20T00:00:00Z")
-    refused("revoked_key", *forged, eff2)     # back-dated, but newer than last_good_version
-    notime = release(tmp_path, eff, primary, version="5.47.0", timestamp=None)
-    refused("revoked_key", *notime, eff2)     # no time: cannot be shown to predate the revocation
+    assert check(*good, eff2, installed="5.46.0").version == "5.47.0"
+    refused("revoked_key", *forged, eff2)                                     # same version, same time, different bytes
+    trust2 = ocw_trust.apply_revocation(
+        {"schema": 1, "serial": 0, "keys": ocw_trust.parse_key_list(json.dumps(key_list([primary, standby])).encode()), "revoked": []},
+        Path(make_revocation(tmp_path / "rk.json", [standby], payload)).read_bytes())[0]
+    assert ocw_trust.verify_release(str(good[0]), str(good[1]), trust2, "5.46.0")["version"] == "5.47.0"
+    with pytest.raises(ocw_trust.TrustError):
+        ocw_trust.verify_release(str(forged[0]), str(forged[1]), trust2, "5.46.0")
+    # the pin survives a reload of both state files
+    assert keylib.validate_state(json.loads(json.dumps(state)))["revoked"][0]["known_good"] == {"5.47.0": sha}
+    with pytest.raises(keylib.KeyListError):
+        apply_rev(tmp_path, eff, [standby], revocation_payload(1, [{"key_id": primary.key_id, "known_good": {"5.47.0": "XYZ"}}], [TestKey(), TestStandby()]))
 
 
 # --- offline CLI, state file, audit ------------------------------------------------
@@ -864,8 +899,6 @@ def test_revoke_tool_refusals(tmp_path):
     def run(args, signer=signer, confirm=lambda: True):
         return tool.run(args, signer, confirm)
 
-    with pytest.raises(tool.ReleaseError, match="last good version"):
-        run(revoke_args(tmp_path, keys_path, [primary.key_id]))
     with pytest.raises(tool.ReleaseError, match="not a pinned key"):
         run(revoke_args(tmp_path, keys_path, ["0" * 16]))
     with pytest.raises(tool.ReleaseError, match="not an active standby"):

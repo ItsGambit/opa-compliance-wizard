@@ -81,7 +81,9 @@ def test_real_minisign_releases_verify_in_both_implementations():
         ocw_trust.verify_release(str(t10), str(s10), trust, "5.46.0")
     assert e.value.code == "key_unknown"
     assert ocw_trust.verify_release(str(t10), str(s10), new, "5.46.0")["version"] == "9.9.10"
-    assert ocw_trust.verify_release(str(tar), str(sig), new, "5.46.0")["version"] == "9.9.9"  # signed before the revocation
+    with pytest.raises(ocw_trust.TrustError) as e:  # an old-format revocation pins nothing: the revoked key's releases are refused
+        ocw_trust.verify_release(str(tar), str(sig), new, "5.46.0")
+    assert e.value.code == "revoked_key"
     with pytest.raises(ocw_trust.TrustError) as e:
         ocw_trust.verify_release(str(REAL / "ocw-9.9.11.tar.gz"), str(REAL / "ocw-9.9.11.tar.gz.minisig"), new, "5.46.0")
     assert e.value.code == "revoked_key"
@@ -158,17 +160,21 @@ def test_retired_revoked_and_standby_keys_never_sign_releases(tmp_path):
         with pytest.raises(ocw_trust.TrustError) as e:
             ocw_trust.verify_release(str(tar), sig, t, "5.46.0")
         assert e.value.code == code
-    # revoked after the signing timestamp -> refused; revoked later than the timestamp -> accepted
+    # a revoked key never verifies on the strength of its own timestamp, whatever the timestamp or last_good_version say
     t = trust_from([k, spare, sb], revoked=[{"key_id": k.key_id, "revoked_at": "2026-01-01T00:00:00Z", "last_good_version": None}])
     t["keys"] = [dict(e, status="revoked") if e["key_id"] == k.key_id else e for e in t["keys"]]
-    with pytest.raises(ocw_trust.TrustError) as e:
-        ocw_trust.verify_release(str(tar), sig, t, "5.46.0")
-    assert e.value.code == "revoked_key"
-    t["revoked"][0]["revoked_at"] = "2026-06-01T00:00:00Z"
-    assert ocw_trust.verify_release(str(tar), sig, t, "5.46.0")["version"] == "5.47.0"
-    t["revoked"][0]["last_good_version"] = "5.46.0"
+    for revoked_at, lgv in (("2026-01-01T00:00:00Z", None), ("2099-06-01T00:00:00Z", None), ("2099-06-01T00:00:00Z", "9.9.9")):
+        t["revoked"][0].update(revoked_at=revoked_at, last_good_version=lgv)
+        with pytest.raises(ocw_trust.TrustError) as e:
+            ocw_trust.verify_release(str(tar), sig, t, "5.46.0")
+        assert e.value.code == "revoked_key"
+    # ... except a file the revocation pins by version AND sha256
+    sha = hashlib.sha256(Path(tar).read_bytes()).hexdigest()
+    t["revoked"][0]["known_good"] = {"5.47.0": "0" * 64}
     with pytest.raises(ocw_trust.TrustError):
         ocw_trust.verify_release(str(tar), sig, t, "5.46.0")
+    t["revoked"][0]["known_good"] = {"5.47.0": sha}
+    assert ocw_trust.verify_release(str(tar), sig, t, "5.46.0")["version"] == "5.47.0"
     # a standby key cannot sign a release
     forged = tmp_path / "f" / "ocw-5.47.0.tar.gz"
     forged.parent.mkdir()

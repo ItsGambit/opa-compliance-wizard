@@ -246,7 +246,7 @@ chain heads are unchanged; an authenticated read works). Any failure rolls back 
 
 When an upgrade fails, the updater builds a redacted bundle (`ocw-support-<from>-to-<to>-<time>-<id>.tar.gz`, at most 5 MB) before anyone asks.
 An **app administrator without shell access can download it**: `GET /api/upgrade/bundle?name=...` (admin-only; it is linked from the
-failed upgrade's Audit Log entry, which records `bundle.name`, size and sha256; the button itself arrives with the in-app flow). From a shell: `sudo ocw-updater bundle`
+failed upgrade's Audit Log entry, which records `bundle.name`, size and sha256; the Audit Log offers the download button). From a shell: `sudo ocw-updater bundle`
 (`--include-hosts` keeps host and environment names). Email it yourself to the address in SECURITY.md; **nothing is ever sent automatically.**
 
 * **In it:** `summary.json` (versions, reason code, failed step, timings, OS / Python / SQLite / systemd versions, free space, the
@@ -278,17 +278,41 @@ install its packages from the bundle: see that section).
 | `apply <version> [--at "YYYY-MM-DD HH:MM" [--tz Europe/London]]` | install now or schedule (typed confirmation); `cancel` removes a schedule |
 | `rollback` / `restore --confirm RESTORE` | code-only rollback / archive restore, as above |
 | `bundle [--correlation ID] [--include-hosts]`, `clear-failure` | support bundle; allow a failed version again |
+| `prune-backups --keep N` or `--name FILE ...` with `--confirm PRUNE` | delete old pre-upgrade archive copies (never the newest, never the last upgrade's) |
 | `trust list`, `trust apply <revocation.json>`, `trust add <key.json>` | the signing keys root trusts (the standby key can only change by a signed revocation; `add` takes only an active release key and a typed `TRUST`) |
 | `nginx-sync` | apply the current release's nginx template (maintenance page) |
 | `check`, `enable-check`, `disable-check`, `verify`, `audit`, `keys ...` | the 5.46.0 tools (run as the application's account automatically) |
 
 Exit codes: `0` ok, `2` refused (signature, version, key, sync running, another upgrade in flight, bad usage), `3` failed and rolled back,
-`4` failed and an operator is needed. `--json` where it makes sense. Every action writes the same audit events as the in-app flow will (the actor is `cli:<os user>`).
+`4` failed and an operator is needed. `--json` where it makes sense. Every action writes the same audit events as the in-app flow (the actor is `cli:<os user>`).
 
-#### What this does not do yet
+#### Upgrading from the Updates page (5.48.0)
 
-The Updates screen in the web app only reports (5.46.0); approving an upgrade with MFA, scheduling from the browser and the
-progress page arrive with the in-app flow. See `CHANGELOG.md` for the known limitations of this release.
+On an install that has run `server/install.sh`, administrators can upgrade without a shell: **Updates**, then **Upgrade now** or **Schedule…**.
+
+1. The page reads the new release's signature file and manifest (a few KB), checks the signature's trusted comment against the pinned keys and runs a
+   **preflight** (free disk space, Python and SQLite versions, no sync running, the updater present). **Re-check** repeats it.
+2. A **confirmation screen** shows exactly what is approved: versions, artifact, sha256, signing key, what changes, schema migrations (and which of them a code
+   rollback cannot undo), the backup, the rollback policy and the downtime. You tick the acknowledgement and **Approve with MFA**: a fresh Okta challenge that is
+   bound to *this* version, hash and time. Nothing is installed before you return from it.
+3. **Now** writes the request to the updater, which downloads, verifies, backs up, switches, restarts and health-checks (README above). The page shows the nine
+   steps live and keeps waiting through the restart (other users see the maintenance page; your session survives); when the new version answers it reloads once.
+   **Scheduled** upgrades are held by the application and handed to the updater at the chosen time; if the application is not running then, the upgrade is marked
+   **missed** and is never run late. Cancelling or rescheduling needs MFA too.
+4. The result is a card: success (with the eight health checks and a 24-hour rollback window), or failure (what happened, where you are now, and the redacted
+   **support bundle to download**, also linked from the failed upgrade's Audit Log entry). Every step of the run is in the Audit Log under one correlation id.
+
+Notes:
+
+* **Two-person rule** (Update check, "Change…"; off by default): a second, different administrator must approve within 24 hours.
+* **Rollback, restore, clear failure, rebuilding the support bundle and deleting old pre-upgrade backups are buttons** on the page (typed confirmation where something is
+  lost or deleted: `ROLLBACK`, `RESTORE`, `PRUNE`; then the MFA approval), and each is also a command: `sudo ocw-updater rollback | restore --confirm RESTORE | clear-failure | bundle [--include-hosts] | prune-backups --keep N --confirm PRUNE`.
+  The updater re-checks every request and refuses what the command line would refuse; the newest backup and the one the last upgrade took are never deleted. After a failure the same
+  version is refused until the failure is cleared; if the rollback itself failed the page says an operator must act on the server.
+* **Local (laptop) mode** does not offer this flow (no identity provider to step up with); it shows the commands `python launch.py upgrade` and
+  `python launch.py upgrade --restore-previous`.
+* `server/deploy.sh --ref` (unsigned source) is deprecated for operators; use the Updates page or `ocw-updater`.
+* The page needs the upgrade layout. Without it, the page says so and shows the manual `deploy.sh --release` command.
 
 ### Upgrading a local (laptop or desktop) install
 
@@ -440,12 +464,13 @@ The project holds two keys in different places: a **primary** that signs release
 **standby** (a different kind of key, in a different cloud) that can only sign a *revocation*. If the primary is ever lost or stolen the
 maintainers publish a signed `revocation.json` that revokes it and installs a new release key (and,
 if needed, a new standby), with a link to a security advisory. It is published in two places: as an
-asset of the GitHub release tagged `revocation`, and (optional, `OPA_REVOCATION_URL`) at an
+asset of a GitHub release (`revocation`, or `revocation-<serial>` for later ones), and (optional, `OPA_REVOCATION_URL`) at an
 owner-controlled static URL, so one outage or one compromised account cannot hide it.
 
 What you will see: a release signed by a key you do not know (*"signed by key ... which is not
 pinned ... apply the published revocation"*), or by a key marked revoked (*"was revoked ... Do
-not install it"*). Releases the old key signed **before** the revocation stay valid.
+not install it"*). A revoked key's releases are refused, except the ones the revocation names
+by version and file digest as known good.
 
 What to do:
 1. **Online:** with the update check on, the server fetches and applies the revocation by itself

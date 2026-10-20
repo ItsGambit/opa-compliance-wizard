@@ -23,6 +23,8 @@ import { ServiceAccountsDashboard } from './components/ServiceAccountsDashboard'
 import { REPORTS_SUB_TABS, SideNav } from './components/SideNav'
 import { UserMenu } from './components/UserMenu'
 import { UpdateBanner } from './components/UpdateBanner'
+import { UpgradeNoticeBanner } from './components/UpgradeNoticeBanner'
+import { rememberRequested } from './utils/upgradeRequested'
 import { UpdatesPage } from './components/UpdatesPage'
 import { UpdateKeysPage } from './components/UpdateKeysPage'
 import { environmentScopeKey } from './utils/environmentRows'
@@ -119,6 +121,27 @@ export default function App() {
     mutationFn: (_pending: Extract<PendingStepUp, { kind: 'environment_change' }>) => saveEnvironmentChange(),
     onSuccess: (resp, pending) => {
       clearPendingStepUp()
+      if (pending.action === 'upgrade.request') {
+        // 5.48.0: an upgrade request the gate just approved (now / schedule / reschedule / cancel / second approval).
+        const kind = String(resp.kind ?? '')
+        const version = typeof resp.version === 'string' ? resp.version : null
+        const OPS: Record<string, string> = { rollback: 'Rollback', restore: 'Restore', clear_failure: 'Clear failure', bundle: 'Support bundle', prune_backups: 'Delete backups' }
+        const label = OPS[kind] ? 'requested' : kind === 'cancel' ? 'cancelled' : resp.awaiting_second_approval ? 'waiting for a second admin'
+          : kind === 'schedule' ? 'scheduled' : kind === 'reschedule' ? 'rescheduled' : 'requested'
+        if ((kind === 'apply' || kind === 'approve_second') && typeof resp.correlation_id === 'string' && !resp.awaiting_second_approval) {
+          rememberRequested({ correlationId: resp.correlation_id, version: version ?? '', approvedAt: new Date().toISOString(), email: whoami?.email ?? null, stepUp: true })
+        } else if (['rollback', 'restore', 'clear_failure', 'bundle', 'prune_backups'].includes(kind) && typeof resp.correlation_id === 'string') {
+          rememberRequested({ correlationId: resp.correlation_id, version: '', approvedAt: new Date().toISOString(), email: whoami?.email ?? null, stepUp: true,
+            kind: kind as 'rollback' | 'restore' | 'clear_failure' | 'bundle' | 'prune_backups' })
+        }
+        toast({
+          title: OPS[kind] ? `${OPS[kind]}: requested` : kind === 'cancel' ? 'Upgrade request cancelled' : `Upgrade${version ? ` to ${version}` : ''}: ${label}`,
+          description: `Approved via step-up MFA at ${new Date().toLocaleString()}.`, variant: 'success',
+        })
+        setActiveTab('updates')
+        for (const key of ['upgrade_status', 'upgrade_notice', 'audit_log']) queryClient.invalidateQueries({ queryKey: [key] })
+        return
+      }
       const active = typeof resp.active === 'string' ? resp.active : null
       toast({
         title: resp.activated && active ? `Connected to '${active}'` : `${pending.label}: done`,
@@ -223,6 +246,7 @@ export default function App() {
     <div className="flex flex-col h-dvh">
       <AnnouncementBanner />
       <UpdateBanner canAdmin={canAdmin} onOpenUpdates={() => setActiveTab('updates')} />
+      <UpgradeNoticeBanner canAdmin={canAdmin} onOpenUpdates={() => setActiveTab('updates')} />
       <div className="flex flex-1 min-h-0">
         <SideNav
           activeTab={activeTab}

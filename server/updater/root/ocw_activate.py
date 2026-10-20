@@ -63,7 +63,7 @@ import ocw_bundle  # noqa: E402
 import ocw_host  # noqa: E402
 import ocw_trust  # noqa: E402
 
-ACTIVATOR_VERSION = "5.47.0"
+ACTIVATOR_VERSION = "5.48.0"
 STEP_ORDER = ["validated", "downloaded", "staged", "preflight", "backup", "switching", "restarting", "health_check", "completed"]
 STEP_LABEL = {"validated": "Received and validated", "downloaded": "Downloaded", "staged": "Verified and staged",
               "preflight": "Preflight", "backup": "Backup", "switching": "Switching", "restarting": "Restarting",
@@ -75,7 +75,19 @@ REASONS = {"request_invalid", "request_replayed", "request_stale", "signature_in
            "health_unit", "health_version", "health_healthz", "health_gate", "health_quick_check", "health_schema",
            "health_chain", "health_smoke", "rollback_failed", "interrupted", "failed_before", "too_many_failures",
            "version_failed_before", "in_flight", "bad_release", "bad_artifact", "revoked_key", "retired_key", "wrong_role",
-           "no_key_pinned", "keys_changed", "unknown_alg", "no_trust", "bad_trust", "internal_error"}
+           "no_key_pinned", "keys_changed", "unknown_alg", "no_trust", "bad_trust", "internal_error", "needs_install_sh",
+           "confirm_required", "rollback_unavailable", "no_backup", "action_unsupported", "prune_refused"}
+# What the web application may ask for through the request inbox (5.48.0). Each is advisory: the application has checked the
+# administrator's step-up approval, root re-validates everything here. Scheduling stays in the application (it never sends a time).
+APP_ACTIONS = ("apply", "rollback", "restore", "clear_failure", "bundle", "prune_backups")
+_COMMON_FIELDS = {"schema", "action", "correlation_id", "requested_at", "action_id", "origin", "actor", "trigger_kind", "_file"}
+_ACTION_FIELDS = {"apply": {"version", "sha256", "not_before", "entered"}, "rollback": {"confirm"}, "restore": {"confirm"},
+                  "clear_failure": set(), "bundle": {"include_hosts", "for_correlation_id"},
+                  "prune_backups": {"confirm", "keep_last", "names"}}
+_STR_LIMITS = {"actor": 120, "trigger_kind": 80, "entered": 80, "origin": 8, "confirm": 16, "not_before": 24, "requested_at": 24}
+ROLLBACK_WINDOW = 24 * 3600
+QUIESCE_SECONDS = 600
+_BACKUP_NAME = re.compile(r"^audit_store-pre-[0-9A-Za-z._-]{1,80}\.db$")
 HEALTH_REASON = {"unit_active": "health_unit", "version": "health_version", "healthz": "health_healthz", "gate_401": "health_gate",
                  "quick_check": "health_quick_check", "schema_version": "health_schema", "chain_heads": "health_chain",
                  "smoke_read": "health_smoke"}
@@ -85,6 +97,7 @@ _CID = re.compile(r"^(upg|sched)-[0-9a-f]{8}$")
 _VER = re.compile(r"^\d+\.\d+\.\d+$")
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _ACTION_ID = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+_ACTOR = re.compile(r"[^\x20-\x7e]")
 
 
 class Killed(BaseException):
@@ -100,19 +113,41 @@ class StepFailed(Exception):
 # --- configuration ---------------------------------------------------------------------
 
 
+# A root-owned file whose presence allows the OCW_* test and path overrides for a process running as root. Nothing in a
+# normal install creates it; the VM test does (and removes it).
+TEST_MARKER = "/etc/ocw-updater-test-mode"
+
+
+def env_overrides_allowed():
+    """Root honours test-mode and path overrides from the environment only when the marker exists, is a plain file owned by
+    root and not writable by others. A non-root process (the unit tests) is never privileged, so it may use them freely."""
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return True
+    try:
+        st = os.lstat(TEST_MARKER)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o022
+
+
 class Cfg:
     def __init__(self, environ=None):
-        env = environ if environ is not None else os.environ
+        if environ is None:
+            environ = dict(os.environ)
+            if not env_overrides_allowed():  # only where the wrapper and the units put them: the install location
+                environ = {k: v for k, v in environ.items() if k in ("OCW_OPT_DIR", "OCW_DATA_DIR")}
+        env = environ
         self.opt = env.get("OCW_OPT_DIR", "/opt/opa-compliance-wizard")
         self.data = env.get("OCW_DATA_DIR", "/var/lib/opa-compliance-wizard")
         self.updater_dir = env.get("OCW_UPDATER_DIR", os.path.join(self.opt, "updater"))
-        self.env_file = env.get("OCW_ENV_FILE", "/etc/opa-compliance-wizard.env")
+        self.env_file = env.get("OCW_ENV_FILE", "")
         c = {}
         try:
             with open(os.path.join(self.updater_dir, "config.json"), encoding="utf-8") as fh:
                 c = json.load(fh)
         except (OSError, ValueError):
             pass
+        self.env_file = self.env_file or c.get("env_file") or "/etc/opa-compliance-wizard.env"
         self.app_user = c.get("app_user", "")
         self.app_group = c.get("app_group", "")
         self.stage_user = c.get("stage_user", "ocw-updater")
@@ -124,14 +159,16 @@ class Cfg:
         if env.get("OCW_TEST_MODE") == "1":
             self.faults = {f for f in env.get("OCW_UPDATER_FAULT", "").split(",") if f}
         self.fast = env.get("OCW_TEST_MODE") == "1" and env.get("OCW_FAST") == "1"
-        self.releases = os.path.join(self.opt, "releases")
+        self.releases = os.path.join(self.opt, "releases")  # root-owned: only root renames or removes entries here
+        self.handoff = os.path.join(self.opt, "handoff")  # root:<staging group> 0750: where an operator's file is handed to staging
+        self.staging = os.path.join(self.opt, "staging")  # owned by the staging account: <staging>/<version> until root takes it
         self.current = os.path.join(self.opt, "current")
         self.previous = os.path.join(self.opt, "previous")
         self.maintenance_dir = os.path.join(self.opt, "maintenance")
         self.maintenance_page = os.path.join(self.maintenance_dir, "active.html")
         self.upgrade = os.path.join(self.data, "upgrade")
         self.requests = os.path.join(self.upgrade, "inbox", "requests")
-        self.artifacts = env.get("OCW_ARTIFACTS_DIR", "/var/lib/ocw-updater/artifacts")
+        self.artifacts = env.get("OCW_ARTIFACTS_DIR") or c.get("artifacts_dir") or "/var/lib/ocw-updater/artifacts"
         self.verified = os.path.join(self.upgrade, "verified")
         self.state_path = os.path.join(self.upgrade, "state.json")
         self.history_path = os.path.join(self.upgrade, "history.jsonl")
@@ -140,6 +177,9 @@ class Cfg:
         self.backups = os.path.join(self.upgrade, "backups")
         self.schedule = os.path.join(self.upgrade, "schedule")
         self.rejections = os.path.join(self.upgrade, "rejections")
+        self.actions_path = os.path.join(self.upgrade, "actions.jsonl")          # approval ids already used by the non-apply kinds
+        self.quiesce_path = os.path.join(self.upgrade, "quiesce.json")           # "start no new sync until ..." (read by the application)
+        self.backups_status = os.path.join(self.upgrade, "backups-status.json")  # names, sizes, dates, integrity (no paths)
         self.work = os.path.join(self.upgrade, "work")
         self.done = os.path.join(self.upgrade, "requests-done")
         self.lock_path = os.path.join(self.upgrade, "lock")
@@ -245,10 +285,30 @@ def write_json_atomic(path, obj, mode=0o644):
     fsync_dir(directory)
 
 
+def open_regular(path, write=False):
+    """Open a file in a directory root does not own: never follow a link, never block on a pipe, and only a plain file
+    is accepted (checked on the open descriptor). `write` opens for append (no create)."""
+    flags = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags | ((os.O_WRONLY | os.O_APPEND) if write else os.O_RDONLY))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", path)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def read_regular(path, max_bytes=16 * 1024 * 1024):
+    """The bytes of a plain file (at most max_bytes), opened safely; OSError if it is a link, pipe or directory."""
+    fd = open_regular(path)
+    with os.fdopen(fd, "rb") as fh:
+        return fh.read(max_bytes)
+
+
 def read_json(path, default=None):
     try:
-        with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
+        return json.loads(read_regular(path).decode("utf-8"))
     except (OSError, ValueError):
         return default
 
@@ -298,8 +358,17 @@ def audit_append(cfg, action, details, actor_email=None, ids=(None, None)):
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
-            lock_fd = os.open(os.path.join(os.path.dirname(path), "." + os.path.basename(path) + ".lock"),
-                              os.O_RDWR | os.O_CREAT | nofollow, 0o600)
+            lock_path = os.path.join(os.path.dirname(path), "." + os.path.basename(path) + ".lock")
+            nb = getattr(os, "O_NONBLOCK", 0)
+            try:  # created by us: hand it to the application account (a root-owned lock would shut the application out of it)
+                lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow | nb, 0o600)
+                if ids[0] is not None and os.geteuid() == 0:
+                    os.fchown(lock_fd, ids[0], ids[1])
+            except FileExistsError:
+                lock_fd = os.open(lock_path, os.O_RDWR | nofollow | nb)
+                if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+                    os.close(lock_fd)
+                    raise OSError(errno.EINVAL, "not a regular file", lock_path)
             deadline = time.monotonic() + 5
             while True:
                 try:
@@ -316,7 +385,7 @@ def audit_append(cfg, action, details, actor_email=None, ids=(None, None)):
             if ids[0] is not None and os.geteuid() == 0:
                 os.fchown(fd, ids[0], ids[1])
         except FileExistsError:
-            fd = os.open(path, os.O_WRONLY | os.O_APPEND | nofollow)
+            fd = open_regular(path, write=True)
         try:
             view = memoryview(data)
             while view:
@@ -335,7 +404,7 @@ def audit_entries_for(cfg, correlation_id, max_bytes=16 * 1024 * 1024):
     """Audit entries whose details carry this correlation id (tail of the file only)."""
     out = []
     try:
-        with open(cfg.audit_log, "rb") as fh:
+        with os.fdopen(open_regular(cfg.audit_log), "rb") as fh:
             fh.seek(0, os.SEEK_END)
             size = fh.tell()
             fh.seek(max(0, size - max_bytes))
@@ -462,6 +531,7 @@ class Updater:
             log("WARN", f"could not write the maintenance page: {exc.strerror}")
 
     def page_off(self):
+        self.unquiesce()
         try:
             os.unlink(self.cfg.maintenance_page)
         except FileNotFoundError:
@@ -499,11 +569,21 @@ class Updater:
     # --- request validation (the request is advisory) ---------------------------------------------
     def validate_request(self, req, origin_trusted):
         c = self.cfg
-        if not isinstance(req, dict) or req.get("schema") != 1 or req.get("action") != "apply":
+        if not isinstance(req, dict) or req.get("schema") != 1 or req.get("action") not in APP_ACTIONS:
             raise StepFailed("request_invalid", "unsupported request")
+        action = req["action"]
+        # closed set of fields, plain types, bounded lengths: anything else is refused, never ignored
+        if set(req) - _COMMON_FIELDS - _ACTION_FIELDS[action]:
+            raise StepFailed("request_invalid", "unexpected field in the request")
+        for key, limit in _STR_LIMITS.items():
+            v = req.get(key)
+            if v is not None and (not isinstance(v, str) or len(v) > limit):
+                raise StepFailed("request_invalid", f"{key} must be text of at most {limit} characters")
+        if req.get("origin") not in (None, "cli", "app"):
+            raise StepFailed("request_invalid", "bad origin")
         if not _CID.match(str(req.get("correlation_id", ""))):
             raise StepFailed("request_invalid", "bad correlation id")
-        if not _VER.match(str(req.get("version", ""))) or not _SHA.match(str(req.get("sha256", ""))):
+        if action == "apply" and (not _VER.match(str(req.get("version", ""))) or not _SHA.match(str(req.get("sha256", "")))):
             raise StepFailed("request_invalid", "bad version or sha256")
         aid = req.get("action_id")
         if aid is not None and not _ACTION_ID.match(str(aid)):
@@ -512,15 +592,20 @@ class Updater:
         now = self.host.now()
         if at is None or at > now + 300 or now - at > REQUEST_MAX_AGE:
             raise StepFailed("request_stale", "the request is older than 24 hours or dated in the future")
-        if aid:
-            for line in self._history_lines():
-                if line.get("action_id") == aid:
-                    raise StepFailed("request_replayed", "this approval was already used")
+        if aid and self.action_id_used(aid):
+            raise StepFailed("request_replayed", "this approval was already used")
+        if action != "apply":
+            self.validate_other(req, action)
+            return
         nb = req.get("not_before")
         if nb is not None and parse_iso(nb) is None:
             raise StepFailed("request_invalid", "bad not_before")
         if self.in_flight():
             raise StepFailed("in_flight", "another upgrade is in progress")
+        last = read_json(self.cfg.state_path) or {}
+        if last.get("result") == "failed_needs_operator":
+            raise StepFailed("failed_before", "the last upgrade failed and could not be rolled back automatically; an operator must "
+                                              "check `ocw-updater status`, fix it, then run `ocw-updater clear-failure`")
         f = self.failures()
         rec = f["versions"].get(req["version"])
         if rec and rec.get("count", 0) >= 1:
@@ -529,15 +614,58 @@ class Updater:
         if sum(v.get("count", 0) for v in f["versions"].values()) >= 2:
             raise StepFailed("too_many_failures", "two upgrades have failed; contact the maintainers with the support bundle, then clear-failure")
 
+    def validate_other(self, req, action):
+        """Field rules of the kinds other than apply (the common ones were checked already)."""
+        if action == "rollback" and req.get("confirm") != "ROLLBACK":
+            raise StepFailed("confirm_required", "a rollback request must carry the typed confirmation ROLLBACK")
+        if action == "restore" and req.get("confirm") != "RESTORE":
+            raise StepFailed("confirm_required", "a restore request must carry the typed confirmation RESTORE")
+        if action == "bundle":
+            if not isinstance(req.get("include_hosts", False), bool):
+                raise StepFailed("request_invalid", "include_hosts must be true or false")
+            fc = req.get("for_correlation_id")
+            if fc is not None and not _CID.match(str(fc)):
+                raise StepFailed("request_invalid", "bad for_correlation_id")
+        if action == "prune_backups":
+            if req.get("confirm") != "PRUNE":
+                raise StepFailed("confirm_required", "a backup clean-up request must carry the typed confirmation PRUNE")
+            keep, names = req.get("keep_last"), req.get("names")
+            if (keep is None) == (names is None):
+                raise StepFailed("request_invalid", "send exactly one of keep_last and names")
+            if keep is not None and (not isinstance(keep, int) or isinstance(keep, bool) or not 1 <= keep <= 50):
+                raise StepFailed("request_invalid", "keep_last must be a whole number from 1 to 50")
+            if names is not None and (not isinstance(names, list) or not 1 <= len(names) <= 50
+                                      or not all(isinstance(n, str) and _BACKUP_NAME.match(n) for n in names)):
+                raise StepFailed("request_invalid", "names must be 1 to 50 backup file names")
+
+    def action_id_used(self, aid):
+        for line in self._history_lines():
+            if line.get("action_id") == aid:
+                return True
+        try:
+            return aid in read_regular(self.cfg.actions_path, 4 * 1024 * 1024).decode("utf-8", "replace").split()
+        except OSError:
+            return False
+
+    def remember_action_id(self, aid):
+        """Record a used approval id (root-owned directory; the file is opened without following links)."""
+        if not aid:
+            return
+        fd = os.open(self.cfg.actions_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.write(fd, (aid + "\n").encode("ascii"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
     def _history_lines(self):
         out = []
         try:
-            with open(self.cfg.history_path, encoding="utf-8") as fh:
-                for line in fh:
-                    try:
-                        out.append(json.loads(line))
-                    except ValueError:
-                        pass
+            for line in read_regular(self.cfg.history_path, 8 * 1024 * 1024).decode("utf-8", "replace").splitlines():
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    pass
         except OSError:
             pass
         return out
@@ -558,6 +686,8 @@ class Updater:
             if rel_base == ".":
                 dirs[:] = [d for d in dirs if d != ".venv"]
                 files = [f for f in files if f not in (".staged", ".staging")]
+            if os.lstat(base).st_mode & 0o6022:
+                raise StepFailed("tree_mismatch", f"{os.path.relpath(base, root)} is writable by others or has a setuid/setgid bit", "staged")
             for d in list(dirs):
                 p = os.path.join(base, d)
                 if os.path.islink(p):
@@ -568,6 +698,8 @@ class Updater:
                 st = os.lstat(p)
                 if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
                     raise StepFailed("tree_mismatch", f"{rel} is not a plain single-link file", "staged")
+                if st.st_mode & 0o6022:
+                    raise StepFailed("tree_mismatch", f"{rel} is writable by others or has a setuid/setgid bit", "staged")
                 if "__pycache__" in rel.split("/"):
                     os.unlink(p)
                     continue
@@ -583,6 +715,35 @@ class Updater:
         missing = sorted(set(expected) - seen)
         if missing:
             raise StepFailed("tree_mismatch", f"{len(missing)} file(s) the manifest lists are missing (first: {missing[0]})", "staged")
+        self.check_venv(root)
+
+    def check_venv(self, root):
+        """The virtualenv is not in the manifest (pip built it), but it is walked too: no link may resolve outside the release
+        directory (except bin/python* pointing into /usr, the base interpreter), no hard links, no setuid/setgid/group- or
+        world-writable entry, nothing but plain files, directories and links."""
+        venv = os.path.join(root, ".venv")
+        if os.path.islink(venv):
+            raise StepFailed("tree_mismatch", ".venv is a link", "staged")
+        real_root = os.path.realpath(root)
+        for base, dirs, files in os.walk(venv, followlinks=False):
+            for name in dirs + files:
+                p = os.path.join(base, name)
+                rel = os.path.relpath(p, root).replace(os.sep, "/")
+                st = os.lstat(p)
+                if stat.S_ISLNK(st.st_mode):
+                    target = os.path.realpath(p)
+                    inside = target == real_root or target.startswith(real_root + os.sep)
+                    interpreter = rel.startswith(".venv/bin/python") and target.startswith("/usr/")
+                    if not (inside or interpreter):
+                        raise StepFailed("tree_mismatch", f"{rel} is a link that leaves the release directory", "staged")
+                    continue
+                if st.st_mode & 0o6022:
+                    raise StepFailed("tree_mismatch", f"{rel} is writable by others or has a setuid/setgid bit", "staged")
+                if stat.S_ISREG(st.st_mode):
+                    if st.st_nlink != 1:
+                        raise StepFailed("tree_mismatch", f"{rel} has more than one hard link", "staged")
+                elif not stat.S_ISDIR(st.st_mode):
+                    raise StepFailed("tree_mismatch", f"{rel} is not a plain file, directory or link", "staged")
 
     # --- prepare phase (everything before the switch) ----------------------------------------------
     def prepare(self, req):
@@ -595,7 +756,8 @@ class Updater:
             raise StepFailed("internal_error", "cannot read the installed version", "validated")
         self.st["version_from"] = installed
         artifact = os.path.join(c.artifacts, f"ocw-{ver}.tar.gz")
-        staged_marker = os.path.join(c.releases, ver, ".staged")
+        staged_dir = os.path.join(c.staging, ver)
+        staged_marker = os.path.join(staged_dir, ".staged")
         had_artifact = os.path.exists(artifact) and os.path.exists(staged_marker)
         self.finish("validated", request=os.path.basename(req.get("_file", "")), sha256_ok=True)
         self.begin("downloaded")
@@ -621,17 +783,23 @@ class Updater:
         manifest = info["manifest"]
         self.st["manifest"] = {k: manifest.get(k) for k in ("version", "min_upgrade_from", "migrations",
                                                          "downtime_estimate_seconds", "nginx_template_changed", "expected_schema_version",
-                                                         "migration_time_estimate_seconds") if k in manifest}
+                                                         "migration_time_estimate_seconds", "nginx_change_required", "requires_install_sh") if k in manifest}
         self.st["downtime_estimate_seconds"] = manifest.get("downtime_estimate_seconds") or 60
+        if manifest.get("requires_install_sh"):
+            raise StepFailed("needs_install_sh", f"{ver} changes the systemd units, the ocw-updater command or server/install.sh, which the "
+                                                 "updater cannot replace by itself: unpack this release and run `sudo bash server/install.sh` "
+                                                 "from it, then apply it again", "staged")
         self.st["signed_by"] = info["key_id"]
         self.st["sha256"] = info["sha256"]
         self._adoption = (info["adoption"], info["candidate_keys"])
-        root = os.path.join(c.releases, ver)
-        if not os.path.isdir(os.path.join(root, ".venv")):
-            raise StepFailed("not_staged", "the staged release has no virtualenv", "staged")
-        # Take the tree away from the staging account FIRST (the stage unit has exited), then hash it: nobody but
-        # root can change a file between the check and the switch.
-        self.host.chown_tree(root)
+        root = self.take_staged(ver)
+        # The tree is now under releases/ (a directory only root can write): take it away from the staging account
+        # FIRST (the stage unit has exited), then hash it. Nobody but root can change, replace or move a file or a
+        # directory entry between the check and the switch.
+        try:
+            self.host.chown_tree(root)
+        except ocw_host.HostError as exc:
+            raise StepFailed("tree_mismatch", str(exc), "staged")
         self.check_tree(root, manifest)
         self.finish("staged", signed_by=info["key_id"], files_verified=len(manifest["files"]), adoption=info["adoption"])
         self.begin("preflight")
@@ -641,11 +809,37 @@ class Updater:
         self.backup()
         b = self.st.get("backup") or {}
         self.finish("backup", **{k: b[k] for k in ("name", "size", "integrity") if k in b})
+        try:
+            self.publish_backups()
+        except OSError as exc:
+            log("WARN", f"could not publish the backups status: {exc.strerror}")
         self.audit("upgrade.started", {"version_from": installed, "version_to": ver, "trigger_kind": req.get("trigger_kind", "request"),
                                        "backup": (self.st.get("backup") or {}).get("name"),
                                        "schema_before": self.st.get("schema_before"),
                                        "chain_heads_recorded": len(self.st.get("chain_heads_before") or {}),
                                        "requested_by": req.get("actor")})
+
+    def take_staged(self, ver):
+        """Move staging/<ver> to releases/<ver> and return the new path. The rename comes FIRST: it pins whatever entry the
+        staging account left, under a parent directory only root can write, so nothing it does afterwards can swap the
+        tree that is about to be owned, hashed and switched to."""
+        c = self.cfg
+        src, dst = os.path.join(c.staging, ver), os.path.join(c.releases, ver)
+        st = os.lstat(src) if os.path.lexists(src) else None
+        if st is None or not stat.S_ISDIR(st.st_mode):
+            raise StepFailed("not_staged", "the staged release is missing or is not a directory", "staged")
+        if os.path.lexists(dst):
+            if ver in (link_version(c.current), link_version(c.previous)):
+                raise StepFailed("internal_error", f"releases/{ver} is the current or previous release", "staged")
+            shutil.rmtree(dst)  # root-owned leftover of an earlier attempt that failed after the rename
+        os.rename(src, dst)
+        after = os.lstat(dst)
+        if not stat.S_ISDIR(after.st_mode):  # swapped for a link or file between the check and the rename: never follow it
+            os.unlink(dst)
+            raise StepFailed("not_staged", "the staged release is not a plain directory", "staged")
+        if not os.path.isdir(os.path.join(dst, ".venv")):
+            raise StepFailed("not_staged", "the staged release has no virtualenv", "staged")
+        return dst
 
     def _trust(self):
         try:
@@ -662,7 +856,7 @@ class Updater:
         for src in (artifact, artifact + ".minisig"):
             dst = os.path.join(c.verified, os.path.basename(src))
             try:
-                fd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                fd = open_regular(src)
             except OSError as exc:
                 raise ocw_trust.TrustError("bad_artifact", f"cannot open {os.path.basename(src)}: {exc.strerror}")
             with os.fdopen(fd, "rb") as fin:
@@ -701,6 +895,7 @@ class Updater:
                              {"free_opt": free_opt, "free_data": free_data, "need_opt": need_opt, "need_data": need_data})
         waited = 0
         limit = 0 if c.fast else 600
+        self.quiesce()
         while snap.get("sync_running"):
             if waited >= limit:
                 raise StepFailed("sync_in_progress", "an archive sync is running; the upgrade waited 10 minutes and did not start", "preflight")
@@ -750,7 +945,7 @@ class Updater:
             # The work directory belongs to the application account: copy from a file descriptor opened without following
             # links (never rename a path the application could have swapped), into a fresh root-only file.
             try:
-                fd = os.open(work_file, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                fd = open_regular(work_file)
             except OSError as exc:
                 raise StepFailed("backup_failed", f"cannot open the backup copy: {exc.strerror}", "backup")
             with os.fdopen(fd, "rb") as fin:
@@ -795,23 +990,36 @@ class Updater:
         self.st["backup"] = record
 
     # --- nginx -------------------------------------------------------------------------------------
+    def _nginx_skip(self, why, step="preflight"):
+        """The server's nginx site cannot take this release's template. Unless the manifest says the new site is required,
+        that is not a reason to refuse the upgrade: leave nginx alone, say so in the journal and the audit log."""
+        self._nginx_baked = self._nginx_live = None
+        if (self.st.get("manifest") or {}).get("nginx_change_required"):
+            raise StepFailed("nginx_invalid", why, step)
+        log("WARN", f"nginx left unchanged: {why}")
+        self.audit("upgrade.step", {"step": "nginx_skipped", "detail": why[:300]})
+
     def nginx_prepare(self):
-        """Bake the release's template with this server's values (refuses a site with another layout)."""
+        """Bake the release's template with this server's values. A missing or differently laid out site is skipped with a
+        warning (the maintenance page then simply does not show), unless the manifest says the change is required."""
         import nginx_bake
         c = self.cfg
+        self._nginx_baked = self._nginx_live = None
         template = os.path.join(c.releases, self.st["version_to"], "server", "nginx-opa-secrets-wizard.conf")
         if os.path.islink(c.nginx_site) or (os.path.exists(c.nginx_site) and not os.path.isfile(c.nginx_site)):
-            raise StepFailed("nginx_invalid", f"{c.nginx_site} is a link or not a regular file: refusing to read or replace it", "preflight")
+            return self._nginx_skip(f"{c.nginx_site} is a link or not a regular file: not reading or replacing it")
+        if not os.path.exists(c.nginx_site):
+            return self._nginx_skip(f"there is no nginx site at {c.nginx_site}")
         try:
             with open(c.nginx_site, encoding="utf-8") as fh:
                 live = fh.read()
             with open(template, encoding="utf-8") as fh:
                 tpl = fh.read()
-        except OSError as exc:
-            raise StepFailed("nginx_invalid", f"cannot read the nginx files: {exc.strerror}", "preflight")
+        except (OSError, UnicodeDecodeError) as exc:
+            return self._nginx_skip(f"cannot read the nginx files: {getattr(exc, 'strerror', None) or exc}")
         baked, problems = nginx_bake.bake(live, tpl)
         if problems:
-            raise StepFailed("nginx_invalid", "the nginx site cannot take this release's template: " + "; ".join(problems), "preflight")
+            return self._nginx_skip("the nginx site cannot take this release's template: " + "; ".join(problems))
         self._nginx_baked = baked
         self._nginx_live = live
 
@@ -831,7 +1039,13 @@ class Updater:
         self._write_site(baked)
         rc, out = self.host.nginx_test()
         if rc != 0:
-            self.nginx_restore()
+            if not self.nginx_restore():
+                # `nginx -t` fails on the ORIGINAL site too: the test cannot run here (or nginx was already broken), so it
+                # says nothing about this release. Not the release's fault: no version is marked failed.
+                f = StepFailed("internal_error", "`nginx -t` fails on the original site as well, so it cannot judge this release: " + out[-300:],
+                               "restarting")
+                f.no_blame = True
+                raise f
             raise StepFailed("nginx_invalid", "the new nginx configuration failed `nginx -t`: " + out[-300:], "restarting")
         if not self.host.nginx_reload():
             self.nginx_restore()
@@ -1014,6 +1228,7 @@ class Updater:
         _cid[0] = req.get("correlation_id")
         try:
             self.validate_request(req, True)
+            self.remember_action_id(req.get("action_id"))
         except StepFailed as f:
             reject(self, str(req.get("correlation_id", "upg-00000000")), f.code, str(f))
             return "rejected"
@@ -1119,6 +1334,8 @@ class Updater:
                                             "started_at", "updated_at", "action_id", "seconds")}
         line["backup"] = (self.st.get("backup") or {}).get("path")
         line["bundle"] = (self.st.get("bundle") or {}).get("name")
+        b = self.st.get("backup") or {}
+        line["backup_size"], line["backup_integrity"] = b.get("size"), b.get("integrity")
         fd = os.open(self.cfg.history_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         with os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(line) + "\n")
@@ -1182,7 +1399,7 @@ class Updater:
         self.st.update(result="rolled_back", step="rolled_back", rolled_back_to=target, rollback_seconds=secs,
                        reason_code=(self.st.get("failure") or {}).get("reason_code") if failure else "operator")
         self.persist()
-        if failure is not None and self.st["version_to"]:
+        if failure is not None and self.st["version_to"] and not getattr(failure, "no_blame", False):
             self.record_failure(self.st["version_to"], self.st["reason_code"])
         self.make_bundle()
         self._history()
@@ -1220,12 +1437,19 @@ class Updater:
             cid = correlation_id or self.st.get("correlation_id")
             secrets = [v for k, v in c.env_values().items() if ocw_bundle.SENSITIVE_NAME.search(k)]
             entries = audit_entries_for(c, cid) if cid else []
-            red = ocw_bundle.Redactor(secret_values=secrets, include_hosts=include_hosts, env_names=ocw_bundle.collect_env_names(entries))
+            env_names = set(ocw_bundle.collect_env_names(entries))
+            try:  # the tenant / environment names the archive holds, so the application's own log lines can be scrubbed of them
+                env_names.update(self.host.db_tool(["snapshot", c.db_path()]).get("env_names") or [])
+            except (OSError, ocw_host.HostError):
+                pass
+            red = ocw_bundle.Redactor(secret_values=secrets, include_hosts=include_hosts, env_names=env_names)
             since = self.st.get("started_at")
             texts = {}
             names = list(dict.fromkeys(self.units() + ["ocw-upgrade"]))
             for u in names:
-                texts[f"journal-{u}.txt"] = self.host.journal(u, 500, since)
+                raw = self.host.journal(u, 500, since)
+                # the updater's own journal is ours and stays whole; the application's is filtered (WARN and above, or this run)
+                texts[f"journal-{u}.txt"] = raw if u == "ocw-upgrade" else ocw_bundle.filter_app_journal(raw, cid)
                 texts[f"status-{u}.txt"] = self.host.status_text(u)
             texts["journal-ocw-stage.txt"] = self.host.journal("ocw-stage@*", 500, since)
             rc, out = self.host.nginx_test()
@@ -1246,7 +1470,8 @@ class Updater:
     def _summary(self):
         c = self.cfg
         rc, ver = self.host.run(["systemctl", "--version"], 10)
-        staged = read_json(os.path.join(c.releases, str(self.st.get("version_to")), ".staged"), {}) or {}
+        ver_to = str(self.st.get("version_to"))
+        staged = (read_json(os.path.join(c.releases, ver_to, ".staged")) or read_json(os.path.join(c.staging, ver_to, ".staged")) or {})
         s = {k: self.st.get(k) for k in ("correlation_id", "action", "version_from", "version_to", "result", "reason_code", "failure",
                                          "failed_step", "error", "started_at", "updated_at", "seconds", "rollback_seconds",
                                          "steps_done", "health", "rollback_health", "schema_before", "schema_after", "manifest",
@@ -1292,7 +1517,7 @@ class Updater:
         os.makedirs(tmp, mode=0o755)
         for name, path in files.items():
             safe_copy(path, os.path.join(tmp, name), 0o755 if name == "ocw_activate.py" else 0o644)
-        rc, out = self.host.run([sys.executable, "-I", os.path.join(tmp, "ocw_activate.py"), "selftest"], 60)
+        rc, out = self.host.run([sys.executable, "-I", "-B", os.path.join(tmp, "ocw_activate.py"), "selftest"], 60)
         if rc != 0:
             shutil.rmtree(tmp, ignore_errors=True)
             log("WARN", "the new updater failed its self-test; keeping the current one: " + out[-200:])
@@ -1306,8 +1531,15 @@ class Updater:
         return "updated"
 
     def prune(self, keep_ver):
-        """Keep current, previous and the one newest other release; remove older release directories."""
+        """Keep current, previous and the one newest other release; remove older release directories (and any staging
+        directory of a version that is no longer newer than the one just installed)."""
         c = self.cfg
+        try:
+            for d in os.listdir(c.staging):
+                if _VER.match(d) and ocw_trust.version_tuple(d) <= ocw_trust.version_tuple(keep_ver):
+                    shutil.rmtree(os.path.join(c.staging, d), ignore_errors=True)
+        except OSError:
+            pass
         keep = {keep_ver, link_version(c.previous), link_version(c.current)}
         others = sorted((d for d in os.listdir(c.releases) if _VER.match(d) and d not in keep), key=ocw_trust.version_tuple, reverse=True)
         removed = []
@@ -1315,6 +1547,147 @@ class Updater:
             shutil.rmtree(os.path.join(c.releases, d), ignore_errors=True)
             removed.append(d)
         return removed
+
+    # --- requests from the web application (5.48.0) --------------------------------------------------------------
+    @staticmethod
+    def clean_actor(value):
+        """The requester as the application named them: advisory text for the audit trail, printable ASCII, bounded."""
+        return _ACTOR.sub("?", str(value or ""))[:120] or "web application"
+
+    def quiesce(self):
+        """Tell the application to start no new sync for ten minutes: a root-owned file it reads before every sync start
+        (nothing to call, nothing to authenticate). The preflight still waits for a running sync."""
+        try:
+            write_json_atomic(self.cfg.quiesce_path, {"until": iso(self.host.now() + QUIESCE_SECONDS), "correlation_id": _cid[0]})
+        except OSError as exc:
+            log("WARN", f"could not write the quiesce file: {exc.strerror}")
+
+    def unquiesce(self):
+        try:
+            os.unlink(self.cfg.quiesce_path)
+        except OSError:
+            pass
+
+    def rollback_allowed(self):
+        """The same rules as `ocw-updater rollback`: a previous release exists, and the last upgrade finished under 24 hours ago."""
+        c = self.cfg
+        cur, prev = installed_version(c), link_version(c.previous)
+        if not prev or prev == cur:
+            raise StepFailed("rollback_unavailable", "there is no previous release to roll back to")
+        st = read_json(c.state_path) or {}
+        done = parse_iso(st.get("updated_at"))
+        if st.get("result") == "completed" and done and self.host.now() - done > ROLLBACK_WINDOW:
+            raise StepFailed("rollback_unavailable", "the 24-hour rollback window after the last upgrade has passed")
+        if self.in_flight():
+            raise StepFailed("in_flight", "another upgrade is in progress")
+
+    def backup_files(self):
+        """[(name, size, mtime)] of the pre-upgrade copies, oldest first. Plain files only, matched by name."""
+        out = []
+        try:
+            names = os.listdir(self.cfg.backups)
+        except OSError:
+            return out
+        for n in names:
+            if not _BACKUP_NAME.match(n):
+                continue
+            try:
+                st = os.lstat(os.path.join(self.cfg.backups, n))
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                out.append((n, st.st_size, st.st_mtime))
+        return sorted(out, key=lambda t: (t[2], t[0]))
+
+    def publish_backups(self):
+        """upgrade/backups-status.json: what the Updates page shows as 'Pre-upgrade backups'. Names, sizes, dates, the integrity
+        result recorded when it was taken and the version it was taken before; no paths. The backup directory itself is root-only."""
+        info = {}
+        for h in self._history_lines():
+            if h.get("backup"):
+                info[os.path.basename(str(h["backup"]))] = h
+        rows = []
+        for n, size, mtime in self.backup_files():
+            h = info.get(n) or {}
+            rows.append({"name": n, "size": size, "taken_at": iso(mtime), "taken_before": h.get("version_to"),
+                         "integrity": h.get("backup_integrity")})
+        total = sum(r["size"] for r in rows)
+        write_json_atomic(self.cfg.backups_status, {"schema": 1, "updated_at": iso(self.host.now()), "backups": rows, "total_bytes": total})
+
+    def prune_backups(self, req, actor):
+        """Delete pre-upgrade copies the administrator chose (explicit names, or everything but the newest N). The newest copy
+        and the one the last upgrade took are never deleted: they are what `restore` needs."""
+        files = self.backup_files()
+        protected = {files[-1][0]} if files else set()
+        for h in reversed(self._history_lines()):
+            if h.get("action") == "apply" and h.get("backup"):
+                protected.add(os.path.basename(str(h["backup"])))
+                break
+        have = {n for n, _s, _m in files}
+        if req.get("names") is not None:
+            chosen = list(dict.fromkeys(req["names"]))
+            unknown = [n for n in chosen if n not in have]
+            if unknown:
+                raise StepFailed("prune_refused", f"{len(unknown)} of the named backups do not exist")
+        else:
+            chosen = [n for n, _s, _m in files[:-req["keep_last"]]] if len(files) > req["keep_last"] else []
+        refused = [n for n in chosen if n in protected]
+        if req.get("names") is not None and refused:
+            raise StepFailed("prune_refused", "the newest backup and the one the last upgrade took cannot be deleted (restore needs them)")
+        chosen = [n for n in chosen if n not in protected]
+        freed = 0
+        for n in chosen:
+            path = os.path.join(self.cfg.backups, n)
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                continue
+            freed += os.lstat(path).st_size
+            os.unlink(path)
+        self.publish_backups()
+        self.audit("upgrade.backups_pruned", {"deleted": chosen, "bytes_freed": freed, "kept": len(have) - len(chosen), "requested_by": actor})
+        return "backups_pruned"
+
+    def app_action(self, req):
+        """rollback / restore / clear_failure / bundle / prune_backups, asked for through the inbox. The application has checked the
+        administrator's step-up approval and the typed confirmation; the validation and the checks here are root's own."""
+        c = self.cfg
+        cid = str(req.get("correlation_id", "upg-00000000"))
+        _cid[0] = cid
+        action = req.get("action")
+        actor = self.clean_actor(req.get("actor"))
+        try:
+            self.validate_request(req, True)
+            self.remember_action_id(req.get("action_id"))
+            if action == "clear_failure":
+                f = self.failures()
+                cleared = sorted(f["versions"])
+                write_json_atomic(c.failures_path, {"versions": {}, "cleared_at": iso(self.host.now())})
+                self.st = {"correlation_id": cid}
+                self.audit("upgrade.clear_failure", {"cleared": cleared, "via": "web application", "requested_by": actor}, actor_email=actor)
+                self.st = None
+                return "failure_cleared"
+            if action == "bundle":
+                st = read_json(c.state_path) or {}
+                want = req.get("for_correlation_id") or st.get("correlation_id")
+                self.st = dict(st) if st.get("correlation_id") == want else {"correlation_id": want}
+                info = self.make_bundle(include_hosts=bool(req.get("include_hosts")), correlation_id=want)
+                if not info:
+                    raise StepFailed("internal_error", "could not build the support bundle")
+                return "bundle_created"
+            if action == "prune_backups":
+                self.st = {"correlation_id": cid}
+                try:
+                    return self.prune_backups(req, actor)
+                finally:
+                    self.st = None
+            if action == "rollback":
+                self.rollback_allowed()
+                return self.rollback_action(actor)
+            if action == "restore":
+                return self.restore_action(actor)
+        except StepFailed as f:
+            reject(self, cid, f.code, str(f))
+            return "rejected"
+        return "rejected"
 
     # --- resume after a crash / power loss ------------------------------------------------------------------------------
     def resume(self):
@@ -1501,23 +1874,38 @@ def process_directory(up, directory, due_only=False):
     except OSError:
         return results
     for name in names:
-        if not name.endswith(".json"):
-            continue
         path = os.path.join(directory, name)
+        if not name.endswith(".json"):
+            # anything we will not process leaves the directory: a stray entry would otherwise keep the path unit
+            # (DirectoryNotEmpty=) starting this service in a loop
+            log("WARN", f"unexpected entry {name[:60]!r} in {os.path.basename(os.path.dirname(directory)) or directory}: moved aside")
+            _discard(path, cfg)
+            continue
         try:
             req = read_request_file(cfg, path, up.uid)
         except (StepFailed, OSError) as exc:
             reject(up, name[:-5], getattr(exc, "code", "request_invalid"), str(exc), name)
             _discard(path, cfg)
             continue
-        if due_only and req.get("not_before"):
+        if due_only and isinstance(req, dict) and req.get("not_before"):
             nb = parse_iso(req["not_before"])
             if nb is None or nb > up.host.now():
                 continue
         _discard(path, cfg)
+        if not isinstance(req, dict):  # valid JSON, wrong shape (a list, a number): refuse it, never crash the run
+            reject(up, name[:-5], "request_invalid", "not a request object", name)
+            continue
         req["_file"] = name
         up.t0 = up.host.now()
-        results.append(up.apply(req))
+        if due_only or req.get("action") == "apply":
+            if not due_only and req.get("not_before") is not None:  # the inbox means "now"; scheduling is the application's or the CLI's
+                reject(up, str(req.get("correlation_id", name[:-5])), "request_invalid", "an inbox request cannot carry a start time", name)
+                continue
+            results.append(up.apply(req))
+        elif req.get("action") in APP_ACTIONS:
+            results.append(up.app_action(req))
+        else:
+            reject(up, str(req.get("correlation_id", name[:-5])), "request_invalid", "unsupported request", name)
         up.st = None
     return results
 
@@ -1558,11 +1946,7 @@ def ingest_revocations(up):
             continue
         for n in names:
             try:
-                fd = os.open(os.path.join(d, n), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-                try:
-                    raw = os.read(fd, ocw_trust.MAX_JSON + 1)
-                finally:
-                    os.close(fd)
+                raw = read_regular(os.path.join(d, n), ocw_trust.MAX_JSON + 1)
             except OSError:
                 continue
             serial = ocw_trust.revocation_serial(raw)
@@ -1596,6 +1980,10 @@ def run(cfg, host):
         up.st = None
         process_directory(up, cfg.requests)
         process_directory(up, cfg.schedule, due_only=True)
+        try:
+            up.publish_backups()
+        except OSError as exc:
+            log("WARN", f"could not publish the backups status: {exc.strerror}")
         return 0
     finally:
         os.close(fd)

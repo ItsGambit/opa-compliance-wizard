@@ -79,11 +79,41 @@ done
 say() { printf '\n==> %s\n' "$*"; }
 ok() { PASS=$((PASS + 1)); printf '  ok    %s\n' "$*"; }
 bad() { FAIL=$((FAIL + 1)); FAILED_NAMES+=("$*"); printf '  FAIL  %s\n' "$*"; }
-check() { # check "description" command...
-  local d="$1"; shift
-  if "$@" >/dev/null 2>&1; then ok "$d"; else bad "$d"; fi
+DIAG_N=0
+diag() { # what to look at when a check failed (printed, and kept in $WORK/diag-N.txt): the updater's own view of the run
+  DIAG_N=$((DIAG_N + 1))
+  [ "$DIAG_N" -le 8 ] || return 0
+  {
+    echo "---- diagnostics #$DIAG_N ----"
+    echo "-- ocw-updater status --json"; /usr/local/bin/ocw-updater status --json 2>&1 | tail -n 60
+    echo "-- state.json"; cat "$DATA/upgrade/state.json" 2>&1 | tail -n 60
+    echo "-- journal: ocw-upgrade.service (last 50)"; journalctl -u ocw-upgrade.service --no-pager -o cat -n 50 2>&1
+    echo "-- journal: opa-compliance-wizard (last 50)"; journalctl -u opa-compliance-wizard --no-pager -o cat -n 50 2>&1
+    echo "-- ls releases / staging"; ls -la "$OPT/releases" "$OPT/staging" 2>&1
+  } 2>&1 | tee "$WORK/diag-$DIAG_N.txt" | sed 's/^/        /'
 }
-check_not() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then bad "$d"; else ok "$d"; fi; }
+check() { # check "description" command...   (on failure: the exit status, the command's output tail, and the diagnostics above)
+  local d="$1" out rc
+  shift
+  out="$("$@" 2>&1)" && rc=0 || rc=$?
+  if [ "$rc" -eq 0 ]; then ok "$d"; else
+    bad "$d"
+    printf '        exit status %s; command: %s\n' "$rc" "$*"
+    printf '%s\n' "$out" | tail -n 15 | sed 's/^/        | /'
+    diag
+  fi
+}
+check_not() {
+  local d="$1" out rc
+  shift
+  out="$("$@" 2>&1)" && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ]; then ok "$d"; else
+    bad "$d"
+    printf '        unexpectedly succeeded; command: %s\n' "$*"
+    printf '%s\n' "$out" | tail -n 15 | sed 's/^/        | /'
+    diag
+  fi
+}
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -104,13 +134,19 @@ cleanup() {
   rm -f /etc/systemd/system/{opa-compliance-wizard,opa-auth-gate,ocw-stage@,ocw-upgrade,ocw-upgrade-due}.service \
     /etc/systemd/system/ocw-upgrade.path /etc/systemd/system/ocw-upgrade-due.timer
   rm -rf /etc/systemd/system/ocw-upgrade.service.d
+  rm -f /etc/ocw-updater-test-mode
   systemctl daemon-reload
   rm -f /etc/nginx/sites-enabled/opa-secrets-wizard "$NGINX_SITE" /etc/nginx/ssl/opa-secrets-wizard.crt /etc/nginx/ssl/opa-secrets-wizard.key
   systemctl reload nginx 2>/dev/null
   rm -rf "$OPT" "$DATA" /var/lib/ocw-updater /var/cache/ocw-updater /opt/ocw-vm-test
   rm -f /usr/local/bin/ocw-updater "$ENV_FILE" /etc/ocw-updater.env "$ENV_FILE".bak*
   loginctl disable-linger "$TEST_USER" 2>/dev/null
-  userdel -r "$TEST_USER" 2>/dev/null
+  # The account's systemd user manager keeps running briefly after linger is off; userdel refuses while it does.
+  loginctl terminate-user "$TEST_USER" 2>/dev/null
+  for _ in $(seq 1 20); do pgrep -u "$TEST_USER" >/dev/null 2>&1 || break; sleep 0.5; done
+  if id "$TEST_USER" >/dev/null 2>&1 && ! userdel -r "$TEST_USER" 2>/dev/null; then
+    echo "WARNING: could not remove the $TEST_USER account; remove it with: sudo userdel -r $TEST_USER" >&2
+  fi
   userdel ocw-updater 2>/dev/null
   rm -rf "$WORK"
   echo "clean."
@@ -171,6 +207,11 @@ python3 "$CHECKOUT/tests/integration/make_test_release.py" build "$CHECKOUT" "$K
 python3 "$CHECKOUT/tests/integration/make_test_release.py" build "$CHECKOUT" "$KEYS" "$REL" 98.0.5
 python3 "$CHECKOUT/tests/integration/make_test_release.py" build "$CHECKOUT" "$KEYS" "$REL" 98.0.6
 python3 "$CHECKOUT/tests/integration/make_test_release.py" build "$CHECKOUT" "$KEYS" "$REL" 98.0.7
+python3 "$CHECKOUT/tests/integration/make_test_release.py" build "$CHECKOUT" "$KEYS" "$REL" 98.0.8 --template-comment
+python3 "$CHECKOUT/tests/integration/make_test_release.py" build "$CHECKOUT" "$KEYS" "$REL" 98.0.9
+python3 "$CHECKOUT/tests/integration/make_test_release.py" build "$CHECKOUT" "$KEYS" "$REL" 98.0.10 --break unhealthy
+python3 "$CHECKOUT/tests/integration/make_test_release.py" build "$CHECKOUT" "$KEYS" "$REL" 98.0.11
+python3 "$CHECKOUT/tests/integration/make_test_release.py" revoke "$KEYS" "$REL/revocation.json"
 umask 022
 
 say "1. A legacy in-home install (98.0.1) with seeded synthetic data"
@@ -282,16 +323,27 @@ poll_site() { # poll_site <seconds> <outfile>: record the HTTP status of /health
   done
 }
 
+watch_page() { # watch_page <seconds>: did the updater ever create the maintenance file? (separates "not written" from "not served")
+  local end=$((SECONDS + $1))
+  rm -f "$WORK/page-seen"
+  while [ $SECONDS -lt $end ]; do [ ! -e "$OPT/maintenance/active.html" ] || cp "$OPT/maintenance/active.html" "$WORK/page-seen" 2>/dev/null; sleep 0.05; done
+}
+
 say "3. A good signed release (98.0.2), with the site polled during the switch"
+check "the live nginx site carries the maintenance-page block" grep -q ocw_maintenance_page "$NGINX_SITE"
 "$UPDATER_CMD" stage "$REL/ocw-98.0.2.tar.gz" > "$WORK/stage2.txt" 2>&1 || { cat "$WORK/stage2.txt"; bad "stage 98.0.2"; }
-check "98.0.2 is staged and its tree is root-owned" bash -c "test -f $OPT/releases/98.0.2/.staged && test \"\$(stat -c %U $OPT/releases/98.0.2/create_secret_folders.py)\" = root"
+check "98.0.2 is staged under staging/, still owned by the staging account, and not yet in releases/" bash -c "test -f $OPT/staging/98.0.2/.staged && test \"\$(stat -c %U $OPT/staging/98.0.2/create_secret_folders.py)\" = ocw-updater && test ! -e $OPT/releases/98.0.2"
 poll_site 150 "$WORK/poll2.txt" &
 POLL=$!
+watch_page 150 &
+WATCH=$!
 "$UPDATER_CMD" apply 98.0.2 --confirm-text 98.0.2 > "$WORK/apply2.txt" 2>&1 && RC=0 || RC=$?
 sleep 3
-kill "$POLL" 2>/dev/null || true
-wait "$POLL" 2>/dev/null || true
+kill "$POLL" "$WATCH" 2>/dev/null || true
+wait "$POLL" "$WATCH" 2>/dev/null || true
+cat "$WORK/apply2.txt" | sed 's/^/        apply: /'
 check "apply 98.0.2 exits 0" test "$RC" -eq 0
+check "the updater wrote the maintenance page while switching" test -s "$WORK/page-seen"
 check "98.0.2 is live" wait_version 98.0.2
 check "the maintenance page (503 with the 'Upgrading' text) was served while switching" grep -q '^503 [1-9]' "$WORK/poll2.txt"
 check "the page contains no version number" bash -c "test -s $WORK/maintenance-page.html && ! grep -qE '[0-9]+\\.[0-9]+\\.[0-9]+' $WORK/maintenance-page.html"
@@ -302,17 +354,43 @@ check "state.json says completed" bash -c "grep -q '\"result\": \"completed\"' $
 check "audit log has upgrade.completed with a correlation id" bash -c "grep -q 'upgrade.completed' $DATA/audit_log.jsonl && grep -q 'upg-' $DATA/audit_log.jsonl"
 check "previous points at 98.0.1" test "$(readlink "$OPT/previous")" = "releases/98.0.1"
 
+say "3b. releases/ is root-only: the staging account cannot swap or add a release (the guarantee that nothing changes after the check)"
+check "releases/ is root:root 0755" bash -c "test \"\$(stat -c '%U:%G %a' $OPT/releases)\" = 'root:root 755'"
+check "staging/ belongs to the staging account" bash -c "test \"\$(stat -c %U $OPT/staging)\" = ocw-updater"
+check "the applied tree is root-owned" bash -c "test \"\$(stat -c %U $OPT/releases/98.0.2/create_secret_folders.py)\" = root"
+check_not "the staging account cannot move the current release away" runuser -u ocw-updater -- mv "$OPT/releases/98.0.2" /tmp/ocw-vm-moved
+check_not "the staging account cannot add an entry to releases/" runuser -u ocw-updater -- touch "$OPT/releases/x"
+check_not "the staging account cannot add a file to a release" runuser -u ocw-updater -- touch "$OPT/releases/98.0.2/x"
+check "no release entry is setuid, setgid or group/other-writable" bash -c "test -z \"\$(find $OPT/releases ! -type l -perm /6022)\""
+check "no link under a release leaves it (except .venv/bin/python*)" python3 -c '
+import os, sys
+bad = []
+for rel in os.listdir(sys.argv[1]):
+    root = os.path.realpath(os.path.join(sys.argv[1], rel))
+    for base, dirs, files in os.walk(root):
+        for n in dirs + files:
+            p = os.path.join(base, n)
+            if os.path.islink(p):
+                t = os.path.realpath(p)
+                ok = t == root or t.startswith(root + os.sep) or (os.path.relpath(p, root).startswith(".venv/bin/python") and t.startswith("/usr/"))
+                if not ok:
+                    bad.append(p + " -> " + t)
+print("\n".join(bad))
+sys.exit(1 if bad else 0)' "$OPT/releases"
+check "the audit lock file belongs to the application account" bash -c "test \"\$(stat -c %U $DATA/.audit_log.jsonl.lock)\" = $TEST_USER"
+
 say "4. A release whose application crashes at start (98.0.3): automatic rollback and a redacted bundle"
 "$UPDATER_CMD" stage "$REL/ocw-98.0.3.tar.gz" >/dev/null 2>&1 || bad "stage 98.0.3"
 "$UPDATER_CMD" apply 98.0.3 --confirm-text 98.0.3 > "$WORK/apply3.txt" 2>&1 && RC=0 || RC=$?
 check "apply 98.0.3 exits 3 (rolled back)" test "$RC" -eq 3
 check "98.0.2 is serving again" wait_version 98.0.2
-BUNDLE="$(ls -1 "$DATA"/upgrade/bundles/ocw-support-98.0.2-to-98.0.3-*.tar.gz 2>/dev/null | head -1)"
+BUNDLE="$(ls -1 "$DATA"/upgrade/bundles/ocw-support-98.0.2-to-98.0.3-*.tar.gz 2>/dev/null | head -1 || true)"
 check "a support bundle was written" test -n "$BUNDLE"
 if [ -n "$BUNDLE" ]; then
   mkdir -p "$WORK/bundle" && tar -xzf "$BUNDLE" -C "$WORK/bundle"
   check "the bundle holds none of the synthetic secrets" bash -c "! grep -rqE '$PROXY_SECRET|$KEYRING_PW' $WORK/bundle"
   check "the bundle holds no e-mail address, host name or environment name" bash -c "! grep -rqE 'vm-test-admin@example.com|$SITE_NAME|$FAKE_ENV|vm-test-team' $WORK/bundle"
+  check "nginx -t ran inside the root unit's sandbox and passed (nginx-test.txt starts with exit 0)" bash -c "head -1 $WORK/bundle/nginx-test.txt | grep -qx 'exit 0'"
   check "the bundle is under 5 MB" test "$(stat -c %s "$BUNDLE")" -lt 5242880
 fi
 "$UPDATER_CMD" stage "$REL/ocw-98.0.3.tar.gz" >/dev/null 2>&1 || true
@@ -324,16 +402,17 @@ say "5. A stranger's signature, and a tampered staged tree"
 "$UPDATER_CMD" stage "$REL/ocw-98.0.4.tar.gz" >/dev/null 2>&1 && RC=0 || RC=$?
 check "a release signed by an unknown key is refused (exit 2)" test "$RC" -eq 2
 "$UPDATER_CMD" stage "$REL/ocw-98.0.5.tar.gz" >/dev/null 2>&1
-chmod u+w "$OPT/releases/98.0.5/requirements.lock" 2>/dev/null || true
-echo "# tampered" >> "$OPT/releases/98.0.5/requirements.lock" 2>/dev/null || true
+echo "# tampered" >> "$OPT/staging/98.0.5/requirements.lock"
 "$UPDATER_CMD" apply 98.0.5 --confirm-text 98.0.5 > "$WORK/apply5.txt" 2>&1 && RC=0 || RC=$?
 check "a modified staged tree is refused by root (exit 2 or 3, never 0)" test "$RC" -ne 0
 check "the running version did not change" wait_version 98.0.2
 
 say "6. Power loss: killed at a step boundary, then resumed"
-rm -rf "$OPT/releases/98.0.5" 2>/dev/null || true
+rm -rf "$OPT/staging/98.0.5" "$OPT/releases/98.0.5" 2>/dev/null || true
 "$UPDATER_CMD" stage "$REL/ocw-98.0.6.tar.gz" >/dev/null 2>&1 || bad "stage 98.0.6"
 mkdir -p /etc/systemd/system/ocw-upgrade.service.d
+# the root updater honours test-mode variables only when this root-owned marker exists (removed again below)
+touch /etc/ocw-updater-test-mode && chmod 644 /etc/ocw-updater-test-mode
 printf '[Service]\nEnvironment=OCW_TEST_MODE=1\nEnvironment=OCW_UPDATER_FAULT=kill_at:restarting\n' > /etc/systemd/system/ocw-upgrade.service.d/fault.conf
 systemctl daemon-reload
 "$UPDATER_CMD" apply 98.0.6 --confirm-text 98.0.6 > "$WORK/apply6.txt" 2>&1 || true
@@ -342,6 +421,7 @@ check "the CLI told the operator the updater stopped (exit 4)" bash -c "grep -q 
 check "the updater was killed mid-flight (state has no result)" bash -c "grep -q '\"result\": null' $DATA/upgrade/state.json"
 check "current already points at 98.0.6 (switched before the kill)" test "$(readlink "$OPT/current")" = "releases/98.0.6"
 rm -rf /etc/systemd/system/ocw-upgrade.service.d
+rm -f /etc/ocw-updater-test-mode
 systemctl daemon-reload
 systemctl start ocw-upgrade.service
 check "the resume completed the upgrade" wait_version 98.0.6
@@ -368,9 +448,68 @@ check "the due timer is enabled while an upgrade is scheduled" systemctl is-enab
 wait_version_for() { for _ in $(seq 1 "$2"); do curl -sf http://127.0.0.1:8766/api/version 2>/dev/null | grep -q "\"$1\"" && return 0; sleep 2; done; return 1; }
 check "the scheduled upgrade ran from the timer" wait_version_for 98.0.7 150
 
+say "7b. A release whose nginx template differs (a comment): nginx -t must work inside the root unit"
+"$UPDATER_CMD" stage "$REL/ocw-98.0.8.tar.gz" > "$WORK/stage8.txt" 2>&1 || bad "stage 98.0.8"
+"$UPDATER_CMD" apply 98.0.8 --confirm-text 98.0.8 > "$WORK/apply8.txt" 2>&1 && RC=0 || RC=$?
+cat "$WORK/apply8.txt" | sed 's/^/        apply: /'
+check "apply of the changed-template release exits 0" test "$RC" -eq 0
+check "the live nginx site now carries the new template's comment" grep -q "vm test: template changed" "$NGINX_SITE"
+check "nginx still passes its own test" nginx -t
+check "the journal shows no read-only or permission errors from nginx -t" bash -c "! journalctl -u ocw-upgrade.service --no-pager -o cat 2>/dev/null | grep -qE 'Read-only file system|nginx.*(Permission denied|Operation not permitted)'"
+check "the site is still served" bash -c "curl -sk --resolve $SITE_NAME:443:127.0.0.1 https://$SITE_NAME/healthz | grep -q status"
+
+say "7c. Hostile accounts: the application account and the staging account plant links, pipes and strays"
+runuser -u "$TEST_USER" -- bash -c "mkfifo $DATA/upgrade/revocations/pipe.json; ln -s /etc/hostname $DATA/upgrade/revocations/9.json; touch $DATA/upgrade/inbox/requests/x.txt; mkdir $DATA/upgrade/inbox/requests/adir"
+HOSTNAME_SUM="$(sha256sum /etc/hostname | cut -d' ' -f1)"
+TRUST_SUM="$(sha256sum $OPT/updater/trust.json | cut -d' ' -f1)"
+T0=$SECONDS
+timeout 60 systemctl start ocw-upgrade.service && RC=0 || RC=$?
+check "the root service finished within 60 s with stray entries present" bash -c "test $RC -eq 0 && test $((SECONDS - T0)) -lt 60"
+check "/etc/hostname is unchanged" bash -c "test \"\$(sha256sum /etc/hostname | cut -d' ' -f1)\" = $HOSTNAME_SUM"
+check "the stray inbox entries were moved away" bash -c "test -z \"\$(ls -A $DATA/upgrade/inbox/requests)\""
+sleep 3
+check "the service is not in a start loop (not failed)" bash -c "! systemctl is-failed --quiet ocw-upgrade.service"
+runuser -u ocw-updater -- bash -c "ln -s $OPT/updater/trust.json /var/lib/ocw-updater/artifacts/ocw-98.0.9.tar.gz; ln -s $OPT/updater/trust.json /var/lib/ocw-updater/artifacts/ocw-98.0.9.tar.gz.minisig"
+"$UPDATER_CMD" stage "$REL/ocw-98.0.9.tar.gz" > "$WORK/stage9.txt" 2>&1 || true
+check "trust.json is unchanged and still root-owned after staging past planted links" bash -c "test \"\$(sha256sum $OPT/updater/trust.json | cut -d' ' -f1)\" = $TRUST_SUM && test \"\$(stat -c %U $OPT/updater/trust.json)\" = root"
+runuser -u ocw-updater -- bash -c "rm -f /var/lib/ocw-updater/artifacts/ocw-98.0.9.tar.gz*; mv /var/lib/ocw-updater/artifacts /var/lib/ocw-updater/artifacts.real; ln -s $OPT/updater /var/lib/ocw-updater/artifacts"
+"$UPDATER_CMD" stage "$REL/ocw-98.0.9.tar.gz" > "$WORK/stage9b.txt" 2>&1 || true
+check "the updater directory was not chowned or filled through a replaced artifacts link" bash -c "test \"\$(stat -c %U $OPT/updater)\" = root && test \"\$(stat -c %U $OPT/updater/trust.json)\" = root && ! ls $OPT/updater/*.tar.gz >/dev/null 2>&1"
+rm -f /var/lib/ocw-updater/artifacts
+mv /var/lib/ocw-updater/artifacts.real /var/lib/ocw-updater/artifacts
+rm -rf "$OPT/staging/98.0.9" "$OPT/handoff"/* 2>/dev/null || true
+
+say "7d. failed_needs_operator blocks a different version until clear-failure"
+"$UPDATER_CMD" clear-failure >/dev/null 2>&1 || true
+touch /etc/ocw-updater-test-mode && chmod 644 /etc/ocw-updater-test-mode
+mkdir -p /etc/systemd/system/ocw-upgrade.service.d
+printf '[Service]\nEnvironment=OCW_TEST_MODE=1\nEnvironment=OCW_UPDATER_FAULT=rollback_fail\n' > /etc/systemd/system/ocw-upgrade.service.d/fault.conf
+systemctl daemon-reload
+"$UPDATER_CMD" stage "$REL/ocw-98.0.10.tar.gz" >/dev/null 2>&1 || bad "stage 98.0.10"
+"$UPDATER_CMD" apply 98.0.10 --confirm-text 98.0.10 > "$WORK/apply10.txt" 2>&1 && RC=0 || RC=$?
+check "the unhealthy release with a failing rollback exits 4 (operator needed)" test "$RC" -eq 4
+rm -rf /etc/systemd/system/ocw-upgrade.service.d
+rm -f /etc/ocw-updater-test-mode
+systemctl daemon-reload
+"$UPDATER_CMD" stage "$REL/ocw-98.0.11.tar.gz" >/dev/null 2>&1 || bad "stage 98.0.11"
+"$UPDATER_CMD" apply 98.0.11 --confirm-text 98.0.11 > "$WORK/apply11.txt" 2>&1 && RC=0 || RC=$?
+check "another version is refused with failed_before (exit 2)" bash -c "test $RC -eq 2 && grep -q failed_before $WORK/apply11.txt"
+check "clear-failure lets it through" "$UPDATER_CMD" clear-failure
+"$UPDATER_CMD" apply 98.0.11 --confirm-text 98.0.11 > "$WORK/apply11b.txt" 2>&1 && RC=0 || RC=$?
+check "98.0.11 applies after clear-failure" test "$RC" -eq 0
+
+say "7e. A revoked key: a back-dated release by the revoked key is refused, and the revocation file is not written anywhere the application owns"
+"$UPDATER_CMD" trust apply "$REL/revocation.json" > "$WORK/trustapply.txt" 2>&1 && RC=0 || RC=$?
+check "trust apply of the test revocation succeeds" test "$RC" -eq 0
+"$UPDATER_CMD" stage "$REL/ocw-98.0.9.tar.gz" > "$WORK/stage9c.txt" 2>&1 && RC=0 || RC=$?
+check "a release signed by the revoked key (with an old timestamp) is refused (exit 2)" test "$RC" -eq 2
+check "the refusal says the key is revoked" bash -c "grep -qi 'revoked' $WORK/stage9c.txt"
+check "the applied revocation was not copied into the application's directory" test ! -e "$DATA/upgrade/revocations/1.json"
+
 say "8. The root unit's sandbox (for tightening CapabilityBoundingSet)"
-systemctl show ocw-upgrade.service -p CapabilityBoundingSet -p ProtectSystem -p IPAddressDeny > "$WORK/sandbox.txt" || true
+systemctl show ocw-upgrade.service -p CapabilityBoundingSet -p ProtectSystem -p IPAddressDeny -p IPAddressAllow > "$WORK/sandbox.txt" || true
 cat "$WORK/sandbox.txt"
+check "the sandbox allows nginx -t to bind and the updater to kill a child" bash -c "grep -qi cap_net_bind_service $WORK/sandbox.txt && grep -qi cap_kill $WORK/sandbox.txt"
 check "no permission errors in the updater's journal" bash -c "! journalctl -u ocw-upgrade.service --no-pager 2>/dev/null | grep -qiE 'permission denied|operation not permitted'"
 journalctl -u 'ocw-upgrade.service' -u 'ocw-stage@*' --no-pager -o cat 2>/dev/null | tail -n 40 > "$WORK/journal-tail.txt" || true
 

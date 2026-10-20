@@ -132,7 +132,7 @@ def read_bundle(name):
 
 
 def default_data():
-    return {"settings": {"enabled": None, "share_version": False, "manual_only": False, "channel": "stable"},
+    return {"settings": {"enabled": None, "share_version": False, "manual_only": False, "second_approval": False, "channel": "stable"},
             "state": {"latest_version": None, "published_at": None, "release_url": None, "signed_artifact": None,
                       "size": None, "notes_title": None, "notes": None, "last_check_by": None,
                       "last_check_at": None, "last_status": None, "last_code": None, "next_check_at": None,
@@ -162,6 +162,7 @@ def load():
     data["settings"]["manual_only"] = data["settings"]["manual_only"] is True
     if data["settings"]["channel"] not in CHANNELS:
         data["settings"]["channel"] = "stable"
+    data["settings"]["second_approval"] = data["settings"]["second_approval"] is True
     return data
 
 
@@ -219,10 +220,16 @@ def revocation_base():
     return base if base.endswith("/") else base + "/"
 
 
-def revocation_sources():
+def revocation_sources(applied_serial=None):
     """[(name, url)]: the revocation.json asset of the project's `revocation`
-    release, and an optional owner-controlled static URL (OPA_REVOCATION_URL)."""
+    release, the asset of a per-serial release `revocation-<next serial>` (GitHub's
+    immutable releases allow one publication per tag, so a second revocation cannot
+    reuse the first tag), and an optional owner-controlled static URL
+    (OPA_REVOCATION_URL)."""
     sources = [("release_assets", revocation_base() + keylib.REVOCATION_FILE_NAME)]
+    base = revocation_base()
+    if applied_serial is not None and base.endswith("/revocation/"):
+        sources.append(("release_assets_next", f"{base[:-len('revocation/')]}revocation-{int(applied_serial) + 1}/{keylib.REVOCATION_FILE_NAME}"))
     static = os.environ.get(REVOCATION_URL_ENV)
     if static:
         sources.append(("static_url", static))
@@ -277,7 +284,7 @@ def status(data, installed_version):
         "installed_version": installed_version,
         "check": {"enabled": enabled, "source": source, "env_locked": switch is not None,
                   "env_invalid_value": bad, "prompt_needed": data["settings"]["enabled"] is None and switch is None,
-                  "share_version": data["settings"]["share_version"], "mirror": bool(os.environ.get(API_URL_ENV)),
+                  "share_version": data["settings"]["share_version"], "second_approval": data["settings"]["second_approval"], "mirror": bool(os.environ.get(API_URL_ENV)),
                   "frequency": frequency, "url": api_url(),
                   "channel": effective_channel(data)[0], "channel_source": effective_channel(data)[1]},
         "latest": latest,
@@ -320,7 +327,7 @@ def _recent_revocation(kl):
     return last
 
 
-def set_settings(enabled=None, share_version=None, manual_only=None, channel=None):
+def set_settings(enabled=None, share_version=None, manual_only=None, channel=None, second_approval=None):
     """Returns the changes {name: [old, new]} (empty if nothing changed)."""
     with _lock:
         data = load()
@@ -340,6 +347,9 @@ def set_settings(enabled=None, share_version=None, manual_only=None, channel=Non
             st = data["state"]   # what was learned on the other channel is not valid on this one
             st["etag"], st["channel"], st["next_check_at"] = None, None, None
             _clear_latest(st)
+        if second_approval is not None and second_approval != data["settings"]["second_approval"]:
+            changes["second_approval"] = [data["settings"]["second_approval"], second_approval]
+            data["settings"]["second_approval"] = second_approval
         if changes:
             if enabled is True:  # a fresh answer to "check now?" -> do not wait up to a day
                 data["state"]["next_check_at"] = None
@@ -350,7 +360,7 @@ def set_settings(enabled=None, share_version=None, manual_only=None, channel=Non
 FREQUENCIES = {"daily": (True, False), "manual": (True, True), "off": (False, False)}
 
 
-def change_settings(enabled, share_version, installed_version, audit, frequency=None, channel=None):
+def change_settings(enabled, share_version, installed_version, audit, frequency=None, channel=None, second_approval=None):
     """The one settings change used by the web route and the CLI (same rules,
     same audit event). `audit(action, details)` records who did it. Returns
     (http_status, body)."""
@@ -364,11 +374,11 @@ def change_settings(enabled, share_version, installed_version, audit, frequency=
     if channel is not None and effective_channel(load())[1] == "env" and channel != effective_channel(load())[0]:
         return 409, {"error": "The release channel is fixed by OPA_UPDATE_CHANNEL in this server's environment, which always "
                               "wins. Remove that setting (and restart) to change it here.", "reason": "env_locked"}
-    changes = set_settings(enabled, share_version, manual_only, channel)
+    changes = set_settings(enabled, share_version, manual_only, channel, second_approval)
     if changes:
         now_settings = load()["settings"]
         shown = "off" if now_settings["enabled"] is False else ("manual" if now_settings["manual_only"] else "daily") if now_settings["enabled"] else "unset"
-        audit("upgrade.settings", {"frequency": shown, "share_version": now_settings["share_version"], "channel": now_settings["channel"], "changes": changes,
+        audit("upgrade.settings", {"frequency": shown, "share_version": now_settings["share_version"], "channel": now_settings["channel"], "second_approval": now_settings["second_approval"], "changes": changes,
                                    "correlation_id": _engine().CORRELATION_ID.get()})
         if enabled is True and not manual_only and switch != "off":
             kick(installed_version)
@@ -382,17 +392,18 @@ def apply_settings_request(payload, installed_version, audit):
     if error:
         return 400, {"error": error}
     return change_settings(payload.get("enabled"), payload.get("share_version"), installed_version, audit, payload.get("frequency"),
-                           payload.get("channel"))
+                           payload.get("channel"), payload.get("second_approval"))
 
 
 def validate_settings_payload(payload):
     """None if the body is acceptable, else a message."""
-    allowed = {"enabled", "share_version", "frequency", "channel"}
+    allowed = {"enabled", "share_version", "frequency", "channel", "second_approval"}
     if not isinstance(payload, dict) or not payload or set(payload) - allowed:
-        return 'Send {"frequency": "daily"|"manual"|"off"}, {"share_version": true|false} and/or {"channel": "stable"|"prerelease"}.'
+        return ('Send {"frequency": "daily"|"manual"|"off"}, {"share_version": true|false}, {"channel": "stable"|"prerelease"} '
+                'and/or {"second_approval": true|false}.')
     if "frequency" in payload and ("enabled" in payload or payload["frequency"] not in FREQUENCIES):
         return 'frequency must be "daily", "manual" or "off" (and cannot be combined with enabled).'
-    for key in ("enabled", "share_version"):
+    for key in ("enabled", "share_version", "second_approval"):
         if key in payload and not isinstance(payload[key], bool):
             return f"{key} must be true or false."
     if "channel" in payload and payload["channel"] not in CHANNELS:
@@ -422,7 +433,11 @@ def _revocation_step(st, installed_user_agent):
     of short outcome strings (one per source) for the audit row."""
     allowed = _allowed_hosts()
     outcomes = []
-    for name, url in revocation_sources():
+    try:
+        serial = keylib.effective_key_list()["serial"]
+    except keylib.KeyListError:
+        serial = None
+    for name, url in revocation_sources(serial):
         got = check.fetch(url, allowed, st["revocation_etags"].get(name), installed_user_agent,
                           max_bytes=keylib.MAX_JSON_BYTES, accept="application/octet-stream")
         if got.status == "not_modified":

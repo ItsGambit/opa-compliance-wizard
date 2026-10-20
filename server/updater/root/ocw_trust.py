@@ -137,11 +137,27 @@ def load_trust(path):
             _ts(r.get("revoked_at"))
             if r.get("last_good_version") is not None:
                 version_tuple(r["last_good_version"])
-            revoked.append({"key_id": r["key_id"], "revoked_at": r["revoked_at"], "last_good_version": r.get("last_good_version")})
+            rec = {"key_id": r["key_id"], "revoked_at": r["revoked_at"], "last_good_version": r.get("last_good_version")}
+            if r.get("known_good") is not None:
+                rec["known_good"] = _check_known_good(r["known_good"])
+            revoked.append(rec)
     except (ValueError, UnicodeDecodeError, TrustError) as exc:
         raise TrustError("bad_trust", f"{path} is damaged ({exc}); restore it from a release's server/release_keys.json "
                                       "with `ocw-updater trust seed --force` and re-apply any published revocation")
     return {"schema": SCHEMA, "serial": obj["serial"], "keys": keys, "revoked": revoked}
+
+
+def _check_known_good(kg):
+    """{version: sha256 of the release tarball} pinned by a revocation, or None."""
+    if kg is None:
+        return None
+    if not isinstance(kg, dict) or len(kg) > 200:
+        raise TrustError("bad_revocation", "known_good must be a short map of version to sha256")
+    for v, d in kg.items():
+        version_tuple(v)
+        if not isinstance(d, str) or not _SHA.match(d):
+            raise TrustError("bad_revocation", "known_good digests must be lower-case sha256 hex")
+    return dict(kg)
 
 
 def _revoked_map(trust):
@@ -190,8 +206,12 @@ def check_adoption(trust, candidate):
     return "older"
 
 
-def pick_release_key(trust, key_id, signed_at, version):
-    """The raw 32-byte Ed25519 key allowed to sign this release, or TrustError."""
+def pick_release_key(trust, key_id, signed_at, version, sha256=None):
+    """The raw 32-byte Ed25519 key allowed to sign this release, or TrustError.
+
+    A REVOKED key never verifies a release on the strength of anything the signature itself says (its trusted comment,
+    including the timestamp, is chosen by whoever holds the key). The only exception is a release the revocation itself
+    pins by version and tarball sha256 (`known_good`); the digest of the file in hand is compared, never a time."""
     if not trust["keys"]:
         raise TrustError("no_key_pinned", "no release key is pinned in root's trust list")
     entry = next((k for k in trust["keys"] if k["key_id"] == key_id), None)
@@ -204,13 +224,10 @@ def pick_release_key(trust, key_id, signed_at, version):
     if entry["status"] == "retired":
         raise TrustError("retired_key", f"key {key_id} is retired and no longer signs releases")
     if entry["status"] == "revoked":
-        rec = _revoked_map(trust).get(key_id)
-        if rec is None or not signed_at:
-            raise TrustError("revoked_key", f"key {key_id} is revoked and this signature cannot be shown to predate the revocation")
-        if _ts(signed_at) >= _ts(rec["revoked_at"]):
-            raise TrustError("revoked_key", f"key {key_id} was revoked at {rec['revoked_at']}; this release was signed after that")
-        if rec.get("last_good_version") and version_tuple(version) > version_tuple(rec["last_good_version"]):
-            raise TrustError("revoked_key", f"key {key_id} is only trusted up to version {rec['last_good_version']}")
+        rec = _revoked_map(trust).get(key_id) or {}
+        pinned = (rec.get("known_good") or {}).get(version)
+        if not pinned or sha256 is None or pinned != sha256:
+            raise TrustError("revoked_key", f"key {key_id} is revoked: releases it signed are refused unless the revocation pins this exact file")
     return base64.b64decode(entry["public_key"])
 
 
@@ -259,7 +276,7 @@ def parse_trusted_comment(comment):
 def hash_file(path, limit=MAX_TARBALL):
     """(blake2b-512 digest, sha256 hex, size) of a regular file, one pass."""
     b2, s2, size = hashlib.blake2b(digest_size=64), hashlib.sha256(), 0
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     fd = os.open(path, flags)
     with os.fdopen(fd, "rb") as fh:
         if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
@@ -302,7 +319,7 @@ def verify_release(tar_path, sig_path, trust, installed_version=None, expect_sha
     fields = parse_trusted_comment(sig["comment"])
     version = fields["version"]
     version_tuple(version)
-    raw_key = pick_release_key(trust, sig["key_id"], fields.get("timestamp"), version)
+    raw_key = pick_release_key(trust, sig["key_id"], fields.get("timestamp"), version, sha256)
     if not ocw_crypto.ed25519_verify(raw_key, prehash, sig["sig"]):
         raise TrustError("signature_invalid", "the signature does not match the file")
     if not ocw_crypto.ed25519_verify(raw_key, sig["sig"] + sig["comment"].encode("utf-8"), sig["global_sig"]):
@@ -421,17 +438,21 @@ def apply_revocation(trust, raw):
     revoked = {r["key_id"]: dict(r) for r in trust["revoked"]}
     newly = []
     for item in p["revoke"]:
+        kg = None
         if isinstance(item, str):
             key_id, lgv = item, None
-        elif isinstance(item, dict):
+        elif isinstance(item, dict) and set(item) <= {"key_id", "last_good_version", "known_good"}:
             key_id, lgv = item.get("key_id"), item.get("last_good_version")
+            kg = _check_known_good(item.get("known_good"))
         else:
             key_id, lgv = None, None
         if lgv is not None:
             version_tuple(lgv)
-        if key_id not in keys or key_id in revoked:
+        if not isinstance(key_id, str) or key_id not in keys or key_id in revoked:
             raise TrustError("bad_revocation", f"cannot revoke {key_id!r}: not a pinned, unrevoked key")
         revoked[key_id] = {"key_id": key_id, "revoked_at": p["issued_at"], "last_good_version": lgv}
+        if kg:
+            revoked[key_id]["known_good"] = kg
         keys[key_id]["status"] = "revoked"
         newly.append(key_id)
     added = []

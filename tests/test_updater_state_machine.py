@@ -74,7 +74,7 @@ def test_tampered_staged_tree_is_refused_by_root(m):
     m.build_release("5.47.0")
     m.put_artifacts("5.47.0")
     assert m.host.run(["systemctl", "start", "ocw-stage@5.47.0.service"])[0] == 0
-    (m.opt / "releases" / "5.47.0" / "requirements.lock").write_text("# evil\n")
+    (m.opt / "staging" / "5.47.0" / "requirements.lock").write_text("# evil\n")
     result = m.updater().apply(m.request("5.47.0", correlation_id="upg-aaaa0003"))
     assert result == "failed" and m.read_state()["reason_code"] == "tree_mismatch"
     assert os.readlink(m.opt / "current") == "releases/5.46.0"
@@ -84,7 +84,7 @@ def test_extra_file_in_staged_tree_is_refused(m):
     m.build_release("5.47.0")
     m.put_artifacts("5.47.0")
     m.host.run(["systemctl", "start", "ocw-stage@5.47.0.service"])
-    (m.opt / "releases" / "5.47.0" / "server" / "planted.py").write_text("import os\n")
+    (m.opt / "staging" / "5.47.0" / "server" / "planted.py").write_text("import os\n")
     assert m.updater().apply(m.request("5.47.0", correlation_id="upg-aaaa0004")) == "failed"
     assert m.read_state()["reason_code"] == "tree_mismatch"
 
@@ -187,11 +187,16 @@ def test_nginx_template_is_baked_applied_and_rolled_back_on_failure(m):
     assert m2.host.reloads == 1
 
 
-def test_unlisted_layout_nginx_refuses_before_switching(m):
+def test_unlisted_layout_nginx_is_skipped_with_a_warning_unless_the_release_requires_it(m):
     m.site.write_text("server { listen 80; }\n")
     up, result = run_apply(m, cid="upg-aaaa0016", release={"nginx_changed": True})
-    assert result == "failed" and m.read_state()["reason_code"] == "nginx_invalid"
-    assert os.readlink(m.opt / "current") == "releases/5.46.0"
+    assert result == "completed" and m.site.read_text() == "server { listen 80; }\n"
+    assert any(e["action"] == "upgrade.step" and e["details"].get("step") == "nginx_skipped" for e in m.audit_actions())
+    m2 = uf.Machine(m.root / "two")
+    m2.site.write_text("server { listen 80; }\n")
+    up, result = run_apply(m2, cid="upg-aaaa0017", release={"nginx_changed": True, "manifest_over": {"nginx_change_required": True}})
+    assert result == "failed" and m2.read_state()["reason_code"] == "nginx_invalid"
+    assert os.readlink(m2.opt / "current") == "releases/5.46.0"
 
 
 def test_request_validation(m):
@@ -199,7 +204,7 @@ def test_request_validation(m):
     m.put_artifacts("5.47.0")
     up = m.updater()
     cases = [({"schema": 2}, "request_invalid"), ({"correlation_id": "bad"}, "request_invalid"), ({"version": "5.47"}, "request_invalid"),
-             ({"requested_at": act.iso(m.host.now() - 90000)}, "request_stale"), ({"action": "restore"}, "request_invalid")]
+             ({"requested_at": act.iso(m.host.now() - 90000)}, "request_stale"), ({"action": "format_disk"}, "request_invalid")]
     for i, (over, code) in enumerate(cases):
         req = m.request("5.47.0", correlation_id=f"upg-bbbb00{i:02d}")
         req.update(over)
@@ -353,6 +358,7 @@ def test_self_update_is_atomic_and_keeps_the_old_updater_when_the_new_one_fails(
     m.build_release("5.47.0")
     m.put_artifacts("5.47.0")
     m.host.run(["systemctl", "start", "ocw-stage@5.47.0.service"])
+    os.rename(m.opt / "staging" / "5.47.0", m.opt / "releases" / "5.47.0")  # what root's prepare step does first
     up = m.updater()
     real_run = up.host.run
 

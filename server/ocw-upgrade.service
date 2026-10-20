@@ -9,10 +9,14 @@
 [Unit]
 Description=Activate a staged OPA Compliance Wizard release (and resume after a crash)
 After=network.target local-fs.target
+# Set on purpose: the path unit can start this service often (a request, a stray file), but never in a tight loop that trips the
+# default limit and leaves the service failed. Every run drains the inbox, so a burst of starts is harmless.
+StartLimitIntervalSec=120
+StartLimitBurst=30
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 -I __OPT_DIR__/updater/ocw_activate.py run
+ExecStart=/usr/bin/python3 -I -B __OPT_DIR__/updater/ocw_activate.py run
 TimeoutStartSec=4h
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=OCW_OPT_DIR=__OPT_DIR__
@@ -23,7 +27,8 @@ ProtectSystem=strict
 ProtectHome=true
 # the code tree + updater, the data directory, the staging account's downloads (a refused file is renamed there) and the nginx
 # site (the template is baked into it); "-" = ignore a path that does not exist on this server
-ReadWritePaths=__OPT_DIR__ __DATA_DIR__ -/var/lib/ocw-updater -/etc/nginx
+# /run and /var/log/nginx: `nginx -t` opens (creates) its pid file and may open its log files even in test mode
+ReadWritePaths=__OPT_DIR__ __DATA_DIR__ -/var/lib/ocw-updater -/etc/nginx /run -/var/log/nginx
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -32,10 +37,12 @@ LockPersonality=true
 # (PrivateNetwork=yes would hide the host's loopback from the health checks.)
 IPAddressDeny=any
 IPAddressAllow=localhost
+# CAP_NET_BIND_SERVICE: `nginx -t` still bind()s every listen address (:80/:443). CAP_KILL: a timed-out child that runs as
+# another account (the database tool) must be killed.
 # UNVERIFIED on a real host until tests/integration/updater-vm.sh has run: the capability set below is what the
 # updater needs by design (chown/chmod of the release tree, reading files it does not own, dropping to the
 # application account for database access); tighten or loosen it from that run's result.
-CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID CAP_SETPCAP
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_NET_BIND_SERVICE CAP_KILL
 
 [Install]
 WantedBy=multi-user.target

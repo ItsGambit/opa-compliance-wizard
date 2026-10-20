@@ -30,10 +30,19 @@ export function UpdateCheckForm({ status, secondaryLabel, onSecondary, onSaved }
   const queryClient = useQueryClient()
   const [frequency, setFrequency] = useState<UpdateFrequency>(status.check.frequency ?? 'daily')
   const [share, setShare] = useState(status.check.share_version)
+  const [second, setSecond] = useState(!!status.check.second_approval)
+  const [channel, setChannel] = useState<'stable' | 'prerelease'>(status.check.channel ?? 'stable')
+  const channelKnown = status.check.channel !== undefined
+  const channelLocked = status.check.channel_source === 'env'
   const locked = status.check.env_locked
 
   const save = useMutation({
-    mutationFn: () => saveUpgradeSettings({ frequency, share_version: share }),
+    mutationFn: () => saveUpgradeSettings({
+      frequency, share_version: share,
+      // only what changed, so an older server never sees a field it does not know
+      ...(second !== !!status.check.second_approval ? { second_approval: second } : {}),
+      ...(channelKnown && !channelLocked && channel !== status.check.channel ? { channel } : {}),
+    }),
     onSuccess: resp => {
       if (isStepUpRequired(resp)) {
         // Hosted mode: approve with MFA first; the page leaves here and returns to Updates.
@@ -68,6 +77,26 @@ export function UpdateCheckForm({ status, secondaryLabel, onSecondary, onSaved }
           onChange={e => setShare(e.target.checked)} />
         <span>Include the installed version in the request (helps the maintainers see which versions are in use; off by default).</span>
       </label>
+      {channelKnown && (
+        <fieldset className="border-0 p-0 m-0 mt-3 flex flex-col gap-2" disabled={locked || channelLocked}>
+          <legend className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted mb-1.5">Release channel</legend>
+          {([['stable', 'Stable', ' (recommended) — only releases the maintainers marked as stable.'],
+            ['prerelease', 'Pre-release', ' — also offers release candidates. For a test install, not for production.']] as const).map(([value, title, text]) => (
+            <label key={value} className="flex gap-2 items-start p-2.5 border border-border rounded-lg bg-bg-card cursor-pointer text-xs text-text-dim">
+              <input type="radio" name="update-channel" className="mt-0.5 accent-[var(--color-accent)]" checked={channel === value} onChange={() => setChannel(value)} />
+              <span><strong className="text-text">{title}</strong>{text}</span>
+            </label>
+          ))}
+          {channelLocked && <p className="text-xs text-muted m-0" role="status">The channel is set by this server's environment and cannot be changed here. Change it there (and restart).</p>}
+        </fieldset>
+      )}
+      {!isLocal && status.upgrade && (
+        <label className="flex gap-2.5 items-start mt-3 text-xs text-text-dim cursor-pointer">
+          <input type="checkbox" className="mt-0.5 w-[15px] h-[15px] accent-[var(--color-accent)]" checked={second} disabled={locked}
+            onChange={e => setSecond(e.target.checked)} />
+          <span>Require a second admin to approve every upgrade (two-person rule; off by default). The first admin's approval is held for 24 hours.</span>
+        </label>
+      )}
       <div className="flex flex-wrap items-center gap-2 mt-4">
         <button type="submit" className="btn-primary" disabled={save.isPending || locked}>
           <ShieldCheck size={14} aria-hidden="true" />

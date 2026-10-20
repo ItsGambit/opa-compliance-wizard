@@ -196,8 +196,7 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    environment file (steps 2-5), the units' own keyring and `/run/user` carve-outs (they stay as they are), the nginx site
    (`install.sh --apply-nginx` then adds the maintenance-page directives to it), and the gate. With the new layout:
    * **no sudoers rules for deploys are needed** and the web application's account can no longer restart services or write
-     the nginx site (`install.sh --remove-legacy-sudoers` removes an old deploy rule; step 7 below is for installs that stay on
-     the old in-place layout);
+     the nginx site (`install.sh --remove-legacy-sudoers` removes an old deploy rule; see step 7);
    * the unit templates in `server/` use `__APP_DIR__` = `/opt/opa-compliance-wizard/current` and `__DATA_DIR__` =
      `/var/lib/opa-compliance-wizard`; the backend unit also has `ProtectSystem=strict` (the gate unit does not: it creates its
      session key under `/etc` on first start);
@@ -284,113 +283,12 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    admin flag it was issued with until it expires (12 h). Each additional
    gate has its own key (`/etc/opa-auth-gate-<name>/session.key`) and
    unit (`opa-auth-gate-<name>`).
-7. **(Old in-place layout only: with the 5.47.0 upgrade layout there is no deploy sudoers rule.)**
-   **One-time sudoers setup, only if you'll use `server/deploy.sh` to
-   redeploy later** (recommended — it's the repeatable path; see that
-   file's own header comment). This grants the deploying user exactly the
-   commands that script runs — a one-time, human-reviewed step done
-   directly on the server, not something `deploy.sh` ever does to itself.
-   **Be aware what that amounts to (OPS-05):** the `cp` grant installs a
-   file the deploy user can write as nginx's config, and nginx's master
-   process (root) parses it, so an account holding this rule can get root
-   with some nginx knowledge. Treat the deploy account as an
-   administrator: keep its SSH key protected, and don't use it for
-   anything else. Separating the deploy identity from the service identity
-   is the real fix; it is a planned change, not something this step
-   provides. (Why not have the script do
-   this automatically? Because it pulls and runs code from GitHub on
-   every invocation — letting it also edit sudoers would mean any future
-   commit could silently grant itself more privilege than this exact
-   list, which defeats the entire point of scoping sudo narrowly in the
-   first place.) **This step is no longer optional as of Phase 8
-   (2026-10-02)** — `deploy.sh` used to continue (with a printed warning)
-   if the `opa-auth-gate` restart specifically couldn't run, since
-   auth_gate.py is this app's own OIDC auth gate and a deploy that ships
-   new auth logic but silently fails to restart the process running it
-   is the wrong thing to call "completed." That restart is now
-   unconditional and fatal — skip this sudoers setup and a deploy with
-   any code change at all will fail outright at that step, not just
-   warn. The nginx apply is just as strict (a denied, invalid or
-   unreloadable config stops the deploy and rolls back), and since 5.41.0
-   `deploy.sh` checks every grant with `sudo -n -l` **before** it changes
-   anything, listing what's missing.
-
-   Step 7a. Find the exact paths to `systemctl`, `nginx`, and `cp` on
-   *your* server — sudoers rules match an exact binary path, not just a
-   command name, and these vary by distro:
-   ```bash
-   which systemctl nginx cp
-   ```
-   Note the three paths this prints — you'll use them in step 7c below.
-   (The example in step 7c uses the common Debian/Ubuntu paths
-   `/bin/systemctl`, `/usr/sbin/nginx`, `/bin/cp` — replace them if your
-   `which` output differs.)
-
-   Step 7b. Confirm the deploying Linux username (the account that will
-   actually run `./deploy.sh` — e.g. `<app-user>`) and the real path to
-   this repo on the server (e.g. `/home/<app-user>/opa-compliance-wizard`)
-   — you'll substitute both into step 7c.
-
-   Step 7c. Open a new sudoers file for editing. **Always use `visudo`**
-   (never edit the file directly) — it validates syntax before saving, so
-   a typo here can't lock out `sudo` entirely:
-   ```bash
-   sudo visudo -f /etc/sudoers.d/opa-compliance-wizard-deploy
-   ```
-   Paste the following into the editor that opens, then replace every
-   `<app-user>` with your actual deploying username (step 7b) and every
-   `/home/<app-user>/opa-compliance-wizard` with your actual repo path
-   (step 7b) — leave `opa-secrets-wizard`/`opa-compliance-wizard` and
-   `opa-auth-gate` exactly as-is, those are fixed systemd unit names, not
-   placeholders. Note there are **two separate `cp` lines**, not one —
-   `deploy.sh` applies the new nginx config over the live path, and (only
-   if `nginx -t` or the reload then fails) rolls its own backup — kept in
-   the repo's own `$APP_DIR`, not under `/etc/nginx`, so creating/
-   deleting it never needs sudo at all — back over the live path;
-   sudoers matches each exact argument list separately, so a rule for
-   only one of these two leaves the other silently denied.
-
-   If you set `OPA_NGINX_SITE` (see "Redeploying" below) because your
-   distro keeps sites elsewhere, the two `cp` lines name that path
-   instead.
-
-   **Two `systemctl restart` lines for the backend, not one** (OPS-01,
-   external review, 2026-10-05): `deploy.sh`/`setup-second-gate.sh`
-   detect WHICH of `opa-secrets-wizard`/`opa-compliance-wizard` is
-   actually installed at runtime (the unit was renamed at 5.20.0 — a
-   fresh install from this repo's own templates uses the new name; an
-   install that predates the rename keeps the old one), but sudoers
-   itself can't do that detection — it matches the literal command sudo
-   was asked to run. Keep BOTH restart lines below so the grant works
-   whichever name your install actually uses; the one that doesn't match
-   your installed unit is simply never invoked, which is harmless:
-   ```
-   <app-user> ALL=(ALL) NOPASSWD: /bin/systemctl restart opa-secrets-wizard, \
-     /bin/systemctl restart opa-compliance-wizard, \
-     /bin/systemctl restart opa-auth-gate, \
-     /bin/cp /home/<app-user>/opa-compliance-wizard/server/nginx-opa-secrets-wizard.conf /etc/nginx/sites-available/opa-secrets-wizard, \
-     /bin/cp /home/<app-user>/opa-compliance-wizard/.nginx-deploy-backup /etc/nginx/sites-available/opa-secrets-wizard, \
-     /usr/sbin/nginx -t, \
-     /bin/systemctl reload nginx
-   ```
-   Save and exit (same keys as your system's default editor — usually
-   `nano`: Ctrl+O then Enter, then Ctrl+X). `visudo` will refuse to save a
-   file with a syntax error and tell you so — if that happens, fix the
-   reported line rather than forcing a save.
-
-   Step 7d. Verify the rule actually works, logged in AS the deploying
-   user (not as root or your own login) — `-l` only lists what you're
-   allowed to run, without actually running (and so without restarting
-   the live app or touching nginx):
-   ```bash
-   sudo -n -l
-   ```
-   You should see all six commands from step 7c listed under
-   `NOPASSWD:`, with no password prompt. If you instead get a password
-   prompt, a `sudo: a password is required` error, or the list doesn't
-   include all six, re-open the file from step 7c and check for a typo
-   — most commonly the username, or a binary path that doesn't match
-   step 7a's `which` output exactly.
+7. **No sudoers rule is needed any more (5.48.0).** The 5.47.0 upgrade layout (`server/install.sh`) gives the web application's
+   account no right to restart services or write the nginx site; upgrades are done by the root-owned updater, started from the
+   Updates page or with `sudo ocw-updater`. A server set up before that may still carry the old `deploy.sh` sudoers file: moving it
+   to the upgrade layout (`sudo server/install.sh`, README "Upgrading") keeps it working, and `--remove-legacy-sudoers` removes it
+   afterwards. This guide no longer walks through creating one; a deploy account with that grant is effectively an administrator
+   (the `cp` into nginx's configuration is a path to root).
 
 **Upgrading on the 5.47.0 upgrade layout:** `sudo ocw-updater stage <version>` then `sudo ocw-updater apply <version>`
 (or `server/deploy.sh --release <version>`, which now only calls those two): README, "Upgrading". The paragraph below
@@ -434,6 +332,9 @@ Optional settings, from the environment or from `<install dir>/.deploy.conf`
 - `OPA_RELEASE_BASE_URL` / `OPA_REVOCATION_URL_BASE` — where `--release`
   downloads from, e.g. a mirror inside your network (https only). A mirror
   can delay an upgrade but cannot alter one: the signature is still checked.
+- `OPA_REVOCATION_URL` — an owner-controlled https URL that serves the current `revocation.json`
+  (checked in addition to the project's GitHub releases). Set it on every install: it is the
+  one channel for a second revocation that does not depend on GitHub's release tags.
 - `OPA_DEPLOY_REF` (or `--ref <x>`) — a branch, tag or full commit to
   deploy instead of the default branch's tip (unsigned). `--ref <previous
   commit>` is also the quickest way back after a bad deploy (a signed
@@ -859,7 +760,7 @@ backs up first, and is safe to re-run. What it creates:
   `KEYRING_UNLOCK_PASSWORD` and
   `NGINX_PROXY_SECRET` as the main file.
 - systemd unit `opa-auth-gate-<name>` (copy of the main unit on another
-  port) and a sudoers grant so `server/deploy.sh` can restart it.
+  port); on an install that still uses the old in-place layout it also adds the sudoers grant `server/deploy.sh` needs.
 - nginx site `opa-<name>` built by `server/nginx_second_site.py` from the
   live main site: same rules, listening on `--listen` (loopback by default,
   for a Cloudflare Tunnel; TLS ends in front of it), sign-in routes pointed

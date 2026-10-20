@@ -165,6 +165,58 @@ def _migrations_from(files):
             numbers[-1])
 
 
+NGINX_TEMPLATE = "server/nginx-opa-secrets-wizard.conf"
+
+
+def _previous_tag(repo, version):
+    """The newest release tag below `version`, or None."""
+    try:
+        tags = _git(repo, "tag", "--list", "v*").split()
+    except ReleaseError:
+        return None
+    below = []
+    for t in tags:
+        v = t[1:]
+        if VERSION_RE.match(v) and tuple(map(int, v.split("."))) < tuple(map(int, version.split("."))):
+            below.append((tuple(map(int, v.split("."))), t))
+    return max(below)[1] if below else None
+
+
+def _nginx_template_changed(repo, files, version):
+    """True when this release's nginx template differs from the previous tag's (or there is no previous tag to compare
+    with): only then does the updater touch the server's nginx site."""
+    mine = files.get(NGINX_TEMPLATE)
+    prev = _previous_tag(repo, version)
+    if mine is None or prev is None:
+        return mine is not None
+    try:
+        old = subprocess.run(["git", "-C", str(repo), "show", f"{prev}:{NGINX_TEMPLATE}"], capture_output=True, check=True).stdout
+    except (subprocess.CalledProcessError, OSError):
+        return True
+    return old != mine[1]
+
+
+INSTALL_SH_FILES = ("server/ocw-stage@.service", "server/ocw-upgrade.service", "server/ocw-upgrade.path", "server/ocw-upgrade-due.service",
+                    "server/ocw-upgrade-due.timer", "server/ocw-updater.sh", "server/install.sh")
+
+
+def _requires_install_sh(repo, files, version):
+    """True when a unit, the wrapper or install.sh differs from the previous tag's: the updater cannot replace those itself
+    (only the root-owned Python files self-update), so the operator must re-run server/install.sh from the new release."""
+    prev = _previous_tag(repo, version)
+    if prev is None:
+        return any(n in files for n in INSTALL_SH_FILES)
+    for name in INSTALL_SH_FILES:
+        mine = files.get(name)
+        try:
+            old = subprocess.run(["git", "-C", str(repo), "show", f"{prev}:{name}"], capture_output=True, check=True).stdout
+        except (subprocess.CalledProcessError, OSError):
+            old = None
+        if (mine[1] if mine else None) != old:
+            return True
+    return False
+
+
 def _activator_version(files):
     m = files.get("server/updater/root/ocw_activate.py")
     found = re.search(rb'^ACTIVATOR_VERSION = "([^"]+)"', m[1], re.M) if m else None
@@ -208,9 +260,14 @@ def build_release(version, repo=REPO, out_dir=None, frontend_dist=None, min_upgr
         "migrations": migrations,
         "expected_schema_version": expected_schema,
         "migration_time_estimate_seconds": 30,
-        # The updater compares the baked template with the live site itself, so this is always true: it only means
-        # "check", and a release that does not change nginx leaves the site untouched.
-        "nginx_template_changed": True,
+        # True only when this release's nginx template differs from the previous tag's. The updater still compares the
+        # baked template with the live site itself and touches nginx only when they differ. `nginx_change_required` is for
+        # the rare release that cannot work without the new site (then an unbakeable site refuses the upgrade).
+        "nginx_template_changed": _nginx_template_changed(repo, files, version),
+        "nginx_change_required": False,
+        # The units, the wrapper and install.sh are not self-updated: when they changed the updater refuses and says to
+        # run server/install.sh from the new release first.
+        "requires_install_sh": _requires_install_sh(repo, files, version),
         "requires_reboot": False,
         "activator_version": activator_version,
         "frontend_lock_sha256": hashlib.sha256(lock[1]).hexdigest() if lock else None,

@@ -187,6 +187,12 @@ def isolate_update_check(tmp_path, monkeypatch):
     network request, or inherit OPA_UPDATE_CHECK from the shell."""
     monkeypatch.setenv("OPA_UPDATE_STATE_PATH", str(tmp_path / "update_check.json"))
     monkeypatch.setenv("OPA_RELEASE_KEYS_LOCAL", str(tmp_path / "release_keys.local.json"))
-    for name in ("OPA_UPDATE_CHECK", "OPA_RELEASE_API_URL", "OPA_REVOCATION_URL_BASE", "OPA_UPDATE_CHANNEL",
-                 "OPA_RELEASE_LIST_URL"):
+    # 5.48.0: the in-app upgrade flow's own files and the updater's directory layout
+    monkeypatch.setenv("OPA_UPGRADE_SCHEDULE_PATH", str(tmp_path / "upgrade_schedule.json"))
+    monkeypatch.setenv("OPA_UPGRADE_PREVIEW_PATH", str(tmp_path / "upgrade_preview.json"))
+    monkeypatch.setenv("OPA_UPGRADE_DIR", str(tmp_path / "upgrade-absent"))
+    from server.updater import upgrade as _upgrade
+    _upgrade._quiesce_until[0] = None
+    for name in ("OPA_UPDATE_CHECK", "OPA_RELEASE_API_URL", "OPA_REVOCATION_URL_BASE", "OPA_RELEASE_BASE_URL", "OCW_OPT_DIR",
+                 "OPA_UPDATE_CHANNEL", "OPA_RELEASE_LIST_URL"):
         monkeypatch.delenv(name, raising=False)

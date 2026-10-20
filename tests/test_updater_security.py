@@ -67,7 +67,7 @@ def test_staged_tree_attacks_are_all_refused(m, tmp_path):
     m.build_release("5.47.0")
     m.put_artifacts("5.47.0")
     m.host.run(["systemctl", "start", "ocw-stage@5.47.0.service"])
-    root = m.opt / "releases" / "5.47.0"
+    root = m.opt / "staging" / "5.47.0"
     up = m.updater()
     manifest = json.loads(__import__("tarfile").open(m.releases_dir / "ocw-5.47.0.tar.gz").extractfile("manifest.json").read())
     up.check_tree(str(root), manifest)  # the honest tree passes
@@ -139,7 +139,7 @@ def test_a_request_for_a_staged_release_whose_tree_vanished_changes_nothing(m):
     m.put_artifacts("5.47.0")
     m.host.run(["systemctl", "start", "ocw-stage@5.47.0.service"])
     import shutil
-    shutil.rmtree(m.opt / "releases" / "5.47.0" / "server")
+    shutil.rmtree(m.opt / "staging" / "5.47.0" / "server")
     assert m.updater().apply(m.request("5.47.0", correlation_id="upg-aabb0003")) == "failed"
     assert m.read_state()["reason_code"] == "tree_mismatch" and os.readlink(m.opt / "current") == "releases/5.46.0"
 

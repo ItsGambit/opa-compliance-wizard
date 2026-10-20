@@ -11,8 +11,8 @@ already on the server, never the file being checked).
 What must all hold (any failure refuses the file, with the reason):
   1. the signature is a prehashed ("ED") minisign signature -- legacy "Ed"
      is refused -- made by a pinned PRIMARY key that is not revoked (a
-     revoked key is accepted only for a release that predates its
-     revocation; a standby key never signs releases; see keys.py);
+     revoked key is accepted only for a file the revocation pins by version
+     and sha256; a standby key never signs releases; see keys.py);
   2. the trusted comment's signature verifies, and it reads
      `file=ocw-<ver>.tar.gz version=<ver> sha256=<hex> [timestamp=<UTC>]`;
   3. file name, version and sha256 match the tarball, the manifest.json
@@ -104,7 +104,7 @@ def verify_release(tar_path, sig_path, key_list, installed_version=None, allow_s
         fields = minisign.parse_trusted_comment(sig.trusted_comment, optional=("timestamp",))
         version = fields["version"]
         keylib.parse_version(version)
-        pub = keylib.pick_signer(key_list, sig.key_id, "release", fields.get("timestamp"), version)
+        pub = keylib.pick_signer(key_list, sig.key_id, "release", fields.get("timestamp"), version, sha256)
         minisign.verify(prehash, sig, pub)
     except (minisign.SignatureError, keylib.KeyListError) as exc:
         raise _wrap(exc)
