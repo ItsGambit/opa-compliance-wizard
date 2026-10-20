@@ -121,7 +121,7 @@ def read_bundle(name):
 
 
 def default_data():
-    return {"settings": {"enabled": None, "share_version": False, "manual_only": False},
+    return {"settings": {"enabled": None, "share_version": False, "manual_only": False, "second_approval": False},
             "state": {"latest_version": None, "published_at": None, "release_url": None, "signed_artifact": None,
                       "size": None, "notes_title": None, "notes": None, "last_check_by": None,
                       "last_check_at": None, "last_status": None, "last_code": None, "next_check_at": None,
@@ -149,6 +149,7 @@ def load():
         data["settings"]["enabled"] = None
     data["settings"]["share_version"] = data["settings"]["share_version"] is True
     data["settings"]["manual_only"] = data["settings"]["manual_only"] is True
+    data["settings"]["second_approval"] = data["settings"]["second_approval"] is True
     return data
 
 
@@ -241,7 +242,7 @@ def status(data, installed_version):
         "installed_version": installed_version,
         "check": {"enabled": enabled, "source": source, "env_locked": switch is not None,
                   "env_invalid_value": bad, "prompt_needed": data["settings"]["enabled"] is None and switch is None,
-                  "share_version": data["settings"]["share_version"], "mirror": bool(os.environ.get(API_URL_ENV)),
+                  "share_version": data["settings"]["share_version"], "second_approval": data["settings"]["second_approval"], "mirror": bool(os.environ.get(API_URL_ENV)),
                   "frequency": frequency, "url": api_url()},
         "latest": latest,
         "update_available": bool(latest and newer(latest["version"], installed_version)),
@@ -283,7 +284,7 @@ def _recent_revocation(kl):
     return last
 
 
-def set_settings(enabled=None, share_version=None, manual_only=None):
+def set_settings(enabled=None, share_version=None, manual_only=None, second_approval=None):
     """Returns the changes {name: [old, new]} (empty if nothing changed)."""
     with _lock:
         data = load()
@@ -297,6 +298,9 @@ def set_settings(enabled=None, share_version=None, manual_only=None):
         if share_version is not None and share_version != data["settings"]["share_version"]:
             changes["share_version"] = [data["settings"]["share_version"], share_version]
             data["settings"]["share_version"] = share_version
+        if second_approval is not None and second_approval != data["settings"]["second_approval"]:
+            changes["second_approval"] = [data["settings"]["second_approval"], second_approval]
+            data["settings"]["second_approval"] = second_approval
         if changes:
             if enabled is True:  # a fresh answer to "check now?" -> do not wait up to a day
                 data["state"]["next_check_at"] = None
@@ -307,7 +311,7 @@ def set_settings(enabled=None, share_version=None, manual_only=None):
 FREQUENCIES = {"daily": (True, False), "manual": (True, True), "off": (False, False)}
 
 
-def change_settings(enabled, share_version, installed_version, audit, frequency=None):
+def change_settings(enabled, share_version, installed_version, audit, frequency=None, second_approval=None):
     """The one settings change used by the web route and the CLI (same rules,
     same audit event). `audit(action, details)` records who did it. Returns
     (http_status, body)."""
@@ -318,11 +322,11 @@ def change_settings(enabled, share_version, installed_version, audit, frequency=
     if enabled is True and switch == "off":
         return 409, {"error": "The update check is switched off by OPA_UPDATE_CHECK=off in this server's environment, "
                               "which always wins. Remove that setting (and restart) to allow it.", "reason": "env_locked"}
-    changes = set_settings(enabled, share_version, manual_only)
+    changes = set_settings(enabled, share_version, manual_only, second_approval)
     if changes:
         now_settings = load()["settings"]
         shown = "off" if now_settings["enabled"] is False else ("manual" if now_settings["manual_only"] else "daily") if now_settings["enabled"] else "unset"
-        audit("upgrade.settings", {"frequency": shown, "share_version": now_settings["share_version"], "changes": changes,
+        audit("upgrade.settings", {"frequency": shown, "share_version": now_settings["share_version"], "second_approval": now_settings["second_approval"], "changes": changes,
                                    "correlation_id": _engine().CORRELATION_ID.get()})
         if enabled is True and not manual_only and switch != "off":
             kick(installed_version)
@@ -335,17 +339,18 @@ def apply_settings_request(payload, installed_version, audit):
     error = validate_settings_payload(payload)
     if error:
         return 400, {"error": error}
-    return change_settings(payload.get("enabled"), payload.get("share_version"), installed_version, audit, payload.get("frequency"))
+    return change_settings(payload.get("enabled"), payload.get("share_version"), installed_version, audit, payload.get("frequency"),
+                           payload.get("second_approval"))
 
 
 def validate_settings_payload(payload):
     """None if the body is acceptable, else a message."""
-    allowed = {"enabled", "share_version", "frequency"}
+    allowed = {"enabled", "share_version", "frequency", "second_approval"}
     if not isinstance(payload, dict) or not payload or set(payload) - allowed:
-        return 'Send {"frequency": "daily"|"manual"|"off"} and/or {"share_version": true|false}.'
+        return 'Send {"frequency": "daily"|"manual"|"off"}, {"share_version": true|false} and/or {"second_approval": true|false}.'
     if "frequency" in payload and ("enabled" in payload or payload["frequency"] not in FREQUENCIES):
         return 'frequency must be "daily", "manual" or "off" (and cannot be combined with enabled).'
-    for key in ("enabled", "share_version"):
+    for key in ("enabled", "share_version", "second_approval"):
         if key in payload and not isinstance(payload[key], bool):
             return f"{key} must be true or false."
     return None

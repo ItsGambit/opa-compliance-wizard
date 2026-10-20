@@ -113,6 +113,12 @@ ROUTES = {
     ("POST", "path == '/api/upgrade/settings'"):
         Route("POST", "/api/upgrade/settings", "admin", {"share_version": True}, 200, stepup="upgrade.settings"),
     ("POST", "path == '/api/upgrade/check'"): Route("POST", "/api/upgrade/check", "admin", {}, 409),
+    # 5.48.0: the in-app upgrade flow. preview: a read (409: the update check is off in this fixture). request: one
+    # step-up action type whose kinds are apply / schedule / reschedule / cancel / approve_second (sample: cancel, 409
+    # because nothing is scheduled; the step-up test below schedules one first). notice: the banner, any signed-in user.
+    ("POST", "path == '/api/upgrade/preview'"): Route("POST", "/api/upgrade/preview", "admin", {}, 409),
+    ("POST", "path == '/api/upgrade/request'"): Route("POST", "/api/upgrade/request", "admin", {"kind": "cancel"}, 409, stepup="upgrade.request"),
+    ("GET", "path == '/api/upgrade/notice'"): Route("GET", "/api/upgrade/notice", "open", None, 200),
     ("GET", "path == '/api/shared_permissions'"): Route("GET", "/api/shared_permissions", "admin", None, 200),
     ("POST", "path == '/api/banner'"):
         Route("POST", "/api/banner", "admin", {"enabled": True, "message": "Maintenance tonight", "variant": "info"}, 200),
@@ -1484,6 +1490,12 @@ def _stepup_case(serve, route):
         who, admin = ADMIN, True
     elif route.stepup in ("shared_permissions.update", "upgrade.settings"):
         who, admin = ADMIN, True
+    elif route.stepup == "upgrade.request":
+        who, admin = ADMIN, True
+        from server.updater import upgrade as upgrade_service
+        upgrade_service.save_schedule({"schedule": {"correlation_id": "upg-0000abcd", "version": "9.9.9", "sha256": "a" * 64,
+                                                    "when_utc": "2099-01-01T00:00:00Z", "status": "scheduled"},
+                                       "pending_approval": None, "last": None})
     elif route.stepup == "environment.share":
         body = {"shared": False}
     return env_id, who, admin, sample, body
@@ -1529,7 +1541,8 @@ def test_every_environment_change_needs_a_step_up_bound_to_it(matrix_server, mon
     assert 200 <= done.status_code < 300, done.text
     assert done.json()["step_up_verified"] is True and done.json()["action"] == route.stepup
     entry = [json.loads(line) for line in open(tmp_audit_log, encoding="utf-8") if line.strip()][-1]
-    assert entry["action"] == route.stepup
+    # (upgrade.request logs the specific event of its kind: upgrade.cancelled, upgrade.scheduled, upgrade.requested ...)
+    assert entry["action"] == route.stepup or (route.stepup == "upgrade.request" and entry["action"] == "upgrade.cancelled")
     assert entry["details"]["step_up_verified"] is True
     # Single use: a replay of the same approval is refused.
     replay = _stepup(base_url, who, action_id, admin=admin)

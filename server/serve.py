@@ -45,6 +45,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 import create_secret_folders as engine  # noqa: E402
 from server.updater import service as update_service  # noqa: E402
+from server.updater import upgrade as upgrade_service  # noqa: E402
 
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 # 5.47.0: user-saved folder templates and execution records live with the data
@@ -185,7 +186,7 @@ STEPUP_PREPARE_TTL_SECONDS = 15 * 60
 ENV_CHANGE_ACTION_TYPES = (
     "environment.upsert", "environment.share", "environment.delete",
     "sync_schedule.update", "sync.reset_watermark", "sync.import_csv",
-    "archive.purge", "shared_permissions.update", "upgrade.settings",
+    "archive.purge", "shared_permissions.update", "upgrade.settings", "upgrade.request",
 )
 
 # The environment form's two secrets never go into pending_admin_actions
@@ -854,6 +855,11 @@ def _start_sync_job(env_id, env_name, ingestion_scope, owner=engine.LOCAL_OWNER_
     trigger, same as any other CLI/background-triggered audit entry in
     this project's existing convention."""
     storage_name = env_id
+    if upgrade_service.quiesced():
+        # 5.48.0: an upgrade was just handed to the updater; no new sync starts while it runs (a running one finishes first).
+        if trigger == "scheduled":
+            engine.log_audit_event(actor_email, actor_sub, "sync.scheduled_skipped", {"name": env_name, "reason": "an upgrade is starting"}, client_ip=client_ip, user_agent=user_agent)
+        return False
     with _sync_jobs_lock:
         if _sync_jobs.get(storage_name, {}).get("status") == "running":
             if trigger == "scheduled":
@@ -933,6 +939,18 @@ def _launch_claimed_sync(env_id, env_name, ingestion_scope, owner, trigger, acto
     return True
 
 
+def _upgrade_context():
+    """What the upgrade preflight and the schedule tick need to know about this process."""
+    import audit_store
+    with _sync_jobs_lock:
+        running = any(j.get("status") == "running" for j in _sync_jobs.values())
+    try:
+        db_bytes = os.path.getsize(audit_store._audit_db_path())
+    except OSError:
+        db_bytes = 0
+    return {"sync_running": running, "db_bytes": db_bytes, "run": update_service.upgrade_run()}
+
+
 def _scheduler_loop():
     """Runs forever in a daemon thread, started once at server boot.
     Every SCHEDULER_POLL_INTERVAL_SECS, checks every saved environment's
@@ -983,6 +1001,8 @@ def _scheduler_loop():
         # 5.46.0: the opt-in update check (own thread; a failure here never
         # affects syncs, and update_service.maybe_start never raises).
         update_service.maybe_start(engine.SCRIPT_VERSION)
+        # 5.48.0: a scheduled upgrade that has come due is handed to the updater here (or marked missed).
+        upgrade_service.tick(engine.SCRIPT_VERSION, _upgrade_context)
         _scheduler_stop_event.wait(SCHEDULER_POLL_INTERVAL_SECS)
 
 
@@ -1287,6 +1307,7 @@ _ENV_CHANGE_EXECUTORS = {
     "archive.purge": "_exec_archive_purge",
     "shared_permissions.update": "_exec_shared_permissions_update",
     "upgrade.settings": "_exec_upgrade_settings_update",
+    "upgrade.request": "_exec_upgrade_request",
 }
 assert set(_ENV_CHANGE_EXECUTORS) == set(ENV_CHANGE_ACTION_TYPES)
 
@@ -1910,7 +1931,7 @@ class Handler(SimpleHTTPRequestHandler):
         if problem:
             return 400, {"error": problem}
         switch, _bad = update_service.env_switch()
-        wants_on = payload.get("frequency", "on" if payload.get("enabled") else "off") != "off"
+        wants_on = payload.get("frequency", "on" if payload.get("enabled") else "off") != "off" and ("frequency" in payload or "enabled" in payload)
         if wants_on and switch == "off":
             return 409, {"error": "The update check is switched off by OPA_UPDATE_CHECK=off in this server's environment, "
                                   "which always wins. Remove that setting (and restart) to allow it.", "reason": "env_locked"}
@@ -1922,6 +1943,258 @@ class Handler(SimpleHTTPRequestHandler):
             self._log_audit_event(actor_email, actor_sub, action, {**details, **extra})
 
         return update_service.apply_settings_request(payload, engine.SCRIPT_VERSION, audit)
+
+    # -----------------------------------------------------------------
+    # In-app upgrade (5.48.0)
+    # -----------------------------------------------------------------
+    def _upgrade_view(self, qs):
+        now = datetime.now(timezone.utc)
+        data = update_service.load()
+        latest = data["state"].get("latest_version")
+        run = upgrade_service.run_view()
+        sched = upgrade_service.load_schedule()
+        pa = upgrade_service.pending_approval(now)
+        owner_key, _e, _em, actor_sub = self._caller()
+        preview = upgrade_service.current_preview(latest) if latest and update_service.newer(latest, engine.SCRIPT_VERSION) else None
+        rej = None
+        for cid in (qs.get("correlation_id") or [])[:1]:
+            rej = upgrade_service.rejection(cid)
+        hist = upgrade_service.history_view()
+        return {
+            "run": run,
+            "updater": upgrade_service.updater_state(),
+            "preview": preview,
+            "schedule": sched["schedule"],
+            "last": sched["last"],
+            "pending_approval": ({k: pa.get(k) for k in ("kind", "version", "sha256", "when_utc", "entered", "first_email", "created_at",
+                                                         "expires_at", "correlation_id")}
+                                 | {"mine": bool(actor_sub) and pa.get("first_sub") == actor_sub}) if pa else None,
+            "settings": {"second_approval": data["settings"].get("second_approval") is True},
+            "rejection": rej,
+            "rollback": upgrade_service.rollback_view(run, now),
+            "failures": upgrade_service.failures_view(),
+            "history": hist,
+            "zone": {"iana": upgrade_service.server_zone()},
+            "sync_hint": self._upgrade_sync_hint(),
+            "step_up_required": _step_up_required_for_changes(),
+            "now": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+
+    @staticmethod
+    def _upgrade_sync_hint():
+        """For the schedule dialog's maintenance-window hint: when the last sync finished and when the daily syncs run (UTC)."""
+        import audit_store
+        last, times = None, set()
+        try:
+            for environment_id in engine.list_all_environments():
+                try:
+                    schedule = engine.get_sync_schedule_by_id(environment_id)
+                except KeyError:
+                    continue
+                if schedule.get("enabled"):
+                    times.add(str(schedule.get("run_time") or "02:00")[:5])
+                state = audit_store.get_sync_state(environment_id) or {}
+                done = state.get("last_sync_completed_at")
+                if isinstance(done, str) and (last is None or done > last):
+                    last = done
+        except Exception:  # noqa: BLE001 - a hint must never break the status
+            pass
+        return {"last_sync_completed_at": last, "daily_run_times_utc": sorted(times)}
+
+    def _upgrade_preview(self, actor_email, actor_sub):
+        data = update_service.load()
+        st = data["state"]
+        if not update_service.is_enabled(data)[0]:
+            return 409, {"error": "The update check is off; turn it on and use Check now first.", "reason": "check_off"}
+        try:
+            preview = upgrade_service.build_preview(engine.SCRIPT_VERSION, st.get("size"), _upgrade_context())
+        except upgrade_service.PreviewError as exc:
+            self._log_audit_event(actor_email, actor_sub, "upgrade.preview", {"result": "failed", "reason_code": exc.code, "detail": str(exc)[:300]})
+            return (502 if exc.code == "fetch_failed" else 409), {"error": str(exc), "reason": exc.code}
+        self._log_audit_event(actor_email, actor_sub, "upgrade.preview", {
+            "result": "ok" if preview["preflight_ok"] else "preflight_failed", "version": preview["version"], "sha256": preview["sha256"],
+            "signed_by": preview["key_id"], "preflight": {i["id"]: i["ok"] for i in preview["preflight"]}})
+        return 200, {"preview": preview}
+
+    UPGRADE_BODY_FIELDS = {"kind": 16, "version": 20, "sha256": 64, "when_utc": 24, "entered_tz": 64, "entered_local": 20, "target": 16}
+
+    def _exec_upgrade_request(self, params, dry_run, via_step_up):
+        """5.48.0: upgrade now (apply) / schedule / reschedule / cancel / the second administrator's approval. Every check
+        runs again when the approved request is applied; the approval covers this exact version, hash and time."""
+        owner_key, _engine_owner_, actor_email, actor_sub = self._caller()
+        if not _can_admin(owner_key, self.headers):
+            return 403, {"error": "Admin access required to upgrade."}
+        body = params.get("body") or {}
+        if not isinstance(body, dict):
+            return 400, {"error": "Send a JSON object."}
+        for key, value in body.items():
+            if key == "acknowledged":
+                if not isinstance(value, bool):
+                    return 400, {"error": "acknowledged must be true or false."}
+            elif key not in self.UPGRADE_BODY_FIELDS or not isinstance(value, str) or len(value) > self.UPGRADE_BODY_FIELDS[key]:
+                return 400, {"error": f"Unexpected or oversized field '{key}'."}
+        kind = body.get("kind")
+        if kind not in ("apply", "schedule", "reschedule", "cancel", "approve_second"):
+            return 400, {"error": "kind must be apply, schedule, reschedule, cancel or approve_second."}
+        now = datetime.now(timezone.utc)
+        stamp = lambda dt: dt.strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
+        sched_data = upgrade_service.load_schedule()
+        sched = sched_data["schedule"] if (sched_data["schedule"] or {}).get("status") == "scheduled" else None
+        pa = upgrade_service.pending_approval(now)
+        two = update_service.load()["settings"].get("second_approval") is True and _step_up_required_for_changes()
+        actor = (actor_email, actor_sub)
+        if kind == "cancel":
+            if not sched and not pa:
+                return 409, {"error": "Nothing is scheduled or waiting for approval.", "reason": "not_scheduled"}
+            if dry_run:
+                return None, {"cancel": (sched or pa).get("correlation_id")}
+            bound = (params.get("bound") or {}).get("cancel")
+            with upgrade_service._lock:
+                data = upgrade_service.load_schedule()
+                target = data["schedule"] if (data["schedule"] or {}).get("status") == "scheduled" else None
+                held = data["pending_approval"]
+                cid = (target or held or {}).get("correlation_id")
+                if cid is None or (bound is not None and bound != cid):
+                    return self._target_changed()
+                if target:
+                    target["status"] = "cancelled"
+                data["pending_approval"] = None
+                data["last"] = {"kind": "cancelled", "version": (target or held).get("version"), "at": stamp(now), "correlation_id": cid}
+                upgrade_service.save_schedule(data)
+            details = {"correlation_id": cid, "version": (target or held).get("version"), "what": "schedule" if target else "approval request"}
+            if held and not target and held.get("first_sub") != actor_sub:
+                details["declined_by_second_admin"] = True
+            if via_step_up:
+                details["step_up_verified"] = True
+            self._log_audit_event(actor_email, actor_sub, "upgrade.cancelled", details)
+            return 200, {"kind": "cancel", "correlation_id": cid}
+
+        # --- the kinds that start or schedule an install -------------------------------------------------------------
+        if kind == "approve_second":
+            if not pa:
+                return 409, {"error": "No request is waiting for a second approval (it may have expired).", "reason": "no_pending"}
+            if actor_sub and pa.get("first_sub") == actor_sub:
+                return 403, {"error": "A different administrator must give the second approval.", "reason": "same_admin"}
+            version, sha256, eff_kind = pa["version"], pa["sha256"], pa["kind"]
+            when_utc, entered_tz, entered_local = pa.get("when_utc"), None, None
+            ack = True
+        else:
+            version, sha256, eff_kind = body.get("version"), body.get("sha256"), kind
+            when_utc, entered_tz, entered_local = body.get("when_utc"), body.get("entered_tz"), body.get("entered_local")
+            ack = body.get("acknowledged") is True
+            if not isinstance(version, str) or not upgrade_service.VERSION_RE.match(version) or not isinstance(sha256, str) \
+                    or not upgrade_service.SHA_RE.match(sha256):
+                return 400, {"error": "version (X.Y.Z) and sha256 (64 hex digits) are required."}
+            if not ack:
+                return 400, {"error": "Tick the acknowledgement: you must confirm the code-only rollback and the downtime.", "reason": "not_acknowledged"}
+            if kind == "apply" and when_utc:
+                return 400, {"error": "'apply' runs now; use 'schedule' for a time."}
+            if pa:
+                return 409, {"error": "An upgrade request is already waiting for a second administrator's approval; cancel it first.",
+                             "reason": "already_pending"}
+        if eff_kind in ("schedule", "reschedule"):
+            when = update_service._parse_iso(when_utc) if isinstance(when_utc, str) else None
+            if when is None:
+                return 400, {"error": "when_utc must be a UTC time like 2026-10-21T02:30:00Z."}
+            if (entered_tz or entered_local) and not (entered_tz and entered_local):
+                return 400, {"error": "Send entered_tz and entered_local together."}
+            if entered_tz:
+                try:
+                    consistent = upgrade_service.convert_local(entered_local, entered_tz) == when_utc
+                except Exception:  # noqa: BLE001 - unknown zone / malformed time
+                    return 400, {"error": "entered_tz / entered_local are not a valid zone and time."}
+                if not consistent:
+                    return 400, {"error": "entered_local in entered_tz is not the same moment as when_utc."}
+            if when < now + upgrade_service.MIN_LEAD:
+                return 409, {"error": "That time is in the past or less than two minutes away. Pick a later time.", "reason": "time_passed"}
+            if when > now + upgrade_service.MAX_AHEAD:
+                return 400, {"error": "An upgrade can be scheduled at most 31 days ahead."}
+            if eff_kind == "schedule" and sched:
+                return 409, {"error": "An upgrade is already scheduled; reschedule or cancel it.", "reason": "already_scheduled"}
+            if eff_kind == "reschedule" and not sched:
+                return 409, {"error": "Nothing is scheduled to reschedule.", "reason": "not_scheduled"}
+        state = upgrade_service.updater_state()
+        if not state["ready"]:
+            return 409, {"error": state["message"], "reason": state["reason"]}
+        data = update_service.load()
+        latest = data["state"].get("latest_version")
+        if latest != version or not update_service.newer(version, engine.SCRIPT_VERSION):
+            return 409, {"error": f"{version} is not the latest known release for this installation. Use Check now.", "reason": "target_changed"}
+        preview = upgrade_service.current_preview(version)
+        if not preview or preview.get("sha256") != sha256:
+            return 409, {"error": "The signed release information must be reviewed first (or it changed). Reload the Updates page.",
+                         "reason": "preview_missing" if not preview else "target_changed"}
+        fails = upgrade_service.failures_view()
+        if fails.get(version, {}).get("count", 0) >= 1:
+            return 409, {"error": f"{version} failed here before. An operator must run `ocw-updater clear-failure` on the server first.",
+                         "reason": "version_failed_before"}
+        if sum(v.get("count", 0) for v in fails.values()) >= 2:
+            return 409, {"error": "Two upgrades have failed. Contact the maintainers with the support bundle; an operator must run "
+                                  "`ocw-updater clear-failure` first.", "reason": "too_many_failures"}
+        run = update_service.upgrade_run() or {}
+        if run.get("result") == "failed_needs_operator":
+            return 409, {"error": "The last upgrade could not be rolled back automatically. An operator must act on the server "
+                                  "(`ocw-updater status`).", "reason": "needs_operator"}
+        if run.get("result") is None and run.get("step"):
+            return 409, {"error": "Another upgrade is in progress.", "reason": "in_flight"}
+        fresh = upgrade_service.refresh_preflight(_upgrade_context(), now) or preview
+        if not fresh.get("preflight_ok"):
+            bad = next((i for i in fresh["preflight"] if not i["ok"]), {"text": "a preflight check failed"})
+            return 409, {"error": "Preflight failed: " + bad["text"], "reason": "preflight_failed"}
+        if dry_run:
+            return None, {"version": version, "sha256": sha256, "when_utc": when_utc if eff_kind in ("schedule", "reschedule") else None}
+        bound = params.get("bound") or {}
+        if bound.get("version") != version or bound.get("sha256") != sha256 or (
+                eff_kind in ("schedule", "reschedule") and bound.get("when_utc") != when_utc):
+            return self._target_changed()
+        if eff_kind in ("schedule", "reschedule"):
+            if update_service._parse_iso(when_utc) < now + timedelta(seconds=60):
+                return 409, {"error": "The scheduled time passed while waiting for the MFA approval. Pick a new time.", "reason": "time_passed"}
+        cid = upgrade_service.new_correlation_id()
+        action_id = self.headers.get("X-Auth-Action-Id") if via_step_up else None
+        entered = f"{entered_tz} {entered_local[11:16]}" if entered_tz and entered_local else None
+        details = {"correlation_id": cid, "version": version, "sha256": sha256, "signed_by": preview.get("key_id"),
+                   "acknowledged": ["rollback is code-only", "downtime about a minute"]}
+        if via_step_up:
+            details.update(step_up_verified=True, action_id=action_id)
+        if kind != "approve_second" and two:
+            with upgrade_service._lock:
+                d = upgrade_service.load_schedule()
+                d["pending_approval"] = {"kind": eff_kind, "version": version, "sha256": sha256, "when_utc": when_utc if eff_kind != "apply" else None,
+                                         "entered": entered, "first_sub": actor_sub, "first_email": actor_email, "correlation_id": cid,
+                                         "action_id": action_id, "created_at": stamp(now),
+                                         "expires_at": stamp(now + upgrade_service.APPROVAL_TTL)}
+                upgrade_service.save_schedule(d)
+            self._log_audit_event(actor_email, actor_sub, "upgrade.requested", {**details, "awaiting_second_approval": True,
+                                                                               "when_utc": when_utc, "expires_at": stamp(now + upgrade_service.APPROVAL_TTL)})
+            return 200, {"kind": kind, "awaiting_second_approval": True, "correlation_id": cid}
+        if kind == "approve_second":
+            cid = pa["correlation_id"]
+            details.update(correlation_id=cid, second_approval=True, first_approved_by=pa.get("first_email") or "an administrator")
+            entered = pa.get("entered")
+        with upgrade_service._lock:
+            d = upgrade_service.load_schedule()
+            d["pending_approval"] = None
+            if eff_kind == "apply":
+                if sched:
+                    d["schedule"]["status"] = "replaced"
+                    self._log_audit_event(actor_email, actor_sub, "upgrade.cancelled", {
+                        "correlation_id": sched.get("correlation_id"), "version": sched.get("version"), "what": "schedule",
+                        "reason": "the administrator chose to upgrade now instead"})
+                upgrade_service.save_schedule(d)
+                upgrade_service.write_request(correlation_id=cid, version=version, sha256=sha256, action_id=action_id,
+                                              actor=actor_email or actor_sub, trigger_kind="app", now=now)
+                self._log_audit_event(actor_email, actor_sub, "upgrade.requested", {**details, "when": "now"})
+                return 200, {"kind": "apply", "correlation_id": cid, "version": version}
+            d["schedule"] = {"correlation_id": cid, "version": version, "sha256": sha256, "when_utc": when_utc, "entered": entered,
+                             "entered_tz": entered_tz, "status": "scheduled", "actor_email": actor_email, "actor_sub": actor_sub,
+                             "action_id": action_id, "approved_at": stamp(now), "key_id": preview.get("key_id"),
+                             "replaces": sched.get("correlation_id") if sched else None}
+            d["last"] = None
+            upgrade_service.save_schedule(d)
+        self._log_audit_event(actor_email, actor_sub, "upgrade.rescheduled" if eff_kind == "reschedule" else "upgrade.scheduled",
+                              {**details, "when_utc": when_utc, "entered_tz": entered_tz, "entered_zone_time": entered})
+        return 200, {"kind": eff_kind, "correlation_id": cid, "version": version, "when_utc": when_utc}
 
     def _exec_shared_permissions_update(self, params, dry_run, via_step_up):
         """Admin-only: the global defaults (no environment_id), one
@@ -2545,7 +2818,13 @@ class Handler(SimpleHTTPRequestHandler):
                     return self._send_json(403, {"error": "Admin access required to view update status."})
                 body = update_service.status(update_service.load(), engine.SCRIPT_VERSION)
                 body["upgrade_run"] = update_service.upgrade_run()  # 5.47.0: the root-owned updater's current/last run
+                body["upgrade"] = self._upgrade_view(qs)  # 5.48.0: everything the in-app flow shows
                 return self._send_json(200, body)
+
+            if path == "/api/upgrade/notice":
+                # 5.48.0: the one-line banner (any signed-in user): an upgrade is scheduled / running / failed; only admins
+                # are told that one is merely available.
+                return self._send_json(200, upgrade_service.notice(engine.SCRIPT_VERSION, _can_admin(owner_key, self.headers)))
 
             if path == "/api/upgrade/bundle":
                 # 5.47.0: download a redacted support bundle the updater built after a failed upgrade (the failed
@@ -2681,6 +2960,21 @@ class Handler(SimpleHTTPRequestHandler):
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to change update settings."})
                 return self._environment_change("upgrade.settings", {"body": payload})
+
+            if path == "/api/upgrade/preview":
+                # 5.48.0: read the release's signature file and manifest (a few KB), verify the signature's trusted comment
+                # against the pinned keys and run the preflight. No install, no step-up: it is a read.
+                if not _can_admin(owner_key, self.headers):
+                    return self._send_json(403, {"error": "Admin access required to review an update."})
+                status, body = self._upgrade_preview(actor_email, actor_sub)
+                return self._send_json(status, body)
+
+            if path == "/api/upgrade/request":
+                # 5.48.0: upgrade now / schedule / reschedule / cancel / second approval. Admin-only; in hosted mode every one
+                # is stored as a pending action bound to the exact version, hash and time and needs a fresh MFA approval.
+                if not _can_admin(owner_key, self.headers):
+                    return self._send_json(403, {"error": "Admin access required to upgrade."})
+                return self._environment_change("upgrade.request", {"body": payload})
 
             if path == "/api/upgrade/check":
                 # 5.46.0: the Updates screen's "Check now" -- one request to the release server (never
@@ -2971,7 +3265,8 @@ class Handler(SimpleHTTPRequestHandler):
                     user_agent=self.headers.get("User-Agent"),
                     correlation_id=engine.CORRELATION_ID.get(),
                 )
-                return self._send_json(200, {"started": started, "already_running": not started})
+                return self._send_json(200, {"started": started, "already_running": not started and not upgrade_service.quiesced(),
+                                             "upgrade_starting": not started and upgrade_service.quiesced()})
 
             if path.startswith("/api/environments/") and path.endswith("/sync/import_csv"):
                 name = unquote(path[len("/api/environments/"):-len("/sync/import_csv")])

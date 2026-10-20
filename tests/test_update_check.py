@@ -245,7 +245,7 @@ def test_damaged_state_file_means_off(tmp_path, mirror):
     assert service.is_enabled(service.load()) == (False, "default_off")
     Path(service.state_path()).write_text(json.dumps({"settings": {"enabled": "yes", "share_version": 1}, "state": []}))
     data = service.load()
-    assert data["settings"] == {"enabled": None, "share_version": False, "manual_only": False}
+    assert data["settings"] == {"enabled": None, "share_version": False, "manual_only": False, "second_approval": False}
 
 
 def test_settings_change_is_audited_locked_by_env_and_kicks(monkeypatch):
