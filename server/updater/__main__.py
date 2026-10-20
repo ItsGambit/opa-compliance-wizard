@@ -4,6 +4,8 @@ Updates page shows is also here, for admins who work from a shell).
     python -m server.updater status [--json]
     python -m server.updater check [--force] [--json]
     python -m server.updater enable-check | disable-check
+    python -m server.updater set-channel stable|prerelease
+    python -m server.updater share-version on|off
     python -m server.updater verify <tarball> <minisig> [verify options]
     python -m server.updater keys list
     python -m server.updater keys apply-revocation <revocation.json>
@@ -62,6 +64,9 @@ def _print_status(s):
              "setting": "ON (admin setting)" if chk["enabled"] else "OFF (admin setting)",
              "default_off": "OFF (never enabled; this is the default)"}[chk["source"]]
     print(f"Update check      : {where}")
+    print(f"Release channel   : {chk['channel']}" + (" (fixed by OPA_UPDATE_CHANNEL)" if chk["channel_source"] == "env" else "")
+          + ("  -- includes prereleases; set back with `set-channel stable`" if chk["channel"] == "prerelease" else ""))
+    print("Share my version  : " + ("on (the installed version is added to the check's User-Agent)" if chk["share_version"] else "off (default)"))
     if chk["prompt_needed"]:
         print("                    Enable with: python -m server.updater enable-check")
     if last["at"]:
@@ -137,6 +142,30 @@ def _set(enabled):
     return EXIT_OK
 
 
+def _set_channel(a):
+    status_code, body = service.change_settings(None, None, _installed(), _cli_audit, channel=a.channel)
+    if status_code != 200:
+        print(f"ERROR: {body['error']}", file=sys.stderr)
+        return EXIT_FAILURE
+    if a.channel == "prerelease":
+        print("Release channel is now PRERELEASE: the check also offers releases the maintainers marked as prereleases. "
+              "They are signed and verified like any other release, but have had less testing. Switch back with `set-channel stable`.")
+    else:
+        print("Release channel is now STABLE (the default). A prerelease that is already installed is never downgraded; "
+              "you simply get the next stable release when it is newer.")
+    return EXIT_OK
+
+
+def _share_version(a):
+    status_code, body = service.change_settings(None, a.state == "on", _installed(), _cli_audit)
+    if status_code != 200:
+        print(f"ERROR: {body['error']}", file=sys.stderr)
+        return EXIT_FAILURE
+    print("The update check will now include the installed version in its User-Agent." if a.state == "on" else
+          "The update check no longer includes the installed version.")
+    return EXIT_OK
+
+
 def cmd_keys_list(_a):
     try:
         kl = keylib.effective_key_list()
@@ -204,6 +233,12 @@ def build_parser():
     s.set_defaults(fn=cmd_check)
     sub.add_parser("enable-check").set_defaults(fn=lambda a: _set(True))
     sub.add_parser("disable-check").set_defaults(fn=lambda a: _set(False))
+    s = sub.add_parser("set-channel")
+    s.add_argument("channel", choices=service.CHANNELS)
+    s.set_defaults(fn=_set_channel)
+    s = sub.add_parser("share-version")
+    s.add_argument("state", choices=("on", "off"))
+    s.set_defaults(fn=_share_version)
     s = sub.add_parser("verify")
     s.add_argument("tarball")
     s.add_argument("minisig")

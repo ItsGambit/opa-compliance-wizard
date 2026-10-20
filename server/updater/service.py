@@ -3,7 +3,8 @@ tell the audit log. serve.py only wires this to its scheduler loop and routes.
 
 Stored in one small JSON file (update_check.json, next to the app; override
 with OPA_UPDATE_STATE_PATH), never in the archive database:
-  settings  enabled (null = never answered, true, false), share_version
+  settings  enabled (null = never answered, true, false), share_version,
+            channel ("stable" default | "prerelease", 5.49.0)
   state     latest version seen, its published date, release URL, whether a
             signed artifact is attached, last check time and result, plus the
             bookkeeping needed to be polite (ETag, next check time, failure
@@ -13,6 +14,13 @@ Switches (operator, environment): OPA_UPDATE_CHECK=off always wins and
 cannot be overridden from the UI; =on enables the check without any admin
 action; unset leaves it to the admin setting, which defaults to OFF -- a
 fresh or upgraded install never phones anywhere until it is switched on.
+OPA_UPDATE_CHANNEL=stable|prerelease fixes the release channel from the
+environment (the admin setting then cannot change it). The prerelease channel
+reads GET /releases (a page of releases) instead of /releases/latest and offers
+the newest release, stable or prerelease; every release is verified against the
+pinned keys regardless of channel. OPA_RELEASE_LIST_URL names the list endpoint
+of a mirror (default: derived from OPA_RELEASE_API_URL when that ends in
+/releases/latest).
 OPA_RELEASE_API_URL / OPA_REVOCATION_URL_BASE point the check at a mirror;
 OPA_REVOCATION_URL adds a second, owner-controlled source of revocation.json.
 
@@ -44,6 +52,9 @@ API_URL_ENV = "OPA_RELEASE_API_URL"
 REVOCATION_BASE_ENV = "OPA_REVOCATION_URL_BASE"
 REVOCATION_URL_ENV = "OPA_REVOCATION_URL"
 SWITCH_ENV = "OPA_UPDATE_CHECK"
+CHANNEL_ENV = "OPA_UPDATE_CHANNEL"
+LIST_URL_ENV = "OPA_RELEASE_LIST_URL"
+CHANNELS = ("stable", "prerelease")
 OK_INTERVAL = timedelta(hours=24)
 ERROR_INTERVAL = timedelta(hours=6)
 MIN_RATE_LIMIT_WAIT = timedelta(hours=1)
@@ -121,11 +132,11 @@ def read_bundle(name):
 
 
 def default_data():
-    return {"settings": {"enabled": None, "share_version": False, "manual_only": False},
+    return {"settings": {"enabled": None, "share_version": False, "manual_only": False, "channel": "stable"},
             "state": {"latest_version": None, "published_at": None, "release_url": None, "signed_artifact": None,
                       "size": None, "notes_title": None, "notes": None, "last_check_by": None,
                       "last_check_at": None, "last_status": None, "last_code": None, "next_check_at": None,
-                      "etag": None, "consecutive_failures": 0, "failing_since": None,
+                      "etag": None, "channel": None, "latest_prerelease": False, "consecutive_failures": 0, "failing_since": None,
                       "revocation_etags": {}, "revocation_seen": {}}}
 
 
@@ -149,6 +160,8 @@ def load():
         data["settings"]["enabled"] = None
     data["settings"]["share_version"] = data["settings"]["share_version"] is True
     data["settings"]["manual_only"] = data["settings"]["manual_only"] is True
+    if data["settings"]["channel"] not in CHANNELS:
+        data["settings"]["channel"] = "stable"
     return data
 
 
@@ -180,6 +193,27 @@ def api_url():
     return os.environ.get(API_URL_ENV) or check.DEFAULT_API_URL
 
 
+def effective_channel(data):
+    """('stable'|'prerelease', 'env'|'setting'). The environment wins, like OPA_UPDATE_CHECK."""
+    raw = (os.environ.get(CHANNEL_ENV) or "").strip().lower()
+    if raw in CHANNELS:
+        return raw, "env"
+    return data["settings"]["channel"], "setting"
+
+
+def list_url():
+    """The 'list releases' endpoint the prerelease channel reads, or None when
+    a mirror is configured that does not say where its list is."""
+    explicit = os.environ.get(LIST_URL_ENV)
+    if explicit:
+        return explicit
+    api = api_url()
+    suffix = "/releases/latest"
+    if api.endswith(suffix):
+        return api[:-len("/latest")] + "?per_page=10"
+    return None
+
+
 def revocation_base():
     base = os.environ.get(REVOCATION_BASE_ENV) or check.DEFAULT_REVOCATION_BASE
     return base if base.endswith("/") else base + "/"
@@ -199,6 +233,8 @@ def _allowed_hosts():
     hosts = check.GITHUB_HOSTS
     if os.environ.get(API_URL_ENV) or os.environ.get(REVOCATION_BASE_ENV):
         hosts = check.hosts_for(api_url(), revocation_base())
+        if os.environ.get(LIST_URL_ENV):
+            hosts = frozenset(hosts) | check.hosts_for(os.environ[LIST_URL_ENV])
     if os.environ.get(REVOCATION_URL_ENV):
         hosts = frozenset(hosts) | check.hosts_for(os.environ[REVOCATION_URL_ENV])
     return hosts
@@ -219,7 +255,7 @@ def status(data, installed_version):
     if st["latest_version"]:
         latest = {"version": st["latest_version"], "published_at": st["published_at"],
                   "release_url": st["release_url"], "signed_artifact": st["signed_artifact"], "size": st["size"],
-                  "notes_title": st["notes_title"], "notes": st["notes"]}
+                  "notes_title": st["notes_title"], "notes": st["notes"], "prerelease": st["latest_prerelease"] is True}
     revocation = None
     try:
         kl = keylib.effective_key_list()
@@ -242,7 +278,8 @@ def status(data, installed_version):
         "check": {"enabled": enabled, "source": source, "env_locked": switch is not None,
                   "env_invalid_value": bad, "prompt_needed": data["settings"]["enabled"] is None and switch is None,
                   "share_version": data["settings"]["share_version"], "mirror": bool(os.environ.get(API_URL_ENV)),
-                  "frequency": frequency, "url": api_url()},
+                  "frequency": frequency, "url": api_url(),
+                  "channel": effective_channel(data)[0], "channel_source": effective_channel(data)[1]},
         "latest": latest,
         "update_available": bool(latest and newer(latest["version"], installed_version)),
         "last_check": {"at": st["last_check_at"], "status": st["last_status"], "code": st["last_code"],
@@ -283,7 +320,7 @@ def _recent_revocation(kl):
     return last
 
 
-def set_settings(enabled=None, share_version=None, manual_only=None):
+def set_settings(enabled=None, share_version=None, manual_only=None, channel=None):
     """Returns the changes {name: [old, new]} (empty if nothing changed)."""
     with _lock:
         data = load()
@@ -297,6 +334,12 @@ def set_settings(enabled=None, share_version=None, manual_only=None):
         if share_version is not None and share_version != data["settings"]["share_version"]:
             changes["share_version"] = [data["settings"]["share_version"], share_version]
             data["settings"]["share_version"] = share_version
+        if channel is not None and channel != data["settings"]["channel"]:
+            changes["channel"] = [data["settings"]["channel"], channel]
+            data["settings"]["channel"] = channel
+            st = data["state"]   # what was learned on the other channel is not valid on this one
+            st["etag"], st["channel"], st["next_check_at"] = None, None, None
+            _clear_latest(st)
         if changes:
             if enabled is True:  # a fresh answer to "check now?" -> do not wait up to a day
                 data["state"]["next_check_at"] = None
@@ -307,7 +350,7 @@ def set_settings(enabled=None, share_version=None, manual_only=None):
 FREQUENCIES = {"daily": (True, False), "manual": (True, True), "off": (False, False)}
 
 
-def change_settings(enabled, share_version, installed_version, audit, frequency=None):
+def change_settings(enabled, share_version, installed_version, audit, frequency=None, channel=None):
     """The one settings change used by the web route and the CLI (same rules,
     same audit event). `audit(action, details)` records who did it. Returns
     (http_status, body)."""
@@ -318,11 +361,14 @@ def change_settings(enabled, share_version, installed_version, audit, frequency=
     if enabled is True and switch == "off":
         return 409, {"error": "The update check is switched off by OPA_UPDATE_CHECK=off in this server's environment, "
                               "which always wins. Remove that setting (and restart) to allow it.", "reason": "env_locked"}
-    changes = set_settings(enabled, share_version, manual_only)
+    if channel is not None and effective_channel(load())[1] == "env" and channel != effective_channel(load())[0]:
+        return 409, {"error": "The release channel is fixed by OPA_UPDATE_CHANNEL in this server's environment, which always "
+                              "wins. Remove that setting (and restart) to change it here.", "reason": "env_locked"}
+    changes = set_settings(enabled, share_version, manual_only, channel)
     if changes:
         now_settings = load()["settings"]
         shown = "off" if now_settings["enabled"] is False else ("manual" if now_settings["manual_only"] else "daily") if now_settings["enabled"] else "unset"
-        audit("upgrade.settings", {"frequency": shown, "share_version": now_settings["share_version"], "changes": changes,
+        audit("upgrade.settings", {"frequency": shown, "share_version": now_settings["share_version"], "channel": now_settings["channel"], "changes": changes,
                                    "correlation_id": _engine().CORRELATION_ID.get()})
         if enabled is True and not manual_only and switch != "off":
             kick(installed_version)
@@ -335,19 +381,22 @@ def apply_settings_request(payload, installed_version, audit):
     error = validate_settings_payload(payload)
     if error:
         return 400, {"error": error}
-    return change_settings(payload.get("enabled"), payload.get("share_version"), installed_version, audit, payload.get("frequency"))
+    return change_settings(payload.get("enabled"), payload.get("share_version"), installed_version, audit, payload.get("frequency"),
+                           payload.get("channel"))
 
 
 def validate_settings_payload(payload):
     """None if the body is acceptable, else a message."""
-    allowed = {"enabled", "share_version", "frequency"}
+    allowed = {"enabled", "share_version", "frequency", "channel"}
     if not isinstance(payload, dict) or not payload or set(payload) - allowed:
-        return 'Send {"frequency": "daily"|"manual"|"off"} and/or {"share_version": true|false}.'
+        return 'Send {"frequency": "daily"|"manual"|"off"}, {"share_version": true|false} and/or {"channel": "stable"|"prerelease"}.'
     if "frequency" in payload and ("enabled" in payload or payload["frequency"] not in FREQUENCIES):
         return 'frequency must be "daily", "manual" or "off" (and cannot be combined with enabled).'
     for key in ("enabled", "share_version"):
         if key in payload and not isinstance(payload[key], bool):
             return f"{key} must be true or false."
+    if "channel" in payload and payload["channel"] not in CHANNELS:
+        return 'channel must be "stable" or "prerelease".'
     return None
 
 
@@ -401,7 +450,7 @@ def _revocation_step(st, installed_user_agent):
     return outcomes
 
 
-def run_check(installed_version, now=None, force=False, trigger="scheduler", actor=None):
+def run_check(installed_version, now=None, force=False, trigger="scheduler", actor=None, channel=None):
     """One full check, persisted and audited. Never raises. Safe to call from
     a thread; a second concurrent call returns None. `force` runs it although
     the check is off (the CLI's --force; recorded as such) -- but never when
@@ -423,7 +472,17 @@ def run_check(installed_version, now=None, force=False, trigger="scheduler", act
             return None
         st = data["state"]
         ua = check.USER_AGENT + (f"/{installed_version}" if data["settings"]["share_version"] else "")
-        got = check.fetch(api_url(), _allowed_hosts(), st["etag"], ua)
+        channel = channel or effective_channel(data)[0]
+        if st.get("channel") != channel:   # an ETag from the other channel's URL must not be replayed
+            st["etag"] = None
+        st["channel"] = channel
+        if channel == "prerelease":
+            url = list_url()
+            got = (check.fetch(url, _allowed_hosts(), st["etag"], ua, max_bytes=check.MAX_LIST_RESPONSE_BYTES) if url else
+                   check.Fetched("error", "channel_unsupported", "The prerelease channel needs OPA_RELEASE_LIST_URL when a "
+                                 "mirror is configured.", None, None, None))
+        else:
+            got = check.fetch(api_url(), _allowed_hosts(), st["etag"], ua)
         previous_code = st["last_code"] if st["last_status"] != "ok" else None
         result = "failed"
         code = got.code
@@ -432,14 +491,15 @@ def run_check(installed_version, now=None, force=False, trigger="scheduler", act
         if got.status in ("ok", "not_modified", "not_found"):
             try:
                 if got.status == "ok":
-                    latest = check.parse_latest(got.body)
+                    latest = (check.parse_latest_from_list(got.body) if channel == "prerelease"
+                              else check.parse_latest(got.body))
                     st["etag"] = got.etag
                     if latest is None:
                         _clear_latest(st)
                     else:
                         st.update(latest_version=latest.version, published_at=latest.published_at,
                                   release_url=latest.release_url, signed_artifact=latest.signed_artifact, size=latest.size,
-                                  notes_title=latest.notes_title, notes=latest.notes)
+                                  notes_title=latest.notes_title, notes=latest.notes, latest_prerelease=latest.prerelease)
                 elif got.status == "not_found":
                     _clear_latest(st)
                     st["etag"] = None
@@ -464,7 +524,7 @@ def run_check(installed_version, now=None, force=False, trigger="scheduler", act
         details = {"outcome": result, "result": _human_result(result, installed_version, st["latest_version"], code),
                    "installed_version": installed_version, "latest_version": st["latest_version"],
                    "reason": None if result != "failed" else code,
-                   "source": _source_text(got)}
+                   "source": _source_text(got), "channel": channel}
         if trigger != "scheduler":
             details["trigger"] = trigger
         if not enabled:
@@ -502,6 +562,7 @@ def run_check(installed_version, now=None, force=False, trigger="scheduler", act
 def _clear_latest(st):
     for k in ("latest_version", "published_at", "release_url", "signed_artifact", "size", "notes_title", "notes"):
         st[k] = None
+    st["latest_prerelease"] = False
 
 
 def _human_result(outcome, installed, latest, code):

@@ -7,6 +7,7 @@ calls it.
 
     release.py build <version> [--out DIR] [--repo DIR]
     release.py sign <ocw-version.tar.gz> --signer kms --kms-key K [--aws-profile P]
+    release.py build-offline <ocw-version.tar.gz> [--out DIR] [--python 3.12 ...] [--platform linux-x86_64 ...]
     release.py verify <ocw-version.tar.gz> <ocw-version.tar.gz.minisig> [...]
     release.py pubkey --aws-kms <key id|arn|alias> | --azure <key id URL> [--out entry.json]
     release.py rotate [--add-key entry.json] [--retire <key id>]
@@ -52,6 +53,7 @@ from signing_backends import AwsKmsBackend, AzureKeyVaultSigner, RawSignerBacken
 from server.updater import keys as keylib  # noqa: E402
 from server.updater import minisign  # noqa: E402
 from server.updater import verify as verifylib  # noqa: E402
+from server.updater import offline as offlinelib  # noqa: E402
 
 DEFAULT_MIN_UPGRADE_FROM = "5.41.0"  # first release with deploy.sh handoff protocol 2
 DEFAULT_DOWNTIME_SECONDS = 60
@@ -315,6 +317,205 @@ def cmd_verify(a):
     return verifylib.main(argv)
 
 
+# --- offline bundle (5.49.0) ------------------------------------------------------------
+
+
+# Python versions the project supports (CI runs 3.9, 3.12 and 3.14; README documents 3.9 and newer).
+OFFLINE_PYTHONS = ("3.9", "3.10", "3.11", "3.12", "3.13", "3.14")
+# Where an air-gapped computer can run it. `pip download` is given these platform tags explicitly, because it cannot
+# probe a machine it is not running on. Linux wheels need glibc 2.17-2.34 depending on the package (cryptography now
+# ships manylinux_2_28); Alpine/musl is not covered.
+OFFLINE_PLATFORMS = {
+    "linux-x86_64": {"os_name": "posix", "platform_system": "Linux", "sys_platform": "linux", "platform_machine": "x86_64",
+                     "tags": ["manylinux2014_x86_64", "manylinux_2_17_x86_64", "manylinux_2_28_x86_64", "manylinux_2_34_x86_64"]},
+    "linux-aarch64": {"os_name": "posix", "platform_system": "Linux", "sys_platform": "linux", "platform_machine": "aarch64",
+                      "tags": ["manylinux2014_aarch64", "manylinux_2_17_aarch64", "manylinux_2_28_aarch64", "manylinux_2_34_aarch64"]},
+    "macos-arm64": {"os_name": "posix", "platform_system": "Darwin", "sys_platform": "darwin", "platform_machine": "arm64",
+                    "tags": ["macosx_11_0_arm64", "macosx_12_0_arm64", "macosx_13_0_arm64", "macosx_14_0_arm64",
+                             "macosx_10_13_universal2", "macosx_10_9_universal2", "macosx_11_0_universal2"]},
+    "macos-x86_64": {"os_name": "posix", "platform_system": "Darwin", "sys_platform": "darwin", "platform_machine": "x86_64",
+                     "tags": ["macosx_10_9_x86_64", "macosx_10_13_x86_64", "macosx_10_15_x86_64", "macosx_11_0_x86_64",
+                              "macosx_10_13_universal2", "macosx_10_9_universal2", "macosx_11_0_universal2"]},
+    "windows-amd64": {"os_name": "nt", "platform_system": "Windows", "sys_platform": "win32", "platform_machine": "AMD64",
+                      "tags": ["win_amd64"]},
+}
+
+
+def _marker_class():
+    try:
+        from packaging.markers import Marker
+        return Marker
+    except ImportError:
+        try:
+            from pip._vendor.packaging.markers import Marker
+            return Marker
+        except ImportError:
+            raise ReleaseError("build-offline needs the 'packaging' package (pip install packaging) to read requirements.lock markers")
+
+
+def parse_lock(text):
+    """requirements.lock (pip --generate-hashes format) -> [{name, version, marker, hashes}]."""
+    joined = re.sub(r"\\\n\s*", " ", text)
+    entries = []
+    for line in joined.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        head, _, rest = line.partition(" --hash=")
+        hashes = re.findall(r"--hash=sha256:([0-9a-f]{64})", " --hash=" + rest) if rest else []
+        spec, _, marker = head.partition(";")
+        m = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s]+)$", spec.strip())
+        if not m:
+            raise ReleaseError(f"requirements.lock has a line build-offline cannot read: {line[:80]!r}")
+        if not hashes:
+            raise ReleaseError(f"requirements.lock entry {m.group(1)} has no sha256 hashes; the lock must be hash-pinned")
+        entries.append({"name": m.group(1), "version": m.group(2), "marker": marker.strip() or None, "hashes": hashes})
+    if not entries:
+        raise ReleaseError("requirements.lock lists no packages")
+    return entries
+
+
+def _norm(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _marker_env(py, platform):
+    spec = OFFLINE_PLATFORMS[platform]
+    base = {"implementation_name": "cpython", "platform_python_implementation": "CPython", "python_version": py,
+            "os_name": spec["os_name"], "platform_system": spec["platform_system"], "sys_platform": spec["sys_platform"],
+            "platform_machine": spec["platform_machine"], "platform_release": "", "platform_version": ""}
+    # python_full_version / implementation_version: the marker may split a minor version (>= 3.9.2); take the union of an
+    # early and a late patch release so no package that could apply is left out. Extra wheels are harmless.
+    return [dict(base, python_full_version=f"{py}.{micro}", implementation_version=f"{py}.{micro}") for micro in (0, 99)]
+
+
+def entries_for(entries, py, platform):
+    marker_cls = _marker_class()
+    out = []
+    for e in entries:
+        if e["marker"] is None:
+            out.append(e)
+            continue
+        marker = marker_cls(e["marker"])
+        if any(marker.evaluate(env) for env in _marker_env(py, platform)):
+            out.append(e)
+    return out
+
+
+def _wheel_project_version(filename):
+    parts = filename[:-4].split("-")
+    if len(parts) < 5:
+        raise ReleaseError(f"{filename} is not a wheel file name")
+    return _norm(parts[0]), parts[1]
+
+
+def default_pip_runner(argv):
+    proc = subprocess.run([sys.executable, "-m", "pip", *argv], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise ReleaseError("pip download failed: " + (proc.stderr or proc.stdout).strip()[-600:])
+
+
+def build_offline(tar_path, out_dir=None, pythons=OFFLINE_PYTHONS, platforms=tuple(OFFLINE_PLATFORMS), keys_path=None,
+                  runner=default_pip_runner):
+    """Collect the hash-pinned wheels for `tar_path`'s requirements.lock and pack them with the signed release into
+    ocw-<version>-offline.tar.gz. The release must already be signed (release.py sign): its signature is checked here
+    against the pinned keys, and requirements.lock must be one of the files its signed manifest lists. `runner(argv)`
+    runs `pip <argv>` (tests replace it; nothing else here touches the network)."""
+    tar_path = Path(tar_path)
+    sig_path = Path(str(tar_path) + ".minisig")
+    if not sig_path.is_file():
+        raise ReleaseError(f"{sig_path} is missing: sign the release first (release.py sign), then build the offline bundle")
+    for py in pythons:
+        if not re.match(r"^3\.\d{1,2}$", py):
+            raise ReleaseError(f"--python must look like 3.12 (got {py!r})")
+    for plat in platforms:
+        if plat not in OFFLINE_PLATFORMS:
+            raise ReleaseError(f"unknown platform {plat!r}; choose from {', '.join(OFFLINE_PLATFORMS)}")
+    keys_path = Path(keys_path or REPO / "server" / "release_keys.json")
+    eff = keylib.effective_from(keylib.load_key_list(keys_path))
+    info = verifylib.verify_release(str(tar_path), str(sig_path), eff, None)
+    version = info.version
+    if tar_path.name != f"ocw-{version}.tar.gz":
+        raise ReleaseError(f"file name must be ocw-{version}.tar.gz (it is {tar_path.name})")
+    with tarfile.open(tar_path, "r:gz") as tar:
+        lock_bytes = tar.extractfile("requirements.lock").read()
+        manifest_bytes = tar.extractfile("manifest.json").read()
+    lock_sha = hashlib.sha256(lock_bytes).hexdigest()
+    if info.manifest["files"].get("requirements.lock") != lock_sha:
+        raise ReleaseError("requirements.lock inside the release does not match its signed manifest")
+    entries = parse_lock(lock_bytes.decode("utf-8"))
+    out_dir = Path(out_dir or tar_path.parent)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="ocw-offline-") as tmp:
+        wheels = Path(tmp) / "wheels"
+        wheels.mkdir()
+        for py in pythons:
+            for plat in platforms:
+                chosen = entries_for(entries, py, plat)
+                reqs = Path(tmp) / f"req-{py}-{plat}.txt"
+                reqs.write_text("".join(f"{e['name']}=={e['version']} " + " ".join(f"--hash=sha256:{h}" for h in e["hashes"]) + "\n"
+                                        for e in chosen), encoding="utf-8")
+                print(f"==> pip download for Python {py}, {plat} ({len(chosen)} packages)")
+                argv = ["download", "-q", "--no-deps", "--only-binary=:all:", "--require-hashes", "-r", str(reqs), "-d", str(wheels),
+                        "--python-version", py, "--implementation", "cp"]
+                for tag in OFFLINE_PLATFORMS[plat]["tags"]:
+                    argv += ["--platform", tag]
+                runner(argv)
+        # Defence in depth: whatever pip left in the folder must be a wheel whose hash the signed lock records, and every
+        # package any target needs must be present.
+        allowed = {h: (_norm(e["name"]), e["version"]) for e in entries for h in e["hashes"]}
+        listed = {}
+        for f in sorted(wheels.iterdir()):
+            if f.suffix != ".whl" or not offlinelib.WHEEL_RE.match(f.name):
+                raise ReleaseError(f"unexpected file in the wheel folder: {f.name}")
+            sha = hashlib.sha256(f.read_bytes()).hexdigest()
+            if sha not in allowed:
+                raise ReleaseError(f"{f.name} is not recorded in requirements.lock (sha256 {sha[:12]}…); refusing to bundle it")
+            if allowed[sha] != _wheel_project_version(f.name):
+                raise ReleaseError(f"{f.name} does not match the package its hash belongs to in requirements.lock")
+            listed[f.name] = sha
+        have = {_wheel_project_version(n) for n in listed}
+        for py in pythons:
+            for plat in platforms:
+                for e in entries_for(entries, py, plat):
+                    if (_norm(e["name"]), e["version"]) not in have:
+                        raise ReleaseError(f"no wheel for {e['name']}=={e['version']} ({py}, {plat}) was collected")
+        offline = {"schema": 1, "version": version, "requirements_lock_sha256": lock_sha, "python_versions": list(pythons),
+                   "platforms": list(platforms), "wheels": listed,
+                   "note": "Safety rests on requirements.lock (signed via the release manifest) and pip --require-hashes."}
+        offline_bytes = (json.dumps(offline, indent=2, sort_keys=True) + "\n").encode()
+        bundle = out_dir / f"ocw-{version}-offline.tar.gz"
+        members = [(tar_path.name, tar_path.read_bytes()), (sig_path.name, sig_path.read_bytes()),
+                   ("manifest.json", manifest_bytes),
+                   ("offline.json", offline_bytes)] + [(f"wheels/{n}", (wheels / n).read_bytes()) for n in sorted(listed)]
+        with open(bundle, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0, filename="") as gz, \
+                tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar:
+            for name, data in members:
+                ti = tarfile.TarInfo(name)
+                ti.size, ti.mode, ti.mtime = len(data), 0o644, 0
+                ti.uid = ti.gid = 0
+                ti.uname = ti.gname = ""
+                tar.addfile(ti, io.BytesIO(data))
+    # The bundle must open with the same code the installer uses.
+    with tempfile.TemporaryDirectory(prefix="ocw-offline-check-") as chk:
+        try:
+            offlinelib.open_bundle(bundle, chk)
+        except offlinelib.BundleError as exc:
+            bundle.unlink(missing_ok=True)
+            raise ReleaseError(f"the bundle just built does not pass its own check: {exc}")
+    digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+    (out_dir / (bundle.name + ".sha256")).write_text(f"{digest}  {bundle.name}\n", encoding="utf-8")
+    return bundle, offline, digest
+
+
+def cmd_build_offline(a):
+    bundle, offline, digest = build_offline(a.tarball, a.out, tuple(a.python or OFFLINE_PYTHONS),
+                                            tuple(a.platform or OFFLINE_PLATFORMS), a.keys)
+    print(f"Built {bundle} ({len(offline['wheels'])} wheels, {bundle.stat().st_size // 1024 // 1024} MB) sha256 {digest}")
+    print("The release inside is the signed one, unchanged; the wheels are checked by pip against the signed requirements.lock.")
+    print("Upload it to the GitHub release next to the three signed files, with its .sha256 file.")
+
+
 # --- public keys / rotation ------------------------------------------------------
 
 
@@ -384,6 +585,13 @@ def build_parser():
     s.add_argument("--keys", help="key list to self-verify against (default server/release_keys.json)")
     s.add_argument("--require-minisign", action="store_true", help="fail if the official minisign program is not available")
     s.set_defaults(fn=cmd_sign)
+    s = sub.add_parser("build-offline", help="pack a signed release with its hash-pinned Python packages, for computers without internet")
+    s.add_argument("tarball")
+    s.add_argument("--out", help="output directory (default: next to the tarball)")
+    s.add_argument("--python", action="append", help="Python minor version to include, e.g. 3.12 (repeatable; default 3.9-3.14)")
+    s.add_argument("--platform", action="append", choices=tuple(OFFLINE_PLATFORMS), help="platform to include (repeatable; default all)")
+    s.add_argument("--keys", help="key list to verify the signature against (default server/release_keys.json)")
+    s.set_defaults(fn=cmd_build_offline)
     s = sub.add_parser("verify")
     s.add_argument("tarball")
     s.add_argument("minisig")
@@ -409,7 +617,7 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
         return args.fn(args) or 0
-    except (ReleaseError, keylib.KeyListError, minisign.SignatureError, verifylib.VerifyError) as exc:
+    except (ReleaseError, keylib.KeyListError, minisign.SignatureError, verifylib.VerifyError, offlinelib.BundleError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     except (OSError, tarfile.TarError, KeyError, ValueError) as exc:

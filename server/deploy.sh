@@ -178,6 +178,12 @@ _deploy_via_updater() {
   fi
   [ -x "$_bin" ] || { echo "ERROR: $_bin not found: re-run server/install.sh" >&2; return 1; }
   [ "$(id -u)" -eq 0 ] || _sudo="sudo"
+  if [ -n "$_dir" ] && [ -f "$_dir/ocw-$_v-offline.tar.gz" ] && [ ! -f "$_dir/ocw-$_v.tar.gz" ]; then
+    echo "ERROR: the updater layout cannot yet install Python packages from an offline bundle (ocw-updater stage has no wheelhouse" >&2
+    echo "       option in this version). Nothing was changed. Unpack the bundle and stage the release inside it, with network access" >&2
+    echo "       to the package index for the packages, or use the in-place layout. README, 'Upgrading', 'Air-gapped'." >&2
+    return 2
+  fi
   if [ -n "$_dir" ]; then
     [ -f "$_dir/ocw-$_v.tar.gz" ] && [ -f "$_dir/ocw-$_v.tar.gz.minisig" ] || {
       echo "ERROR: $_dir must contain ocw-$_v.tar.gz and ocw-$_v.tar.gz.minisig" >&2
@@ -242,7 +248,7 @@ esac
 if [ -z "${DEPLOY_SH_PHASE:-}" ]; then
   # Phase 0: nothing inherited from the caller is handoff state.
   unset DEPLOY_SH_PHASE1_FROZEN_DIR DEPLOY_SH_PHASE1_TMP_DIR DEPLOY_COMMIT DEPLOY_VERSION \
-    DEPLOY_APP_DIR DEPLOY_LOCK_HELD DEPLOY_PREFLIGHT_DONE DEPLOY_STARTED_LOGGED DEPLOY_RELEASE_MODE
+    DEPLOY_APP_DIR DEPLOY_LOCK_HELD DEPLOY_PREFLIGHT_DONE DEPLOY_STARTED_LOGGED DEPLOY_RELEASE_MODE OPA_DEPLOY_WHEELHOUSE
 fi
 # FIX (4th independent review, 2026-10-02): every variable each phase's own
 # later logic depends on is required up front.
@@ -640,12 +646,27 @@ _fetch_signed_release() {
   _sig="$_tar.minisig"
   if [ -n "$RELEASE_DIR" ]; then
     echo "==> Using the release files in $RELEASE_DIR"
-    if [ ! -f "$RELEASE_DIR/ocw-$RELEASE_VERSION.tar.gz" ] || [ ! -f "$RELEASE_DIR/ocw-$RELEASE_VERSION.tar.gz.minisig" ]; then
-      echo "ERROR: $RELEASE_DIR must contain ocw-$RELEASE_VERSION.tar.gz and ocw-$RELEASE_VERSION.tar.gz.minisig" >&2
+    # 5.49.0: an offline bundle (release + hash-pinned Python packages, for a server without internet) stands in for
+    # the two files. It is unpacked with the installed copy's own checker; the release inside is verified below like
+    # any other, and pip installs only wheels whose sha256 the signed requirements.lock records.
+    if [ -f "$RELEASE_DIR/ocw-$RELEASE_VERSION-offline.tar.gz" ] && [ ! -f "$RELEASE_DIR/ocw-$RELEASE_VERSION.tar.gz" ]; then
+      echo "==> Unpacking the offline bundle"
+      if ! (cd "$APP_DIR" && "$_py" -m server.updater.offline unpack "$RELEASE_DIR/ocw-$RELEASE_VERSION-offline.tar.gz" "$TMP_DIR/offline" >/dev/null); then
+        echo "ERROR: the offline bundle was refused (reason above). Nothing has been changed." >&2
+        exit 1
+      fi
+      cp -- "$TMP_DIR/offline/ocw-$RELEASE_VERSION.tar.gz" "$_tar"
+      cp -- "$TMP_DIR/offline/ocw-$RELEASE_VERSION.tar.gz.minisig" "$_sig"
+      OPA_DEPLOY_WHEELHOUSE="$TMP_DIR/offline/wheels"
+      export OPA_DEPLOY_WHEELHOUSE
+    elif [ ! -f "$RELEASE_DIR/ocw-$RELEASE_VERSION.tar.gz" ] || [ ! -f "$RELEASE_DIR/ocw-$RELEASE_VERSION.tar.gz.minisig" ]; then
+      echo "ERROR: $RELEASE_DIR must contain ocw-$RELEASE_VERSION.tar.gz and ocw-$RELEASE_VERSION.tar.gz.minisig (or ocw-$RELEASE_VERSION-offline.tar.gz)" >&2
       exit 1
     fi
-    cp -- "$RELEASE_DIR/ocw-$RELEASE_VERSION.tar.gz" "$_tar"
-    cp -- "$RELEASE_DIR/ocw-$RELEASE_VERSION.tar.gz.minisig" "$_sig"
+    if [ -z "${OPA_DEPLOY_WHEELHOUSE:-}" ]; then
+      cp -- "$RELEASE_DIR/ocw-$RELEASE_VERSION.tar.gz" "$_tar"
+      cp -- "$RELEASE_DIR/ocw-$RELEASE_VERSION.tar.gz.minisig" "$_sig"
+    fi
     [ ! -f "$RELEASE_DIR/revocation.json" ] || cp -- "$RELEASE_DIR/revocation.json" "$_dl/revocation.json"
   else
     echo "==> Downloading release $RELEASE_VERSION from $RELEASE_BASE_URL"
@@ -916,7 +937,11 @@ echo "==> Reinstalling Python dependencies"
 # 5.46.0: hash-pinned install when the release ships requirements.lock (every
 # package must match a recorded sha256, so a tampered PyPI upload is refused
 # instead of installed). Older refs have no lock: requirements.txt, as before.
-if [ -f "$APP_DIR/requirements.lock" ]; then
+if [ -f "$APP_DIR/requirements.lock" ] && [ -n "${OPA_DEPLOY_WHEELHOUSE:-}" ] && [ -d "$OPA_DEPLOY_WHEELHOUSE" ]; then
+  # 5.49.0: from an offline bundle: only the bundle's wheels, no index, still hash-checked against the signed lock.
+  echo "==> Installing Python packages from the offline bundle (no network)"
+  "$APP_DIR/.venv/bin/pip" install -q --no-index --find-links "$OPA_DEPLOY_WHEELHOUSE" --only-binary=:all: --require-hashes -r "$APP_DIR/requirements.lock"
+elif [ -f "$APP_DIR/requirements.lock" ]; then
   "$APP_DIR/.venv/bin/pip" install -q --require-hashes -r "$APP_DIR/requirements.lock"
 else
   echo "WARNING: no requirements.lock in this version; installing from requirements.txt (not hash-checked)." >&2

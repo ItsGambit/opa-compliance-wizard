@@ -193,3 +193,50 @@ def test_git_ref_deploys_still_work_and_say_they_are_unsigned(d):
     assert "UNSIGNED source" in d.out and "--release" in d.out
     started = [e for e in d.events() if e["action"] == "deploy.started"][0]
     assert started["details"]["source"] == "unsigned_git"
+
+
+# --- the offline bundle (5.49.0) ------------------------------------------------------------------------
+
+
+def make_bundle(rel, version, wheel_ok=True, extra_member=None):
+    import io
+    import tarfile
+    tar_bytes = (rel / f"ocw-{version}.tar.gz").read_bytes()
+    sig_bytes = (rel / f"ocw-{version}.tar.gz.minisig").read_bytes()
+    wheel = b"wheel-bytes"
+    info = {"schema": 1, "version": version, "requirements_lock_sha256": "0" * 64,
+            "wheels": {"a-1-py3-none-any.whl": hashlib.sha256(wheel if wheel_ok else b"other").hexdigest()}}
+    members = {f"ocw-{version}.tar.gz": tar_bytes, f"ocw-{version}.tar.gz.minisig": sig_bytes,
+               "offline.json": json.dumps(info).encode(), "wheels/a-1-py3-none-any.whl": wheel}
+    if extra_member:
+        members[extra_member] = b"x"
+    out = rel / "bundle"
+    out.mkdir()
+    with tarfile.open(out / f"ocw-{version}-offline.tar.gz", "w:gz") as tf:
+        for name, data in members.items():
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+    return out
+
+
+def test_offline_bundle_installs_with_pip_no_index(d, pinned):
+    primary, _s, kl = pinned
+    rel = make_release(d, kl, primary)
+    proc = d.run("--release", NEW, "--from-dir", str(make_bundle(rel, NEW)))
+    assert proc.returncode == 0, d.out
+    argv = d.state["pip_argv"]
+    assert "--no-index" in argv and "--require-hashes" in argv and "--only-binary=:all:" in argv
+    assert argv[argv.index("--find-links") + 1].endswith("/offline/wheels")
+    assert f'SCRIPT_VERSION = "{NEW}"' in (d.app / "create_secret_folders.py").read_text()
+
+
+@pytest.mark.parametrize("kwargs", [{"wheel_ok": False}, {"extra_member": "../evil"}])
+def test_a_damaged_or_hostile_offline_bundle_changes_nothing(d, pinned, kwargs):
+    primary, _s, kl = pinned
+    rel = make_release(d, kl, primary)
+    before = snapshot(d)
+    proc = d.run("--release", NEW, "--from-dir", str(make_bundle(rel, NEW, **kwargs)))
+    assert proc.returncode != 0 and "offline bundle was refused" in d.out
+    assert snapshot(d) == before
+    assert not (d.tmp / "evil").exists()

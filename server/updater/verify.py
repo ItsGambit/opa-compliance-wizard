@@ -171,11 +171,19 @@ def verify_release(tar_path, sig_path, key_list, installed_version=None, allow_s
     return Release(version, sha256, sig.key_id, fields.get("timestamp"), manifest, action, candidate)
 
 
+# Names Windows treats specially (devices, alternate data streams, trailing dots/spaces are silently dropped): a
+# release that carries one would unpack differently there. Refused everywhere so the check is the same on every OS.
+_WINDOWS_UNSAFE_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
+_WINDOWS_DEVICE = re.compile(r"^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$", re.IGNORECASE)
+
+
 def _safe_relpath(name):
     if not name or "\x00" in name or "\\" in name or name.startswith("/") or re.match(r"^[A-Za-z]:", name):
         return None
     clean = name.rstrip("/").split("/")
     if any(p in ("", ".", "..") for p in clean):
+        return None
+    if any(_WINDOWS_UNSAFE_CHARS.search(p) or p.endswith((".", " ")) or _WINDOWS_DEVICE.match(p) for p in clean):
         return None
     return "/".join(clean)
 
@@ -193,6 +201,7 @@ def safe_extract(tar_path, dest, manifest):
     root = dest.resolve()
     total = count = 0
     seen = set()
+    seen_folded = set()
     try:
         with tarfile.open(tar_path, "r:gz") as tar:
             for member in tar:
@@ -207,9 +216,11 @@ def safe_extract(tar_path, dest, manifest):
                     continue
                 if not member.isreg():
                     raise VerifyError("unsafe_member", f"the release contains a link or special file ({rel}); do not install it")
-                if rel in seen:
-                    raise VerifyError("bad_archive", f"{rel} appears twice in the release")
+                if rel in seen or rel.lower() in seen_folded:
+                    raise VerifyError("bad_archive", f"{rel} appears twice in the release (or differs from another file only by "
+                                      "upper/lower case, which Windows and macOS cannot hold apart)")
                 seen.add(rel)
+                seen_folded.add(rel.lower())
                 total += member.size
                 if member.size > MAX_MEMBER_BYTES or total > MAX_UNPACKED_BYTES:
                     raise VerifyError("bad_archive", "the release unpacks to an unreasonable size")

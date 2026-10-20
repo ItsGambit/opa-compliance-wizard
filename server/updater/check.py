@@ -39,7 +39,10 @@ _TAG_RE = re.compile(r"^v?(\d+\.\d+\.\d+)$")
 _PUBLISHED_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 Fetched = namedtuple("Fetched", "status code detail body etag retry_after")
-Latest = namedtuple("Latest", "version published_at release_url signed_artifact size notes_title notes")
+Latest = namedtuple("Latest", "version published_at release_url signed_artifact size notes_title notes prerelease",
+                    defaults=(False,))
+MAX_LIST_RESPONSE_BYTES = 2 * 1024 * 1024  # the prerelease channel reads a page of releases, not one
+MAX_DOWNLOAD_SECONDS = 3600
 
 
 def url_allowed(url, allowed_hosts):
@@ -135,16 +138,12 @@ def _plain(value, limit):
     return text or None
 
 
-def parse_latest(body):
-    """Latest(...) from a GitHub 'latest release' JSON body, None if it is
-    not a stable release, or raises ValueError('bad_response')."""
-    try:
-        data = json.loads(body.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
-        raise ValueError("bad_json")
+def _latest_from_release(data, allow_prerelease):
+    """Latest(...) from one release object; None for a draft (or a prerelease
+    when not allowed); ValueError('bad_response') for an unusable tag."""
     if not isinstance(data, dict) or not isinstance(data.get("tag_name"), str):
         raise ValueError("bad_response")
-    if data.get("draft") or data.get("prerelease"):
+    if data.get("draft") or (data.get("prerelease") and not allow_prerelease):
         return None
     match = _TAG_RE.match(data["tag_name"])
     if not match:
@@ -159,4 +158,105 @@ def parse_latest(body):
     signed = {f"ocw-{version}.tar.gz", f"ocw-{version}.tar.gz.minisig", "manifest.json"} <= names
     size = next((a.get("size") for a in assets if a.get("name") == f"ocw-{version}.tar.gz"), None)
     size = size if isinstance(size, int) and not isinstance(size, bool) and 0 < size < 10 ** 10 else None
-    return Latest(version, published, url, signed, size, _plain(data.get("name"), 120), _plain(data.get("body"), 800))
+    return Latest(version, published, url, signed, size, _plain(data.get("name"), 120), _plain(data.get("body"), 800),
+                  data.get("prerelease") is True)
+
+
+def parse_latest(body):
+    """Latest(...) from a GitHub 'latest release' JSON body, None if it is
+    not a stable release, or raises ValueError('bad_response')."""
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise ValueError("bad_json")
+    return _latest_from_release(data, allow_prerelease=False)
+
+
+def parse_latest_from_list(body):
+    """The prerelease channel (5.49.0): from a GitHub 'list releases' body, the
+    NEWEST (by version number, not by list order) non-draft release, stable or
+    prerelease -- an early tester must also hear about a stable release that
+    is newer than the newest prerelease. Entries that are not X.Y.Z releases
+    are skipped; None when there is none; ValueError for a body that is not a
+    list. The release is still verified against the pinned keys like any
+    other before anything is installed."""
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise ValueError("bad_json")
+    if not isinstance(data, list):
+        raise ValueError("bad_response")
+    best = None
+    for item in data:
+        try:
+            found = _latest_from_release(item, allow_prerelease=True)
+        except ValueError:
+            continue
+        if found is None:
+            continue
+        if best is None or tuple(int(x) for x in found.version.split(".")) > tuple(int(x) for x in best.version.split(".")):
+            best = found
+    return best
+
+
+def download_file(url, allowed_hosts, dest, max_bytes, timeout=60, user_agent=USER_AGENT):
+    """Stream `url` into the new file `dest` (via dest + '.part', renamed at the
+    end), under the same host rules as fetch(). Never raises: Fetched(status, code,
+    detail, None, None, None). A body longer than max_bytes, or shorter than its
+    Content-Length, is refused and the partial file removed."""
+    import os
+    import time
+    if not url_allowed(url, allowed_hosts):
+        return Fetched("error", "bad_url", "The release URL must be https:// (and on an allowed host).", None, None, None)
+    part = str(dest) + ".part"
+    opener = urllib.request.build_opener(_GuardedRedirect(allowed_hosts))
+    headers = {"User-Agent": user_agent, "Accept": "application/octet-stream"}
+    try:
+        with opener.open(urllib.request.Request(url, headers=headers), timeout=timeout) as resp, open(part, "wb") as out:
+            declared = resp.headers.get("Content-Length")
+            if declared and declared.isdigit() and int(declared) > max_bytes:
+                raise ValueError("too_large")
+            total, deadline = 0, time.monotonic() + MAX_DOWNLOAD_SECONDS
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError("too_large")
+                if time.monotonic() > deadline:
+                    raise ValueError("timeout")
+                out.write(chunk)
+            if declared and declared.isdigit() and total < int(declared):
+                raise ValueError("truncated")
+        os.replace(part, dest)
+        return Fetched("ok", "ok", "", None, None, None)
+    except urllib.error.HTTPError as exc:
+        _discard(part)
+        if exc.code == 404:
+            return Fetched("not_found", "not_found", "That file is not published at the release host.", None, None, None)
+        return Fetched("error", f"http_{exc.code}", f"The release server answered HTTP {exc.code}.", None, None, None)
+    except ValueError as exc:
+        _discard(part)
+        messages = {"too_large": "The download is larger than allowed.", "truncated": "The download was cut short.",
+                    "timeout": "The download took too long."}
+        return Fetched("error", str(exc), messages.get(str(exc), "The download failed."), None, None, None)
+    except urllib.error.URLError as exc:
+        _discard(part)
+        code, detail = _classify_url_error(exc)
+        return Fetched("error", code, detail, None, None, None)
+    except (TimeoutError, OSError) as exc:
+        _discard(part)
+        code, detail = _classify_url_error(exc)
+        return Fetched("error", code, detail, None, None, None)
+    except Exception:  # noqa: BLE001 - http.client oddities must not escape
+        _discard(part)
+        return Fetched("error", "network", "The download could not be completed.", None, None, None)
+
+
+def _discard(path):
+    import os
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
