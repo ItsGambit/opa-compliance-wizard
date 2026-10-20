@@ -144,6 +144,12 @@ def test_template_declares_the_hardening_once_at_server_level():
     https = [b for b in nginx_second_site.server_blocks(text) if "listen 443" in b][0]
     for _path, block in nginx_second_site._location_blocks(https):
         structure = nginx_second_site._structure(block)
+        if _path == "/__ocw_maintenance":
+            # The internal maintenance-page location sets Retry-After/Cache-Control, so it must repeat every
+            # server-level security header itself (a location with any add_header inherits none).
+            for header in ("X-Content-Type-Options", "X-Frame-Options", "Content-Security-Policy", "Referrer-Policy"):
+                assert f"add_header {header} " in block, (_path, header)
+            continue
         assert "add_header" not in structure, _path
     for header in ("X-Content-Type-Options", "X-Frame-Options", "Content-Security-Policy", "Referrer-Policy"):
         assert f'add_header {header} ' in https
@@ -235,7 +241,7 @@ def served(tmp_path):
                 else http.client.HTTPConnection("127.0.0.1", port, timeout=10))
         conn.request("GET", path, headers=headers or {})
         resp = conn.getresponse()
-        resp.read()
+        resp.body = resp.read()
         conn.close()
         return resp
 
@@ -495,6 +501,7 @@ def test_maintenance_page_is_served_with_503_while_the_flag_file_exists(served, 
         before = len(rec.backend_requests)
         resp = request(path, {"Cookie": cookie} if cookie else {})
         assert resp.status == 503, (path, resp.status)
+        assert b"Upgrading" in resp.body, (path, "nginx served its built-in 503 page instead of the maintenance page")
         assert resp.getheader("Retry-After") == "30" and "no-store" in (resp.getheader("Cache-Control") or "")
         assert resp.getheader("X-Frame-Options") == "DENY" and "default-src 'none'" in resp.getheader("Content-Security-Policy")
         assert len(rec.backend_requests) == before  # the application is not asked at all
