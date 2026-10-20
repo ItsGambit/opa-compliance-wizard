@@ -384,6 +384,16 @@ def preflight(manifest, size, ctx, now):
     return items
 
 
+def _free_bytes():
+    out = {}
+    for key, path in (("opt", opt_dir() or Path(keylib.REPO_ROOT)), ("data", data_dir())):
+        try:
+            out[key] = shutil.disk_usage(str(path)).free
+        except OSError:
+            out[key] = None
+    return out
+
+
 def build_preview(installed_version, size, ctx, now=None):
     """Fetch and verify the latest release's signature file and manifest, compute the preflight, store and return the
     preview. Raises PreviewError (stable code, plain message)."""
@@ -417,7 +427,8 @@ def build_preview(installed_version, size, ctx, now=None):
                "key_since": key_entry.get("since"), "key_role": key_entry.get("role"), "signed_at": fields.get("timestamp"),
                "manifest": manifest, "manifest_source": "the release's manifest.json asset (not itself signed; the updater re-verifies the "
                                                         "signed copy inside the archive before installing)",
-               "checked_at": _iso(now), "db_bytes": ctx.get("db_bytes"),
+               "checked_at": _iso(now), "db_bytes": ctx.get("db_bytes"), "backup_dir": str(service.upgrade_dir() / "backups"),
+               "free_bytes": _free_bytes(),
                "preflight": preflight(manifest, size, ctx, now)}
     preview["preflight_ok"] = all(i["ok"] for i in preview["preflight"])
     save_preview(preview)
@@ -431,6 +442,7 @@ def refresh_preflight(ctx, now=None):
         return None
     p["preflight"] = preflight(p.get("manifest"), p.get("size"), ctx, now)
     p["preflight_ok"] = all(i["ok"] for i in p["preflight"])
+    p["free_bytes"] = _free_bytes()
     p["checked_at"] = _iso(now)
     save_preview(p)
     return p
@@ -624,6 +636,24 @@ def tick(installed_version, ctx_fn, now=None):
 
 
 # --- what the Updates page reads -----------------------------------------------------------------------------------------
+_DETAIL_KEYS = ("request", "source", "signed_by", "files_verified", "free_opt_mb", "free_data_mb", "sync_waited_s", "nginx_template_changed",
+                "name", "size", "integrity", "current", "previous", "units", "passed", "total")
+
+
+def _step_detail(d):
+    """The few plain facts each step recorded (file names, counts, sizes) for the progress list; nothing else from the state file."""
+    out = {}
+    for k in _DETAIL_KEYS:
+        v = (d or {}).get(k) if isinstance(d, dict) else None
+        if isinstance(v, (int, float, bool)) or v is None:
+            out[k] = v
+        elif isinstance(v, str):
+            out[k] = v[:120]
+        elif k == "units" and isinstance(v, list):
+            out[k] = [str(u)[:60] for u in v[:8]]
+    return {k: v for k, v in out.items() if v is not None}
+
+
 RUN_EXTRA = ("steps_done", "health", "rollback_health", "rolled_back_to", "rollback_seconds", "failure", "signed_by", "sha256",
              "requested_by", "schema_before", "schema_after", "backup", "manifest", "downtime_estimate_seconds", "step_started_at")
 
@@ -642,6 +672,8 @@ def run_view():
     if st is None:
         return None
     out = {k: st.get(k) for k in service._RUN_FIELDS}
+    heads = st.get("chain_heads_before")
+    out["chain_heads_recorded"] = len(heads) if isinstance(heads, dict) else None
     for k in RUN_EXTRA:
         v = st.get(k)
         if k == "backup" and isinstance(v, dict):
@@ -649,7 +681,8 @@ def run_view():
         if k == "manifest" and isinstance(v, dict):
             v = {kk: v.get(kk) for kk in ("migrations", "expected_schema_version")}
         if k == "steps_done" and isinstance(v, list):
-            v = [{"step": s.get("step"), "at": s.get("at"), "seconds": s.get("seconds")} for s in v if isinstance(s, dict)][:20]
+            v = [{"step": s.get("step"), "at": s.get("at"), "seconds": s.get("seconds"), "detail": _step_detail(s.get("detail"))}
+                 for s in v if isinstance(s, dict)][:20]
         if k in ("health", "rollback_health") and isinstance(v, list):
             v = [{"id": h.get("id"), "ok": h.get("ok"), "detail": str(h.get("detail"))[:200]} for h in v if isinstance(h, dict)][:20]
         if k == "failure" and isinstance(v, dict):
