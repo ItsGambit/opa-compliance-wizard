@@ -23,9 +23,14 @@ process LISTENING on that port is this checkout's own server/serve.py
 (5.41.0, LNCH-01: it used to SIGKILL every process whose command line
 merely contained "serve.py").
 
+Upgrading (5.49.0): `python launch.py upgrade ...` is a guided, signature-verified upgrade of this
+folder (server/updater/localupgrade.py): --check, --to X.Y.Z, --from-file <offline bundle>,
+--restore-previous, --discard-previous, --status; see README "Upgrading".
+
 Usage:
     python launch.py [--port 8766] [--no-browser] [--skip-checks]
     (args other than --skip-checks are passed straight through to server/serve.py)
+    python launch.py upgrade --help
 """
 
 import argparse
@@ -242,6 +247,20 @@ def _keyring_importable(python):
         return False
 
 
+def _swap_pending_code():
+    from server.updater.localswap import EXIT_SWAP_PENDING
+    return EXIT_SWAP_PENDING
+
+
+def _finish_pending_swap_if_asked(code, argv):
+    """Windows, outer launcher: an `upgrade` run in the venv asks for the folder renames to be done from here, where no
+    file of the project's .venv is open (a Windows folder cannot be renamed while one is)."""
+    if len(argv) > 2 and argv[2] == "upgrade" and code == _swap_pending_code():
+        from server.updater import localswap
+        return localswap.run_pending_plan(PROJECT_ROOT)
+    return code
+
+
 def _run_child_and_exit(argv, owns_shutdown=True):
     """Windows has no exec: run `argv` as a child and exit with its status.
     The console delivers Ctrl+C to the child too, so on Ctrl+C the child gets
@@ -254,7 +273,7 @@ def _run_child_and_exit(argv, owns_shutdown=True):
     while True:
         try:
             if deadline is None:
-                sys.exit(proc.wait())
+                sys.exit(_finish_pending_swap_if_asked(proc.wait(), sys.argv) if not owns_shutdown else proc.wait())
             sys.exit(proc.wait(timeout=max(0.0, deadline - time.monotonic())))
         except KeyboardInterrupt:
             if owns_shutdown and deadline is None:
@@ -623,7 +642,56 @@ def start_server(extra_args):
     _run_child_and_exit(argv)
 
 
+class _UpgradeHost:
+    """The parts of the guided upgrade that need this launcher's process helpers."""
+
+    def __init__(self):
+        self.interactive = bool(sys.stdin and sys.stdin.isatty())
+
+    def ask(self, prompt):
+        return input(prompt)
+
+    def port_in_use(self, port):
+        return _port_is_bound(port)
+
+    def stop_server(self, port):
+        pid = _listening_pid(port)
+        if pid is None:
+            return False
+        argv, command_line, cwd = _process_command_line(pid)
+        if not _is_this_checkouts_server(argv, command_line, cwd):
+            print(f"Port {port} is used by something else (PID {pid}), not this folder's dashboard; leaving it alone.")
+            return False
+        print(f"The dashboard from this folder is running (PID {pid}).")
+        if not _confirm("Stop it now?"):
+            return False
+        return _stop_pid(pid)
+
+    def pip_python(self):
+        return getattr(sys, "_base_executable", None) or sys.executable
+
+
+def run_upgrade(args):
+    """`python launch.py upgrade ...`. The verifier needs the `cryptography` package, which the project's .venv has; if this
+    interpreter lacks it, continue under the venv (Windows: the outer process stays outside and does the folder renames)."""
+    try:
+        import cryptography  # noqa: F401
+    except ImportError:
+        venv_python = _venv_python()
+        if os.environ.get(_REEXEC_MARKER) != "1" and venv_python.exists():
+            _relaunch_with(venv_python)
+        print("The upgrade needs the Python packages in this folder's .venv. Start the dashboard once with `python launch.py` "
+              "(it offers to create them), then run the upgrade again.")
+        return 4
+    from server.updater import localupgrade
+    return localupgrade.main(args, PROJECT_ROOT, host=_UpgradeHost())
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "upgrade":
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(line_buffering=True)
+        sys.exit(run_upgrade(sys.argv[2:]))
     # LNCH-06: run from the checkout, so nothing is ever resolved relative to
     # whatever directory the launcher happened to be started from.
     os.chdir(PROJECT_ROOT)

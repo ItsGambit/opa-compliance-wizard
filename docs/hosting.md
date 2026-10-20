@@ -396,6 +396,13 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
 (or `server/deploy.sh --release <version>`, which now only calls those two): README, "Upgrading". The paragraph below
 describes the old in-place `deploy.sh`.
 
+**Air-gapped servers (5.49.0).** `server/deploy.sh --release <version> --from-dir <dir>` accepts the offline bundle
+`ocw-<version>-offline.tar.gz` (a signed release plus hash-pinned wheels) in place of the tarball and its `.minisig`: it
+unpacks the bundle with the installed copy's own checker, verifies the release inside like any other and installs the Python
+packages with `pip install --no-index --require-hashes` from the bundle (README, "Upgrading without internet access"). On the upgrade
+layout the updater stages the release only; it cannot yet install packages from the bundle, so deploy.sh refuses a bundle there.
+**Local (laptop) installs** are upgraded with `python launch.py upgrade`; a `DEPLOYMENT_MODE=hosted` install refuses it.
+
 **Redeploying: `server/deploy.sh`.** Run it on the server as the app user.
 For production use a signed release: `<install dir>/server/deploy.sh
 --release <version>` (README, "Upgrading": it checks the download against the

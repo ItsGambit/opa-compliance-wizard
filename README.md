@@ -265,7 +265,9 @@ failed upgrade's Audit Log entry, which records `bundle.name`, size and sha256; 
 Download `ocw-<version>.tar.gz` and `ocw-<version>.tar.gz.minisig` on a computer with internet access, carry them over, and run
 `sudo ocw-updater stage ocw-<version>.tar.gz` then `sudo ocw-updater apply <version>`. A published key revocation
 (`revocation.json`) is applied with `sudo ocw-updater trust apply revocation.json`. For packages without internet access, `install.sh --wheelhouse`
-covers the first install; a vendored-wheel release bundle is planned.
+covers the first install; for releases use the **offline bundle** described under "Upgrading without internet access" below (the bundle is
+accepted by `server/deploy.sh --release X --from-dir` on the in-place layout; the updater layout stages the release inside it and cannot yet
+install its packages from the bundle: see that section).
 
 #### The command
 
@@ -286,7 +288,80 @@ Exit codes: `0` ok, `2` refused (signature, version, key, sync running, another 
 #### What this does not do yet
 
 The Updates screen in the web app only reports (5.46.0); approving an upgrade with MFA, scheduling from the browser and the
-progress page arrive with the in-app flow. Local (laptop) mode has no updater. See `CHANGELOG.md` for the known limitations of this release.
+progress page arrive with the in-app flow. See `CHANGELOG.md` for the known limitations of this release.
+
+### Upgrading a local (laptop or desktop) install
+
+Local mode (`python launch.py`, Windows, macOS or Linux) has no sign-in, so there is **no MFA** for upgrading and none is faked: the guided
+upgrade asks you to **type the version** instead, and everything else is the same as on a server: signed, verified, logged. Run it from the
+install folder, with no dashboard running (it offers to stop this folder's dashboard):
+
+```bash
+python launch.py upgrade --check                # is there a newer signed release? sends one HTTPS request to the release host, nothing about your data
+python launch.py upgrade                        # download, verify, prepare, ask you to type the version, swap folders
+python launch.py upgrade --to 5.49.0            # a specific version (must be newer than the installed one)
+python launch.py upgrade --from-file ocw-5.49.0-offline.tar.gz          # files you brought (see "without internet access")
+python launch.py upgrade --from-file ocw-5.49.0.tar.gz ocw-5.49.0.tar.gz.minisig
+python launch.py upgrade --restore-previous     # bring the previous version back (typed RESTORE)
+python launch.py upgrade --discard-previous     # delete the kept previous version (typed DELETE)
+python launch.py upgrade --status
+```
+
+What it does, in order (it stops, having changed nothing you own, at any step before the last):
+
+1. Downloads `ocw-<version>.tar.gz` and its `.minisig` (or takes the files you name) and applies any published signing-key revocation.
+2. **Verifies the signature, the signed manifest and the version against the keys pinned in your install, before unpacking anything.** An unsigned, altered,
+   renamed, wrongly signed, downgrading or mislabelled file is refused. Archives that contain links, absolute or `..` paths, Windows device names or
+   files the manifest does not list are refused.
+3. Unpacks into a sibling folder, `<your folder>-<version>`, and builds its Python environment from the hash-pinned `requirements.lock`
+   (a `.venv` is created when your current folder has one or this Python lacks the packages).
+4. Shows what changes (database migrations and whether they are rollback-safe) and asks you to type the version.
+5. Copies your data into the new folder, swaps the folder names (`<your folder>` becomes `<your folder>-previous`; the new one takes its name), then
+   starts the new code once with its own Python, which also migrates the **copy** of the database. If that fails, the previous folder is put back automatically.
+
+Your data lives in the install folder and is **copied, never moved**: `audit_store.db` (copied with SQLite's online backup, integrity-checked),
+`environments.json`, `audit_log.jsonl`, `banner_config.json`, `access_control.json`, `secrets_log_cache.json`, `update_check.json`,
+`release_keys.local.json`, `.env`, your saved folder templates (`*.csv` the release does not ship) and `folders_result_*.csv`, with their file permissions.
+Credentials stored in your operating system's keychain are not touched. The previous folder keeps its own copies until you delete it
+(`--discard-previous`), including the plain-text files above; files that are not on this list are left in the previous folder and listed.
+If you keep the data elsewhere (`OPA_DATA_DIR`), it is not touched at all.
+
+**Restoring.** `--restore-previous` swaps the folders back (the one it replaces is kept as `<your folder>-replaced-<version>`). By default it is
+**code only**: your current data stays, and the restore is refused if the newer database can no longer be read by the older code (a migration that is
+not rollback-safe). `--restore-data` then brings back the previous folder's own, older data instead; everything recorded since the upgrade stays in the
+replaced folder. If a swap is ever interrupted (power cut), run `python <your folder>-previous/launch.py upgrade --restore-previous`: it puts the old folder back.
+
+Exit codes: `0` ok or up to date, `1` (`--check`) a newer release exists, `2` refused (signature, version, key, not confirmed, usage), `3` failed and
+nothing changed or everything was put back, `4` failed and you have to act (the message says how). For scripts, `--confirm 5.49.0` (or `RESTORE`,
+`DELETE`) replaces the typed confirmation.
+
+**Windows.** Needs no admin rights and no symbolic links. Windows will not rename a folder while a program has a file in it open: close the dashboard
+(and its window), File Explorer windows on the folder and editors, and run the upgrade with the system Python (`py -3 launch.py upgrade`);
+the launcher does the renames from the outer process when it has relaunched itself in `.venv`. Keep the install path short (about 200 characters at most).
+Run the upgrade from the install folder, not from `<folder>-previous`.
+
+**Release channel.** The default is `stable`. To also see releases the maintainers mark as prereleases (more testing wanted; still signed and checked against the
+same pinned keys): `python -m server.updater set-channel prerelease` (back with `set-channel stable`; `OPA_UPDATE_CHANNEL` fixes it from the environment), or
+`python launch.py upgrade --check --channel prerelease` for one run. On the prerelease channel the newest release of either kind is offered. A prerelease is never
+downgraded when you switch back; you simply wait for the next stable release. The installed version is added to the check's User-Agent only if you
+opt in: `python -m server.updater share-version on` (off by default).
+
+### Upgrading without internet access (the offline bundle)
+
+On a computer that has internet access, download from the release page either the three files (`ocw-<version>.tar.gz`, `.minisig`, `manifest.json`) or the
+**offline bundle** `ocw-<version>-offline.tar.gz` (with its `.sha256`): the same signed release plus the hash-pinned Python packages for Windows, macOS and
+Linux (x86-64 and ARM) on Python 3.9 to 3.14 (Linux needs glibc 2.28 or newer; Alpine is not covered). Carry it over on removable media; check the copy
+with `sha256sum -c ocw-<version>-offline.tar.gz.sha256` if you like (the signature inside is what the install trusts).
+
+* **Local install:** `python launch.py upgrade --from-file ocw-<version>-offline.tar.gz`. Nothing is fetched from the internet; packages are installed with
+  `pip install --no-index --require-hashes`. If a signing-key revocation was published, apply it first
+  with `python -m server.updater keys apply-revocation revocation.json` (for `--from-file` with the two separate files, a `revocation.json` next to them is applied automatically).
+* **Server, in-place layout:** put the bundle in a directory and run `server/deploy.sh --release <version> --from-dir <dir>` (the directory holds only the bundle).
+* **Server, upgrade layout (`install.sh`):** `sudo ocw-updater stage ocw-<version>.tar.gz` stages the signed release from the three files; installing its
+  packages without internet from the bundle is not supported by the updater yet, so `server/deploy.sh --from-dir` refuses a bundle there with a clear message.
+
+The bundle itself carries no signature of its own, and needs none: the release inside it is verified like any other, and `pip` refuses any package whose
+sha256 is not recorded in that release's signed `requirements.lock`. A wrong, damaged or substituted package can make the install fail; it cannot be installed.
 
 ### Installing a signed release
 
@@ -309,7 +384,8 @@ requirements.lock`, restarts with health checks, nginx validation.
 
 - **No internet on the server:** download the two files (and, if published,
   `revocation.json` + `revocation.json.sig`) elsewhere, carry them over, run
-  `server/deploy.sh --release 5.47.0 --from-dir /path/to/dir`.
+  `server/deploy.sh --release 5.47.0 --from-dir /path/to/dir`. From 5.49.0 the directory may hold the offline bundle
+  `ocw-5.47.0-offline.tar.gz` instead (see "Upgrading without internet access").
 - **Re-run the same version** (for example after a failed run): add `--reinstall`.
 - **Going back:** a signed `--release` never installs an older version. On the upgrade
   layout use `sudo ocw-updater rollback` (code only, 24 hours); on an install that has not

@@ -122,6 +122,20 @@ notifications before you publish. Then:
 3. Verify like a user would: download the three files from the published release and run
    `python tools/release.py verify ocw-5.47.0.tar.gz ocw-5.47.0.tar.gz.minisig`.
 4. Never reuse a version number. A bad release is superseded by the next patch (and its notes say so).
+5. **The offline bundle (5.49.0).** After signing, build the air-gapped bundle and attach it (and its `.sha256`) to the same release:
+   ```bash
+   python tools/release.py build-offline release-out/ocw-5.47.0.tar.gz        # -> release-out/ocw-5.47.0-offline.tar.gz (+ .sha256)
+   # narrow it while testing:  --python 3.12 --platform linux-x86_64
+   ```
+   It checks the signature first (so sign before building it), then runs `pip download --no-deps --only-binary=:all: --require-hashes` once per Python
+   (3.9 to 3.14) and platform (linux x86-64/aarch64, macOS arm64/x86-64, Windows amd64) with the packages that `requirements.lock`'s environment markers
+   select for that target, **requires every downloaded wheel to match a hash recorded in the signed lock** (anything else stops the build), and packs the
+   release, its signature, `offline.json` and the wheels. This is the only step that needs the internet (PyPI); a platform with no wheel for a locked package
+   fails the build and names the package. Needs `packaging` (`pip install packaging`) on the releasing computer. Test it: unpack on a machine
+   without network and run `python launch.py upgrade --from-file …`. A new platform or Python version goes into `OFFLINE_PYTHONS` / `OFFLINE_PLATFORMS` in
+   `tools/release.py`. Regenerating `requirements.lock` means building a new bundle; there is nothing to sign separately.
+6. **Prereleases.** Mark a release as a *pre-release* on GitHub to offer it only to installs on the prerelease channel (they use `GET /releases`; stable installs
+   keep using `/releases/latest`, which never returns a prerelease). It is built and signed exactly like any release; the tag is still `vX.Y.Z`.
 
 **First release only: the KMS interop test.** The byte format of KMS's Ed25519 `Sign` answer is not documented beyond "the signature";
 it is expected to be the raw 64-byte RFC 8032 signature. Before cutting 5.46.0 sign a throwaway file with the real key through this
