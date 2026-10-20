@@ -241,9 +241,19 @@ def realpath(state, argv):
     return 0
 
 
+def journalctl(state, argv):
+    """5.47.0: `journalctl -u <unit> -n N --no-pager -o cat [--since X]` prints state["journal"][unit] (last N lines)."""
+    unit = argv[argv.index("-u") + 1] if "-u" in argv else ""
+    n = int(argv[argv.index("-n") + 1]) if "-n" in argv else 100
+    lines = state.get("journal", {}).get(unit, [])
+    for line in lines[-n:]:
+        print(line)
+    return 0 if lines or state.get("journal_empty_ok", True) else 1
+
+
 HANDLERS = {
     "systemctl": systemctl, "nginx": nginx, "sudo": sudo, "git": git, "npm": npm, "npx": npx,
-    "curl": curl, "pip": pip, "sleep": sleep, "flock": flock, "realpath": realpath,
+    "curl": curl, "journalctl": journalctl, "pip": pip, "sleep": sleep, "flock": flock, "realpath": realpath,
 }
 
 # Commands whose calls don't change the state file (and may run while

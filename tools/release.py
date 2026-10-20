@@ -140,6 +140,35 @@ def _read_dist(dist):
     return out
 
 
+def _migrations_from(files):
+    """([{version, since, rollback_safe}], highest migration) from the tagged audit_store.py and
+    server/schema_migrations.json. A tree without audit_store.py (a test fixture) has none; a real one must declare every
+    migration, so a release cannot ship a migration nobody judged for rollback safety."""
+    store = files.get("audit_store.py")
+    if store is None:
+        return [], None
+    text = store[1].decode("utf-8")
+    block = re.search(r"^MIGRATIONS = \{(.*?)^\}", text, re.M | re.S)
+    numbers = sorted(int(n) for n in re.findall(r"^\s*(\d+):\s*_migration_", block.group(1), re.M)) if block else []
+    if not numbers:
+        raise ReleaseError("cannot read MIGRATIONS from audit_store.py")
+    decl = files.get("server/schema_migrations.json")
+    if decl is None:
+        raise ReleaseError("server/schema_migrations.json is missing (it declares each migration's rollback_safe flag)")
+    declared = json.loads(decl[1].decode("utf-8")).get("migrations", {})
+    missing = [n for n in numbers if str(n) not in declared]
+    if missing:
+        raise ReleaseError(f"server/schema_migrations.json does not declare migration(s) {missing}: decide rollback_safe for each")
+    return ([{"version": n, "since": declared[str(n)]["since"], "rollback_safe": bool(declared[str(n)]["rollback_safe"])} for n in numbers],
+            numbers[-1])
+
+
+def _activator_version(files):
+    m = files.get("server/updater/root/ocw_activate.py")
+    found = re.search(rb'^ACTIVATOR_VERSION = "([^"]+)"', m[1], re.M) if m else None
+    return found.group(1).decode() if found else None
+
+
 def build_release(version, repo=REPO, out_dir=None, frontend_dist=None, min_upgrade_from=DEFAULT_MIN_UPGRADE_FROM,
                   downtime_seconds=DEFAULT_DOWNTIME_SECONDS, built_at=None):
     if not VERSION_RE.match(version):
@@ -163,6 +192,8 @@ def build_release(version, repo=REPO, out_dir=None, frontend_dist=None, min_upgr
     dist = _read_dist(frontend_dist) if frontend_dist else _build_frontend(files)
     files.update(dist)
     lock = files.get("frontend/package-lock.json")
+    migrations, expected_schema = _migrations_from(files)
+    activator_version = _activator_version(files)
     manifest = {
         "schema": 1,
         "version": version,
@@ -170,9 +201,16 @@ def build_release(version, repo=REPO, out_dir=None, frontend_dist=None, min_upgr
         "built_at": built_at or now_utc(),
         "min_upgrade_from": min_upgrade_from,
         "downtime_estimate_seconds": downtime_seconds,
-        # TODO(Phase 2): list schema migrations this release adds, each with a
-        # rollback_safe flag (not derivable from the code today).
-        "migrations": [],
+        # Every schema migration this release's code knows (audit_store.MIGRATIONS), with the rollback_safe flag the
+        # maintainers record in server/schema_migrations.json; the updater shows the ones above the installed schema.
+        "migrations": migrations,
+        "expected_schema_version": expected_schema,
+        "migration_time_estimate_seconds": 30,
+        # The updater compares the baked template with the live site itself, so this is always true: it only means
+        # "check", and a release that does not change nginx leaves the site untouched.
+        "nginx_template_changed": True,
+        "requires_reboot": False,
+        "activator_version": activator_version,
         "frontend_lock_sha256": hashlib.sha256(lock[1]).hexdigest() if lock else None,
         "changelog_excerpt": excerpt,
         "files": {name: hashlib.sha256(data).hexdigest() for name, (_m, data) in sorted(files.items())},

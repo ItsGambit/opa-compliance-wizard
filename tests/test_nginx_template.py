@@ -115,6 +115,7 @@ def _template_with(tmp, crt, key, *, http_port=None, https_port=None, backend=87
     assert f"listen 127.0.0.1:{http_port};" in text and f"listen 127.0.0.1:{https_port} ssl;" in text
     text = text.replace("127.0.0.1:8766", f"127.0.0.1:{backend}")
     text = text.replace("127.0.0.1:8767", f"127.0.0.1:{gate}")
+    text = text.replace("/opt/opa-compliance-wizard/maintenance/active.html", str(tmp / "maintenance.html"))
     return text
 
 
@@ -481,3 +482,22 @@ def test_second_site_still_serves_everything_else(served_second, method, path):
         return
     assert status == 200
     assert seen[-1][0] == method and seen[-1][2]["X-Auth-Issuer"] == "https://second.example"
+
+
+def test_maintenance_page_is_served_with_503_while_the_flag_file_exists(served, tmp_path):
+    """5.47.0: the root-owned updater creates the page while it switches versions; every request, authenticated or
+    not, gets it with 503 + Retry-After, and the usual hardening headers; removing the file restores normal service."""
+    request, rec, _ = served
+    page = tmp_path / "maintenance.html"
+    assert request("/", {"Cookie": "opa_wizard_session=good"}).status == 200
+    page.write_text("<html><body>Upgrading</body></html>")
+    for path, cookie in (("/", "opa_wizard_session=good"), ("/", None), ("/healthz", None), ("/api/environments", None)):
+        before = len(rec.backend_requests)
+        resp = request(path, {"Cookie": cookie} if cookie else {})
+        assert resp.status == 503, (path, resp.status)
+        assert resp.getheader("Retry-After") == "30" and "no-store" in (resp.getheader("Cache-Control") or "")
+        assert resp.getheader("X-Frame-Options") == "DENY" and "default-src 'none'" in resp.getheader("Content-Security-Policy")
+        assert len(rec.backend_requests) == before  # the application is not asked at all
+    assert request("/__ocw_maintenance").status in (404, 503)  # internal only: a client cannot request it directly
+    page.unlink()
+    assert request("/", {"Cookie": "opa_wizard_session=good"}).status == 200

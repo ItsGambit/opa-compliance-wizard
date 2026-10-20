@@ -22,6 +22,7 @@ saves it via POST /api/environments.
 
 import argparse
 import csv as _csv
+import hashlib
 import hmac
 import io
 import json
@@ -46,6 +47,11 @@ import create_secret_folders as engine  # noqa: E402
 from server.updater import service as update_service  # noqa: E402
 
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
+# 5.47.0: user-saved folder templates and execution records live with the data
+# files when OPA_DATA_DIR is set (the /var/lib layout; the code directory is
+# read-only to this process there). Unset = the project directory, as always.
+def _csv_dir():
+    return Path(os.environ["OPA_DATA_DIR"]) if os.environ.get("OPA_DATA_DIR") else PROJECT_ROOT
 
 # Real-world Group Push/SCIM propagation can take well over the old 7.5s
 # window (5 x 1.5s) under load -- 20 x 1.5s = 30s gives real syncs more
@@ -1157,7 +1163,7 @@ def _safe_csv_path(filename):
     name = os.path.basename(raw)
     if not name or name != raw or "\\" in raw or not name.lower().endswith(".csv"):
         raise ValueError("filename must be a bare name ending in .csv")
-    return PROJECT_ROOT / name
+    return _csv_dir() / name
 
 
 # SRV-06 (external review, 2026-10-05): POST /api/csv could create or
@@ -1208,7 +1214,7 @@ def _count_template_csv_files():
     the .csv extension, excluding /api/execute's own folders_result_* records
     (which must never block saving a template)."""
     try:
-        names = os.listdir(PROJECT_ROOT)
+        names = os.listdir(_csv_dir())
     except OSError:
         return 0
     return sum(1 for n in names if n.casefold().endswith(".csv") and not n.casefold().startswith(_CSV_RESULT_PREFIX))
@@ -2493,7 +2499,7 @@ class Handler(SimpleHTTPRequestHandler):
                     return self._send_json(200, job["result"])
 
             if path == "/api/csv_files":
-                files = sorted(p.name for p in PROJECT_ROOT.glob("*.csv"))
+                files = sorted(p.name for p in _csv_dir().glob("*.csv"))
                 return self._send_json(200, {"files": files})
 
             if path == "/api/csv":
@@ -2511,7 +2517,32 @@ class Handler(SimpleHTTPRequestHandler):
                 # is out of date is for the people who operate it.
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to view update status."})
-                return self._send_json(200, update_service.status(update_service.load(), engine.SCRIPT_VERSION))
+                body = update_service.status(update_service.load(), engine.SCRIPT_VERSION)
+                body["upgrade_run"] = update_service.upgrade_run()  # 5.47.0: the root-owned updater's current/last run
+                return self._send_json(200, body)
+
+            if path == "/api/upgrade/bundle":
+                # 5.47.0: download a redacted support bundle the updater built after a failed upgrade (the failed
+                # upgrade's Audit Log entry names it). Admin-only and read-only; the bundle is created by root, holds no
+                # secrets, tenant data or personal data (see docs and ocw_bundle.py), and is never uploaded anywhere.
+                if not _can_admin(owner_key, self.headers):
+                    return self._send_json(403, {"error": "Admin access required to download a support bundle."})
+                name = (qs.get("name") or [""])[0]
+                code, data = update_service.read_bundle(name)
+                if code != 200:
+                    return self._send_json(code, {"error": data})
+                _o, _e, actor_email, actor_sub = self._caller()
+                self._log_audit_event(actor_email, actor_sub, "upgrade.bundle_downloaded",
+                                      {"bundle": name, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/gzip")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(data)
+                return
 
             if path == "/api/audit_log":
                 # Admin-only -- this is every user's activity across every
@@ -3237,7 +3268,7 @@ class Handler(SimpleHTTPRequestHandler):
                         400, {"error": "Invalid folder name(s); fix and retry.", "invalid_names": invalid_names}
                     )
                 results = engine.execute_plan(local_client, rg_id, proj_id, ordered_paths, descriptions, existing)
-                output_path = PROJECT_ROOT / f"folders_result_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
+                output_path = _csv_dir() / f"folders_result_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
                 # ENG2-06: folders now exist -- a failure to write the results
                 # file must not also lose the audit entry and the response.
                 try:

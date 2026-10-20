@@ -155,6 +155,57 @@ if [ -n "$_ARG_RELEASE" ]; then
   [ -z "$_ARG_REINSTALL" ] || { OPA_DEPLOY_REINSTALL=1; export OPA_DEPLOY_REINSTALL; }
 fi
 
+# 5.47.0: on an install that has run server/install.sh (the code lives under /opt/.../releases and is root-owned),
+# this script is only a thin wrapper: it stages the signed release and starts the root-owned updater, so the manual and
+# the in-app path are the same code (ocw-updater: README, "Upgrading"). An install that has NOT run install.sh keeps
+# using the in-place logic below, exactly as before, and is told how to migrate. DEPLOY_SH_PHASE is the old logic's own
+# internal hand-off, so a run already in progress never takes this branch.
+_deploy_via_updater() {
+  local _bin="${OCW_UPDATER_BIN:-/usr/local/bin/ocw-updater}" _sudo="" _v="$_ARG_RELEASE" _dir="$_ARG_FROM_DIR"
+  if [ -n "$_ARG_REF" ]; then
+    echo "ERROR: --ref installs UNSIGNED source into the code directory, which is root-owned in this layout. Build and sign a" >&2
+    echo "       release (docs/releasing.md) and use  deploy.sh --release <version>." >&2
+    return 2
+  fi
+  if [ -z "$_v" ]; then
+    echo "usage: $0 --release <version> [--from-dir <dir>]      (this install uses the upgrade layout; see 'ocw-updater help')" >&2
+    return 2
+  fi
+  if [ -n "$_ARG_REINSTALL" ]; then
+    echo "ERROR: the updater never installs the same version again. To go back one release: sudo ocw-updater rollback;" >&2
+    echo "       to repair a damaged archive: sudo ocw-updater restore --confirm RESTORE." >&2
+    return 2
+  fi
+  [ -x "$_bin" ] || { echo "ERROR: $_bin not found: re-run server/install.sh" >&2; return 1; }
+  [ "$(id -u)" -eq 0 ] || _sudo="sudo"
+  if [ -n "$_dir" ]; then
+    [ -f "$_dir/ocw-$_v.tar.gz" ] && [ -f "$_dir/ocw-$_v.tar.gz.minisig" ] || {
+      echo "ERROR: $_dir must contain ocw-$_v.tar.gz and ocw-$_v.tar.gz.minisig" >&2
+      return 1
+    }
+    if [ -f "$_dir/revocation.json" ]; then
+      $_sudo "$_bin" trust apply "$_dir/revocation.json" || { echo "ERROR: the key revocation in $_dir could not be applied; nothing was installed." >&2; return 1; }
+    fi
+    $_sudo "$_bin" stage "$_dir/ocw-$_v.tar.gz" || return $?
+  else
+    $_sudo "$_bin" stage "$_v" || return $?
+  fi
+  $_sudo "$_bin" apply "$_v"
+}
+_OPT_FOR_WRAPPER="${OCW_OPT_DIR:-/opt/opa-compliance-wizard}"
+_SELF_FOR_WRAPPER="$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+if [ -z "${DEPLOY_SH_PHASE:-}" ] && [ -z "${OPA_APP_DIR:-}" ] && [ -x "$_OPT_FOR_WRAPPER/updater/ocw_activate.py" ]; then
+  case "$_SELF_FOR_WRAPPER/" in
+    "$_OPT_FOR_WRAPPER"/releases/*) _deploy_via_updater; exit $? ;;
+    *) ;;
+  esac
+fi
+if [ -z "${DEPLOY_SH_PHASE:-}" ] && [ -z "${DEPLOY_QUIET_MIGRATE_NOTE:-}" ]; then
+  echo "NOTE: this install still uses the in-place layout. server/install.sh (one time, as root; start with --dry-run)" >&2
+  echo "      moves it to the upgrade layout: signed upgrades with automatic rollback, the code no longer writable by the" >&2
+  echo "      web application's account, no sudoers rules for deploys. This run continues the old way. README, 'Upgrading'." >&2
+fi
+
 # FIX (external review, 2026-10-02, "will run on servers neither of us
 # administers"): preflight-check every external tool this script calls
 # BEFORE the destructive rsync --delete step -- a missing command

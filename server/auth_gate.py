@@ -315,7 +315,7 @@ STEPUP_LOG_LOOKBACK_SECONDS = 120
 # writes it, avoiding any dual-writer race between the two processes.
 # Per gate instance (OPA_ACCESS_CONTROL_PATH, 5.38.3): an additional gate for another Okta org must not check
 # the main org's group IDs. Unset = access_control.json next to the app, as always.
-ACCESS_CONTROL_FILE_PATH = access_control_path(os.environ, Path(__file__).resolve().parent.parent / "access_control.json")
+ACCESS_CONTROL_FILE_PATH = access_control_path(os.environ, Path(os.environ.get("OPA_DATA_DIR") or Path(__file__).resolve().parent.parent) / "access_control.json")
 # GATE-14 (external review, 2026-10-05): an operator who points a gate at its own access-control file (every
 # additional gate does -- setup-second-gate.sh writes it with restrict_login on) has said "this gate's rules live
 # HERE". A missing or never-parseable file then means "config lost", not "not configured yet", so the callback

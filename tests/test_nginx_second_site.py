@@ -264,7 +264,7 @@ def test_quoted_regex_location_is_seen_and_refused():
 from server.nginx_second_site import SECOND_SITE_DENIED_PREFIXES  # noqa: E402
 
 
-@pytest.mark.parametrize("prefix", ["/api/shared_permissions", "/api/archives"])
+@pytest.mark.parametrize("prefix", ["/api/shared_permissions", "/api/archives", "/api/upgrade"])
 def test_shared_permissions_and_archive_purge_are_denied_entirely(site, prefix):
     assert prefix in SECOND_SITE_DENIED_PREFIXES
     assert re.search(rf"location {re.escape(prefix)} \{{\s*return 403;\s*\}}", site)
@@ -273,7 +273,7 @@ def test_shared_permissions_and_archive_purge_are_denied_entirely(site, prefix):
 
 
 def test_access_control_deny_is_still_there_with_the_new_ones(site):
-    assert SECOND_SITE_DENIED_PREFIXES == ("/api/access_control", "/api/shared_permissions", "/api/archives")
+    assert SECOND_SITE_DENIED_PREFIXES == ("/api/access_control", "/api/shared_permissions", "/api/archives", "/api/upgrade")
     for prefix in SECOND_SITE_DENIED_PREFIXES:
         assert site.count(f"location {prefix} {{") == 1
 
@@ -289,7 +289,8 @@ def test_delete_with_archive_purge_is_denied_at_server_level(site):
     # Server level (not inside a location): it runs before any location is chosen.
     for _path, blk in _location_blocks(site):
         assert "opa_second_site_delete" not in blk
-    assert structure.count("if (") == 1
+    # two server-level ifs: this site's delete rule and (5.47.0) the maintenance-page flag file
+    assert structure.count("if (") == 2 and "-f $ocw_maintenance_page" in site
 
 
 @pytest.mark.parametrize("prefix,shadow", [

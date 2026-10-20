@@ -108,6 +108,8 @@ ROUTES = {
     ("GET", "path == '/api/access_control'"): Route("GET", "/api/access_control", "admin", None, 200),
     # 5.46.0: update-check status (read-only) and its on/off switch.
     ("GET", "path == '/api/upgrade/status'"): Route("GET", "/api/upgrade/status", "admin", None, 200),
+    # 5.47.0: a redacted support bundle the root-owned updater built (admin-only, read-only); no such file here -> 404.
+    ("GET", "path == '/api/upgrade/bundle'"): Route("GET", "/api/upgrade/bundle?name=ocw-support-1.0.0-to-1.0.1-20260101T000000Z-ab12.tar.gz", "admin", None, 404),
     ("POST", "path == '/api/upgrade/settings'"): Route("POST", "/api/upgrade/settings", "admin", {"share_version": False}, 200),
     ("GET", "path == '/api/shared_permissions'"): Route("GET", "/api/shared_permissions", "admin", None, 200),
     ("POST", "path == '/api/banner'"):

@@ -58,7 +58,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.46.0
+# Version     : 5.47.0
 # =============================================================================
 
 import argparse
@@ -84,7 +84,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.46.0"
+SCRIPT_VERSION = "5.47.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 # ENG2-12: OPA's spec documents no pattern or length for a secret-folder
 # name (SecretFolderCreateRequest.name is a bare string); 255 is the limit
@@ -646,12 +646,27 @@ def validate_okta_url(okta_url):
     return okta_url
 
 
+def _data_dir():
+    """Where this install keeps its own data files (audit_log.jsonl,
+    access_control.json, banner_config.json, the legacy environments.json).
+    5.47.0: OPA_DATA_DIR (an absolute path; set by server/install.sh for the
+    /var/lib layout) moves them out of the code directory so the web process
+    need not be able to write its own code. Unset = next to this file, as
+    always, so every existing install and every dev checkout is unchanged."""
+    override = os.environ.get("OPA_DATA_DIR")
+    if override:
+        if not os.path.isabs(override):
+            raise RuntimeError(f"OPA_DATA_DIR must be an absolute path, got {override!r}")
+        return override
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def _environments_file_path():
     """Only still used by migrate_legacy_environments_json() -- the
     one-shot Phase 2 import of this file's data into SQLite. Nothing else
     reads/writes environments.json anymore (see list_environments_for()/
     list_all_environments() below, all SQL-backed as of v5.29.0)."""
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "environments.json")
+    return os.path.join(_data_dir(), "environments.json")
 
 
 LOCAL_OWNER_KEY = None  # sentinel for "no verified identity" -- local/direct runs, and every CLI call
@@ -945,7 +960,7 @@ _BANNER_DEFAULTS = {"enabled": False, "message": "", "variant": "warning", "dism
 def _banner_config_path():
     """Only still used by migrate_legacy_environments_json() -- the
     one-shot Phase 2 import of this file's data into SQLite."""
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "banner_config.json")
+    return os.path.join(_data_dir(), "banner_config.json")
 
 
 def get_banner_config():
@@ -996,7 +1011,7 @@ _ACCESS_CONTROL_DEFAULTS = {"admin_group_id": None, "user_group_id": None, "rest
 
 
 def _access_control_file_path():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "access_control.json")
+    return os.path.join(_data_dir(), "access_control.json")
 
 
 def get_access_control_config():
@@ -1821,7 +1836,7 @@ _audit_log_lock = threading.Lock()
 
 
 def _audit_log_path():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit_log.jsonl")
+    return os.path.join(_data_dir(), "audit_log.jsonl")
 
 
 def _audit_log_lock_path(path):

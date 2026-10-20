@@ -141,6 +141,24 @@ restore the comment header, and check it installs on the oldest supported Python
 --require-hashes -r requirements.lock`). Without `uv`, use `pip-compile --generate-hashes` per platform and merge with environment
 markers.
 
+## What the updater needs from a release (5.47.0)
+
+* **Declare every schema migration.** `server/schema_migrations.json` lists each migration in `audit_store.MIGRATIONS` with the
+  release it came in (`since`) and `rollback_safe`: whether the *previous* release's code still works on a database at that
+  schema (true for added tables, columns and indexes; false for anything older code reads that was dropped or renamed).
+  `tools/release.py build` refuses a release that has an undeclared migration and writes the list, `expected_schema_version`,
+  `migration_time_estimate_seconds` and `activator_version` into `manifest.json`; the updater shows the unsafe ones before an upgrade
+  is approved. `tests/test_migration_rollback_safety.py` keeps the file in step with the code and opens a database migrated by the new
+  code with the previous release's `audit_store.py` (`tests/fixtures/previous_release/`). **Refresh that fixture when you release**
+  (copy `audit_store.py` from the tag you are replacing): it is what an automatic code rollback runs.
+* **The updater updates itself.** After a successful upgrade root copies `server/updater/root/*.py` and `server/nginx_bake.py` from the
+  *verified* release over its own files (after a self-test of the new copy), so an upgrade always runs the previous release's
+  updater. Changing those files is changing code that runs as root: review them as such.
+* **The nginx template** (`server/nginx-opa-secrets-wizard.conf`) is baked with the live server's values and applied by the updater
+  (`nginx -t` first, restored on failure). Keep the template's layout (the directives `server/nginx_bake.py` carries over).
+* **The real-systemd test:** before releasing a version that touches the updater, the units or `install.sh`, run
+  `tests/integration/updater-vm.sh` on a throwaway Debian VM (synthetic data and test-only keys; see its header). It is not part of CI.
+
 ## Routine key rotation (release key)
 
 Done with the key still healthy (a new KMS key, a key reaching old age). The new key is introduced by a release signed by the **current**

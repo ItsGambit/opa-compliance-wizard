@@ -7,7 +7,13 @@ Updates page shows is also here, for admins who work from a shell).
     python -m server.updater verify <tarball> <minisig> [verify options]
     python -m server.updater keys list
     python -m server.updater keys apply-revocation <revocation.json>
-    python -m server.updater audit [--since 2026-01-31[T10:00:00Z]] [--json]
+    python -m server.updater audit [--since 2026-01-31[T10:00:00Z]] [--correlation upg-xxxxxxxx] [--last N] [--json]
+
+Installing, rolling back, restoring, staging and the support bundle need root
+and are run through the `ocw-updater` command that server/install.sh puts on
+the PATH (the same name also forwards the commands above to this module as the
+application user): `ocw-updater stage | apply | cancel | rollback | restore |
+bundle | clear-failure | trust ...`. Typing them here only explains that.
 
 Exit status: 0 ok, 1 `check` found a newer release, 2 usage error,
 3 failure (the message says what to do). Actions that change anything write
@@ -86,6 +92,11 @@ def cmd_status(a):
         print(json.dumps(s, indent=2))
     else:
         _print_status(s)
+        run = service.upgrade_run()
+        if run:
+            print(f"Last upgrade run  : {run['correlation_id']} {run['version_from']} -> {run['version_to']}: "
+                  f"{run['result'] or 'IN PROGRESS at ' + str(run['step'])}" + (f" ({run['reason_code']})" if run["reason_code"] else ""))
+            print("                    Full picture and actions: sudo ocw-updater status")
     return EXIT_OK
 
 
@@ -153,8 +164,11 @@ def cmd_verify(a):
 
 def cmd_audit(a):
     engine = _engine()
-    entries = [e for e in engine.read_audit_log(limit=1000)
-               if str(e.get("action", "")).startswith(AUDIT_PREFIXES) and (not a.since or e.get("timestamp", "") >= a.since)]
+    entries = [e for e in engine.read_audit_log(limit=5000)
+               if str(e.get("action", "")).startswith(AUDIT_PREFIXES) and (not a.since or e.get("timestamp", "") >= a.since)
+               and (not a.correlation or (e.get("details") or {}).get("correlation_id") == a.correlation)]
+    if a.last:
+        entries = entries[:a.last]  # newest first
     if a.json:
         print(json.dumps(entries, indent=2))
         return EXIT_OK
@@ -165,6 +179,17 @@ def cmd_audit(a):
         brief = ", ".join(f"{k}={v}" for k, v in d.items() if k != "correlation_id" and v not in (None, ""))
         print(f"{e.get('timestamp', '')[:19]}  {e['action']:34} {e.get('actor_email') or 'system':16} {brief[:140]}")
     return EXIT_OK
+
+
+ROOT_COMMANDS = ("stage", "apply", "cancel", "rollback", "restore", "bundle", "clear-failure", "trust")
+
+
+def cmd_root_only(a):
+    print(f"`{a.cmd}` changes the installation and runs as root through the updater, not through this module.\n"
+          f"Use:  sudo ocw-updater {a.cmd} ...   (installed by server/install.sh; see README 'Upgrading').\n"
+          "If this server has not been migrated yet, run server/install.sh first (it prints a dry-run plan with --dry-run).",
+          file=sys.stderr)
+    return 2
 
 
 def build_parser():
@@ -192,8 +217,14 @@ def build_parser():
     s = k.add_parser("apply-revocation")
     s.add_argument("revocation_json")
     s.set_defaults(fn=cmd_keys_apply)
+    for name in ROOT_COMMANDS:
+        r = sub.add_parser(name, add_help=False)
+        r.add_argument("rest", nargs="*")
+        r.set_defaults(fn=cmd_root_only)
     s = sub.add_parser("audit")
     s.add_argument("--since", help="ISO date or time, e.g. 2026-01-31 or 2026-01-31T10:00:00Z")
+    s.add_argument("--correlation", help="only the entries of one upgrade run, e.g. upg-7f3a9c2e")
+    s.add_argument("--last", type=int, help="only the newest N entries")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_audit)
     return p

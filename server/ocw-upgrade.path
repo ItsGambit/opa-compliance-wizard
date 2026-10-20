@@ -1,0 +1,14 @@
+# Starts ocw-upgrade.service when a request file appears in the inbox the web
+# application is allowed to write. A path unit also fires at once if the
+# directory is already non-empty when it starts, which covers a request written
+# while the updater was down. The request is only advice: the root-owned
+# updater re-validates everything (signature, version, replay, size, owner).
+[Unit]
+Description=Watch for OPA Compliance Wizard upgrade requests
+
+[Path]
+DirectoryNotEmpty=__DATA_DIR__/upgrade/inbox/requests
+Unit=ocw-upgrade.service
+
+[Install]
+WantedBy=multi-user.target

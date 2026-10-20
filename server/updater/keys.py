@@ -233,7 +233,7 @@ def load_state(path):
 
 
 def local_path():
-    return Path(os.environ.get(LOCAL_PATH_ENV) or (REPO_ROOT / "release_keys.local.json"))
+    return Path(os.environ.get(LOCAL_PATH_ENV) or (Path(os.environ.get("OPA_DATA_DIR") or REPO_ROOT) / "release_keys.local.json"))
 
 
 # --- the effective list --------------------------------------------------------
@@ -502,6 +502,21 @@ def record_change(action, details):
         print(f"warning: could not write the audit entry for {action}: {exc}", file=sys.stderr)
 
 
+def _keep_raw_copy(raw, serial):
+    """5.47.0: in the /var/lib layout the root-owned updater keeps its own trust list and does not read this install's
+    key state; it re-verifies any revocation.json left in upgrade/revocations/ itself (an untrusted carrier, a verified
+    file). Best effort and only when that directory exists (install.sh creates it)."""
+    data = os.environ.get("OPA_DATA_DIR")
+    if not data:
+        return
+    d = Path(data) / "upgrade" / "revocations"
+    try:
+        if d.is_dir():
+            (d / f"{int(serial)}.json").write_bytes(raw)
+    except OSError:
+        pass
+
+
 def apply_revocation_bytes(raw, source="file", shipped=None, local_state_path=None):
     """Verify, persist, audit. Returns (effective list after, details)."""
     shipped_list = load_key_list(shipped if shipped is not None else SHIPPED_PATH)
@@ -509,6 +524,7 @@ def apply_revocation_bytes(raw, source="file", shipped=None, local_state_path=No
     eff = effective_from(shipped_list, load_state(path))
     state, details = apply_revocation(eff, raw)
     write_local(state, path)
+    _keep_raw_copy(raw, details["to_serial"])
     details = {**details, "source": source}
     record_change("release_keys.revocation_applied", details)
     return effective_from(shipped_list, state), details

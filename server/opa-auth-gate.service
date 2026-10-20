@@ -6,6 +6,8 @@ After=network.target opa-compliance-wizard.service
 Type=simple
 User=__APP_USER__
 WorkingDirectory=__APP_DIR__
+Environment=OPA_DATA_DIR=__DATA_DIR__
+Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=/etc/opa-compliance-wizard.env
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
@@ -13,6 +15,13 @@ ExecStart=__APP_DIR__/.venv/bin/python server/auth_gate.py --port 8767
 Restart=on-failure
 RestartSec=3
 
+# 5.47.0 layout (server/install.sh writes this unit): __APP_DIR__ is
+# /opt/opa-compliance-wizard/current (a symlink to the active release; the
+# application user cannot write it), __DATA_DIR__ is
+# /var/lib/opa-compliance-wizard (the only place the application writes, via
+# OPA_DATA_DIR). The keyring and /run/user carve-outs below are unchanged:
+# see the ProtectHome incident described in this file's comments.
+#
 # Phase 8 of docs/fast-follow-redesign.md -- same hardening and the
 # same three ReadWritePaths= as opa-compliance-wizard.service's own
 # comment explains (including /run/user/1000, confirmed live 2026-10-02
@@ -25,7 +34,7 @@ RestartSec=3
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=read-only
-ReadWritePaths=__APP_DIR__
+ReadWritePaths=__DATA_DIR__
 ReadWritePaths=__APP_USER_HOME__/.local/share/keyrings
 ReadWritePaths=/run/user/1000
 ProtectKernelTunables=true

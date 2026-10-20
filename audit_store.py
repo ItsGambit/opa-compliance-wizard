@@ -262,7 +262,8 @@ def _audit_db_path():
     override = os.environ.get("OPA_AUDIT_DB_PATH")
     if override:
         return override
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit_store.db")
+    data_dir = os.environ.get("OPA_DATA_DIR")  # 5.47.0: the /var/lib layout (see create_secret_folders._data_dir)
+    return os.path.join(data_dir or os.path.dirname(os.path.abspath(__file__)), "audit_store.db")
 
 
 # DATA-14: the archive holds names, e-mails, client IPs and pending admin

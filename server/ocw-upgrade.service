@@ -1,0 +1,41 @@
+# The root-owned updater (updater/ocw_activate.py): handles upgrade requests,
+# due scheduled upgrades and, at boot, RESUMES an upgrade that a crash or power
+# loss interrupted. Standard library only; it executes nothing from a release
+# tree. Silent when there is nothing to do. Installed by server/install.sh.
+#
+# Not ordered Before=opa-compliance-wizard.service (the design note said so):
+# resuming restarts those units and runs health checks against them, which
+# would deadlock against such an ordering at boot.
+[Unit]
+Description=Activate a staged OPA Compliance Wizard release (and resume after a crash)
+After=network.target local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I __OPT_DIR__/updater/ocw_activate.py run
+TimeoutStartSec=4h
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=OCW_OPT_DIR=__OPT_DIR__
+Environment=OCW_DATA_DIR=__DATA_DIR__
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# the code tree + updater, the data directory, the staging account's downloads (a refused file is renamed there) and the nginx
+# site (the template is baked into it); "-" = ignore a path that does not exist on this server
+ReadWritePaths=__OPT_DIR__ __DATA_DIR__ -/var/lib/ocw-updater -/etc/nginx
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+# Root never needs the internet: only loopback (the application's health endpoints).
+# (PrivateNetwork=yes would hide the host's loopback from the health checks.)
+IPAddressDeny=any
+IPAddressAllow=localhost
+# UNVERIFIED on a real host until tests/integration/updater-vm.sh has run: the capability set below is what the
+# updater needs by design (chown/chmod of the release tree, reading files it does not own, dropping to the
+# application account for database access); tighten or loosen it from that run's result.
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID CAP_SETPCAP
+
+[Install]
+WantedBy=multi-user.target

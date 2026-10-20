@@ -1,0 +1,10 @@
+# Fired by ocw-upgrade-due.timer once a minute, only while an upgrade is
+# scheduled with `ocw-updater apply --at ...`: hands over to ocw-upgrade.service,
+# which starts any scheduled upgrade that is due. Skipped silently otherwise.
+[Unit]
+Description=Check for a due scheduled OPA Compliance Wizard upgrade
+ConditionDirectoryNotEmpty=__DATA_DIR__/upgrade/schedule
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl start --no-block ocw-upgrade.service

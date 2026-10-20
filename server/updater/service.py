@@ -59,7 +59,7 @@ def _engine():
 
 def state_path():
     override = os.environ.get(STATE_ENV)
-    return override or str(Path(keylib.REPO_ROOT) / "update_check.json")
+    return override or str(Path(os.environ.get("OPA_DATA_DIR") or keylib.REPO_ROOT) / "update_check.json")
 
 
 def _iso(dt):
@@ -71,6 +71,53 @@ def _parse_iso(text):
         return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except (TypeError, ValueError):
         return None
+
+
+# --- the root-owned updater's output (5.47.0) --------------------------------------------------------
+# The updater (updater/ocw_activate.py, root) writes upgrade/state.json (world-readable) and, on a failure,
+# a redacted support bundle into upgrade/bundles/ (readable by this account). This module only READS them.
+BUNDLE_NAME_RE = __import__("re").compile(r"^ocw-support-[A-Za-z0-9._-]{1,160}\.tar\.gz$")
+MAX_BUNDLE_BYTES = 6 * 1024 * 1024
+_RUN_FIELDS = ("correlation_id", "action", "version_from", "version_to", "step", "result", "reason_code", "started_at",
+               "updated_at", "seconds", "failed_step", "operator_reason", "bundle", "schema_before", "schema_after")
+
+
+def upgrade_dir():
+    override = os.environ.get("OPA_UPGRADE_DIR")
+    return Path(override) if override else Path(os.environ.get("OPA_DATA_DIR") or keylib.REPO_ROOT) / "upgrade"
+
+
+def upgrade_run():
+    """The updater's current/last run (fields only, no paths or manifest), or None when there is none or this
+    install does not use the updater layout."""
+    import json
+    try:
+        with open(upgrade_dir() / "state.json", encoding="utf-8") as fh:
+            st = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return {k: st.get(k) for k in _RUN_FIELDS} if isinstance(st, dict) else None
+
+
+def read_bundle(name):
+    """(status, bytes-or-error-text) for a support bundle by file name. Only a plain name in upgrade/bundles/ is
+    ever opened: no path separators, no links, regular files up to 6 MB."""
+    if not isinstance(name, str) or not BUNDLE_NAME_RE.match(name) or ".." in name:
+        return 400, "Not a support bundle name."
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(upgrade_dir() / "bundles" / name), flags)
+    except OSError:
+        return 404, "No such support bundle."
+    try:
+        st = os.fstat(fd)
+        import stat as _stat
+        if not _stat.S_ISREG(st.st_mode) or st.st_size > MAX_BUNDLE_BYTES:
+            return 404, "No such support bundle."
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            return 200, fh.read(MAX_BUNDLE_BYTES + 1)
+    finally:
+        os.close(fd)
 
 
 def default_data():

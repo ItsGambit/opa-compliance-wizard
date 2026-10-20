@@ -188,25 +188,46 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    origin -- otherwise every write request is rejected with `403 Origin
    '...' is not allowed to call this API"` once real browser traffic
    arrives from that origin.
-6. Install and enable the two systemd units (`opa-compliance-wizard.service`,
+6. **5.47.0 and newer: let `server/install.sh` do steps 6 and 7 (recommended).** It installs the upgrade layout
+   (code in `/opt/opa-compliance-wizard/releases/<version>`, owned by root; data in
+   `/var/lib/opa-compliance-wizard`, the only place the application writes; the root-run updater and its units;
+   the `ocw-updater` command) and, on a server that already runs from a home directory, migrates it with a rollback
+   if the result is not healthy. Run `sudo server/install.sh --dry-run` first. Prerequisites you still do yourself: the
+   environment file (steps 2-5), the units' own keyring and `/run/user` carve-outs (they stay as they are), the nginx site
+   (`install.sh --apply-nginx` then adds the maintenance-page directives to it), and the gate. With the new layout:
+   * **no sudoers rules for deploys are needed** and the web application's account can no longer restart services or write
+     the nginx site (`install.sh --remove-legacy-sudoers` removes an old deploy rule; step 7 below is for installs that stay on
+     the old in-place layout);
+   * the unit templates in `server/` use `__APP_DIR__` = `/opt/opa-compliance-wizard/current` and `__DATA_DIR__` =
+     `/var/lib/opa-compliance-wizard`; the backend unit also has `ProtectSystem=strict` (the gate unit does not: it creates its
+     session key under `/etc` on first start);
+   * the app's archive path (`OPA_AUDIT_DB_PATH`, below) and every other data file follow `OPA_DATA_DIR`;
+   * a second gate's site generated before 5.47.0 lacks the `/api/upgrade` deny block: run `server/setup-second-gate.sh` again for it;
+   * the units `ocw-stage@.service` (unprivileged staging; optional proxy settings in `/etc/ocw-updater.env`), `ocw-upgrade.path` and
+     `ocw-upgrade.service` (root: activate, roll back, resume at boot) are documented in the README ("Upgrading").
+
+   The rest of this step describes the manual installation the old layout (and `install.sh`'s migration) is based on.
+
+   Install and enable the two systemd units (`opa-compliance-wizard.service`,
    `opa-auth-gate.service`) and the nginx site config, adjusting paths/IPs
    for your own server. (An install predating the 5.20.0 rename can keep
    its existing `opa-secrets-wizard.service` unit name as-is — nothing
    requires renaming a unit that's already running; this filename is the
    template a fresh install starts from.)
 
-   Both `.service` files use `__APP_USER__`/`__APP_DIR__`/
-   `__APP_USER_HOME__` placeholders (not a real username/path — this repo
+   Both `.service` files use `__APP_USER__`/`__APP_DIR__`/`__DATA_DIR__`/
+   `__APP_USER_HOME__` placeholders (set `__DATA_DIR__` to the same path as `__APP_DIR__`
+   for the old in-place layout and delete the `OPA_DATA_DIR` and `ProtectSystem` lines) (not a real username/path — this repo
    is public and doesn't hardcode either), so fill those in before
    installing, e.g.:
    ```bash
    sed -e "s|__APP_USER__|$(whoami)|g" \
        -e "s|__APP_DIR__|$(pwd)|g" \
-       -e "s|__APP_USER_HOME__|$HOME|g" \
+       -e "s|__APP_USER_HOME__|$HOME|g" -e "s|__DATA_DIR__|$(pwd)|g" \
        server/opa-compliance-wizard.service | sudo tee /etc/systemd/system/opa-compliance-wizard.service
    sed -e "s|__APP_USER__|$(whoami)|g" \
        -e "s|__APP_DIR__|$(pwd)|g" \
-       -e "s|__APP_USER_HOME__|$HOME|g" \
+       -e "s|__APP_USER_HOME__|$HOME|g" -e "s|__DATA_DIR__|$(pwd)|g" \
        server/opa-auth-gate.service | sudo tee /etc/systemd/system/opa-auth-gate.service
    sudo systemctl daemon-reload
    ```
@@ -263,7 +284,8 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    admin flag it was issued with until it expires (12 h). Each additional
    gate has its own key (`/etc/opa-auth-gate-<name>/session.key`) and
    unit (`opa-auth-gate-<name>`).
-7. **One-time sudoers setup, only if you'll use `server/deploy.sh` to
+7. **(Old in-place layout only: with the 5.47.0 upgrade layout there is no deploy sudoers rule.)**
+   **One-time sudoers setup, only if you'll use `server/deploy.sh` to
    redeploy later** (recommended — it's the repeatable path; see that
    file's own header comment). This grants the deploying user exactly the
    commands that script runs — a one-time, human-reviewed step done
@@ -369,6 +391,10 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
    include all six, re-open the file from step 7c and check for a typo
    — most commonly the username, or a binary path that doesn't match
    step 7a's `which` output exactly.
+
+**Upgrading on the 5.47.0 upgrade layout:** `sudo ocw-updater stage <version>` then `sudo ocw-updater apply <version>`
+(or `server/deploy.sh --release <version>`, which now only calls those two): README, "Upgrading". The paragraph below
+describes the old in-place `deploy.sh`.
 
 **Redeploying: `server/deploy.sh`.** Run it on the server as the app user.
 For production use a signed release: `<install dir>/server/deploy.sh

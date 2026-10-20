@@ -1,0 +1,42 @@
+# Stages one signed release (the instance name is the version): verify the
+# signature, unpack, build the virtual environment with hash-checked pip.
+# Runs as the unprivileged ocw-updater account, never as root and never as the
+# web application's account; root re-verifies everything before it switches
+# (updater/ocw_activate.py). Started by root (ocw-upgrade.service or
+# `ocw-updater stage`), not by hand. Installed by server/install.sh.
+[Unit]
+Description=Stage OPA Compliance Wizard release %i (verify, unpack, build environment)
+Documentation=https://github.com/ItsGambit/opa-compliance-wizard#upgrading
+
+[Service]
+Type=oneshot
+User=ocw-updater
+Group=ocw-updater
+WorkingDirectory=__OPT_DIR__/current
+Environment=OCW_OPT_DIR=__OPT_DIR__
+Environment=OCW_DATA_DIR=__DATA_DIR__
+Environment=OCW_ARTIFACTS_DIR=/var/lib/ocw-updater/artifacts
+Environment=HOME=/var/lib/ocw-updater
+Environment=XDG_CACHE_HOME=/var/cache/ocw-updater
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Optional, no secrets: https_proxy / no_proxy for the download and for pip, OPA_RELEASE_BASE_URL for a mirror.
+EnvironmentFile=-/etc/ocw-updater.env
+ExecStart=__OPT_DIR__/current/.venv/bin/python -m server.updater.stage %i
+TimeoutStartSec=3600
+StateDirectory=ocw-updater
+CacheDirectory=ocw-updater
+UMask=0022
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=__OPT_DIR__/releases
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service

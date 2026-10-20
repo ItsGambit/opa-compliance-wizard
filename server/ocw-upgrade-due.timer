@@ -1,0 +1,12 @@
+# Enabled by `ocw-updater apply --at ...` and disabled again by `ocw-updater cancel`
+# or when no upgrade is scheduled any more; not enabled otherwise.
+[Unit]
+Description=Once a minute: is a scheduled OPA Compliance Wizard upgrade due?
+
+[Timer]
+OnCalendar=minutely
+Persistent=true
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

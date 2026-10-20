@@ -137,11 +137,12 @@ Want to run it as a CLI instead, or host it for a team? See
 
 ## Upgrading
 
-**Nothing changes for you unless you choose it.** Upgrading to 5.46.0 changes no
-behaviour of an existing install: the update check is **off**, `server/deploy.sh`
-and `--ref` work as before (with a warning that they install unsigned source), and
-no key has to be pinned. What 5.46.0 adds is a way to install **signed releases**
-and to learn that one exists.
+**Nothing changes for you unless you choose it.** Upgrading to 5.47.0 changes no
+behaviour of an existing install: the update check is **off**, `server/deploy.sh` and `--ref`
+keep working in place (with a note that the install can move to the upgrade layout), and no
+key has to be pinned. 5.46.0 added **signed releases** and the update check; 5.47.0 adds the
+**upgrade layout** and the **updater**: one command stages a signed release, backs up the
+archive, switches versions, health-checks the result and rolls back by itself if it is not healthy.
 
 ### Where your install stands
 
@@ -173,6 +174,112 @@ the check last ran (file `update_check.json` next to the app, owner-only).
   Updates screen and recorded in the **Audit Log**; an identical failure is not
   logged again, and the next success says how many failed and since when.
 
+### The upgrade layout and the updater (5.47.0, recommended for production)
+
+Run once, on the server, as root. Start with `--dry-run`: it prints exactly what it would do and
+changes nothing.
+
+```bash
+sudo server/install.sh --dry-run
+sudo server/install.sh
+```
+
+What it does, and why:
+
+| | |
+|---|---|
+| `/opt/opa-compliance-wizard/` (owned by root) | `releases/<version>/` (each with its own Python environment), `current` and `previous` symlinks, and the small root-run **updater** (Python standard library only, `updater/`). The web application's account **cannot write its own code**. |
+| `/var/lib/opa-compliance-wizard/` | The application's data (archive, audit log, access control, folder templates): the only place it writes (`OPA_DATA_DIR`). The root-owned `upgrade/` directory inside it holds the updater's state, backups and support bundles. |
+| accounts | the application's account (unchanged) and `ocw-updater`, an unprivileged account that downloads, verifies and unpacks a release and builds its environment. Root re-verifies everything and never executes anything from a release. |
+| `ocw-upgrade.path`, `ocw-upgrade.service`, `ocw-stage@.service` | the units that activate, roll back and resume after a crash. `/usr/local/bin/ocw-updater` is the command. |
+
+An existing install is **migrated**: the data files are copied (the originals are renamed
+`*.migrated-<time>`, never deleted), the units are rewritten (`WorkingDirectory`, `ExecStart`,
+`ReadWritePaths`; the keyring and `/run/user` carve-outs stay exactly as they were), the services are
+restarted and checked, and if they do not come up healthy everything is put back. The old directory is
+left where it is. `--remove-legacy-sudoers` removes the old deploy sudoers file (after checking it only
+grants what `deploy.sh` needed; it is moved aside, not deleted); nothing removes it unasked.
+`--apply-nginx` also applies this release's nginx template, which adds the maintenance page shown to
+other users while the version switches. Offline server: `--wheelhouse DIR` installs the Python packages
+from a directory only.
+
+**Upgrading:**
+
+```bash
+sudo ocw-updater stage 5.48.0              # downloads, verifies, unpacks, builds the environment (as ocw-updater)
+sudo ocw-updater apply 5.48.0              # shows what changes, asks you to type the version, then runs the whole sequence
+sudo server/deploy.sh --release 5.48.0     # the same two steps (this script is now a thin wrapper)
+```
+
+The sequence, with every step in the Audit Log (`upgrade.*`, one correlation id for the whole run) and
+the server journal (JSON lines): request accepted and validated; staged release re-verified by root (signature, version, every
+file against the signed manifest; the tree is made root-owned first, so nothing can change after the check); preflight (free disk
+space on both volumes, no archive sync running, nginx template bakes); **backup** of the archive (SQLite's online backup, integrity-checked, root-only,
+never pruned automatically) and the audit chain heads; **switch** (atomic symlink rename, while nginx shows the maintenance page);
+restart; **eight health checks** (the unit is active with no restarts; `/api/version` answers the new version from a
+*new* process; `/healthz` is not worse than before; the login gate answers 401; the archive's `quick_check`; the schema version; the audit
+chain heads are unchanged; an authenticated read works). Any failure rolls back **once, automatically**.
+
+#### Rollback is code only; restoring data is a separate, typed decision
+
+* **Rollback** (automatic on a failed health check, or `sudo ocw-updater rollback` within 24 hours, typed `ROLLBACK`)
+  switches the *code* back to the previous release and restarts. **Data is never touched.** A newer release may have
+  migrated the archive schema forward; the old code runs on it when the migration is *rollback-safe* (each migration says so
+  in `server/schema_migrations.json` and the release manifest; `ocw-updater apply` tells you before you approve).
+* **Restore** (`sudo ocw-updater restore --confirm RESTORE`) replaces the archive with the copy taken before the last upgrade. It
+  **loses every event archived since** and is never automatic. The database it replaces is moved aside (never deleted).
+  Only do this if the maintainers tell you to, and after you have the support bundle.
+* If the rollback itself fails the updater does not leave the service down silently: nginx shows a page that says an operator
+  is needed, a `CRIT` line goes to the journal, `upgrade.failed` is written to the Audit Log, the state is `failed_needs_operator`,
+  and the bundle is written. `ocw-updater status` tells you what to do; the previous code is still on disk.
+* A version that failed is not tried again until `sudo ocw-updater clear-failure`; after two failures it stays off.
+
+#### The support bundle ("send to the maintainers")
+
+When an upgrade fails, the updater builds a redacted bundle (`ocw-support-<from>-to-<to>-<time>-<id>.tar.gz`, at most 5 MB) before anyone asks.
+An **app administrator without shell access can download it**: `GET /api/upgrade/bundle?name=...` (admin-only; it is linked from the
+failed upgrade's Audit Log entry, which records `bundle.name`, size and sha256; the button itself arrives with the in-app flow). From a shell: `sudo ocw-updater bundle`
+(`--include-hosts` keeps host and environment names). Email it yourself to the address in SECURITY.md; **nothing is ever sent automatically.**
+
+* **In it:** `summary.json` (versions, reason code, failed step, timings, OS / Python / SQLite / systemd versions, free space, the
+  manifest, the health results, `pip freeze`, schema before and after, the chain-head comparison, the run's history), the last 500 journal lines of each
+  OPA unit and of the updater, `nginx -t`, `systemctl status`, the audit entries of this run only, and `redaction-report.txt` (how many
+  things were redacted, never what).
+* **Never in it:** the environment file, anything from the keyring, the session key, the archive or any row of it, environment (tenant)
+  metadata, the nginx site file (it holds the proxy secret), request bodies, cookies.
+* **Redacted before it is written:** the values of every secret in the server's environment file wherever they appear; variables named
+  `*SECRET`, `*TOKEN`, `*PASSWORD`, `*KEY`; `Authorization`, `Cookie`, `Set-Cookie` headers; Okta tokens and JWTs; long token-like strings; e-mail addresses
+  (`user-<hash>@redacted`), Okta subject ids (`sub-<hash>`), host names and IP addresses (`host-<hash>`), tenant and environment names (`env-<hash>`).
+  The hashes use a random salt per bundle. Host and IP detection is pattern-based (known top-level domains): read the bundle once before you send it.
+
+#### Air-gapped servers
+
+Download `ocw-<version>.tar.gz` and `ocw-<version>.tar.gz.minisig` on a computer with internet access, carry them over, and run
+`sudo ocw-updater stage ocw-<version>.tar.gz` then `sudo ocw-updater apply <version>`. A published key revocation
+(`revocation.json`) is applied with `sudo ocw-updater trust apply revocation.json`. For packages without internet access, `install.sh --wheelhouse`
+covers the first install; a vendored-wheel release bundle is planned.
+
+#### The command
+
+| Command | What it does |
+|---|---|
+| `ocw-updater status [--json]` | installed, staged, scheduled, updater health, keys, backups, last run (reads only; any user) |
+| `stage <file or version>` | verify and stage (root) |
+| `apply <version> [--at "YYYY-MM-DD HH:MM" [--tz Europe/London]]` | install now or schedule (typed confirmation); `cancel` removes a schedule |
+| `rollback` / `restore --confirm RESTORE` | code-only rollback / archive restore, as above |
+| `bundle [--correlation ID] [--include-hosts]`, `clear-failure` | support bundle; allow a failed version again |
+| `trust list`, `trust apply <revocation.json>`, `trust add <key.json>` | the signing keys root trusts (the standby key can only change by a signed revocation; `add` takes only an active release key and a typed `TRUST`) |
+| `nginx-sync` | apply the current release's nginx template (maintenance page) |
+| `check`, `enable-check`, `disable-check`, `verify`, `audit`, `keys ...` | the 5.46.0 tools (run as the application's account automatically) |
+
+Exit codes: `0` ok, `2` refused (signature, version, key, sync running, another upgrade in flight, bad usage), `3` failed and rolled back,
+`4` failed and an operator is needed. `--json` where it makes sense. Every action writes the same audit events as the in-app flow will (the actor is `cli:<os user>`).
+
+#### What this does not do yet
+
+The Updates screen in the web app only reports (5.46.0); approving an upgrade with MFA, scheduling from the browser and the
+progress page arrive with the in-app flow. Local (laptop) mode has no updater. See `CHANGELOG.md` for the known limitations of this release.
+
 ### Installing a signed release
 
 On the server, as the account that owns the installation:
@@ -196,10 +303,10 @@ requirements.lock`, restarts with health checks, nginx validation.
   `revocation.json` + `revocation.json.sig`) elsewhere, carry them over, run
   `server/deploy.sh --release 5.47.0 --from-dir /path/to/dir`.
 - **Re-run the same version** (for example after a failed run): add `--reinstall`.
-- **Going back:** a signed `--release` never installs an older version. To return to
-  an earlier version, restore your backup of the installation and archive, or
-  `deploy.sh --ref <previous tag>` (unsigned; maintainers). There is no automatic
-  code rollback in 5.46.0.
+- **Going back:** a signed `--release` never installs an older version. On the upgrade
+  layout use `sudo ocw-updater rollback` (code only, 24 hours); on an install that has not
+  run `install.sh` there is no automatic rollback: restore your backup of the installation and
+  archive, or `deploy.sh --ref <previous tag>` (unsigned; maintainers).
 - **Take a backup first.** Set `OPA_DEPLOY_BACKUP_DIR` (see [docs/hosting.md](docs/hosting.md)).
 - Every refusal is recorded in the Audit Log as `upgrade.verify_failed` with a reason code.
 
