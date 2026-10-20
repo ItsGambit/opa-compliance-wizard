@@ -320,8 +320,17 @@ def audit_append(cfg, action, details, actor_email=None, ids=(None, None)):
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
-            lock_fd = os.open(os.path.join(os.path.dirname(path), "." + os.path.basename(path) + ".lock"),
-                              os.O_RDWR | os.O_CREAT | nofollow, 0o600)
+            lock_path = os.path.join(os.path.dirname(path), "." + os.path.basename(path) + ".lock")
+            nb = getattr(os, "O_NONBLOCK", 0)
+            try:  # created by us: hand it to the application account (a root-owned lock would shut the application out of it)
+                lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow | nb, 0o600)
+                if ids[0] is not None and os.geteuid() == 0:
+                    os.fchown(lock_fd, ids[0], ids[1])
+            except FileExistsError:
+                lock_fd = os.open(lock_path, os.O_RDWR | nofollow | nb)
+                if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+                    os.close(lock_fd)
+                    raise OSError(errno.EINVAL, "not a regular file", lock_path)
             deadline = time.monotonic() + 5
             while True:
                 try:
@@ -338,7 +347,7 @@ def audit_append(cfg, action, details, actor_email=None, ids=(None, None)):
             if ids[0] is not None and os.geteuid() == 0:
                 os.fchown(fd, ids[0], ids[1])
         except FileExistsError:
-            fd = os.open(path, os.O_WRONLY | os.O_APPEND | nofollow)
+            fd = open_regular(path, write=True)
         try:
             view = memoryview(data)
             while view:
@@ -357,7 +366,7 @@ def audit_entries_for(cfg, correlation_id, max_bytes=16 * 1024 * 1024):
     """Audit entries whose details carry this correlation id (tail of the file only)."""
     out = []
     try:
-        with open(cfg.audit_log, "rb") as fh:
+        with os.fdopen(open_regular(cfg.audit_log), "rb") as fh:
             fh.seek(0, os.SEEK_END)
             size = fh.tell()
             fh.seek(max(0, size - max_bytes))
@@ -742,7 +751,7 @@ class Updater:
         for src in (artifact, artifact + ".minisig"):
             dst = os.path.join(c.verified, os.path.basename(src))
             try:
-                fd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                fd = open_regular(src)
             except OSError as exc:
                 raise ocw_trust.TrustError("bad_artifact", f"cannot open {os.path.basename(src)}: {exc.strerror}")
             with os.fdopen(fd, "rb") as fin:
@@ -830,7 +839,7 @@ class Updater:
             # The work directory belongs to the application account: copy from a file descriptor opened without following
             # links (never rename a path the application could have swapped), into a fresh root-only file.
             try:
-                fd = os.open(work_file, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                fd = open_regular(work_file)
             except OSError as exc:
                 raise StepFailed("backup_failed", f"cannot open the backup copy: {exc.strerror}", "backup")
             with os.fdopen(fd, "rb") as fin:
@@ -1672,11 +1681,7 @@ def ingest_revocations(up):
             continue
         for n in names:
             try:
-                fd = os.open(os.path.join(d, n), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-                try:
-                    raw = os.read(fd, ocw_trust.MAX_JSON + 1)
-                finally:
-                    os.close(fd)
+                raw = read_regular(os.path.join(d, n), ocw_trust.MAX_JSON + 1)
             except OSError:
                 continue
             serial = ocw_trust.revocation_serial(raw)

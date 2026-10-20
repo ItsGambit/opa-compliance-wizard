@@ -276,7 +276,7 @@ def parse_trusted_comment(comment):
 def hash_file(path, limit=MAX_TARBALL):
     """(blake2b-512 digest, sha256 hex, size) of a regular file, one pass."""
     b2, s2, size = hashlib.blake2b(digest_size=64), hashlib.sha256(), 0
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     fd = os.open(path, flags)
     with os.fdopen(fd, "rb") as fh:
         if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):

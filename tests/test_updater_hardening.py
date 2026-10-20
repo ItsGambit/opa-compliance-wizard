@@ -375,3 +375,51 @@ def test_check_tree_walks_the_virtualenv_and_refuses_escaping_links_and_setuid_b
     with pytest.raises(act.StepFailed) as e:
         up.check_tree(str(root), manifest)
     assert "setuid" in str(e.value)
+
+
+# --- a pipe or link in a directory root does not own must not block or redirect root --------------------------------
+
+
+@pytest.fixture
+def alarm():
+    import signal
+
+    def handler(*_a):
+        raise AssertionError("blocked: the updater waited on a named pipe")
+    old = signal.signal(signal.SIGALRM, handler)
+    signal.alarm(10)
+    yield
+    signal.alarm(0)
+    signal.signal(signal.SIGALRM, old)
+
+
+def test_a_pipe_among_the_revocation_files_does_not_block_the_updater(m, alarm):
+    d = m.data / "upgrade" / "revocations"
+    d.mkdir(parents=True)
+    os.mkfifo(d / "9.json")
+    os.symlink("/etc/hostname", d / "8.json")
+    act.ingest_revocations(m.updater())  # returns instead of waiting for a writer
+
+
+def test_a_pipe_as_the_audit_log_does_not_block_appends_or_reads(m, alarm):
+    os.mkfifo(m.data / "audit_log.jsonl")
+    act.audit_append(m.cfg(), "x.y", {"a": 1})
+    assert act.audit_entries_for(m.cfg(), "upg-00000000") == []
+
+
+def test_the_audit_lock_file_is_handed_to_the_application_account_when_root_creates_it(m, monkeypatch):
+    chowned = []
+    monkeypatch.setattr(act.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(act.os, "fchown", lambda fd, u, g: chowned.append((os.fstat(fd).st_ino, u, g)))
+    act.audit_append(m.cfg(), "x.y", {}, ids=(4242, 4343))
+    lock = os.stat(m.data / ".audit_log.jsonl.lock")
+    log = os.stat(m.data / "audit_log.jsonl")
+    assert (lock.st_ino, 4242, 4343) in chowned and (log.st_ino, 4242, 4343) in chowned
+
+
+def test_a_planted_link_as_the_audit_lock_is_not_written_through(m, tmp_path):
+    victim = tmp_path / "victim"
+    victim.write_text("precious")
+    os.symlink(victim, m.data / ".audit_log.jsonl.lock")
+    act.audit_append(m.cfg(), "x.y", {})
+    assert victim.read_text() == "precious" and (m.data / "audit_log.jsonl").stat().st_size > 0
