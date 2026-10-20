@@ -141,7 +141,12 @@ cleanup() {
   rm -rf "$OPT" "$DATA" /var/lib/ocw-updater /var/cache/ocw-updater /opt/ocw-vm-test
   rm -f /usr/local/bin/ocw-updater "$ENV_FILE" /etc/ocw-updater.env "$ENV_FILE".bak*
   loginctl disable-linger "$TEST_USER" 2>/dev/null
-  userdel -r "$TEST_USER" 2>/dev/null
+  # The account's systemd user manager keeps running briefly after linger is off; userdel refuses while it does.
+  loginctl terminate-user "$TEST_USER" 2>/dev/null
+  for _ in $(seq 1 20); do pgrep -u "$TEST_USER" >/dev/null 2>&1 || break; sleep 0.5; done
+  if id "$TEST_USER" >/dev/null 2>&1 && ! userdel -r "$TEST_USER" 2>/dev/null; then
+    echo "WARNING: could not remove the $TEST_USER account; remove it with: sudo userdel -r $TEST_USER" >&2
+  fi
   userdel ocw-updater 2>/dev/null
   rm -rf "$WORK"
   echo "clean."
