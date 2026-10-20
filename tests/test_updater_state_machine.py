@@ -74,7 +74,7 @@ def test_tampered_staged_tree_is_refused_by_root(m):
     m.build_release("5.47.0")
     m.put_artifacts("5.47.0")
     assert m.host.run(["systemctl", "start", "ocw-stage@5.47.0.service"])[0] == 0
-    (m.opt / "releases" / "5.47.0" / "requirements.lock").write_text("# evil\n")
+    (m.opt / "staging" / "5.47.0" / "requirements.lock").write_text("# evil\n")
     result = m.updater().apply(m.request("5.47.0", correlation_id="upg-aaaa0003"))
     assert result == "failed" and m.read_state()["reason_code"] == "tree_mismatch"
     assert os.readlink(m.opt / "current") == "releases/5.46.0"
@@ -84,7 +84,7 @@ def test_extra_file_in_staged_tree_is_refused(m):
     m.build_release("5.47.0")
     m.put_artifacts("5.47.0")
     m.host.run(["systemctl", "start", "ocw-stage@5.47.0.service"])
-    (m.opt / "releases" / "5.47.0" / "server" / "planted.py").write_text("import os\n")
+    (m.opt / "staging" / "5.47.0" / "server" / "planted.py").write_text("import os\n")
     assert m.updater().apply(m.request("5.47.0", correlation_id="upg-aaaa0004")) == "failed"
     assert m.read_state()["reason_code"] == "tree_mismatch"
 
@@ -353,6 +353,7 @@ def test_self_update_is_atomic_and_keeps_the_old_updater_when_the_new_one_fails(
     m.build_release("5.47.0")
     m.put_artifacts("5.47.0")
     m.host.run(["systemctl", "start", "ocw-stage@5.47.0.service"])
+    os.rename(m.opt / "staging" / "5.47.0", m.opt / "releases" / "5.47.0")  # what root's prepare step does first
     up = m.updater()
     real_run = up.host.run
 

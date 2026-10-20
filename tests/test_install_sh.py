@@ -76,7 +76,7 @@ def world(tmp_path):
     (stub / "bin").mkdir(parents=True)
     (stub / "units").mkdir()
     for name, body in (("systemctl", STUB_SYSTEMCTL), ("sleep", "#!/bin/bash\nexit 0\n"), ("runuser", '#!/bin/bash\nshift 3\nexec "$@"\n'),
-                       ("useradd", "#!/bin/bash\nexit 0\n")):
+                       ("useradd", "#!/bin/bash\nexit 0\n"), ("chown", '#!/bin/bash\necho "$@" >> "$STUB/chowns"\nexit 0\n')):
         p = stub / "bin" / name
         p.write_text(body)
         p.chmod(0o755)
@@ -290,3 +290,23 @@ def test_the_script_is_not_runnable_by_non_root_without_dry_run(world):
     p = subprocess.run(["bash", str(world.src / "server" / "install.sh"), "--yes"], capture_output=True, text=True, env=e)
     if os.geteuid() != 0:
         assert p.returncode != 0 and "run as root" in p.stderr
+
+
+def test_install_hands_out_owners_releases_root_staging_to_the_staging_account_audit_files_to_the_app(world):
+    # pretend the staging account exists, so install.sh picks it as owner (the real chown is a recording stub here)
+    idstub = world.stub / "bin" / "id"
+    idstub.write_text('#!/bin/bash\n[ "$1" = "ocw-updater" ] && exit 0\nexec /usr/bin/id "$@"\n')
+    idstub.chmod(0o755)
+    Backend.version = "5.47.0"
+    p = world.run()
+    assert p.returncode == 0, p.stderr + p.stdout
+    chowns = [line.split() for line in (world.stub / "chowns").read_text().splitlines()]
+    owner = {Path(line[-1]).name: line[0] for line in chowns if len(line) == 2}
+    assert owner["releases"] == "root:root"
+    assert owner["staging"] == "ocw-updater:ocw-updater"
+    assert owner["handoff"] == "root:ocw-updater"
+    for f in ("audit_log.jsonl", ".audit_log.jsonl.lock"):
+        assert owner[f].split(":")[0] == world.user
+        assert stat.S_IMODE((world.w / "var-lib" / f).stat().st_mode) == 0o600
+    assert stat.S_IMODE((world.w / "opt" / "releases").stat().st_mode) == 0o755
+    assert stat.S_IMODE((world.w / "opt" / "handoff").stat().st_mode) == 0o750

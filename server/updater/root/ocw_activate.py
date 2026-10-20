@@ -124,7 +124,9 @@ class Cfg:
         if env.get("OCW_TEST_MODE") == "1":
             self.faults = {f for f in env.get("OCW_UPDATER_FAULT", "").split(",") if f}
         self.fast = env.get("OCW_TEST_MODE") == "1" and env.get("OCW_FAST") == "1"
-        self.releases = os.path.join(self.opt, "releases")
+        self.releases = os.path.join(self.opt, "releases")  # root-owned: only root renames or removes entries here
+        self.handoff = os.path.join(self.opt, "handoff")  # root:<staging group> 0750: where an operator's file is handed to staging
+        self.staging = os.path.join(self.opt, "staging")  # owned by the staging account: <staging>/<version> until root takes it
         self.current = os.path.join(self.opt, "current")
         self.previous = os.path.join(self.opt, "previous")
         self.maintenance_dir = os.path.join(self.opt, "maintenance")
@@ -245,10 +247,30 @@ def write_json_atomic(path, obj, mode=0o644):
     fsync_dir(directory)
 
 
+def open_regular(path, write=False):
+    """Open a file in a directory root does not own: never follow a link, never block on a pipe, and only a plain file
+    is accepted (checked on the open descriptor). `write` opens for append (no create)."""
+    flags = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags | ((os.O_WRONLY | os.O_APPEND) if write else os.O_RDONLY))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", path)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def read_regular(path, max_bytes=16 * 1024 * 1024):
+    """The bytes of a plain file (at most max_bytes), opened safely; OSError if it is a link, pipe or directory."""
+    fd = open_regular(path)
+    with os.fdopen(fd, "rb") as fh:
+        return fh.read(max_bytes)
+
+
 def read_json(path, default=None):
     try:
-        with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
+        return json.loads(read_regular(path).decode("utf-8"))
     except (OSError, ValueError):
         return default
 
@@ -595,7 +617,8 @@ class Updater:
             raise StepFailed("internal_error", "cannot read the installed version", "validated")
         self.st["version_from"] = installed
         artifact = os.path.join(c.artifacts, f"ocw-{ver}.tar.gz")
-        staged_marker = os.path.join(c.releases, ver, ".staged")
+        staged_dir = os.path.join(c.staging, ver)
+        staged_marker = os.path.join(staged_dir, ".staged")
         had_artifact = os.path.exists(artifact) and os.path.exists(staged_marker)
         self.finish("validated", request=os.path.basename(req.get("_file", "")), sha256_ok=True)
         self.begin("downloaded")
@@ -626,11 +649,10 @@ class Updater:
         self.st["signed_by"] = info["key_id"]
         self.st["sha256"] = info["sha256"]
         self._adoption = (info["adoption"], info["candidate_keys"])
-        root = os.path.join(c.releases, ver)
-        if not os.path.isdir(os.path.join(root, ".venv")):
-            raise StepFailed("not_staged", "the staged release has no virtualenv", "staged")
-        # Take the tree away from the staging account FIRST (the stage unit has exited), then hash it: nobody but
-        # root can change a file between the check and the switch.
+        root = self.take_staged(ver)
+        # The tree is now under releases/ (a directory only root can write): take it away from the staging account
+        # FIRST (the stage unit has exited), then hash it. Nobody but root can change, replace or move a file or a
+        # directory entry between the check and the switch.
         self.host.chown_tree(root)
         self.check_tree(root, manifest)
         self.finish("staged", signed_by=info["key_id"], files_verified=len(manifest["files"]), adoption=info["adoption"])
@@ -646,6 +668,28 @@ class Updater:
                                        "schema_before": self.st.get("schema_before"),
                                        "chain_heads_recorded": len(self.st.get("chain_heads_before") or {}),
                                        "requested_by": req.get("actor")})
+
+    def take_staged(self, ver):
+        """Move staging/<ver> to releases/<ver> and return the new path. The rename comes FIRST: it pins whatever entry the
+        staging account left, under a parent directory only root can write, so nothing it does afterwards can swap the
+        tree that is about to be owned, hashed and switched to."""
+        c = self.cfg
+        src, dst = os.path.join(c.staging, ver), os.path.join(c.releases, ver)
+        st = os.lstat(src) if os.path.lexists(src) else None
+        if st is None or not stat.S_ISDIR(st.st_mode):
+            raise StepFailed("not_staged", "the staged release is missing or is not a directory", "staged")
+        if os.path.lexists(dst):
+            if ver in (link_version(c.current), link_version(c.previous)):
+                raise StepFailed("internal_error", f"releases/{ver} is the current or previous release", "staged")
+            shutil.rmtree(dst)  # root-owned leftover of an earlier attempt that failed after the rename
+        os.rename(src, dst)
+        after = os.lstat(dst)
+        if not stat.S_ISDIR(after.st_mode):  # swapped for a link or file between the check and the rename: never follow it
+            os.unlink(dst)
+            raise StepFailed("not_staged", "the staged release is not a plain directory", "staged")
+        if not os.path.isdir(os.path.join(dst, ".venv")):
+            raise StepFailed("not_staged", "the staged release has no virtualenv", "staged")
+        return dst
 
     def _trust(self):
         try:
@@ -1246,7 +1290,8 @@ class Updater:
     def _summary(self):
         c = self.cfg
         rc, ver = self.host.run(["systemctl", "--version"], 10)
-        staged = read_json(os.path.join(c.releases, str(self.st.get("version_to")), ".staged"), {}) or {}
+        ver_to = str(self.st.get("version_to"))
+        staged = (read_json(os.path.join(c.releases, ver_to, ".staged")) or read_json(os.path.join(c.staging, ver_to, ".staged")) or {})
         s = {k: self.st.get(k) for k in ("correlation_id", "action", "version_from", "version_to", "result", "reason_code", "failure",
                                          "failed_step", "error", "started_at", "updated_at", "seconds", "rollback_seconds",
                                          "steps_done", "health", "rollback_health", "schema_before", "schema_after", "manifest",
@@ -1306,8 +1351,15 @@ class Updater:
         return "updated"
 
     def prune(self, keep_ver):
-        """Keep current, previous and the one newest other release; remove older release directories."""
+        """Keep current, previous and the one newest other release; remove older release directories (and any staging
+        directory of a version that is no longer newer than the one just installed)."""
         c = self.cfg
+        try:
+            for d in os.listdir(c.staging):
+                if _VER.match(d) and ocw_trust.version_tuple(d) <= ocw_trust.version_tuple(keep_ver):
+                    shutil.rmtree(os.path.join(c.staging, d), ignore_errors=True)
+        except OSError:
+            pass
         keep = {keep_ver, link_version(c.previous), link_version(c.current)}
         others = sorted((d for d in os.listdir(c.releases) if _VER.match(d) and d not in keep), key=ocw_trust.version_tuple, reverse=True)
         removed = []

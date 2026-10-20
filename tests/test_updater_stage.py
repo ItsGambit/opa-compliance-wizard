@@ -66,7 +66,7 @@ def env(tmp_path, monkeypatch):
 def test_stage_unpacks_builds_the_environment_with_hashes_and_writes_the_marker_last(env):
     env.put()
     info = stagemod.stage(VERSION)
-    d = env.opt / "releases" / VERSION
+    d = env.opt / "staging" / VERSION
     staged = json.loads((d / ".staged").read_text())
     assert staged["version"] == VERSION and staged["sha256"] == info.sha256 and staged["verifier"] == "ok"
     assert staged["pip_freeze"] == ["cryptography==1.0", "keyring==2.0"] and len(staged["pip_freeze_sha256"]) == 64
@@ -83,7 +83,7 @@ def test_a_forged_release_is_refused_quarantined_and_reported_with_a_code(env, m
     assert stagemod.main([VERSION]) == 1
     err = json.loads((env.art / f"{VERSION}.stage-error.json").read_text())
     assert err["code"] == "key_unknown"
-    assert (env.art / f"ocw-{VERSION}.tar.gz.rejected").exists() and not (env.opt / "releases" / VERSION).exists()
+    assert (env.art / f"ocw-{VERSION}.tar.gz.rejected").exists() and not (env.opt / "staging" / VERSION).exists()
 
 
 def test_downgrade_and_tamper_are_refused(env):
@@ -103,7 +103,7 @@ def test_a_crash_after_unpacking_leaves_nothing_usable_and_the_next_attempt_clea
     monkeypatch.setenv("OCW_UPDATER_FAULT", "after_unpack")
     with pytest.raises(stagemod.StageError):
         stagemod.stage(VERSION)
-    d = env.opt / "releases" / VERSION
+    d = env.opt / "staging" / VERSION
     assert d.exists() and not (d / ".staged").exists()  # incomplete: no marker
     monkeypatch.delenv("OCW_UPDATER_FAULT")
     stagemod.stage(VERSION)
@@ -122,12 +122,12 @@ def test_disk_full_and_pip_failures_have_their_own_codes_and_clean_up(env, monke
     monkeypatch.setenv("OCW_UPDATER_FAULT", "disk_full")
     with pytest.raises(stagemod.StageError) as e:
         stagemod.stage(VERSION)
-    assert e.value.code == "disk_space" and not (env.opt / "releases" / VERSION).exists()
+    assert e.value.code == "disk_space" and not (env.opt / "staging" / VERSION).exists()
     monkeypatch.delenv("OCW_UPDATER_FAULT")
     env.pip.update(rc=1, err="ERROR: THESE PACKAGES DO NOT MATCH THE HASHES")
     with pytest.raises(stagemod.StageError) as e:
         stagemod.stage(VERSION)
-    assert e.value.code == "pip_failed" and "DO NOT MATCH THE HASHES" in str(e.value) and not (env.opt / "releases" / VERSION).exists()
+    assert e.value.code == "pip_failed" and "DO NOT MATCH THE HASHES" in str(e.value) and not (env.opt / "staging" / VERSION).exists()
 
 
 def test_a_release_without_a_lock_cannot_be_staged(env):
@@ -182,7 +182,7 @@ def test_download_from_a_mirror_and_published_revocations_are_kept_for_root(env,
     monkeypatch.setenv("OPA_RELEASE_BASE_URL", base)
     monkeypatch.setenv("OPA_REVOCATION_URL_BASE", base + "/revocation")
     stagemod.stage(VERSION)
-    assert (env.opt / "releases" / VERSION / ".staged").exists()
+    assert (env.opt / "staging" / VERSION / ".staged").exists()
     assert any(p.endswith(".tar.gz.minisig") for p in hits) and "/revocation/revocation.json" in hits
     kept = list((env.art / "revocations").glob("rev-*.json"))
     assert len(kept) == 1  # root re-verifies it itself; staging does not interpret it

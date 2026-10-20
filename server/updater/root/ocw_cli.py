@@ -27,7 +27,6 @@ import getpass
 import json
 import os
 import re
-import shutil
 import sys
 import time
 import uuid
@@ -101,9 +100,9 @@ def collect_status(cfg):
     cur, prev = act.installed_version(cfg), act.link_version(cfg.previous)
     staged = []
     try:
-        for d in sorted(os.listdir(cfg.releases)):
-            m = act.read_json(os.path.join(cfg.releases, d, ".staged"))
-            if m and d not in (cur, prev):
+        for d in sorted(os.listdir(cfg.staging)):
+            m = act.read_json(os.path.join(cfg.staging, d, ".staged"))
+            if isinstance(m, dict) and d not in (cur, prev):
                 staged.append({"version": d, "sha256": m.get("sha256"), "key_id": m.get("key_id"), "staged_at": m.get("staged_at")})
     except OSError:
         pass
@@ -186,7 +185,10 @@ def cmd_status(a, cfg, host):
 # --- stage -----------------------------------------------------------------------------------------
 
 
-def _drop_in_artifacts(cfg, tar_path):
+def _drop_in_handoff(cfg, tar_path):
+    """Give the operator's file to the staging step WITHOUT touching anything that account owns: root writes fresh copies
+    into the root-owned handoff directory (exclusive create, no links followed, group-readable by the staging account)
+    and the staging step copies them from there."""
     base = os.path.basename(tar_path)
     m = re.match(r"^ocw-(\d+\.\d+\.\d+)\.tar\.gz$", base)
     if not m:
@@ -194,28 +196,31 @@ def _drop_in_artifacts(cfg, tar_path):
     sig = tar_path + ".minisig"
     if not os.path.exists(sig):
         raise act.StepFailed("signature_invalid", f"{sig} is missing: bring the .minisig file next to the tarball")
-    os.makedirs(cfg.artifacts, exist_ok=True)
+    gid = _stage_gid(cfg)
+    os.makedirs(cfg.handoff, mode=0o750, exist_ok=True)
+    if os.geteuid() == 0:  # this directory is root's: it is created and fixed by install.sh; correct it if someone loosened it
+        os.chown(cfg.handoff, 0, gid if gid is not None else 0)
+        os.chmod(cfg.handoff, 0o750)
     for src in (tar_path, sig):
-        dst = os.path.join(cfg.artifacts, os.path.basename(src))
-        shutil.copyfile(src, dst)
+        dst = os.path.join(cfg.handoff, os.path.basename(src))
+        act.safe_copy(src, dst, 0o640, 0 if gid is not None and os.geteuid() == 0 else None, gid)
     return m.group(1)
 
 
-def _chown_artifacts(cfg, host, version):
+def _stage_gid(cfg):
     import pwd
     try:
-        uid = pwd.getpwnam(cfg.stage_user).pw_uid
+        return pwd.getpwnam(cfg.stage_user).pw_gid
     except KeyError:
-        return
-    if os.geteuid() != 0:
-        return
-    os.chown(cfg.artifacts, uid, uid)
-    os.chmod(cfg.artifacts, 0o750)
+        return None
+
+
+def _clear_handoff(cfg, version):
     for n in (f"ocw-{version}.tar.gz", f"ocw-{version}.tar.gz.minisig"):
-        p = os.path.join(cfg.artifacts, n)
-        if os.path.exists(p):
-            os.chown(p, uid, uid)
-            os.chmod(p, 0o640)
+        try:
+            os.unlink(os.path.join(cfg.handoff, n))
+        except OSError:
+            pass
 
 
 def cmd_stage(a, cfg, host):
@@ -239,9 +244,11 @@ def cmd_stage(a, cfg, host):
             tar = os.path.abspath(target)
             checked = ocw_trust.verify_release(tar, tar + ".minisig", trust, installed)  # root's own check first
             version = checked["version"]
-            _drop_in_artifacts(cfg, tar)
-            _chown_artifacts(cfg, host, version)
-            ok, out = host.start(f"ocw-stage@{version}.service")
+            _drop_in_handoff(cfg, tar)
+            try:
+                ok, out = host.start(f"ocw-stage@{version}.service")
+            finally:
+                _clear_handoff(cfg, version)
             err = act.read_json(os.path.join(cfg.artifacts, f"{version}.stage-error.json"))
             if not ok:
                 raise act.StepFailed((err or {}).get("code", "stage_failed"), (err or {}).get("message") or out[-300:])
@@ -250,7 +257,7 @@ def cmd_stage(a, cfg, host):
         _audit(cfg, host, "upgrade.verify_failed", {"correlation_id": cid, "reason_code": code, "message": str(exc)[:300], "via": "cli"})
         print(f"refused: {exc}", file=sys.stderr)
         return EXIT_REFUSED
-    marker = act.read_json(os.path.join(cfg.releases, version, ".staged"), {}) or {}
+    marker = act.read_json(os.path.join(cfg.staging, version, ".staged"), {}) or {}
     _audit(cfg, host, "upgrade.staged", {"correlation_id": cid, "version": version, "sha256": marker.get("sha256"),
                                         "signed_by": marker.get("key_id"), "via": "cli"})
     print(f"staged {version}: signature verified, venv built, sha256 {str(marker.get('sha256'))[:8]}…")
@@ -306,7 +313,7 @@ def cmd_apply(a, cfg, host):
     version = a.version
     installed = act.installed_version(cfg)
     artifact = os.path.join(cfg.artifacts, f"ocw-{version}.tar.gz")
-    staged_ok = os.path.exists(os.path.join(cfg.releases, version, ".staged")) and os.path.exists(artifact)
+    staged_ok = os.path.isfile(os.path.join(cfg.staging, version, ".staged")) and os.path.exists(artifact)
     if not staged_ok:
         _say(a, f"{version} is not staged yet: staging it now (verify, unpack, build the environment)...")
         s = argparse.Namespace(target=version, json=a.json)
@@ -592,8 +599,6 @@ def cmd_trust(a, cfg, host):
             print(f"ERROR: {exc}", file=sys.stderr)
             return EXIT_REFUSED
         act.write_json_atomic(cfg.trust_path, new, 0o644)
-        os.makedirs(os.path.join(cfg.upgrade, "revocations"), exist_ok=True)
-        shutil.copyfile(a.file, os.path.join(cfg.upgrade, "revocations", f"{d['to_serial']}.json"))
         _audit(cfg, host, "release_keys.revocation_applied", {**d, "source": "ocw-updater trust apply", "via": "cli", "correlation_id": None})
         print(f"Revocation applied: serial {d['from_serial']} → {d['to_serial']}. Reason: {d['reason']}")
         print("  revoked: " + (", ".join(d["revoked"]) or "none") + "   new keys: " + (", ".join(d["added"]) or "none"))
