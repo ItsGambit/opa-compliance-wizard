@@ -119,7 +119,7 @@ set -euo pipefail
 
 _usage() {
   echo "usage: $0 --release <version> [--from-dir <dir>] [--reinstall]    (signed release; recommended)" >&2
-  echo "       $0 [--ref <branch | tag | 40-character commit>]            (UNSIGNED source; maintainers only)" >&2
+  echo "       $0 [--ref <branch | tag | 40-character commit>]            (UNSIGNED source; maintainers only, deprecated for operators)" >&2
   echo "       settings: see the comment at the top of this file" >&2
 }
 _ARG_REF=""
@@ -720,6 +720,11 @@ if [ "$DEPLOY_SH_PHASE" = "1" ]; then
   else
     echo "WARNING: deploying UNSIGNED source (a git ref, not a signed release). Not for production:" >&2
     echo "         use  server/deploy.sh --release <version>  (README, 'Upgrading')." >&2
+    if [ -z "${OPA_DEPLOY_MAINTAINER:-}" ]; then
+      echo "DEPRECATED (5.48.0): --ref and a bare run are for maintainers and test servers only, and will be removed for operators in a" >&2
+      echo "         later release. Production servers upgrade from the Updates page or with  ocw-updater  (signed, verified, rolled back" >&2
+      echo "         automatically on a failed health check). Set OPA_DEPLOY_MAINTAINER=1 to silence this notice." >&2
+    fi
     echo "==> Fetching ${DEPLOY_REF:-the default branch} from $REPO_URL"
     # OPS-06: an explicit ref deploys exactly that branch, tag or commit
     # instead of whatever the default branch's tip is at that moment.

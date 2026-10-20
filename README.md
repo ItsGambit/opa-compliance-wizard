@@ -246,7 +246,7 @@ chain heads are unchanged; an authenticated read works). Any failure rolls back 
 
 When an upgrade fails, the updater builds a redacted bundle (`ocw-support-<from>-to-<to>-<time>-<id>.tar.gz`, at most 5 MB) before anyone asks.
 An **app administrator without shell access can download it**: `GET /api/upgrade/bundle?name=...` (admin-only; it is linked from the
-failed upgrade's Audit Log entry, which records `bundle.name`, size and sha256; the button itself arrives with the in-app flow). From a shell: `sudo ocw-updater bundle`
+failed upgrade's Audit Log entry, which records `bundle.name`, size and sha256; the Audit Log offers the download button). From a shell: `sudo ocw-updater bundle`
 (`--include-hosts` keeps host and environment names). Email it yourself to the address in SECURITY.md; **nothing is ever sent automatically.**
 
 * **In it:** `summary.json` (versions, reason code, failed step, timings, OS / Python / SQLite / systemd versions, free space, the
@@ -281,12 +281,33 @@ covers the first install; a vendored-wheel release bundle is planned.
 | `check`, `enable-check`, `disable-check`, `verify`, `audit`, `keys ...` | the 5.46.0 tools (run as the application's account automatically) |
 
 Exit codes: `0` ok, `2` refused (signature, version, key, sync running, another upgrade in flight, bad usage), `3` failed and rolled back,
-`4` failed and an operator is needed. `--json` where it makes sense. Every action writes the same audit events as the in-app flow will (the actor is `cli:<os user>`).
+`4` failed and an operator is needed. `--json` where it makes sense. Every action writes the same audit events as the in-app flow (the actor is `cli:<os user>`).
 
-#### What this does not do yet
+#### Upgrading from the Updates page (5.48.0)
 
-The Updates screen in the web app only reports (5.46.0); approving an upgrade with MFA, scheduling from the browser and the
-progress page arrive with the in-app flow. Local (laptop) mode has no updater. See `CHANGELOG.md` for the known limitations of this release.
+On an install that has run `server/install.sh`, administrators can upgrade without a shell: **Updates**, then **Upgrade now** or **Schedule…**.
+
+1. The page reads the new release's signature file and manifest (a few KB), checks the signature's trusted comment against the pinned keys and runs a
+   **preflight** (free disk space, Python and SQLite versions, no sync running, the updater present). **Re-check** repeats it.
+2. A **confirmation screen** shows exactly what is approved: versions, artifact, sha256, signing key, what changes, schema migrations (and which of them a code
+   rollback cannot undo), the backup, the rollback policy and the downtime. You tick the acknowledgement and **Approve with MFA**: a fresh Okta challenge that is
+   bound to *this* version, hash and time. Nothing is installed before you return from it.
+3. **Now** writes the request to the updater, which downloads, verifies, backs up, switches, restarts and health-checks (README above). The page shows the nine
+   steps live and keeps waiting through the restart (other users see the maintenance page; your session survives); when the new version answers it reloads once.
+   **Scheduled** upgrades are held by the application and handed to the updater at the chosen time; if the application is not running then, the upgrade is marked
+   **missed** and is never run late. Cancelling or rescheduling needs MFA too.
+4. The result is a card: success (with the eight health checks and a 24-hour rollback window), or failure (what happened, where you are now, and the redacted
+   **support bundle to download**, also linked from the failed upgrade's Audit Log entry). Every step of the run is in the Audit Log under one correlation id.
+
+Notes:
+
+* **Two-person rule** (Update check, "Change…"; off by default): a second, different administrator must approve within 24 hours.
+* **Rollback, restore, clear-failure and building a bundle on demand are command-line actions** (`sudo ocw-updater rollback | restore --confirm RESTORE | clear-failure | bundle`); the page shows
+  the exact command. After a failure the same version is refused until `clear-failure`; if the rollback itself failed the page says an operator must act.
+* **Local (laptop) mode** does not offer this flow (no identity provider to step up with); it shows the commands `python launch.py upgrade` and
+  `python launch.py upgrade --restore-previous`.
+* `server/deploy.sh --ref` (unsigned source) is deprecated for operators; use the Updates page or `ocw-updater`.
+* The page needs the upgrade layout. Without it, the page says so and shows the manual `deploy.sh --release` command.
 
 ### Installing a signed release
 

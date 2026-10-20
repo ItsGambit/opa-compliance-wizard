@@ -382,7 +382,7 @@ export function UpdatesPage({ onOpenKeys }: { onOpenKeys: () => void }) {
         <p role="status" className="text-xs text-muted m-0">The server did not answer just now (it may be restarting). This page keeps trying.</p>
       )}
       {running && run && <ProgressCard run={run} restarting={restarting} />}
-      {!running && requested && startedWaiting && (
+      {!running && requested && (startedWaiting || status.upgrade?.rejection?.correlation_id === requested.correlationId) && (
         <StartingCard requested={requested} status={status} ageMs={Date.now() - Date.parse(requested.approvedAt)} />
       )}
       {!running && requested && status.upgrade?.rejection?.correlation_id === requested.correlationId && (

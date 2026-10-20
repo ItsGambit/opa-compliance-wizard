@@ -2,7 +2,7 @@ import { AlertTriangle, CalendarClock, CheckCircle2, Download, RefreshCw, Shield
 import type { UpgradeStatus } from '../../types'
 import { formatDateTime } from '../../utils/format'
 import { activeReleaseKey, formatBytes } from '../../utils/upgrade'
-import { formatDuration, shortSha } from '../../utils/upgradeFlow'
+import { blockReason, formatDuration, shortSha } from '../../utils/upgradeFlow'
 import { Badge, CARD_TITLE, CommandBlock, KeyId, KV, Row } from './parts'
 
 interface Props {
@@ -14,24 +14,6 @@ interface Props {
   onUpgradeNow: () => void
   onSchedule: () => void
   onSecondApproval: () => void
-}
-
-/** Why the Upgrade / Schedule buttons are off, in words (null = they are on). */
-export function blockReason(status: UpgradeStatus, reviewing: boolean): string | null {
-  const u = status.upgrade
-  const latest = status.latest
-  if (!u || !latest) return 'Upgrading from this page needs the newer server.'
-  if (!u.updater.ready) return u.updater.message
-  if (u.run?.result === 'failed_needs_operator') return 'The last upgrade could not be rolled back automatically. An operator must act on the server (ocw-updater status) before another upgrade.'
-  if (u.run && u.run.result === null && u.run.step) return 'An upgrade is in progress.'
-  const f = u.failures
-  if ((f[latest.version]?.count ?? 0) >= 1) return `${latest.version} failed here before. An operator must run "ocw-updater clear-failure" on the server before it is tried again.`
-  if (Object.values(f).reduce((n, x) => n + x.count, 0) >= 2) return 'Two upgrades have failed. Contact the maintainers with the support bundle; an operator must clear the failure on the server first.'
-  if (u.schedule?.status === 'scheduled') return 'An upgrade is already scheduled.'
-  if (u.pending_approval) return 'A request is waiting for a second admin.'
-  if (!u.preview) return reviewing ? 'Reading the signed release information…' : 'The signed release information has not been reviewed yet.'
-  if (!u.preview.preflight_ok) return 'A preflight check failed: ' + (u.preview.preflight.find(i => !i.ok)?.text ?? 'see below.')
-  return null
 }
 
 export function AvailableSection({ status, isLocal, reviewing, reviewError, onReview, onUpgradeNow, onSchedule, onSecondApproval }: Props) {

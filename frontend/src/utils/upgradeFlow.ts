@@ -99,8 +99,11 @@ export function wallToUtc(date: string, time: string, zone: string): number {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date)
   const t = /^(\d{2}):(\d{2})$/.exec(time)
   if (!m || !t) return NaN
-  const naive = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(t[1]), Number(t[2]))
-  if (Number.isNaN(naive)) return NaN
+  const [y, mo, d, h, mi] = [m[1], m[2], m[3], t[1], t[2]].map(Number)
+  const naive = Date.UTC(y, mo - 1, d, h, mi)
+  // reject overflow ("2026-13-45", "99:99"): the fields must survive the round trip
+  const back = new Date(naive)
+  if (Number.isNaN(naive) || back.getUTCFullYear() !== y || back.getUTCMonth() !== mo - 1 || back.getUTCDate() !== d || h > 23 || mi > 59) return NaN
   try {
     let guess = naive - zoneOffsetMinutes(zone, naive) * 60000
     guess = naive - zoneOffsetMinutes(zone, guess) * 60000
@@ -135,7 +138,7 @@ export function toIsoUtc(ms: number): string {
 /** "In 1 day 11 h" / "In 35 min" / "Now". */
 export function untilText(ms: number, now = Date.now()): string {
   const diff = Math.max(0, ms - now)
-  const mins = Math.round(diff / 60000)
+  const mins = Math.floor(diff / 60000)
   if (mins < 1) return 'Now'
   if (mins < 60) return `In ${mins} min`
   const hours = Math.floor(mins / 60)
@@ -164,4 +167,22 @@ export function shortSha(sha: string | null | undefined): string {
 export function wallFields(ms: number, zone: string): { date: string; time: string } {
   const iso = new Date(ms + zoneOffsetMinutes(zone, ms) * 60000).toISOString()
   return { date: iso.slice(0, 10), time: iso.slice(11, 16) }
+}
+
+/** Why the Upgrade / Schedule buttons are off, in words (null = they are on). */
+export function blockReason(status: UpgradeStatus, reviewing: boolean): string | null {
+  const u = status.upgrade
+  const latest = status.latest
+  if (!u || !latest) return 'Upgrading from this page needs the newer server.'
+  if (!u.updater.ready) return u.updater.message
+  if (u.run?.result === 'failed_needs_operator') return 'The last upgrade could not be rolled back automatically. An operator must act on the server (ocw-updater status) before another upgrade.'
+  if (u.run && u.run.result === null && u.run.step) return 'An upgrade is in progress.'
+  const f = u.failures
+  if ((f[latest.version]?.count ?? 0) >= 1) return `${latest.version} failed here before. An operator must run "ocw-updater clear-failure" on the server before it is tried again.`
+  if (Object.values(f).reduce((n, x) => n + x.count, 0) >= 2) return 'Two upgrades have failed. Contact the maintainers with the support bundle; an operator must clear the failure on the server first.'
+  if (u.schedule?.status === 'scheduled') return 'An upgrade is already scheduled.'
+  if (u.pending_approval) return 'A request is waiting for a second admin.'
+  if (!u.preview) return reviewing ? 'Reading the signed release information…' : 'The signed release information has not been reviewed yet.'
+  if (!u.preview.preflight_ok) return 'A preflight check failed: ' + (u.preview.preflight.find(i => !i.ok)?.text ?? 'see below.')
+  return null
 }
