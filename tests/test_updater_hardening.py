@@ -299,3 +299,79 @@ def test_the_root_unit_can_run_nginx_t(tmp_path):
     caps = next(line for line in unit.splitlines() if line.startswith("CapabilityBoundingSet="))
     assert "CAP_NET_BIND_SERVICE" in caps and "CAP_KILL" in caps
     assert "python3 -I -B " in unit
+
+
+# --- chown_tree / check_tree on a real tree (no fakes) -------------------------------------------------------------
+
+
+def _tree(tmp_path):
+    root = tmp_path / "rel"
+    (root / "server").mkdir(parents=True)
+    (root / ".venv" / "bin").mkdir(parents=True)
+    (root / "server" / "a.py").write_text("x = 1\n")
+    os.chmod(root, 0o777)
+    os.chmod(root / "server", 0o1777)
+    os.chmod(root / "server" / "a.py", 0o4775)
+    return root
+
+
+def test_chown_tree_locks_every_entry_and_never_touches_what_a_link_points_to(tmp_path):
+    from ocw_host import SystemHost
+    root = _tree(tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep")
+    os.chmod(outside, 0o666)
+    os.symlink(outside, root / "server" / "l")
+    SystemHost().chown_tree(str(root), os.getuid(), os.getgid())
+    assert stat.S_IMODE(os.stat(outside).st_mode) == 0o666           # the link target is untouched
+    for base, dirs, files in os.walk(root):
+        for n in dirs + files:
+            p = os.path.join(base, n)
+            if not os.path.islink(p):
+                assert os.lstat(p).st_mode & 0o7022 == 0, p
+    assert os.lstat(root).st_mode & 0o7022 == 0
+
+
+def test_chown_tree_refuses_hard_links_and_special_files(tmp_path):
+    from ocw_host import HostError, SystemHost
+    root = _tree(tmp_path)
+    os.link(root / "server" / "a.py", root / "server" / "b.py")
+    with pytest.raises(HostError):
+        SystemHost().chown_tree(str(root), os.getuid(), os.getgid())
+    (tmp_path / "two").mkdir()
+    root2 = _tree(tmp_path / "two")
+    os.mkfifo(root2 / "server" / "pipe")
+    with pytest.raises(HostError):
+        SystemHost().chown_tree(str(root2), os.getuid(), os.getgid())
+
+
+def test_chown_tree_does_not_follow_a_link_as_the_top(tmp_path):
+    from ocw_host import SystemHost
+    real = tmp_path / "real"
+    real.mkdir()
+    os.symlink(real, tmp_path / "top")
+    with pytest.raises(OSError):
+        SystemHost().chown_tree(str(tmp_path / "top"), os.getuid(), os.getgid())
+
+
+def test_check_tree_walks_the_virtualenv_and_refuses_escaping_links_and_setuid_bits(m, tmp_path):
+    staged(m)
+    root = m.opt / "staging" / "5.47.0"
+    up = m.updater()
+    manifest = json.loads(__import__("tarfile").open(m.releases_dir / "ocw-5.47.0.tar.gz").extractfile("manifest.json").read())
+    up.check_tree(str(root), manifest)
+    os.symlink("/usr/bin/env", root / ".venv" / "bin" / "python3")                   # the base interpreter: allowed
+    up.check_tree(str(root), manifest)
+    os.symlink("/etc", root / ".venv" / "lib-evil")
+    with pytest.raises(act.StepFailed) as e:
+        up.check_tree(str(root), manifest)
+    assert e.value.code == "tree_mismatch" and "leaves the release" in str(e.value)
+    os.unlink(root / ".venv" / "lib-evil")
+    os.symlink("/usr/bin/env", root / ".venv" / "bin" / "helper")                    # only bin/python* may leave
+    with pytest.raises(act.StepFailed):
+        up.check_tree(str(root), manifest)
+    os.unlink(root / ".venv" / "bin" / "helper")
+    os.chmod(root / "requirements.lock", 0o4644)
+    with pytest.raises(act.StepFailed) as e:
+        up.check_tree(str(root), manifest)
+    assert "setuid" in str(e.value)

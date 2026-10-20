@@ -580,6 +580,8 @@ class Updater:
             if rel_base == ".":
                 dirs[:] = [d for d in dirs if d != ".venv"]
                 files = [f for f in files if f not in (".staged", ".staging")]
+            if os.lstat(base).st_mode & 0o6022:
+                raise StepFailed("tree_mismatch", f"{os.path.relpath(base, root)} is writable by others or has a setuid/setgid bit", "staged")
             for d in list(dirs):
                 p = os.path.join(base, d)
                 if os.path.islink(p):
@@ -590,6 +592,8 @@ class Updater:
                 st = os.lstat(p)
                 if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
                     raise StepFailed("tree_mismatch", f"{rel} is not a plain single-link file", "staged")
+                if st.st_mode & 0o6022:
+                    raise StepFailed("tree_mismatch", f"{rel} is writable by others or has a setuid/setgid bit", "staged")
                 if "__pycache__" in rel.split("/"):
                     os.unlink(p)
                     continue
@@ -605,6 +609,35 @@ class Updater:
         missing = sorted(set(expected) - seen)
         if missing:
             raise StepFailed("tree_mismatch", f"{len(missing)} file(s) the manifest lists are missing (first: {missing[0]})", "staged")
+        self.check_venv(root)
+
+    def check_venv(self, root):
+        """The virtualenv is not in the manifest (pip built it), but it is walked too: no link may resolve outside the release
+        directory (except bin/python* pointing into /usr, the base interpreter), no hard links, no setuid/setgid/group- or
+        world-writable entry, nothing but plain files, directories and links."""
+        venv = os.path.join(root, ".venv")
+        if os.path.islink(venv):
+            raise StepFailed("tree_mismatch", ".venv is a link", "staged")
+        real_root = os.path.realpath(root)
+        for base, dirs, files in os.walk(venv, followlinks=False):
+            for name in dirs + files:
+                p = os.path.join(base, name)
+                rel = os.path.relpath(p, root).replace(os.sep, "/")
+                st = os.lstat(p)
+                if stat.S_ISLNK(st.st_mode):
+                    target = os.path.realpath(p)
+                    inside = target == real_root or target.startswith(real_root + os.sep)
+                    interpreter = rel.startswith(".venv/bin/python") and target.startswith("/usr/")
+                    if not (inside or interpreter):
+                        raise StepFailed("tree_mismatch", f"{rel} is a link that leaves the release directory", "staged")
+                    continue
+                if st.st_mode & 0o6022:
+                    raise StepFailed("tree_mismatch", f"{rel} is writable by others or has a setuid/setgid bit", "staged")
+                if stat.S_ISREG(st.st_mode):
+                    if st.st_nlink != 1:
+                        raise StepFailed("tree_mismatch", f"{rel} has more than one hard link", "staged")
+                elif not stat.S_ISDIR(st.st_mode):
+                    raise StepFailed("tree_mismatch", f"{rel} is not a plain file, directory or link", "staged")
 
     # --- prepare phase (everything before the switch) ----------------------------------------------
     def prepare(self, req):
@@ -653,7 +686,10 @@ class Updater:
         # The tree is now under releases/ (a directory only root can write): take it away from the staging account
         # FIRST (the stage unit has exited), then hash it. Nobody but root can change, replace or move a file or a
         # directory entry between the check and the switch.
-        self.host.chown_tree(root)
+        try:
+            self.host.chown_tree(root)
+        except ocw_host.HostError as exc:
+            raise StepFailed("tree_mismatch", str(exc), "staged")
         self.check_tree(root, manifest)
         self.finish("staged", signed_by=info["key_id"], files_verified=len(manifest["files"]), adoption=info["adoption"])
         self.begin("preflight")
