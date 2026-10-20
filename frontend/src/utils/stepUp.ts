@@ -27,7 +27,7 @@ export type PendingStepUp =
         settings: Partial<Record<SharedCapabilityKey, PermissionSetting>>
       }
       /** Which screen to reopen if the change wasn't applied. */
-      reopen?: 'environments' | 'orphaned_archives' | 'shared_permissions'
+      reopen?: 'environments' | 'orphaned_archives' | 'shared_permissions' | 'updates'
     }
 
 const KEY = 'opa.pendingStepUp'

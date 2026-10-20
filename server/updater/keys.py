@@ -104,7 +104,7 @@ def empty_key_list():
 
 
 def empty_state():
-    return {"schema": SCHEMA, "serial": 0, "keys": [], "revoked": []}
+    return {"schema": SCHEMA, "serial": 0, "keys": [], "revoked": [], "history": []}
 
 
 # --- reading and validating ---------------------------------------------------
@@ -163,8 +163,9 @@ def validate_key_list(obj):
 
 
 def validate_state(obj):
-    if not isinstance(obj, dict) or set(obj) != {"schema", "serial", "keys", "revoked"} or obj["schema"] != SCHEMA:
-        raise _bad("key state must have exactly: schema, serial, keys, revoked")
+    if not isinstance(obj, dict) or not {"schema", "serial", "keys", "revoked"} <= set(obj) <= {"schema", "serial", "keys", "revoked", "history"} \
+            or obj["schema"] != SCHEMA:
+        raise _bad("key state must have: schema, serial, keys, revoked (and optionally history)")
     if isinstance(obj["serial"], bool) or not isinstance(obj["serial"], int) or obj["serial"] < 0:
         raise _bad("serial must be a non-negative whole number")
     revoked = []
@@ -177,7 +178,29 @@ def validate_state(obj):
         if r.get("last_good_version") is not None:
             parse_version(r["last_good_version"])
         revoked.append({"key_id": r["key_id"], "revoked_at": r["revoked_at"], "last_good_version": r.get("last_good_version")})
-    return {"schema": SCHEMA, "serial": obj["serial"], "keys": _validate_entries(obj["keys"]), "revoked": revoked}
+    return {"schema": SCHEMA, "serial": obj["serial"], "keys": _validate_entries(obj["keys"]), "revoked": revoked,
+            "history": _validate_history(obj.get("history", []))}
+
+
+_HISTORY_FIELDS = ("serial", "issued_at", "applied_at", "reason", "advisory_url", "revoked", "added", "signed_by", "source")
+
+
+def _validate_history(items):
+    """The revocations this install applied (newest last), for the Keys screen. Bounded."""
+    if not isinstance(items, list):
+        raise _bad("history must be a list")
+    out = []
+    for h in items[-20:]:
+        if not isinstance(h, dict):
+            raise _bad("history entries must be objects")
+        entry = {k: h.get(k) for k in _HISTORY_FIELDS}
+        for k in ("revoked", "added"):
+            entry[k] = [x for x in (entry[k] or []) if isinstance(x, str) and _ID_RE.match(x)]
+        for k in ("reason", "advisory_url", "issued_at", "applied_at", "signed_by", "source"):
+            entry[k] = entry[k][:300] if isinstance(entry[k], str) else None
+        entry["serial"] = entry["serial"] if isinstance(entry["serial"], int) and not isinstance(entry["serial"], bool) else None
+        out.append(entry)
+    return out
 
 
 def _read_capped(path, what):
@@ -262,7 +285,7 @@ def effective_from(shipped, state=None):
         if key_id in keys:
             keys[key_id]["status"] = "revoked"
     return {"schema": SCHEMA, "serial": state["serial"], "keys": sorted(keys.values(), key=lambda e: e["key_id"]),
-            "revoked": revoked}
+            "revoked": revoked, "history": state.get("history", [])}
 
 
 def effective_key_list(shipped_path=None, local_state_path=None):
@@ -462,9 +485,14 @@ def apply_revocation(eff, raw):
         raise _bad_rev("this revocation would leave no usable release key; it must add a new one")
     if not has_active(result, "standby"):
         raise _bad_rev("this revocation would leave no usable standby key; it must add a new one")
-    state = {"schema": SCHEMA, "serial": serial, "keys": result["keys"], "revoked": list(revoked.values())}
     details = {"from_serial": eff["serial"], "to_serial": serial, "revoked": sorted(newly), "added": sorted(added),
-               "signed_by": signer, "reason": payload["reason"][:200], "advisory_url": payload["advisory_url"]}
+               "signed_by": signer, "reason": payload["reason"][:200], "advisory_url": payload["advisory_url"],
+               "issued_at": issued}
+    history = list(eff.get("history", [])) + [{"serial": serial, "issued_at": issued, "applied_at": None,
+                                               "reason": details["reason"], "advisory_url": details["advisory_url"],
+                                               "revoked": details["revoked"], "added": details["added"],
+                                               "signed_by": signer, "source": None}]
+    state = {"schema": SCHEMA, "serial": serial, "keys": result["keys"], "revoked": list(revoked.values()), "history": history}
     return state, details
 
 
@@ -486,7 +514,8 @@ def write_local(state, path=None):
 def persist_effective(eff, path=None):
     """Remember everything this install knows, so a later (older or stricter)
     shipped list can never make it forget a key, a status or a revocation."""
-    write_local({"schema": SCHEMA, "serial": eff["serial"], "keys": eff["keys"], "revoked": list(eff["revoked"].values())}, path)
+    write_local({"schema": SCHEMA, "serial": eff["serial"], "keys": eff["keys"], "revoked": list(eff["revoked"].values()),
+                 "history": eff.get("history", [])}, path)
 
 
 def record_change(action, details):
@@ -508,14 +537,26 @@ def apply_revocation_bytes(raw, source="file", shipped=None, local_state_path=No
     path = local_state_path if local_state_path is not None else local_path()
     eff = effective_from(shipped_list, load_state(path))
     state, details = apply_revocation(eff, raw)
-    write_local(state, path)
+    state["history"][-1]["applied_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    state["history"][-1]["source"] = source
+    write_local(validate_state(state), path)
     details = {**details, "source": source}
-    record_change("release_keys.revocation_applied", details)
+    # One audit entry per effect, like the Keys screen's history: what was revoked, and what was added.
+    if details["revoked"]:
+        record_change("upgrade.key_revoked", details)
+    if details["added"]:
+        record_change("upgrade.key_added", {k: details[k] for k in ("added", "signed_by", "source", "to_serial", "advisory_url")})
     return effective_from(shipped_list, state), details
 
 
 def apply_revocation_file(path, **kw):
     return apply_revocation_bytes(_read_capped(path, "revocation file"), source="file", **kw)
+
+
+def describe_keys(eff):
+    """Read-only key table for the Updates > Release signing keys screen."""
+    return [{"key_id": k["key_id"], "role": k["role"], "alg": k["alg"], "status": k["status"], "since": k["since"],
+             "revoked_at": (eff["revoked"].get(k["key_id"]) or {}).get("revoked_at")} for k in eff["keys"]]
 
 
 def main(argv=None):

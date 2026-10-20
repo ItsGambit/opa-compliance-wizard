@@ -159,7 +159,7 @@ def test_env_switch_precedence(mirror, monkeypatch):
     service.set_settings(enabled=True)
     monkeypatch.setenv("OPA_UPDATE_CHECK", "off")
     assert service.is_enabled(service.load()) == (False, "env_off")
-    assert run()["result"] == "blocked" and mirror.requests == []
+    assert run()["outcome"] == "blocked" and mirror.requests == []
     assert run(force=True)["reason"] == "env_off" and mirror.requests == []  # --force cannot override it
     monkeypatch.setenv("OPA_UPDATE_CHECK", "ON")
     service.set_settings(enabled=False)
@@ -174,31 +174,31 @@ def test_check_records_state_and_one_audit_row(mirror):
     mirror.respond("/latest", body=release_json("5.47.0"), etag='"e1"')
     mirror.respond("/rev/revocation.json", status=404)
     out = run()
-    assert out["result"] == "update_available"
+    assert out["outcome"] == "update_available"
     st = service.status(service.load(), "5.46.0")
     assert st["update_available"] and st["latest"]["version"] == "5.47.0" and st["latest"]["signed_artifact"]
     assert st["last_check"]["status"] == "ok" and st["last_check"]["next_at"] == "2026-10-21T12:00:00Z"
     rows = audit_rows()
-    assert [r["action"] for r in rows] == ["upgrade.check"] and rows[0]["details"]["result"] == "update_available"
+    assert [r["action"] for r in rows] == ["upgrade.check"] and rows[0]["details"]["outcome"] == "update_available"
     assert rows[0]["details"]["correlation_id"] and rows[0]["actor_email"] is None
     # nothing but the version metadata was stored
     stored = json.loads(Path(service.state_path()).read_text())
     assert set(stored) == {"settings", "state"} and "token" not in json.dumps(stored).lower()
     # a second check uses the ETag and (304) says up to date / still available
     out = run(now=NOW + timedelta(days=1))
-    assert out["result"] == "update_available"
+    assert out["outcome"] == "update_available"
     assert mirror.requests[-2]["headers"].get("if-none-match") == '"e1"'
 
 
 def test_up_to_date_and_no_release(mirror):
     service.set_settings(enabled=True)
     mirror.respond("/latest", body=release_json("5.46.0"))
-    assert run()["result"] == "up_to_date"
+    assert run()["outcome"] == "up_to_date"
     mirror.respond("/latest", status=404)
     out = run(now=NOW + timedelta(days=1))
-    assert out["result"] == "up_to_date" and service.load()["state"]["latest_version"] is None
+    assert out["outcome"] == "up_to_date" and service.load()["state"]["latest_version"] is None
     mirror.respond("/latest", body=release_json("5.47.0", prerelease=True))
-    assert run(now=NOW + timedelta(days=2))["result"] == "up_to_date"  # a pre-release is never offered
+    assert run(now=NOW + timedelta(days=2))["outcome"] == "up_to_date"  # a pre-release is never offered
 
 
 def test_identical_repeated_failures_are_collapsed(mirror):
@@ -215,7 +215,7 @@ def test_identical_repeated_failures_are_collapsed(mirror):
     mirror.respond("/latest", body=release_json("5.46.0"))  # recovery says how long it was down
     run(now=NOW + timedelta(hours=28))
     recovered = audit_rows()[-1]["details"]
-    assert recovered["result"] == "up_to_date" and recovered["recovered_after_failures"] == 4
+    assert recovered["outcome"] == "up_to_date" and recovered["recovered_after_failures"] == 4
     assert recovered["failing_since"] == "2026-10-20T12:00:00Z"
     assert service.load()["state"]["consecutive_failures"] == 0
 
@@ -245,7 +245,7 @@ def test_damaged_state_file_means_off(tmp_path, mirror):
     assert service.is_enabled(service.load()) == (False, "default_off")
     Path(service.state_path()).write_text(json.dumps({"settings": {"enabled": "yes", "share_version": 1}, "state": []}))
     data = service.load()
-    assert data["settings"] == {"enabled": None, "share_version": False}
+    assert data["settings"] == {"enabled": None, "share_version": False, "manual_only": False}
 
 
 def test_settings_change_is_audited_locked_by_env_and_kicks(monkeypatch):
@@ -274,7 +274,7 @@ def test_concurrent_checks_do_not_overlap(mirror):
     time.sleep(0.2)
     assert run() is None  # a second one while the first runs
     t.join()
-    assert results[0]["result"] == "up_to_date"
+    assert results[0]["outcome"] == "up_to_date"
 
 
 # --- revocation via the check ----------------------------------------------------
@@ -294,10 +294,10 @@ def test_check_fetches_and_applies_a_published_revocation(mirror, pinned):
     mirror.respond("/rev/revocation.json", body=(REAL / "revocation.json").read_bytes(), etag='"r1"')
     run()
     assert keylib.effective_key_list()["serial"] == 1
-    actions = [e["action"] for e in audit_rows("release_keys.")]
-    assert actions == ["release_keys.revocation_applied"]
+    actions = [e["action"] for e in audit_rows("upgrade.key_")]
+    assert actions == ["upgrade.key_revoked", "upgrade.key_added"] or sorted(actions) == ["upgrade.key_added", "upgrade.key_revoked"]
     run(now=NOW + timedelta(days=1))  # nothing new: no second entry
-    assert [e["action"] for e in audit_rows("release_keys.")] == ["release_keys.revocation_applied"]
+    assert len(audit_rows("upgrade.key_")) == 2
 
 
 def test_a_forged_revocation_is_rejected_once_and_audited(mirror, pinned):
@@ -311,8 +311,8 @@ def test_a_forged_revocation_is_rejected_once_and_audited(mirror, pinned):
     run()
     run(now=NOW + timedelta(days=1))
     assert keylib.effective_key_list()["serial"] == 0
-    rejected = audit_rows("release_keys.")
-    assert len(rejected) == 1 and rejected[0]["action"] == "release_keys.revocation_rejected"
+    rejected = audit_rows("upgrade.key_")
+    assert len(rejected) == 1 and rejected[0]["action"] == "upgrade.key_revocation_rejected"
     assert rejected[0]["details"]["reason"] == "bad_signature" and rejected[0]["details"]["source"] == "release_assets"
 
 
@@ -323,11 +323,11 @@ def test_the_second_revocation_source_is_checked_too(mirror, pinned, monkeypatch
     mirror.respond("/static/revocation.json", body=(REAL / "revocation.json").read_bytes())   # only the static URL has it
     run()
     assert keylib.effective_key_list()["serial"] == 1
-    applied = [e for e in audit_rows("release_keys.") if e["action"] == "release_keys.revocation_applied"]
+    applied = [e for e in audit_rows("upgrade.key_") if e["action"] == "upgrade.key_revoked"]
     assert len(applied) == 1 and applied[0]["details"]["source"] == "static_url"
     assert {r["path"] for r in mirror.requests} >= {"/rev/revocation.json", "/static/revocation.json"}
     run(now=NOW + timedelta(days=1))   # both sources answer again: already applied, no new entry
-    assert len([e for e in audit_rows("release_keys.")]) == 1
+    assert len(audit_rows("upgrade.key_")) == 2
 
 
 # --- routes -----------------------------------------------------------------------
@@ -342,7 +342,11 @@ def test_status_route_is_admin_only_and_read_only(matrix_server):
     assert body["installed_version"] == engine.SCRIPT_VERSION
     assert body["check"]["enabled"] is False and body["check"]["prompt_needed"] is True
     assert body["latest"] is None and body["update_available"] is False
-    assert body["signing_keys"] == {"pinned": True, "serial": 0, "error": None}
+    keys = body["signing_keys"]
+    assert (keys["pinned"], keys["serial"], keys["error"]) == (True, 0, None)
+    assert sorted((k["role"], k["status"]) for k in keys["keys"]) == [("release", "active"), ("standby", "active")]
+    assert body["revocation"] is None and body["check"]["frequency"] is None and body["installed_at"]
+    assert body["server"]["zone"] and set(body["latest"] or {}) == set()
     assert not Path(service.state_path()).exists()  # a read never writes
 
 

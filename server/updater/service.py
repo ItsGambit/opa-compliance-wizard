@@ -23,7 +23,7 @@ check's correlation_id so the JSON server log lines match):
                             failed (reason code). An identical repeated failure
                             is NOT logged again; the next success says how many
                             failed since when.
-  release_keys.*            see keys.py (revocations applied/rejected, updates)
+  upgrade.key_revoked / key_added / key_list_installed / key_revocation_rejected   see keys.py
 Details keep room for a later "bundle" reference (a downloadable support
 file) without a schema change.
 """
@@ -74,8 +74,9 @@ def _parse_iso(text):
 
 
 def default_data():
-    return {"settings": {"enabled": None, "share_version": False},
+    return {"settings": {"enabled": None, "share_version": False, "manual_only": False},
             "state": {"latest_version": None, "published_at": None, "release_url": None, "signed_artifact": None,
+                      "size": None, "notes_title": None, "notes": None, "last_check_by": None,
                       "last_check_at": None, "last_status": None, "last_code": None, "next_check_at": None,
                       "etag": None, "consecutive_failures": 0, "failing_since": None,
                       "revocation_etags": {}, "revocation_seen": {}}}
@@ -100,6 +101,7 @@ def load():
     if data["settings"]["enabled"] not in (None, True, False):
         data["settings"]["enabled"] = None
     data["settings"]["share_version"] = data["settings"]["share_version"] is True
+    data["settings"]["manual_only"] = data["settings"]["manual_only"] is True
     return data
 
 
@@ -169,31 +171,79 @@ def status(data, installed_version):
     latest = None
     if st["latest_version"]:
         latest = {"version": st["latest_version"], "published_at": st["published_at"],
-                  "release_url": st["release_url"], "signed_artifact": st["signed_artifact"]}
+                  "release_url": st["release_url"], "signed_artifact": st["signed_artifact"], "size": st["size"],
+                  "notes_title": st["notes_title"], "notes": st["notes"]}
+    revocation = None
     try:
         kl = keylib.effective_key_list()
-        keys = {"pinned": bool(kl["keys"]), "serial": kl["serial"], "error": None}
+        keys = {"pinned": bool(kl["keys"]), "serial": kl["serial"], "error": None, "keys": keylib.describe_keys(kl)}
+        recent = _recent_revocation(kl)
+        if recent:
+            revocation = recent
     except keylib.KeyListError as exc:
-        keys = {"pinned": False, "serial": None, "error": str(exc)}
+        keys = {"pinned": False, "serial": None, "error": str(exc), "keys": []}
+    settings = data["settings"]
+    if switch == "off" or settings["enabled"] is False:
+        frequency = "off"
+    elif settings["enabled"] is True or switch == "on":
+        frequency = "manual" if settings["manual_only"] else "daily"
+    else:
+        frequency = None
+    now = datetime.now().astimezone()
     return {
         "installed_version": installed_version,
         "check": {"enabled": enabled, "source": source, "env_locked": switch is not None,
                   "env_invalid_value": bad, "prompt_needed": data["settings"]["enabled"] is None and switch is None,
-                  "share_version": data["settings"]["share_version"], "mirror": bool(os.environ.get(API_URL_ENV))},
+                  "share_version": data["settings"]["share_version"], "mirror": bool(os.environ.get(API_URL_ENV)),
+                  "frequency": frequency, "url": api_url()},
         "latest": latest,
         "update_available": bool(latest and newer(latest["version"], installed_version)),
         "last_check": {"at": st["last_check_at"], "status": st["last_status"], "code": st["last_code"],
                        "next_at": st["next_check_at"] if enabled else None,
-                       "consecutive_failures": st["consecutive_failures"], "failing_since": st["failing_since"]},
+                       "consecutive_failures": st["consecutive_failures"], "failing_since": st["failing_since"],
+                       "by": st["last_check_by"]},
         "signing_keys": keys,
+        "revocation": revocation,
+        "installed_at": _installed_at(),
+        "server": {"time": now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "zone": now.tzname(),
+                   "utc_offset_minutes": int(now.utcoffset().total_seconds() // 60)},
     }
 
 
-def set_settings(enabled=None, share_version=None):
+def _installed_at():
+    """When the running code was put in place: the mtime of the manifest a signed
+    install leaves behind, else of the engine file. None if unreadable."""
+    for name in ("manifest.json", "create_secret_folders.py"):
+        try:
+            return datetime.fromtimestamp((Path(keylib.REPO_ROOT) / name).stat().st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except OSError:
+            continue
+    return None
+
+
+REVOCATION_BANNER_DAYS = 30
+
+
+def _recent_revocation(kl):
+    """The latest applied revocation if it was applied in the last 30 days (drives the red notice), else None."""
+    history = kl.get("history") or []
+    if not history:
+        return None
+    last = history[-1]
+    applied = _parse_iso(last.get("applied_at"))
+    if applied is None or datetime.now(timezone.utc) - applied > timedelta(days=REVOCATION_BANNER_DAYS):
+        return None
+    return last
+
+
+def set_settings(enabled=None, share_version=None, manual_only=None):
     """Returns the changes {name: [old, new]} (empty if nothing changed)."""
     with _lock:
         data = load()
         changes = {}
+        if manual_only is not None and manual_only != data["settings"]["manual_only"]:
+            changes["manual_only"] = [data["settings"]["manual_only"], manual_only]
+            data["settings"]["manual_only"] = manual_only
         if enabled is not None and enabled != data["settings"]["enabled"]:
             changes["enabled"] = [data["settings"]["enabled"], enabled]
             data["settings"]["enabled"] = enabled
@@ -207,46 +257,68 @@ def set_settings(enabled=None, share_version=None):
         return changes
 
 
-def change_settings(enabled, share_version, installed_version, audit):
+FREQUENCIES = {"daily": (True, False), "manual": (True, True), "off": (False, False)}
+
+
+def change_settings(enabled, share_version, installed_version, audit, frequency=None):
     """The one settings change used by the web route and the CLI (same rules,
     same audit event). `audit(action, details)` records who did it. Returns
     (http_status, body)."""
     switch, _bad = env_switch()
+    manual_only = None
+    if frequency is not None:
+        enabled, manual_only = FREQUENCIES[frequency]
     if enabled is True and switch == "off":
         return 409, {"error": "The update check is switched off by OPA_UPDATE_CHECK=off in this server's environment, "
                               "which always wins. Remove that setting (and restart) to allow it.", "reason": "env_locked"}
-    changes = set_settings(enabled, share_version)
+    changes = set_settings(enabled, share_version, manual_only)
     if changes:
-        audit("upgrade.settings", {"changes": changes, "correlation_id": _engine().CORRELATION_ID.get()})
-        if enabled is True and switch != "off":
+        now_settings = load()["settings"]
+        shown = "off" if now_settings["enabled"] is False else ("manual" if now_settings["manual_only"] else "daily") if now_settings["enabled"] else "unset"
+        audit("upgrade.settings", {"frequency": shown, "share_version": now_settings["share_version"], "changes": changes,
+                                   "correlation_id": _engine().CORRELATION_ID.get()})
+        if enabled is True and not manual_only and switch != "off":
             kick(installed_version)
     return 200, {"changed": changes, **status(load(), installed_version)}
 
 
 def apply_settings_request(payload, installed_version, audit):
-    """Validates a JSON body {enabled?: bool, share_version?: bool}."""
-    if not isinstance(payload, dict) or not payload or set(payload) - {"enabled", "share_version"}:
-        return 400, {"error": "Send {\"enabled\": true|false} and/or {\"share_version\": true|false}."}
-    for key in payload:
-        if not isinstance(payload[key], bool):
-            return 400, {"error": f"{key} must be true or false."}
-    return change_settings(payload.get("enabled"), payload.get("share_version"), installed_version, audit)
+    """Validates a JSON body {frequency?: daily|manual|off, share_version?: bool} (or the older
+    {enabled: bool}); `enabled` and `frequency` cannot be combined."""
+    error = validate_settings_payload(payload)
+    if error:
+        return 400, {"error": error}
+    return change_settings(payload.get("enabled"), payload.get("share_version"), installed_version, audit, payload.get("frequency"))
+
+
+def validate_settings_payload(payload):
+    """None if the body is acceptable, else a message."""
+    allowed = {"enabled", "share_version", "frequency"}
+    if not isinstance(payload, dict) or not payload or set(payload) - allowed:
+        return 'Send {"frequency": "daily"|"manual"|"off"} and/or {"share_version": true|false}.'
+    if "frequency" in payload and ("enabled" in payload or payload["frequency"] not in FREQUENCIES):
+        return 'frequency must be "daily", "manual" or "off" (and cannot be combined with enabled).'
+    for key in ("enabled", "share_version"):
+        if key in payload and not isinstance(payload[key], bool):
+            return f"{key} must be true or false."
+    return None
 
 
 def due(data, now):
     enabled, _source = is_enabled(data)
-    if not enabled:
-        return False
+    if not enabled or data["settings"]["manual_only"]:
+        return False   # "manual only": the daily check never runs by itself
     nxt = _parse_iso(data["state"]["next_check_at"])
     return nxt is None or now >= nxt
 
 
-def _audit(action, details):
+def _audit(action, details, actor=None):
+    """`actor`: (email, sub) of the admin who asked, or None for a system event."""
     engine = _engine()
     details = dict(details)
     details.setdefault("correlation_id", engine.CORRELATION_ID.get())
     engine.log("INFO", f"{action}: {details}")
-    engine.log_audit_event(None, None, action, details)
+    engine.log_audit_event(actor[0] if actor else None, actor[1] if actor else None, action, details)
 
 
 def _revocation_step(st, installed_user_agent):
@@ -277,12 +349,12 @@ def _revocation_step(st, installed_user_agent):
                 if exc.code == "replayed":
                     outcomes.append(f"{name}:already_applied")
                 else:
-                    _audit("release_keys.revocation_rejected", {"reason": exc.code, "source": name, "message": str(exc)[:300]})
+                    _audit("upgrade.key_revocation_rejected", {"reason": exc.code, "source": name, "message": str(exc)[:300]})
                     outcomes.append(f"{name}:rejected:{exc.code}")
     return outcomes
 
 
-def run_check(installed_version, now=None, force=False, trigger="scheduler"):
+def run_check(installed_version, now=None, force=False, trigger="scheduler", actor=None):
     """One full check, persisted and audited. Never raises. Safe to call from
     a thread; a second concurrent call returns None. `force` runs it although
     the check is off (the CLI's --force; recorded as such) -- but never when
@@ -299,7 +371,7 @@ def run_check(installed_version, now=None, force=False, trigger="scheduler"):
             data = load()
         enabled, source = is_enabled(data)
         if source == "env_off":
-            return {"result": "blocked", "reason": "env_off"}
+            return {"outcome": "blocked", "result": "blocked", "reason": "env_off"}
         if not enabled and not force:
             return None
         st = data["state"]
@@ -316,12 +388,13 @@ def run_check(installed_version, now=None, force=False, trigger="scheduler"):
                     latest = check.parse_latest(got.body)
                     st["etag"] = got.etag
                     if latest is None:
-                        st["latest_version"] = st["published_at"] = st["release_url"] = st["signed_artifact"] = None
+                        _clear_latest(st)
                     else:
                         st.update(latest_version=latest.version, published_at=latest.published_at,
-                                  release_url=latest.release_url, signed_artifact=latest.signed_artifact)
+                                  release_url=latest.release_url, signed_artifact=latest.signed_artifact, size=latest.size,
+                                  notes_title=latest.notes_title, notes=latest.notes)
                 elif got.status == "not_found":
-                    st["latest_version"] = st["published_at"] = st["release_url"] = st["signed_artifact"] = None
+                    _clear_latest(st)
                     st["etag"] = None
                 result = "update_available" if (st["latest_version"] and newer(st["latest_version"], installed_version)) \
                     else "up_to_date"
@@ -339,17 +412,19 @@ def run_check(installed_version, now=None, force=False, trigger="scheduler"):
         st["next_check_at"] = _iso(next_at)
         st["last_status"] = "ok" if result != "failed" else ("rate_limited" if got.status == "rate_limited" else "error")
         st["last_code"] = code
+        st["last_check_by"] = actor[0] if actor else (trigger if trigger != "scheduler" else None)
         failures_before, since = st["consecutive_failures"], st["failing_since"]
-        details = {"result": result, "installed_version": installed_version, "latest_version": st["latest_version"],
-                   "reason": None if result != "failed" else code}
+        details = {"outcome": result, "result": _human_result(result, installed_version, st["latest_version"], code),
+                   "installed_version": installed_version, "latest_version": st["latest_version"],
+                   "reason": None if result != "failed" else code,
+                   "source": _source_text(got)}
         if trigger != "scheduler":
             details["trigger"] = trigger
         if not enabled:
             details["forced"] = True
         notable = [o for o in (revocation or []) if o.split(":", 1)[1] not in
                    ("none_published", "unchanged", "already_handled", "already_applied")]
-        if notable:
-            details["revocation"] = notable
+        details["revocations"] = "; ".join(notable) if notable else "none"
         log_row = True
         if result == "failed":
             st["consecutive_failures"] = failures_before + 1
@@ -365,7 +440,7 @@ def run_check(installed_version, now=None, force=False, trigger="scheduler"):
             fresh["state"] = st
             save(fresh)
         if log_row:
-            _audit("upgrade.check", details)
+            _audit("upgrade.check", details, actor)
         return details
     except Exception as exc:  # noqa: BLE001 - the check must never take the scheduler down
         try:
@@ -375,6 +450,53 @@ def run_check(installed_version, now=None, force=False, trigger="scheduler"):
         return None
     finally:
         _running.clear()
+
+
+def _clear_latest(st):
+    for k in ("latest_version", "published_at", "release_url", "signed_artifact", "size", "notes_title", "notes"):
+        st[k] = None
+
+
+def _human_result(outcome, installed, latest, code):
+    if outcome == "update_available":
+        return f"newer release found: {latest} (installed {installed})"
+    if outcome == "up_to_date":
+        return f"up to date ({installed})" if code != "no_release" else f"up to date ({installed}); no stable release published"
+    return f"failed: {code}"
+
+
+def _source_text(got):
+    host = urlparse(api_url()).hostname or "release server"
+    if got.status == "not_modified":
+        return f"{host} · 304 Not Modified"
+    if got.status == "ok":
+        return f"{host} · ETag changed"
+    return f"{host} · {got.code}"
+
+
+MANUAL_CHECK_MIN_INTERVAL = timedelta(seconds=60)
+_last_manual = {"at": None}
+
+
+def check_now(installed_version, actor_email, actor_sub, now=None):
+    """Admin's "Check now": runs one check in the request (<= ~20 s), at most once a minute.
+    Returns (http_status, body)."""
+    now = now or datetime.now(timezone.utc)
+    data = load()
+    enabled, source = is_enabled(data)
+    if not enabled:
+        why = ("OPA_UPDATE_CHECK=off in this server's environment" if source == "env_off"
+               else "the update check is off; turn it on (Daily or Manual) first")
+        return 409, {"error": f"No request was sent: {why}.", "reason": source}
+    last = _last_manual["at"]
+    if last is not None and now - last < MANUAL_CHECK_MIN_INTERVAL:
+        return 429, {"error": "Check now is limited to once a minute; try again shortly.", "reason": "rate_limited"}
+    _last_manual["at"] = now
+    out = run_check(installed_version, now=now, trigger=f"admin:{actor_email or actor_sub or 'local'}",
+                    actor=(actor_email, actor_sub), force=True)
+    if out is None:
+        return 409, {"error": "A check is already running; try again in a moment.", "reason": "busy"}
+    return 200, {"outcome": out["outcome"], **status(load(), installed_version)}
 
 
 def maybe_start(installed_version, now=None):

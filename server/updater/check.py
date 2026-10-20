@@ -39,7 +39,7 @@ _TAG_RE = re.compile(r"^v?(\d+\.\d+\.\d+)$")
 _PUBLISHED_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 Fetched = namedtuple("Fetched", "status code detail body etag retry_after")
-Latest = namedtuple("Latest", "version published_at release_url signed_artifact")
+Latest = namedtuple("Latest", "version published_at release_url signed_artifact size notes_title notes")
 
 
 def url_allowed(url, allowed_hosts):
@@ -123,6 +123,18 @@ def fetch(url, allowed_hosts, etag=None, user_agent=USER_AGENT, max_bytes=MAX_RE
         return Fetched("error", "network", "The release server's answer could not be read.", None, None, None)
 
 
+def _plain(value, limit):
+    """Untrusted release text shown to admins: plain text only, bounded. (React
+    escapes it too; this also drops control characters and keeps the first
+    paragraph or two.)"""
+    if not isinstance(value, str):
+        return None
+    text = "".join(ch for ch in value.replace("\r", "") if ch == "\n" or ch >= " ").strip()
+    if len(text) > limit:
+        text = text[:limit].rsplit(" ", 1)[0].rstrip() + "…"
+    return text or None
+
+
 def parse_latest(body):
     """Latest(...) from a GitHub 'latest release' JSON body, None if it is
     not a stable release, or raises ValueError('bad_response')."""
@@ -142,6 +154,9 @@ def parse_latest(body):
     published = published if isinstance(published, str) and _PUBLISHED_RE.match(published) else None
     url = data.get("html_url")
     url = url if isinstance(url, str) and len(url) <= 300 and url.startswith("https://") and " " not in url else None
-    names = {a.get("name") for a in data.get("assets", []) if isinstance(a, dict)} if isinstance(data.get("assets"), list) else set()
+    assets = [a for a in data.get("assets", []) if isinstance(a, dict)] if isinstance(data.get("assets"), list) else []
+    names = {a.get("name") for a in assets}
     signed = {f"ocw-{version}.tar.gz", f"ocw-{version}.tar.gz.minisig", "manifest.json"} <= names
-    return Latest(version, published, url, signed)
+    size = next((a.get("size") for a in assets if a.get("name") == f"ocw-{version}.tar.gz"), None)
+    size = size if isinstance(size, int) and not isinstance(size, bool) and 0 < size < 10 ** 10 else None
+    return Latest(version, published, url, signed, size, _plain(data.get("name"), 120), _plain(data.get("body"), 800))

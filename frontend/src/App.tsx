@@ -23,7 +23,8 @@ import { ServiceAccountsDashboard } from './components/ServiceAccountsDashboard'
 import { REPORTS_SUB_TABS, SideNav } from './components/SideNav'
 import { UserMenu } from './components/UserMenu'
 import { UpdateBanner } from './components/UpdateBanner'
-import { UpdatesDialog } from './components/UpdatesDialog'
+import { UpdatesPage } from './components/UpdatesPage'
+import { UpdateKeysPage } from './components/UpdateKeysPage'
 import { environmentScopeKey } from './utils/environmentRows'
 import { canAdminFrom } from './utils/whoami'
 import { SharedPermissionsDialog } from './components/SharedPermissionsDialog'
@@ -34,7 +35,7 @@ import { clearPendingStepUp, readPendingStepUp, stepUpReturnAction, type Pending
 // keeps a history entry per in-app navigation -- the mouse back button on
 // a compliance report returns to the reports home, not out of the app.
 const ROUTE_VOCAB = {
-  tabs: ['reports', 'access', 'builder', 'audit_log'],
+  tabs: ['reports', 'access', 'builder', 'audit_log', 'updates', 'update_keys'],
   reportsSubTabs: REPORTS_SUB_TABS.map(t => t.value),
   accessSubTabs: ACCESS_SUB_TABS.map(t => t.value),
 }
@@ -51,7 +52,6 @@ export default function App() {
   const [aboutOpen, setAboutOpen] = useState(false)
   const [orphansOpen, setOrphansOpen] = useState(false)
   const [sharedPermissionsOpen, setSharedPermissionsOpen] = useState(false)
-  const [updatesOpen, setUpdatesOpen] = useState(false)
   // 5.42.0: an Environments change whose step-up approval didn't complete --
   // its screen reopens with the user's input (see utils/stepUp.ts).
   const [restore, setRestore] = useState<Extract<PendingStepUp, { kind: 'environment_change' }> | null>(null)
@@ -125,7 +125,7 @@ export default function App() {
         description: 'Approved via step-up MFA.',
         variant: 'success',
       })
-      for (const key of ['environments', 'shared_permissions', 'orphaned_archives', 'audit_log', 'sync_status']) {
+      for (const key of ['environments', 'shared_permissions', 'orphaned_archives', 'audit_log', 'sync_status', 'upgrade_status']) {
         queryClient.invalidateQueries({ queryKey: [key] })
       }
     },
@@ -190,7 +190,8 @@ export default function App() {
   // Reopen the screen a not-applied change came from.
   useEffect(() => {
     if (!restore) return
-    if (restore.reopen === 'orphaned_archives') setOrphansOpen(true)
+    if (restore.reopen === 'updates') { setActiveTab('updates'); setRestore(null) }
+    else if (restore.reopen === 'orphaned_archives') setOrphansOpen(true)
     else if (restore.reopen === 'shared_permissions') setSharedPermissionsOpen(true)
     else setEnvironmentsOpen(true)
   }, [restore])
@@ -221,7 +222,7 @@ export default function App() {
   return (
     <div className="flex flex-col h-dvh">
       <AnnouncementBanner />
-      <UpdateBanner canAdmin={canAdmin} onOpenUpdates={() => setUpdatesOpen(true)} />
+      <UpdateBanner canAdmin={canAdmin} onOpenUpdates={() => setActiveTab('updates')} />
       <div className="flex flex-1 min-h-0">
         <SideNav
           activeTab={activeTab}
@@ -239,8 +240,7 @@ export default function App() {
           onOpenAbout={() => setAboutOpen(true)}
           onOpenOrphanedArchives={() => setOrphansOpen(true)}
           onOpenSharedPermissions={() => setSharedPermissionsOpen(true)}
-          onOpenUpdates={() => setUpdatesOpen(true)}
-          updateAvailable={!!upgradeStatus?.check.enabled && !!upgradeStatus?.update_available}
+          updateCount={upgradeStatus?.check.enabled && upgradeStatus.update_available ? 1 : 0}
         />
 
         <EnvironmentScope scopeKey={scopeKey}>
@@ -255,8 +255,10 @@ export default function App() {
                 {activeTab === 'access' && 'Access Explorer'}
                 {activeTab === 'builder' && 'Folder Builder'}
                 {activeTab === 'audit_log' && 'Audit Log'}
+                {activeTab === 'updates' && 'Updates'}
+                {activeTab === 'update_keys' && (<>Updates <span className="text-sm font-normal text-muted">› Release signing keys</span></>)}
               </h1>
-              <p className="text-xs text-text-faint mt-1">
+              <p className="text-xs text-muted mt-1 max-w-[72ch]">
                 {activeTab === 'reports' && reportsSubTab === 'browse' &&
                   'Audit evidence for SOC 2 / SOX / ISO 27001 and similar frameworks, generated from OPA + core Okta audit history.'}
                 {activeTab === 'reports' && reportsSubTab === 'secrets_access' &&
@@ -269,6 +271,10 @@ export default function App() {
                   'Pick or create a resource group and project, build the folder tree, then preview and create.'}
                 {activeTab === 'audit_log' &&
                   'Every write action across every environment and user — admin-only, for compliance visibility.'}
+                {activeTab === 'updates' &&
+                  'Check for signed releases and see every update step in the audit log. Admin-only.'}
+                {activeTab === 'update_keys' &&
+                  'The keys this install trusts for release signatures. A primary signs releases; the offline standby can only sign a revocation that replaces a primary. A primary can never change the standby or undo a revocation.'}
               </p>
             </div>
             <div className="flex items-center gap-3">
@@ -289,6 +295,8 @@ export default function App() {
           {activeTab === 'access' && <AccessExplorer subTab={accessSubTab} />}
           {activeTab === 'builder' && <FolderBuilder />}
           {activeTab === 'audit_log' && canAdmin && <AuditLogPage />}
+          {activeTab === 'updates' && canAdmin && <UpdatesPage onOpenKeys={() => setActiveTab('update_keys')} />}
+          {activeTab === 'update_keys' && canAdmin && <UpdateKeysPage onBack={() => setActiveTab('updates')} />}
 
           <Footer />
         </main>
@@ -302,7 +310,7 @@ export default function App() {
         onOpenChange={next => { setEnvironmentsOpen(next); if (!next) setRestore(null) }}
         isAdmin={whoami?.is_admin}
         canAdmin={canAdmin}
-        restore={restore && restore.reopen !== 'orphaned_archives' && restore.reopen !== 'shared_permissions' ? restore : null}
+        restore={restore && restore.reopen !== 'orphaned_archives' && restore.reopen !== 'shared_permissions' && restore.reopen !== 'updates' ? restore : null}
       />
       {canAdmin && <OrphanedArchivesDialog open={orphansOpen} onOpenChange={next => { setOrphansOpen(next); if (!next) setRestore(null) }} />}
       {canAdmin && (
@@ -315,7 +323,6 @@ export default function App() {
       <BannerSettingsDialog open={bannerOpen} onOpenChange={setBannerOpen} />
       <AccessControlDialog open={accessControlOpen} onOpenChange={setAccessControlOpen} />
       <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />
-      {canAdmin && <UpdatesDialog open={updatesOpen} onOpenChange={setUpdatesOpen} />}
     </div>
   )
 }

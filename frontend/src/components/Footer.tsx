@@ -7,6 +7,7 @@ import { formatDateTime } from '../utils/format'
 import { getSyncProgressPercent } from '../utils/syncProgress'
 import { activeRow, can, permissionReason } from '../utils/environmentRows'
 import { canAdminFrom } from '../utils/whoami'
+import { AFFILIATION } from '../utils/brand'
 
 // This project split out of the ItsGambit/Okta monorepo into its own
 // standalone repo 2026-09-30 -- these were left pointing at the old
@@ -117,6 +118,7 @@ export function Footer() {
       <a href={REPO_CHANGELOG_URL} target="_blank" rel="noreferrer" className="hover:text-text-dim underline">
         Changelog
       </a>
+      <span className="basis-full text-center text-[11px]">{AFFILIATION}</span>
     </footer>
   )
 }

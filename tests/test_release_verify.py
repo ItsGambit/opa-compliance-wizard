@@ -452,7 +452,7 @@ def test_offline_cli_applies_a_revocation_and_audits(pinned_real, capsys):
     assert shipped.read_text() == (real / "release_keys.json").read_text()
     assert keylib.main(["apply-revocation", str(real / "revocation.json")]) == 0   # idempotent
     import create_secret_folders as engine
-    entries = [e for e in engine.read_audit_log(limit=50) if e["action"] == "release_keys.revocation_applied"]
+    entries = [e for e in engine.read_audit_log(limit=50) if e["action"] == "upgrade.key_revoked"]
     assert len(entries) == 1 and entries[0]["details"]["to_serial"] == 1 and entries[0]["details"]["source"] == "file"
     assert "correlation_id" in entries[0]["details"] and entries[0]["details"]["advisory_url"].startswith("https://")
     assert keylib.main(["show"]) == 0

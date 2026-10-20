@@ -153,7 +153,7 @@ def test_a_published_revocation_blocks_a_release_signed_by_the_revoked_key(d):
     assert keylib.effective_key_list(d.app / "server" / "release_keys.json", d.app / "release_keys.local.json")["serial"] == 1
     assert not [a for a, _ in d.deploy_events() if a == "deploy.started"]
     actions = [e["action"] for e in d.events()]
-    assert "release_keys.revocation_applied" in actions and "upgrade.verify_failed" in actions
+    assert "upgrade.key_revoked" in actions and "upgrade.verify_failed" in actions
 
 
 def test_a_bad_revocation_stops_the_deploy(d):
