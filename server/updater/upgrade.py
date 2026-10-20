@@ -374,7 +374,7 @@ def build_preview(installed_version, size, ctx, now=None):
                "key_since": key_entry.get("since"), "key_role": key_entry.get("role"), "signed_at": fields.get("timestamp"),
                "manifest": manifest, "manifest_source": "the release's manifest.json asset (not itself signed; the updater re-verifies the "
                                                         "signed copy inside the archive before installing)",
-               "checked_at": _iso(now),
+               "checked_at": _iso(now), "db_bytes": ctx.get("db_bytes"),
                "preflight": preflight(manifest, size, ctx, now)}
     preview["preflight_ok"] = all(i["ok"] for i in preview["preflight"])
     save_preview(preview)

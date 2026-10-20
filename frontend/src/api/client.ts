@@ -21,6 +21,10 @@ import type {
   OrphanedArchive,
   UpdateFrequency,
   UpgradeStatus,
+  UpgradeNotice,
+  UpgradePreview,
+  UpgradeRequestBody,
+  StepUpRequiredOrResult,
   OpaGroup,
   PreviewResponse,
   Project,
@@ -159,14 +163,35 @@ export function saveBanner(config: BannerConfig): Promise<BannerConfig> {
   return apiFetch('/api/banner', { method: 'POST', body: JSON.stringify(config) })
 }
 
-export function fetchUpgradeStatus(): Promise<UpgradeStatus> {
-  return apiFetch('/api/upgrade/status')
+export function fetchUpgradeStatus(correlationId?: string): Promise<UpgradeStatus> {
+  return apiFetch(`/api/upgrade/status${correlationId ? `?correlation_id=${encodeURIComponent(correlationId)}` : ''}`)
+}
+
+/** 5.48.0: read the release's signature file and manifest and run the preflight (no install, no step-up). */
+export function reviewUpgrade(): Promise<{ preview: UpgradePreview }> {
+  return apiFetch('/api/upgrade/preview', { method: 'POST', body: JSON.stringify({}) })
+}
+
+/** 5.48.0: upgrade now / schedule / reschedule / cancel / second approval. Hosted mode answers 202 StepUpRequired
+ * (nothing is applied until the MFA approval returns); local mode applies at once. */
+export function requestUpgrade<K extends UpgradeRequestBody>(body: K): Promise<StepUpRequiredOrResult> {
+  return apiFetch('/api/upgrade/request', { method: 'POST', body: JSON.stringify(body) })
+}
+
+/** The one-line banner for any signed-in user. */
+export function fetchUpgradeNotice(): Promise<UpgradeNotice> {
+  return apiFetch('/api/upgrade/notice')
+}
+
+/** Where the browser downloads a redacted support bundle (admin-only, audited; a plain GET with the session cookie). */
+export function upgradeBundleUrl(name: string): string {
+  return `/api/upgrade/bundle?name=${encodeURIComponent(name)}`
 }
 
 /** Changes the update check's frequency / share-version switch. In hosted mode this is a
  * step-up change like the other settings: the answer is a StepUpRequired the caller hands to
  * beginStepUp; in local mode it applies at once and returns the new status. */
-export function saveUpgradeSettings(settings: { frequency?: UpdateFrequency; share_version?: boolean }): Promise<UpgradeStatus | StepUpRequired> {
+export function saveUpgradeSettings(settings: { frequency?: UpdateFrequency; share_version?: boolean; second_approval?: boolean; channel?: 'stable' | 'prerelease' }): Promise<UpgradeStatus | StepUpRequired> {
   return apiFetch('/api/upgrade/settings', { method: 'POST', body: JSON.stringify(settings) })
 }
 

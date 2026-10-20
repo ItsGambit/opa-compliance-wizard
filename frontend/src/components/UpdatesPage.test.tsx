@@ -1,9 +1,9 @@
 /** 5.46.0: the Updates page (artboards 01-03), the Keys page (12), the banners, the nav count and the brand surfaces. */
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
-import { checkUpgradeNow, fetchAuditLog, fetchUpgradeStatus, fetchWhoami, saveUpgradeSettings } from '../api/client'
+import { checkUpgradeNow, fetchAuditLog, fetchUpgradeStatus, fetchVersion, fetchWhoami, saveUpgradeSettings } from '../api/client'
 import { renderWithClient } from '../test/renderWithClient'
-import { makeStatus, NEWER, RELEASE_KEY, STANDBY_KEY } from '../test/upgradeFixtures'
+import { makeStatus, makeUpgrade, NEWER, RELEASE_KEY, STANDBY_KEY } from '../test/upgradeFixtures'
 import type { AuditLogEntry } from '../types'
 import { beginStepUp } from '../utils/stepUp'
 import { describeCheckFailure, formatBytes, updateState } from '../utils/upgrade'
@@ -15,9 +15,10 @@ import { UpdateBanner } from './UpdateBanner'
 import { describeKeyEvent, UpdateKeysPage } from './UpdateKeysPage'
 import { UpdatesPage } from './UpdatesPage'
 
-vi.mock('../api/client', () => ({
+vi.mock('../api/client', async importOriginal => ({
+  ...(await importOriginal<typeof import('../api/client')>()),
   fetchUpgradeStatus: vi.fn(), saveUpgradeSettings: vi.fn(), checkUpgradeNow: vi.fn(), fetchAuditLog: vi.fn(), backfillMfaLogEvents: vi.fn(),
-  fetchWhoami: vi.fn(), isStepUpRequired: (v: unknown) => typeof v === 'object' && v !== null && (v as { step_up_required?: boolean }).step_up_required === true,
+  fetchWhoami: vi.fn(), fetchVersion: vi.fn(), reviewUpgrade: vi.fn(), requestUpgrade: vi.fn(), isStepUpRequired: (v: unknown) => typeof v === 'object' && v !== null && (v as { step_up_required?: boolean }).step_up_required === true,
 }))
 vi.mock('../hooks/useToast', () => ({ toast: vi.fn() }))
 vi.mock('../utils/stepUp', () => ({ beginStepUp: vi.fn() }))
@@ -33,6 +34,7 @@ beforeEach(() => {
   sessionStorage.clear()
   vi.clearAllMocks()
   vi.mocked(fetchWhoami).mockResolvedValue({ email: 'admin@example.com', is_local: false, is_admin: true, can_admin: true })
+  vi.mocked(fetchVersion).mockResolvedValue({ version: '5.46.0' })
 })
 
 const FIRST_RUN = makeStatus({
@@ -101,8 +103,8 @@ describe('Updates page', () => {
     expect(screen.getByText('Enable the update check?')).toBeTruthy()
   })
 
-  it('03 update available (notify only): version, signed badge, key, size, notes, install command; Upgrade/Schedule are disabled', async () => {
-    vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({ ...NEWER }))
+  it('03 update available, updater not installed: version, signed badge, key, size, notes, install command; Upgrade/Schedule are disabled', async () => {
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({ ...NEWER, upgrade: makeUpgrade({ updater: { ready: false, reason: 'updater_not_installed', activator: null, message: 'This server does not use the privileged updater (no upgrade inbox). Run server/install.sh once.' } }) }))
     renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
     expect(await screen.findByText('5.48.0 is available')).toBeTruthy()
     // Mockup 03 (owner, 2026-10-20): the available card replaces the installed-version card.
@@ -114,7 +116,7 @@ describe('Updates page', () => {
     expect(screen.getByText('5.48.0 — Example release')).toBeTruthy()
     expect((screen.getByRole('button', { name: /Upgrade now/ }) as HTMLButtonElement).disabled).toBe(true)
     expect((screen.getByRole('button', { name: /Schedule/ }) as HTMLButtonElement).disabled).toBe(true)
-    expect(screen.getByText(/arrive in a later version/)).toBeTruthy()
+    expect(screen.getByText(/does not use the privileged updater/)).toBeTruthy()
     const link = screen.getByRole('link', { name: 'release notes' }) as HTMLAnchorElement
     expect(link.rel).toContain('noopener')
   })

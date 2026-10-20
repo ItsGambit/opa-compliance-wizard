@@ -16,6 +16,7 @@ import {
   fetchServiceAccountsReport,
   fetchSharedPermissions,
   fetchSyncStatus,
+  fetchUpgradeNotice,
   fetchUpgradeStatus,
   fetchUserResourceAccess,
   fetchVersion,
@@ -40,13 +41,27 @@ export function useEnvironments() {
 /** 5.46.0: the update-check status. Admin-only on the server, so it is only
  * asked for when the caller can admin; refreshed gently (the check itself
  * runs once a day on the server). */
-export function useUpgradeStatus(enabled: boolean) {
+export function useUpgradeStatus(enabled: boolean, pollMs?: number) {
   return useQuery({
     queryKey: ['upgrade_status'],
-    queryFn: fetchUpgradeStatus,
+    queryFn: () => fetchUpgradeStatus(),
     enabled,
-    staleTime: 60_000,
-    refetchInterval: 10 * 60_000,
+    staleTime: pollMs ? 0 : 60_000,
+    // 5.48.0: while an upgrade is starting or running the page polls (2 s). The server restarts underneath it, so a failed
+    // poll is not retried here (the next tick is the retry) and the last good answer stays on screen.
+    refetchInterval: pollMs ?? 10 * 60_000,
+    ...(pollMs ? { retry: false, refetchIntervalInBackground: true } : {}),
+  })
+}
+
+/** 5.48.0: the one-line upgrade banner for every signed-in user (scheduled / running / failed; admins also "available"). */
+export function useUpgradeNotice() {
+  return useQuery({
+    queryKey: ['upgrade_notice'],
+    queryFn: fetchUpgradeNotice,
+    refetchOnWindowFocus: true,
+    staleTime: 30_000,
+    refetchInterval: 60_000,
   })
 }
 
