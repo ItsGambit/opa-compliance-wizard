@@ -76,17 +76,23 @@ REASONS = {"request_invalid", "request_replayed", "request_stale", "signature_in
            "health_chain", "health_smoke", "rollback_failed", "interrupted", "failed_before", "too_many_failures",
            "version_failed_before", "in_flight", "bad_release", "bad_artifact", "revoked_key", "retired_key", "wrong_role",
            "no_key_pinned", "keys_changed", "unknown_alg", "no_trust", "bad_trust", "internal_error", "needs_install_sh",
-           "confirm_required", "rollback_unavailable", "no_backup", "action_unsupported", "prune_refused"}
+           "confirm_required", "rollback_unavailable", "no_backup", "action_unsupported", "prune_refused", "target_changed",
+           "needs_operator"}
 # What the web application may ask for through the request inbox (5.48.0). Each is advisory: the application has checked the
 # administrator's step-up approval, root re-validates everything here. Scheduling stays in the application (it never sends a time).
-APP_ACTIONS = ("apply", "rollback", "restore", "clear_failure", "bundle", "prune_backups")
+APP_ACTIONS = ("apply", "rollback", "restore", "clear_failure", "bundle")
 _COMMON_FIELDS = {"schema", "action", "correlation_id", "requested_at", "action_id", "origin", "actor", "trigger_kind", "_file"}
-_ACTION_FIELDS = {"apply": {"version", "sha256", "not_before", "entered"}, "rollback": {"confirm"}, "restore": {"confirm"},
-                  "clear_failure": set(), "bundle": {"include_hosts", "for_correlation_id"},
-                  "prune_backups": {"confirm", "keep_last", "names"}}
+_ACTION_FIELDS = {"apply": {"version", "sha256", "not_before", "entered"}, "rollback": {"confirm"}, "restore": {"confirm", "backup"},
+                  "clear_failure": set(), "bundle": {"include_hosts", "for_correlation_id"}}
 _STR_LIMITS = {"actor": 120, "trigger_kind": 80, "entered": 80, "origin": 8, "confirm": 16, "not_before": 24, "requested_at": 24}
 ROLLBACK_WINDOW = 24 * 3600
 QUIESCE_SECONDS = 600
+ACTIONS_READ_BYTES = 4 * 1024 * 1024
+ACTIONS_ROTATE_BYTES = 1024 * 1024
+ACTIONS_KEEP_LINES = 20000
+BUNDLES_KEEP = 10                # on-demand support bundles kept (newest)
+BUNDLE_MIN_GAP = 300             # seconds before the same run's bundle may be built again
+DONE_KEEP = 200                  # requests-done/ and rejections/ entries kept (newest)
 _BACKUP_NAME = re.compile(r"^audit_store-pre-[0-9A-Za-z._-]{1,80}\.db$")
 HEALTH_REASON = {"unit_active": "health_unit", "version": "health_version", "healthz": "health_healthz", "gate_401": "health_gate",
                  "quick_check": "health_quick_check", "schema_version": "health_schema", "chain_heads": "health_chain",
@@ -306,6 +312,19 @@ def read_regular(path, max_bytes=16 * 1024 * 1024):
         return fh.read(max_bytes)
 
 
+def read_tail(path, max_bytes):
+    """The last `max_bytes` of a plain file (whole lines only: a cut first line is dropped), opened safely."""
+    fd = open_regular(path)
+    with os.fdopen(fd, "rb") as fh:
+        size = os.fstat(fh.fileno()).st_size
+        if size <= max_bytes:
+            return fh.read()
+        fh.seek(size - max_bytes)
+        data = fh.read()
+    cut = data.find(b"\n")
+    return data[cut + 1:] if cut >= 0 else b""
+
+
 def read_json(path, default=None):
     try:
         return json.loads(read_regular(path).decode("utf-8"))
@@ -505,6 +524,8 @@ class Updater:
         self.st["step_started_at"] = iso(self.host.now())
         self._step_t = self.host.now()
         self.persist()
+        if step in STEP_ORDER[STEP_ORDER.index("preflight"):-1] or step == "rolling_back":
+            self.quiesce()  # ten minutes from every step: the file covers the whole run
         log("INFO", f"step {step} started")
         self.kill_point(step)
 
@@ -618,50 +639,92 @@ class Updater:
         """Field rules of the kinds other than apply (the common ones were checked already)."""
         if action == "rollback" and req.get("confirm") != "ROLLBACK":
             raise StepFailed("confirm_required", "a rollback request must carry the typed confirmation ROLLBACK")
-        if action == "restore" and req.get("confirm") != "RESTORE":
-            raise StepFailed("confirm_required", "a restore request must carry the typed confirmation RESTORE")
+        if action == "restore":
+            if req.get("confirm") != "RESTORE":
+                raise StepFailed("confirm_required", "a restore request must carry the typed confirmation RESTORE")
+            if not isinstance(req.get("backup"), str) or not _BACKUP_NAME.match(req["backup"]):
+                raise StepFailed("request_invalid", "a restore request must name the backup copy it was approved for")
+            if self.in_flight():
+                raise StepFailed("in_flight", "another upgrade is in progress")
+        if action == "clear_failure" and (read_json(self.cfg.state_path) or {}).get("result") == "failed_needs_operator":
+            raise StepFailed("needs_operator", "the last upgrade could not be rolled back automatically; an operator must run "
+                                               "`sudo ocw-updater clear-failure` on the server")
         if action == "bundle":
             if not isinstance(req.get("include_hosts", False), bool):
                 raise StepFailed("request_invalid", "include_hosts must be true or false")
             fc = req.get("for_correlation_id")
             if fc is not None and not _CID.match(str(fc)):
                 raise StepFailed("request_invalid", "bad for_correlation_id")
-        if action == "prune_backups":
-            if req.get("confirm") != "PRUNE":
-                raise StepFailed("confirm_required", "a backup clean-up request must carry the typed confirmation PRUNE")
-            keep, names = req.get("keep_last"), req.get("names")
-            if (keep is None) == (names is None):
-                raise StepFailed("request_invalid", "send exactly one of keep_last and names")
-            if keep is not None and (not isinstance(keep, int) or isinstance(keep, bool) or not 1 <= keep <= 50):
-                raise StepFailed("request_invalid", "keep_last must be a whole number from 1 to 50")
-            if names is not None and (not isinstance(names, list) or not 1 <= len(names) <= 50
-                                      or not all(isinstance(n, str) and _BACKUP_NAME.match(n) for n in names)):
-                raise StepFailed("request_invalid", "names must be 1 to 50 backup file names")
+
+    @staticmethod
+    def validate_prune(req):
+        """Field rules of `ocw-updater prune-backups` (a command-line operation only: the inbox does not take it)."""
+        if req.get("confirm") != "PRUNE":
+            raise StepFailed("confirm_required", "a backup clean-up request must carry the typed confirmation PRUNE")
+        keep, names = req.get("keep_last"), req.get("names")
+        if (keep is None) == (names is None):
+            raise StepFailed("request_invalid", "send exactly one of keep_last and names")
+        if keep is not None and (not isinstance(keep, int) or isinstance(keep, bool) or not 1 <= keep <= 50):
+            raise StepFailed("request_invalid", "keep_last must be a whole number from 1 to 50")
+        if names is not None and (not isinstance(names, list) or not 1 <= len(names) <= 50
+                                  or not all(isinstance(n, str) and _BACKUP_NAME.match(n) for n in names)):
+            raise StepFailed("request_invalid", "names must be 1 to 50 backup file names")
 
     def action_id_used(self, aid):
         for line in self._history_lines():
             if line.get("action_id") == aid:
                 return True
-        try:
-            return aid in read_regular(self.cfg.actions_path, 4 * 1024 * 1024).decode("utf-8", "replace").split()
+        try:  # the newest part of the file: an id remembered last is never beyond the read
+            return aid in read_tail(self.cfg.actions_path, ACTIONS_READ_BYTES).decode("utf-8", "replace").split()
         except OSError:
             return False
 
     def remember_action_id(self, aid):
-        """Record a used approval id (root-owned directory; the file is opened without following links)."""
+        """Record a used approval id (root-owned directory; the file is opened without following links and must be a plain file).
+        Lines are `<id> <epoch seconds>`; past a size the file is rewritten without the old ones."""
         if not aid:
             return
-        fd = os.open(self.cfg.actions_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        fd = os.open(self.cfg.actions_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0), 0o600)
         try:
-            os.write(fd, (aid + "\n").encode("ascii"))
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(errno.EINVAL, "not a regular file", self.cfg.actions_path)
+            os.write(fd, f"{aid} {int(self.host.now())}\n".encode("ascii"))
             os.fsync(fd)
+            size = os.fstat(fd).st_size
         finally:
             os.close(fd)
+        if size > ACTIONS_ROTATE_BYTES:
+            self._rotate_actions()
+
+    def _rotate_actions(self):
+        """Keep the ids remembered in the last two days (never more than ACTIONS_KEEP_LINES): a request older than a day is
+        refused as stale anyway, so a forgotten id cannot be replayed."""
+        try:
+            lines = read_tail(self.cfg.actions_path, ACTIONS_READ_BYTES).decode("ascii", "replace").splitlines()
+        except OSError:
+            return
+        cutoff = self.host.now() - 2 * 86400
+        keep = []
+        for ln in lines:
+            parts = ln.split()
+            if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) >= cutoff:
+                keep.append(ln)
+        keep = keep[-ACTIONS_KEEP_LINES:]
+        tmp = self.cfg.actions_path + ".new"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(fd, "w", encoding="ascii") as fh:
+                fh.write("".join(ln + "\n" for ln in keep))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.cfg.actions_path)
+        except OSError as exc:
+            log("WARN", f"could not rotate the approval ids file: {exc.strerror}")
 
     def _history_lines(self):
         out = []
         try:
-            for line in read_regular(self.cfg.history_path, 8 * 1024 * 1024).decode("utf-8", "replace").splitlines():
+            for line in read_tail(self.cfg.history_path, 8 * 1024 * 1024).decode("utf-8", "replace").splitlines():
                 try:
                     out.append(json.loads(line))
                 except ValueError:
@@ -900,6 +963,7 @@ class Updater:
             if waited >= limit:
                 raise StepFailed("sync_in_progress", "an archive sync is running; the upgrade waited 10 minutes and did not start", "preflight")
             self.host.sleep(5)
+            self.quiesce()
             waited += 5
             snap = self.host.db_tool(["snapshot", db])
         if self.st["manifest"].get("nginx_template_changed"):
@@ -1112,6 +1176,8 @@ class Updater:
             if last[0] or self.host.now() >= deadline:
                 return last
             self.host.sleep(every)
+            if os.path.exists(self.cfg.quiesce_path):
+                self.quiesce()
 
     def run_health(self, expect_version, rollback=False):
         c = self.cfg
@@ -1431,7 +1497,9 @@ class Updater:
         return "failed_needs_operator"
 
     # --- support bundle ---------------------------------------------------------------------------------------
-    def make_bundle(self, include_hosts=False, correlation_id=None):
+    def make_bundle(self, include_hosts=False, correlation_id=None, record=True, touch=True):
+        """Build a support bundle. `record` writes it into self.st["bundle"] and state.json: only ever for a state that was loaded
+        from (or is) the run on disk. `touch` False keeps the state's updated_at (the 24-hour rollback window starts there)."""
         c = self.cfg
         try:
             cid = correlation_id or self.st.get("correlation_id")
@@ -1458,9 +1526,15 @@ class Updater:
             frm, to = self.st.get("version_from") or "unknown", self.st.get("version_to") or "unknown"
             stem = f"ocw-support-{frm}-to-{to}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(self.host.now()))}"
             info = ocw_bundle.build(c.bundles, stem, summary, texts, entries, red, now=self.host.now(), gid=self.gid)
-            self.st["bundle"] = {"name": info["name"], "size": info["size"], "sha256": info["sha256"], "include_hosts": include_hosts}
-            self.persist()
-            self.audit("upgrade.bundle_created", {"bundle": self.st["bundle"], "redaction": info["redaction"]})
+            made = {"name": info["name"], "size": info["size"], "sha256": info["sha256"], "include_hosts": include_hosts,
+                    "at": iso(self.host.now())}
+            if record:
+                self.st["bundle"] = made
+                if touch:
+                    self.persist()
+                else:
+                    write_json_atomic(c.state_path, self.st)
+            self.audit("upgrade.bundle_created", {"bundle": made, "redaction": info["redaction"]})
             return info
         except Exception as exc:  # noqa: BLE001 - a bundle problem must never hide the real failure
             log("ERROR", f"could not build the support bundle: {type(exc).__name__}: {exc}")
@@ -1530,6 +1604,31 @@ class Updater:
             shutil.rmtree(os.path.join(lib, d), ignore_errors=True)
         return "updated"
 
+    def trim_housekeeping(self):
+        """Bound what a flood of requests can leave behind: on-demand support bundles, handled request files, rejection notes."""
+        c = self.cfg
+        for d, keep, pat in ((c.bundles, BUNDLES_KEEP, re.compile(r"^ocw-support-[0-9A-Za-z._-]+\.tar\.gz$")),
+                             (c.done, DONE_KEEP, None), (c.rejections, DONE_KEEP, re.compile(r"^[A-Za-z0-9_-]+\.json$"))):
+            try:
+                rows = []
+                for n in os.listdir(d):
+                    if pat is not None and not pat.match(n):
+                        continue
+                    try:
+                        st = os.lstat(os.path.join(d, n))
+                    except OSError:
+                        continue
+                    if stat.S_ISREG(st.st_mode):
+                        rows.append((st.st_mtime, n))
+                rows.sort(reverse=True)
+                for _m, n in rows[keep:]:
+                    try:
+                        os.unlink(os.path.join(d, n))
+                    except OSError:
+                        pass
+            except OSError:
+                continue
+
     def prune(self, keep_ver):
         """Keep current, previous and the one newest other release; remove older release directories (and any staging
         directory of a version that is no longer newer than the one just installed)."""
@@ -1569,14 +1668,19 @@ class Updater:
             pass
 
     def rollback_allowed(self):
-        """The same rules as `ocw-updater rollback`: a previous release exists, and the last upgrade finished under 24 hours ago."""
+        """A previous release exists, and the last upgrade (a completed apply) finished under 24 hours ago. The command line is
+        looser on purpose (an operator may roll back after a failed run); a request through the inbox is not."""
         c = self.cfg
         cur, prev = installed_version(c), link_version(c.previous)
         if not prev or prev == cur:
             raise StepFailed("rollback_unavailable", "there is no previous release to roll back to")
         st = read_json(c.state_path) or {}
         done = parse_iso(st.get("updated_at"))
-        if st.get("result") == "completed" and done and self.host.now() - done > ROLLBACK_WINDOW:
+        # fails closed: only a completed upgrade, finished less than 24 hours ago, opens the window (a state that says anything
+        # else, or nothing, is not evidence that it is open)
+        if st.get("result") != "completed" or st.get("action") != "apply" or done is None:
+            raise StepFailed("rollback_unavailable", "rolling back is only offered for 24 hours after an upgrade completes")
+        if self.host.now() - done > ROLLBACK_WINDOW:
             raise StepFailed("rollback_unavailable", "the 24-hour rollback window after the last upgrade has passed")
         if self.in_flight():
             raise StepFailed("in_flight", "another upgrade is in progress")
@@ -1657,35 +1761,39 @@ class Updater:
         try:
             self.validate_request(req, True)
             self.remember_action_id(req.get("action_id"))
-            if action == "clear_failure":
+            if action == "clear_failure":  # (validate_request refused it while the run is failed_needs_operator)
                 f = self.failures()
                 cleared = sorted(f["versions"])
                 write_json_atomic(c.failures_path, {"versions": {}, "cleared_at": iso(self.host.now())})
                 self.st = {"correlation_id": cid}
-                self.audit("upgrade.clear_failure", {"cleared": cleared, "via": "web application", "requested_by": actor}, actor_email=actor)
+                self.audit("upgrade.clear_failure", {"cleared": cleared, "via": "web application", "requested_by": actor,
+                                                     "actor_is": "the application's claim, not verified by the updater"}, actor_email=actor)
                 self.st = None
                 return "failure_cleared"
             if action == "bundle":
                 st = read_json(c.state_path) or {}
-                want = req.get("for_correlation_id") or st.get("correlation_id")
-                self.st = dict(st) if st.get("correlation_id") == want else {"correlation_id": want}
-                info = self.make_bundle(include_hosts=bool(req.get("include_hosts")), correlation_id=want)
+                last = st.get("correlation_id")
+                want = req.get("for_correlation_id") or last
+                if not last or want != last:  # the state on disk is never replaced by one built for another run
+                    raise StepFailed("request_invalid", "a support bundle can only be built for the last upgrade run")
+                built = parse_iso((st.get("bundle") or {}).get("at"))
+                if built is not None and 0 <= self.host.now() - built < BUNDLE_MIN_GAP:
+                    raise StepFailed("request_invalid", "a support bundle was built a moment ago")
+                self.st = dict(st)
+                info = self.make_bundle(include_hosts=bool(req.get("include_hosts")), correlation_id=want, touch=False)
                 if not info:
                     raise StepFailed("internal_error", "could not build the support bundle")
                 return "bundle_created"
-            if action == "prune_backups":
-                self.st = {"correlation_id": cid}
-                try:
-                    return self.prune_backups(req, actor)
-                finally:
-                    self.st = None
             if action == "rollback":
                 self.rollback_allowed()
                 return self.rollback_action(actor)
             if action == "restore":
-                return self.restore_action(actor)
+                return self.restore_action(actor, expect_backup=req.get("backup"))
         except StepFailed as f:
             reject(self, cid, f.code, str(f))
+            return "rejected"
+        except (OSError, ocw_host.HostError) as exc:  # the request file is already gone: refuse it, never leave run() on it
+            reject(self, cid, "internal_error", f"{type(exc).__name__}")
             return "rejected"
         return "rejected"
 
@@ -1758,15 +1866,26 @@ class Updater:
         self.st["chain_heads_before"] = snap.get("chain_heads") or {}
         self.st["baseline"] = {"healthz": None}
         self.persist()
-        self.audit("upgrade.step", {"step": "rollback_requested", "requested_by": actor}, actor_email=actor)
+        self.audit("upgrade.step", {"step": "rollback_requested", "requested_by": actor, **self._claim(actor)}, actor_email=actor)
         return self.rollback("operator", failure=None)
 
-    def restore_action(self, actor):
+    @staticmethod
+    def _claim(actor):
+        """Audit details that say where the requester's name came from: the web application's claim, not checked here."""
+        return {"actor_is": "the application's claim, not verified by the updater"} if actor and actor != "web application" else {}
+
+    def restore_action(self, actor, expect_backup=None):
+        """Put the pre-upgrade copy of the last upgrade back. A request through the inbox names the copy the administrator was
+        shown (`expect_backup`) and is refused if the copy this would restore is another one, or if anything is in flight."""
         c = self.cfg
+        if expect_backup is not None and self.in_flight():
+            raise StepFailed("in_flight", "another upgrade is in progress")
         hist = [h for h in self._history_lines() if h.get("backup") and h.get("action") == "apply"]
         if not hist or not os.path.exists(hist[-1]["backup"]):
             raise StepFailed("backup_failed", "there is no pre-upgrade backup to restore")
         backup = hist[-1]["backup"]
+        if expect_backup is not None and os.path.basename(backup) != expect_backup:
+            raise StepFailed("target_changed", "the backup copy this would restore is not the one that was approved; reload the page")
         cid = "upg-" + uuid.uuid4().hex[:8]
         _cid[0] = cid
         db = c.db_path()
@@ -1774,7 +1893,7 @@ class Updater:
                    "step": "restoring", "steps_done": [], "started_at": iso(self.host.now()), "result": None, "bundle": None,
                    "requested_by": actor, "manifest": {}, "activator_version": ACTIVATOR_VERSION, "restoring_from": os.path.basename(backup)}
         self.persist()
-        self.audit("upgrade.restore_requested", {"backup": os.path.basename(backup), "requested_by": actor}, actor_email=actor)
+        self.audit("upgrade.restore_requested", {"backup": os.path.basename(backup), "requested_by": actor, **self._claim(actor)}, actor_email=actor)
         os.makedirs(c.work, exist_ok=True)
         if self.uid is not None and os.geteuid() == 0:
             os.lchown(c.work, self.uid, self.gid)
@@ -1791,6 +1910,7 @@ class Updater:
         if not res.get("ok"):
             raise StepFailed("backup_failed", "the backup copy failed its integrity check: " + str(res.get("error") or res.get("integrity_check")))
         self.page("upgrading", "restarting")
+        self.quiesce()
         self.host.stop(c.backend_service)
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(self.host.now()))
         aside = f"{db}.pre-restore-{stamp}"
@@ -1806,6 +1926,7 @@ class Updater:
         if self.uid is not None and os.geteuid() == 0:
             os.lchown(db, self.uid, self.gid)
         self.restart_all("restore")
+        self.quiesce()
         ok, results = self.run_health(installed_version(c), rollback=True)
         self.page_off()
         self.st.update(result="completed" if ok else "failed_needs_operator", step="restored", health=results, moved_aside=os.path.basename(aside))
@@ -1897,6 +2018,9 @@ def process_directory(up, directory, due_only=False):
             continue
         req["_file"] = name
         up.t0 = up.host.now()
+        if due_only and req.get("action") != "apply":  # the schedule directory only ever holds installs
+            reject(up, str(req.get("correlation_id", name[:-5])), "request_invalid", "unsupported request", name)
+            continue
         if due_only or req.get("action") == "apply":
             if not due_only and req.get("not_before") is not None:  # the inbox means "now"; scheduling is the application's or the CLI's
                 reject(up, str(req.get("correlation_id", name[:-5])), "request_invalid", "an inbox request cannot carry a start time", name)
@@ -1980,6 +2104,7 @@ def run(cfg, host):
         up.st = None
         process_directory(up, cfg.requests)
         process_directory(up, cfg.schedule, due_only=True)
+        up.trim_housekeeping()
         try:
             up.publish_backups()
         except OSError as exc:

@@ -33,6 +33,11 @@ def applied(m, version="5.47.0", cid="upg-ccdd0001"):
     assert m.updater().apply(m.request(version, correlation_id=cid)) == "completed"
 
 
+def shown_backup(m):
+    """The copy name the page shows (state.json backup.name)."""
+    return m.read_state()["backup"]["name"]
+
+
 def inbox(m):
     return m.data / "upgrade" / "inbox" / "requests"
 
@@ -56,9 +61,8 @@ def rejection(m, cid=CID):
 # --- each kind, accepted and carried out ----------------------------------------------------------------------------
 def test_every_kind_the_app_writes_passes_roots_validator(m):
     applied(m)
-    cases = [("rollback", {"confirm": "ROLLBACK"}), ("restore", {"confirm": "RESTORE"}), ("clear_failure", {}),
-             ("bundle", {"include_hosts": True, "for_correlation_id": "upg-ccdd0001"}), ("prune_backups", {"confirm": "PRUNE", "keep_last": 2}),
-             ("prune_backups", {"confirm": "PRUNE", "names": ["audit_store-pre-5.47.0-20260101T000000Z.db"]})]
+    cases = [("rollback", {"confirm": "ROLLBACK"}), ("restore", {"confirm": "RESTORE", "backup": shown_backup(m)}), ("clear_failure", {}),
+             ("bundle", {"include_hosts": True, "for_correlation_id": "upg-ccdd0001"})]
     up = m.updater()
     m.host.clock = time.time()
     for i, (kind, fields) in enumerate(cases):
@@ -96,7 +100,7 @@ def test_restore_request_puts_the_pre_upgrade_archive_back(m):
     conn.execute("INSERT INTO events (who, what) VALUES ('later@example.com', 'after')")
     conn.commit()
     conn.close()
-    send(m, "restore", confirm="RESTORE")
+    send(m, "restore", confirm="RESTORE", backup=shown_backup(m))
     assert process(m) == ["restored"]
     assert sqlite3.connect(m.db).execute("SELECT COUNT(*) FROM events WHERE who = 'later@example.com'").fetchone()[0] == 0
     assert list(m.data.glob("audit_store.db.pre-restore-*"))                    # the replaced database is moved aside, never deleted
@@ -104,7 +108,7 @@ def test_restore_request_puts_the_pre_upgrade_archive_back(m):
 
 
 def test_restore_without_a_backup_is_refused(m):
-    send(m, "restore", confirm="RESTORE")
+    send(m, "restore", confirm="RESTORE", backup="audit_store-pre-5.47.0-20260101T000000Z.db")
     assert process(m) == ["rejected"] and rejection(m)["code"] == "backup_failed"
 
 
@@ -121,6 +125,12 @@ def test_clear_failure_request_allows_the_version_again_and_is_audited(m):
     assert row["details"]["cleared"] == ["5.47.0"] and row["details"]["via"] == "web application" and row["actor_email"] == "admin@example.com"
 
 
+def age_bundle(m, seconds=3600):
+    st = m.read_state()
+    st["bundle"]["at"] = act.iso(time.time() - seconds)
+    (m.data / "upgrade" / "state.json").write_text(json.dumps(st))
+
+
 def test_bundle_request_rebuilds_with_hosts_only_when_asked(m):
     m.host.unhealthy_versions.add("5.47.0")
     m.build_release("5.47.0")
@@ -128,11 +138,13 @@ def test_bundle_request_rebuilds_with_hosts_only_when_asked(m):
     m.updater().apply(m.request("5.47.0", correlation_id="upg-ccdd0010"))
     first = m.read_state()["bundle"]
     assert first["include_hosts"] is False
+    age_bundle(m)
     send(m, "bundle", include_hosts=True)
     assert process(m) == ["bundle_created"]
     second = m.read_state()["bundle"]
     assert second["include_hosts"] is True and second["name"] != first["name"]
     assert (m.data / "upgrade" / "bundles" / second["name"]).exists()
+    age_bundle(m)
     send(m, "bundle", cid="upg-feed0003", aid="aid_0123456789abcdef0003")
     assert process(m) == ["bundle_created"] and m.read_state()["bundle"]["include_hosts"] is False
 
@@ -165,8 +177,11 @@ def test_the_backups_status_file_has_names_sizes_dates_and_integrity_but_no_path
 
 def test_prune_keeps_the_newest_and_the_last_upgrades_copy(m):
     names = three_backups(m)
-    send(m, "prune_backups", confirm="PRUNE", keep_last=1)
-    assert process(m) == ["backups_pruned"]
+    up = m.updater()
+    up.st = {"correlation_id": None}
+    req = {"confirm": "PRUNE", "keep_last": 1, "names": None}
+    up.validate_prune(req)
+    assert up.prune_backups(req, "cli:tester") == "backups_pruned"
     left = sorted(p.name for p in (m.data / "upgrade" / "backups").glob("*.db"))
     assert len(left) == 1 and "5.47.0" in left[0]                                  # the newest is the last upgrade's
     deleted = [e for e in m.audit_actions() if e["action"] == "upgrade.backups_pruned"][-1]["details"]
@@ -177,14 +192,30 @@ def test_prune_keeps_the_newest_and_the_last_upgrades_copy(m):
 def test_prune_by_name_refuses_the_protected_one_and_unknown_names(m):
     names = three_backups(m)
     protected = [n for n in names if "5.47.0" in n][0]
-    send(m, "prune_backups", confirm="PRUNE", names=[protected])
-    assert process(m) == ["rejected"] and rejection(m)["code"] == "prune_refused"
-    send(m, "prune_backups", cid="upg-feed0004", aid="aid_0123456789abcdef0004", confirm="PRUNE", names=["audit_store-pre-9.9.9-20990101T000000Z.db"])
-    assert process(m) == ["rejected"] and rejection(m, "upg-feed0004")["code"] == "prune_refused"
+    up = m.updater()
+    up.st = {"correlation_id": None}
+    with pytest.raises(act.StepFailed) as exc:
+        up.prune_backups({"confirm": "PRUNE", "names": [protected]}, "cli:tester")
+    assert exc.value.code == "prune_refused"
+    with pytest.raises(act.StepFailed):
+        up.prune_backups({"confirm": "PRUNE", "names": ["audit_store-pre-9.9.9-20990101T000000Z.db"]}, "cli:tester")
     other = [n for n in names if n != protected][0]
-    send(m, "prune_backups", cid="upg-feed0005", aid="aid_0123456789abcdef0005", confirm="PRUNE", names=[other])
-    assert process(m) == ["backups_pruned"] and not (m.data / "upgrade" / "backups" / other).exists()
-    assert (m.data / "upgrade" / "backups" / protected).exists()
+    assert up.prune_backups({"confirm": "PRUNE", "names": [other]}, "cli:tester") == "backups_pruned"
+    assert not (m.data / "upgrade" / "backups" / other).exists() and (m.data / "upgrade" / "backups" / protected).exists()
+
+
+def test_deleting_backups_is_not_an_inbox_kind_root_refuses_it_and_the_writer_will_not_write_it(m):
+    names = three_backups(m)
+    with pytest.raises(ValueError):
+        send(m, "prune_backups", confirm="PRUNE", keep_last=1)
+    p = inbox(m) / f"{CID}.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(raw_request(m, action="prune_backups", confirm="PRUNE", keep_last=1)))
+    os.chmod(p, 0o600)
+    assert process(m) == []
+    assert rejection(m)["code"] == "request_invalid"
+    assert sorted(x.name for x in (m.data / "upgrade" / "backups").glob("*.db")) == names      # nothing was deleted
+    assert list(inbox(m).iterdir()) == []
 
 
 # --- quiesce -------------------------------------------------------------------------------------------------------
@@ -209,12 +240,9 @@ def test_the_preflight_quiesces_new_syncs_until_the_end(m):
 
 # --- refusals: root and the app writer agree ------------------------------------------------------------------------
 BAD = [
-    ("rollback", {"confirm": "rollback"}), ("rollback", {}), ("restore", {"confirm": "ROLLBACK"}), ("prune_backups", {"confirm": "PRUNE"}),
-    ("prune_backups", {"confirm": "PRUNE", "keep_last": 0}), ("prune_backups", {"confirm": "PRUNE", "keep_last": 51}),
-    ("prune_backups", {"confirm": "PRUNE", "keep_last": True}), ("prune_backups", {"confirm": "PRUNE", "keep_last": 2, "names": ["audit_store-pre-1-2.db"]}),
-    ("prune_backups", {"confirm": "PRUNE", "names": ["../../etc/passwd"]}), ("prune_backups", {"confirm": "PRUNE", "names": []}),
-    ("prune_backups", {"confirm": "PRUNE", "names": ["audit_store-pre-5.4.0-20250101T000000Z.db"] * 51}),
-    ("prune_backups", {"confirm": "NO", "keep_last": 2}), ("bundle", {"include_hosts": "yes"}), ("bundle", {"for_correlation_id": "../x"}),
+    ("rollback", {"confirm": "rollback"}), ("rollback", {}), ("restore", {"confirm": "ROLLBACK"}), ("restore", {"confirm": "RESTORE"}),
+    ("restore", {"confirm": "RESTORE", "backup": "../../etc/passwd"}), ("prune_backups", {"confirm": "PRUNE", "keep_last": 2}),
+    ("bundle", {"include_hosts": "yes"}), ("bundle", {"for_correlation_id": "../x"}),
     ("clear_failure", {"confirm": "x"}), ("clear_failure", {"names": []}),
 ]
 
@@ -239,8 +267,8 @@ def raw_request(m, **over):
     ({"actor": ["a"]}, "request_invalid"), ({"origin": "web"}, "request_invalid"), ({"correlation_id": "../../x"}, "request_invalid"),
     ({"action_id": "short"}, "request_invalid"), ({"requested_at": "yesterday"}, "request_stale"),
     ({"requested_at": act.iso(time.time() - 90000)}, "request_stale"), ({"schema": 2}, "request_invalid"),
-    ({"action": "bundle", "include_hosts": 1}, "request_invalid"), ({"action": "prune_backups", "confirm": "PRUNE", "keep_last": "2"}, "request_invalid"),
-    ({"action": "restore", "confirm": "RESTORE", "names": []}, "request_invalid"),
+    ({"action": "bundle", "include_hosts": 1}, "request_invalid"), ({"action": "prune_backups", "confirm": "PRUNE", "keep_last": 2}, "request_invalid"),
+    ({"action": "restore", "confirm": "RESTORE", "names": []}, "request_invalid"), ({"action": "restore", "confirm": "RESTORE"}, "request_invalid"),
 ])
 def test_root_refuses_malformed_requests_and_leaves_no_trace(m, over, code):
     up = m.updater()

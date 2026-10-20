@@ -2024,7 +2024,7 @@ class Handler(SimpleHTTPRequestHandler):
         return 200, {"preview": preview}
 
     UPGRADE_BODY_FIELDS = {"kind": 16, "version": 20, "sha256": 64, "when_utc": 24, "entered_tz": 64, "entered_local": 20, "target": 16,
-                           "confirm": 16, "for_correlation_id": 16}
+                           "confirm": 16, "for_correlation_id": 16, "backup": 100}
     UPGRADE_KINDS = ("apply", "schedule", "reschedule", "cancel", "approve_second",
                      "rollback", "restore", "clear_failure", "bundle", "prune_backups")
 
@@ -2033,28 +2033,48 @@ class Handler(SimpleHTTPRequestHandler):
         loses or deletes something, needs a fresh MFA approval, and is handed to the root-owned updater, which re-validates it."""
         owner_key, _e, actor_email, actor_sub = self._caller()
         now = datetime.now(timezone.utc)
-        allowed = {"rollback": {"kind", "confirm"}, "restore": {"kind", "confirm"}, "clear_failure": {"kind"},
-                   "bundle": {"kind", "include_hosts", "for_correlation_id"}, "prune_backups": {"kind", "confirm", "keep_last", "names"}}[kind]
+        if kind == "prune_backups":
+            # Deleting the root-held pre-upgrade copies is not something this application can ask the updater for: a request
+            # from a compromised web process would look the same. The page shows the command instead.
+            return 409, {"error": "Old pre-upgrade backups are deleted on the server, not from this page. Run "
+                                  "`sudo ocw-updater prune-backups --keep N --confirm PRUNE` there.", "reason": "cli_only"}
+        allowed = {"rollback": {"kind", "confirm"}, "restore": {"kind", "confirm", "backup"}, "clear_failure": {"kind"},
+                   "bundle": {"kind", "include_hosts", "for_correlation_id"}}[kind]
         if set(body) - allowed:
             return 400, {"error": "Unexpected field for this request."}
-        typed = {"rollback": "ROLLBACK", "restore": "RESTORE", "prune_backups": "PRUNE"}.get(kind)
+        typed = {"rollback": "ROLLBACK", "restore": "RESTORE"}.get(kind)
         if typed and body.get("confirm") != typed:
             return 400, {"error": f"Type {typed} to confirm.", "reason": "confirm_required"}
         state = upgrade_service.updater_state()
         if not state["ready"]:
             return 409, {"error": state["message"], "reason": state["reason"]}
+        if upgrade_service.activator_too_old(state.get("activator")):
+            return 409, {"error": f"The installed updater (version {state.get('activator')}) does not take this request yet. It is replaced "
+                                  "by the next upgrade, or run `sudo ocw-updater` on the server.", "reason": "activator_too_old",
+                         "activator": state.get("activator")}
         run = upgrade_service.run_view()
         if run and run.get("result") is None and run.get("step"):
             return 409, {"error": "An upgrade is in progress.", "reason": "in_flight"}
-        backups = (upgrade_service.backups_view() or {}).get("backups", [])
+        backups_status = upgrade_service.backups_view()  # None = the updater has not published the list yet (unknown, not "none")
+        backups = (backups_status or {}).get("backups", [])
         if kind == "rollback":
             rb = upgrade_service.rollback_view(run, now)
             if not rb or not rb["available"]:
                 return 409, {"error": "Rolling back is only offered for 24 hours after an upgrade completes.", "reason": "rollback_unavailable"}
         elif kind == "restore":
-            if not backups or not (run and run.get("backup")):
+            shown = (run or {}).get("backup")
+            if (backups_status is not None and not backups) or not (isinstance(shown, dict) and shown.get("name")):
                 return 409, {"error": "There is no pre-upgrade copy of the archive to restore.", "reason": "no_backup"}
+            name = body.get("backup")
+            if not isinstance(name, str) or not upgrade_service.BACKUP_NAME_RE.match(name):
+                return 400, {"error": "Name the backup copy to restore (backup).", "reason": "backup_required"}
+            if name != shown["name"]:  # the copy named in the approved request is the one the updater would restore, or nothing happens
+                return 409, {"error": "The pre-upgrade copy changed since this page was loaded. Nothing was restored; reload the page.",
+                             "reason": "target_changed"}
         elif kind == "clear_failure":
+            if run and run.get("result") == "failed_needs_operator":
+                return 409, {"error": "The last upgrade could not be rolled back automatically. An operator must run "
+                                      "`sudo ocw-updater clear-failure` on the server.", "reason": "needs_operator"}
             if not upgrade_service.failures_view() and not (run and run.get("result") == "failed_needs_operator"):
                 return 409, {"error": "There is no recorded failure to clear.", "reason": "nothing_to_clear"}
         elif kind == "bundle":
@@ -2063,16 +2083,8 @@ class Handler(SimpleHTTPRequestHandler):
             fc = body.get("for_correlation_id")
             if fc is not None and (not upgrade_service.CID_RE.match(fc) or fc != run.get("correlation_id")):
                 return 409, {"error": "A bundle can only be built for the last upgrade run.", "reason": "target_changed"}
-        elif kind == "prune_backups":
-            have = {b["name"] for b in backups}
-            if len(have) < 2:
-                return 409, {"error": "There is nothing to delete: the newest backup is always kept.", "reason": "nothing_to_delete"}
-            if body.get("names") is not None and not set(body["names"]) <= have:
-                return 409, {"error": "One of the named backups no longer exists. Reload the page.", "reason": "target_changed"}
-            if (body.get("keep_last") is None) == (body.get("names") is None):
-                return 400, {"error": "Send exactly one of keep_last and names."}
         if dry_run:
-            return None, {"kind": kind}
+            return None, ({"kind": kind, "backup": body["backup"]} if kind == "restore" else {"kind": kind})
         cid = upgrade_service.new_correlation_id()
         action_id = self.headers.get("X-Auth-Action-Id") if via_step_up else None
         fields = {k: v for k, v in body.items() if k != "kind"}
@@ -2085,8 +2097,8 @@ class Handler(SimpleHTTPRequestHandler):
             details.update(step_up_verified=True, action_id=action_id)
         if kind == "bundle":
             details["include_hosts"] = bool(body.get("include_hosts"))
-        if kind == "prune_backups":
-            details.update(keep_last=body.get("keep_last"), names=body.get("names"))
+        if kind == "restore":
+            details["backup"] = body.get("backup")
         self._log_audit_event(actor_email, actor_sub, "upgrade.requested", details)
         return 200, {"kind": kind, "correlation_id": cid}
 
