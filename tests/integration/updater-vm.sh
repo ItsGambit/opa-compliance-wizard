@@ -503,14 +503,6 @@ check "clear-failure lets it through" "$UPDATER_CMD" clear-failure
 "$UPDATER_CMD" apply 98.0.11 --confirm-text 98.0.11 > "$WORK/apply11b.txt" 2>&1 && RC=0 || RC=$?
 check "98.0.11 applies after clear-failure" test "$RC" -eq 0
 
-say "7e. A revoked key: a back-dated release by the revoked key is refused, and the revocation file is not written anywhere the application owns"
-"$UPDATER_CMD" trust apply "$REL/revocation.json" > "$WORK/trustapply.txt" 2>&1 && RC=0 || RC=$?
-check "trust apply of the test revocation succeeds" test "$RC" -eq 0
-"$UPDATER_CMD" stage "$REL/ocw-98.0.9.tar.gz" > "$WORK/stage9c.txt" 2>&1 && RC=0 || RC=$?
-check "a release signed by the revoked key (with an old timestamp) is refused (exit 2)" test "$RC" -eq 2
-check "the refusal says the key is revoked" bash -c "grep -qi 'revoked' $WORK/stage9c.txt"
-check "the applied revocation was not copied into the application's directory" test ! -e "$DATA/upgrade/revocations/1.json"
-
 say "7f. Requests from the web application (the inbox), written as the application account"
 INBOX="$DATA/upgrade/inbox/requests"
 state_field() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")' "$DATA/upgrade/state.json" "$1"; }
@@ -524,13 +516,13 @@ rejection_code() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]
 audit_has() { grep -q "\"action\":\"$1\"" "$DATA/audit_log.jsonl"; }
 
 # the quiesce file covers the whole run: its end time is renewed at every step (poll it while 98.0.12 is applied)
-"$UPDATER_CMD" stage "$REL/ocw-98.0.12.tar.gz" >/dev/null 2>&1 || bad "stage 98.0.12"
+check "stage 98.0.12" "$UPDATER_CMD" stage "$REL/ocw-98.0.12.tar.gz"   # (before 7e: that step revokes the test signing key)
 : > "$WORK/quiesce-seen.txt"
 ( while [ ! -e "$WORK/quiesce-stop" ]; do python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["until"])' "$DATA/upgrade/quiesce.json" >> "$WORK/quiesce-seen.txt" 2>/dev/null; sleep 0.2; done ) &
 POLL_PID=$!
 "$UPDATER_CMD" apply 98.0.12 --confirm-text 98.0.12 > "$WORK/apply12.txt" 2>&1 && RC=0 || RC=$?
 touch "$WORK/quiesce-stop"; wait "$POLL_PID" 2>/dev/null || true; rm -f "$WORK/quiesce-stop"
-check "98.0.12 applies" test "$RC" -eq 0
+check "98.0.12 applies" bash -c "test $RC -eq 0 || { cat $WORK/apply12.txt; exit 1; }"
 check "the quiesce file was seen during the run and its end time was renewed (two or more different values)" test "$(sort -u "$WORK/quiesce-seen.txt" | grep -c .)" -ge 2
 check "the quiesce file is gone when the run is over" test ! -e "$DATA/upgrade/quiesce.json"
 
@@ -600,6 +592,14 @@ check "the backups directory stays root-only (0700)" test "$(stat -c %a "$DATA/u
 "$UPDATER_CMD" prune-backups --keep 1 --confirm PRUNE > "$WORK/prune.txt" 2>&1 && RC=0 || RC=$?
 check "the command-line prune works" test "$RC" -eq 0
 check "it kept the newest copy" test "$(ls "$DATA"/upgrade/backups/audit_store-pre-*.db | wc -l)" -eq 1
+
+say "7e. A revoked key: a back-dated release by the revoked key is refused, and the revocation file is not written anywhere the application owns"
+"$UPDATER_CMD" trust apply "$REL/revocation.json" > "$WORK/trustapply.txt" 2>&1 && RC=0 || RC=$?
+check "trust apply of the test revocation succeeds" test "$RC" -eq 0
+"$UPDATER_CMD" stage "$REL/ocw-98.0.9.tar.gz" > "$WORK/stage9c.txt" 2>&1 && RC=0 || RC=$?
+check "a release signed by the revoked key (with an old timestamp) is refused (exit 2)" test "$RC" -eq 2
+check "the refusal says the key is revoked" bash -c "grep -qi 'revoked' $WORK/stage9c.txt"
+check "the applied revocation was not copied into the application's directory" test ! -e "$DATA/upgrade/revocations/1.json"
 
 say "8. The root unit's sandbox (for tightening CapabilityBoundingSet)"
 systemctl show ocw-upgrade.service -p CapabilityBoundingSet -p ProtectSystem -p IPAddressDeny -p IPAddressAllow > "$WORK/sandbox.txt" || true
