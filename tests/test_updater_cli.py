@@ -46,7 +46,7 @@ def test_stage_from_a_file_then_apply_completes_with_the_artboard_steps(m, capsy
     assert cli(m, "stage", str(tar)) == 0
     out = capsys.readouterr().out
     assert "staged 5.47.0" in out and "next: ocw-updater apply 5.47.0" in out
-    assert (m.opt / "releases" / "5.47.0" / ".staged").exists()
+    assert (m.opt / "staging" / "5.47.0" / ".staged").exists()
     assert cli(m, "status") == 0
     assert "staged         5.47.0   verified ok, venv built, sha256" in capsys.readouterr().out
     rc = cli(m, "apply", "5.47.0", "--confirm-text", "5.47.0")

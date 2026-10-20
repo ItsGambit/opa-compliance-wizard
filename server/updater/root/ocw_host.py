@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -127,17 +128,51 @@ class SystemHost:
         return shutil.disk_usage(path).free
 
     def chown_tree(self, root, uid=0, gid=0):
-        """Make a verified release tree immutable for everyone but root:
-        ownership root:root, no group/other write bit. Symlinks are not followed."""
-        os.lchown(root, uid, gid)
-        for base, dirs, files in os.walk(root):
-            for name in dirs + files:
-                p = os.path.join(base, name)
-                os.lchown(p, uid, gid)
-                if not os.path.islink(p):
-                    mode = os.lstat(p).st_mode & 0o7777
-                    os.chmod(p, mode & ~0o022)
-        os.chmod(root, os.lstat(root).st_mode & 0o7755)
+        """Make a release tree immutable for everyone but root: owner uid:gid, setuid/setgid and group/other write bits
+        cleared, on every entry. The top directory is locked FIRST, and every entry is handled through a descriptor opened
+        without following links (never by path), so a concurrent change by the account that built the tree cannot redirect a
+        chown or chmod. A hard-linked file, or anything that is not a plain file, directory or link, refuses the tree."""
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        top = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow)
+        try:
+            self._lock_dir(top, uid, gid, "")
+        finally:
+            os.close(top)
+
+    @staticmethod
+    def _clean_mode(mode):
+        return (mode & 0o777) & ~0o022
+
+    def _lock_dir(self, dirfd, uid, gid, rel):
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        st = os.fstat(dirfd)
+        os.fchown(dirfd, uid, gid)
+        os.fchmod(dirfd, self._clean_mode(st.st_mode))
+        for name in os.listdir(dirfd):
+            where = f"{rel}/{name}".lstrip("/")
+            lst = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+            if stat.S_ISLNK(lst.st_mode):
+                os.chown(name, uid, gid, dir_fd=dirfd, follow_symlinks=False)
+            elif stat.S_ISDIR(lst.st_mode):
+                sub = os.open(name, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow, dir_fd=dirfd)
+                try:
+                    self._lock_dir(sub, uid, gid, where)
+                finally:
+                    os.close(sub)
+            elif stat.S_ISREG(lst.st_mode):
+                fd = os.open(name, os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0), dir_fd=dirfd)
+                try:
+                    fst = os.fstat(fd)
+                    if not stat.S_ISREG(fst.st_mode) or (fst.st_ino, fst.st_dev) != (lst.st_ino, lst.st_dev):
+                        raise HostError(f"{where} changed while it was being locked")
+                    if fst.st_nlink > 1:
+                        raise HostError(f"{where} has more than one hard link")
+                    os.fchown(fd, uid, gid)
+                    os.fchmod(fd, self._clean_mode(fst.st_mode))
+                finally:
+                    os.close(fd)
+            else:
+                raise HostError(f"{where} is not a plain file, directory or link")
 
     def switch_symlink(self, link, target):
         """Atomic: build a temporary symlink beside it and rename over it."""
@@ -159,12 +194,12 @@ class SystemHost:
         """Runs `ocw_activate.py _dbtool ...` as the application user (never as
         root: a root SQLite connection could leave root-owned -wal/-shm files
         the application cannot open). Returns the parsed JSON it prints."""
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocw_activate.py")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocw_activate.py")  # run with -B: no .pyc written
         kwargs = {}
         if hasattr(os, "geteuid") and os.geteuid() == 0 and self.app_uid is not None:
             kwargs = {"user": self.app_uid, "group": self.app_gid, "extra_groups": []}
         try:
-            p = subprocess.run([sys.executable, "-I", script, "_dbtool", *args], stdout=subprocess.PIPE,
+            p = subprocess.run([sys.executable, "-I", "-B", script, "_dbtool", *args], stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True, timeout=3600, stdin=subprocess.DEVNULL, **kwargs)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise HostError(f"database tool failed to run: {exc}")
@@ -234,6 +269,7 @@ def snapshot(db, since=None):
             except sqlite3.OperationalError:
                 running = False
         out["sync_running"] = running
+        out["env_names"] = environment_names(conn, db)
         out["sync_after"] = False
         if since:
             try:
@@ -244,6 +280,38 @@ def snapshot(db, since=None):
         return out
     finally:
         conn.close()
+
+
+def environment_names(conn, db):
+    """Distinct tenant / environment names and hosts the application knows (so a support bundle can hide them)."""
+    names = set()
+    try:
+        for row in conn.execute("SELECT display_name, team_name, base_domain, okta_url FROM app_environments"):
+            names.update(v for v in row if isinstance(v, str))
+    except sqlite3.Error:
+        pass
+    try:  # the legacy environments file next to the archive: opened as the application account, plain files only
+        import stat as _stat
+        path = os.path.join(os.path.dirname(os.path.abspath(db)), "environments.json")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as fh:
+            if _stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                def walk(o, depth=0):
+                    if depth > 5:
+                        return
+                    if isinstance(o, dict):
+                        for k, v in o.items():
+                            if k in ("display_name", "name", "team_name", "base_domain", "okta_url", "org_url") and isinstance(v, str):
+                                names.add(v)
+                            else:
+                                walk(v, depth + 1)
+                    elif isinstance(o, list):
+                        for v in o[:500]:
+                            walk(v, depth + 1)
+                walk(json.loads(fh.read(4 << 20).decode("utf-8")))
+    except (OSError, ValueError):
+        pass
+    return sorted(n for n in names if 3 <= len(n) <= 200)[:500]
 
 
 def backup(db, dst):

@@ -13,4 +13,4 @@ _here = os.path.dirname(os.path.abspath(__file__))
 _target = os.path.join(_here, "current", "ocw_activate.py")
 if not os.path.isfile(_target):
     sys.exit("the updater's code directory is missing: re-run server/install.sh --refresh-updater")
-os.execv(sys.executable, [sys.executable, "-I", _target] + sys.argv[1:])
+os.execv(sys.executable, [sys.executable, "-I", "-B", _target] + sys.argv[1:])

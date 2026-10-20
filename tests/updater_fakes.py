@@ -96,6 +96,9 @@ class FakeHost(ocw_host.SystemHost):
 
     def chown_tree(self, root, uid=0, gid=0):
         self.calls.append(("chown_tree", root))
+        # what the real one relies on: by now the tree is under releases/ (root-owned parent), no longer under staging/
+        self.chown_seen = (os.path.dirname(root) == str(self.m.opt / "releases"),
+                           os.path.lexists(self.m.opt / "staging" / os.path.basename(root)))
         for base, dirs, files in os.walk(root):
             for n in dirs + files:
                 p = os.path.join(base, n)
@@ -236,7 +239,7 @@ class Machine:
         self.db = str(self.data / "audit_store.db")
         self.primary, self.standby = TestKey(), TestStandby()
         self.key_list = key_list([self.primary, self.standby])
-        for d in (self.opt / "releases", self.opt / "updater", self.data / "upgrade" / "inbox" / "requests", self.etc, self.root / "nginx"):
+        for d in (self.opt / "releases", self.opt / "staging", self.opt / "handoff", self.opt / "updater", self.data / "upgrade" / "inbox" / "requests", self.etc, self.root / "nginx"):
             d.mkdir(parents=True, exist_ok=True)
         self.install_release(version)
         os.symlink(f"releases/{version}", self.opt / "current")
@@ -313,11 +316,15 @@ class Machine:
         return tar
 
     def stage_impl(self, version):
-        """What ocw-stage@<version> does, without pip: unpack the artifact into releases/<version>."""
+        """What ocw-stage@<version> does, without pip: unpack the artifact into staging/<version>."""
         over = self.stage_overrides.get(version)
         if over:
             return over()
         art = self.data / "upgrade" / "artifacts"
+        art.mkdir(parents=True, exist_ok=True)
+        for n in (f"ocw-{version}.tar.gz", f"ocw-{version}.tar.gz.minisig"):  # the handoff copy wins, like stage.py
+            if (self.opt / "handoff" / n).is_file():
+                (art / n).write_bytes((self.opt / "handoff" / n).read_bytes())
         tar, sig = art / f"ocw-{version}.tar.gz", art / f"ocw-{version}.tar.gz.minisig"
         if not tar.exists():
             return 1, "no artifact"
@@ -328,7 +335,7 @@ class Machine:
                 os.replace(p, str(p) + ".rejected")
             (art / f"{version}.stage-error.json").write_text(json.dumps({"code": exc.code, "message": str(exc)}))
             return 1, str(exc)
-        dest = self.opt / "releases" / version
+        dest = self.opt / "staging" / version
         with tarfile.open(tar, "r:gz") as t:
             for m in t:
                 if m.isreg():

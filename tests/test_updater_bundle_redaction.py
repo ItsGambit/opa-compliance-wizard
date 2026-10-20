@@ -137,3 +137,27 @@ def test_bundle_build_failure_never_hides_the_real_failure(tmp_path, monkeypatch
     m.put_artifacts("5.47.0")
     assert m.updater().apply(m.request("5.47.0", correlation_id="upg-ffff0002")) == "rolled_back"
     assert m.read_state()["bundle"] is None
+
+
+def test_application_journal_lines_are_filtered_and_environment_names_come_from_the_archive(tmp_path):
+    m = uf.Machine(tmp_path)
+    conn = sqlite3.connect(m.db)
+    conn.execute("CREATE TABLE app_environments (environment_id TEXT, display_name TEXT, team_name TEXT, base_domain TEXT, okta_url TEXT)")
+    conn.execute("INSERT INTO app_environments VALUES ('e1', 'Quarterly Audit Tenant', 'Platform Team', 'tenant-two.example.co.nz', NULL)")
+    conn.commit()
+    conn.close()
+    info = json.dumps({"level": "INFO", "msg": "sync progress for Quarterly Audit Tenant at tenant-two.example.co.nz"})
+    warn = json.dumps({"level": "WARN", "msg": "slow sync for Quarterly Audit Tenant (Platform Team)"})
+    plain = "free text line mentioning Quarterly Audit Tenant and tenant-two.example.co.nz"
+    m.host.fake_journal["opa-compliance-wizard"] = "\n".join([info, warn, plain]) + "\n"
+    m.build_release("5.47.0")
+    m.put_artifacts("5.47.0")
+    m.host.unhealthy_versions.add("5.47.0")
+    m.host.schema_on_start["5.47.0"] = 10
+    assert m.updater().apply(m.request("5.47.0", correlation_id="upg-ffff0002")) == "rolled_back"
+    bundle = m.data / "upgrade" / "bundles" / m.read_state()["bundle"]["name"]
+    text = "\n".join(members(bundle).values())
+    for forbidden in ("Quarterly Audit Tenant", "Platform Team", "tenant-two.example.co.nz"):
+        assert forbidden not in text, forbidden
+    journal = members(bundle)["journal-opa-compliance-wizard.txt"]
+    assert "slow sync" in journal and "sync progress" not in journal and "free text line" not in journal

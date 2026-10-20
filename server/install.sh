@@ -259,7 +259,7 @@ own() { # own <owner:group> <mode> <path>
 }
 mkd() { mkdir -p "$3"; own "$1" "$2" "$3"; }
 render() { # render <template> <output>: fill in the __NAME__ words
-  sed -e "s|__OPT_DIR__|$OPT_DIR|g" -e "s|__DATA_DIR__|$DATA_DIR|g" -e "s|__APP_USER__|$APP_USER|g" -e "s|__PYTHON3__|$PY3|g" "$1" > "$2"
+  sed -e "s|__OPT_DIR__|$OPT_DIR|g" -e "s|__DATA_DIR__|$DATA_DIR|g" -e "s|__APP_USER__|$APP_USER|g" -e "s|__PYTHON3__|$PY3|g" -e "s|__ARTIFACTS_DIR__|$ARTIFACTS_DIR|g" -e "s|__ENV_FILE__|$ENV_FILE|g" "$1" > "$2"
 }
 run_as() { # run_as <user> <cmd...>
   local _u="$1"; shift
@@ -275,7 +275,12 @@ fi
 UPD_OWNER="$UPDATER_USER:$UPDATER_USER"
 id "$UPDATER_USER" >/dev/null 2>&1 || UPD_OWNER="root:root"
 mkd root:root 0755 "$OPT_DIR"
-mkd "$UPD_OWNER" 0755 "$OPT_DIR/releases"
+# releases/ is ROOT-owned: only root can rename, replace or remove a release. The staging account builds in staging/<version>
+# and root moves the tree into releases/ before it takes ownership of it and checks it.
+mkd root:root 0755 "$OPT_DIR/releases"
+mkd "$UPD_OWNER" 0755 "$OPT_DIR/staging"
+# where `ocw-updater stage <file>` hands an operator's file to the staging account: root writes, the account only reads
+if id "$UPDATER_USER" >/dev/null 2>&1; then mkd "root:$UPDATER_USER" 0750 "$OPT_DIR/handoff"; else mkd root:root 0750 "$OPT_DIR/handoff"; fi
 mkd root:root 0755 "$OPT_DIR/updater"
 mkd root:root 0755 "$OPT_DIR/maintenance"
 # root-owned with the sticky bit and group write for the application's account: it can create and replace ITS files
@@ -295,6 +300,12 @@ mkd "$APP_USER:$APP_GROUP" 0700 "$DATA_DIR/upgrade/work"
 mkd "$APP_USER:$APP_GROUP" 0700 "$DATA_DIR/upgrade/revocations"
 mkd "$UPD_OWNER" 0750 "$(dirname -- "$ARTIFACTS_DIR")"
 mkd "$UPD_OWNER" 0750 "$ARTIFACTS_DIR"
+# The audit log and its lock file belong to the application account from the start, so a root process that appends to the
+# log can never leave a root-owned lock file that locks the application out of its own cross-process lock.
+for _af in audit_log.jsonl .audit_log.jsonl.lock; do
+  [ -e "$DATA_DIR/$_af" ] || : > "$DATA_DIR/$_af"
+  own "$APP_USER:$APP_GROUP" 0600 "$DATA_DIR/$_af"
+done
 
 note "==> The root-owned updater"
 if [ -z "$LAYOUT_PRESENT" ] || [ -n "$REFRESH_UPDATER" ]; then
@@ -322,7 +333,8 @@ _cfg_tmp="$OPT_DIR/updater/config.json.tmp"
 cat > "$_cfg_tmp" <<EOF
 {"app_user": "$APP_USER", "app_group": "$APP_GROUP", "stage_user": "$UPDATER_USER",
  "backend_service": "${SERVICE_NAME:-opa-compliance-wizard}", "gate_service": "opa-auth-gate",
- "nginx_site": "$CONF_NGINX_SITE", "backend_port": $CONF_PORT}
+ "nginx_site": "$CONF_NGINX_SITE", "backend_port": $CONF_PORT,
+ "artifacts_dir": "$ARTIFACTS_DIR", "env_file": "$ENV_FILE"}
 EOF
 own root:root 0644 "$_cfg_tmp"
 mv "$_cfg_tmp" "$OPT_DIR/updater/config.json"
@@ -350,15 +362,15 @@ if [ "$MODE" != "reinstall" ]; then
       -cf - . | tar -C "$REL" -xf -
     [ -f "$SOURCE_DIR/folders_template.csv" ] && cp "$SOURCE_DIR/folders_template.csv" "$REL/folders_template.csv"
     own "$UPD_OWNER" 0755 "$REL"
-    if [ -z "$TESTING" ]; then chown -R "$UPD_OWNER" "$REL"; fi
+    if [ -z "$TESTING" ]; then chown -Rh "$UPD_OWNER" "$REL"; fi
     _pip=(--require-hashes --only-binary=:all: -r "$REL/requirements.lock")
     [ -z "$WHEELHOUSE" ] || _pip=(--no-index --find-links "$WHEELHOUSE" "${_pip[@]}")
     run_as "$UPDATER_USER" "$PY3" -m venv "$REL/.venv" || die "could not create the virtual environment in $REL/.venv"
-    run_as "$UPDATER_USER" env PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1 "$REL/.venv/bin/pip" install -q "${_pip[@]}" \
+    run_as "$UPDATER_USER" env HOME=/var/lib/ocw-updater PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1 "$REL/.venv/bin/pip" install -q "${_pip[@]}" \
       || die "pip install --require-hashes failed in $REL (the old install is untouched)"
     find "$REL" -path "$REL/.venv" -prune -o -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
     printf '{"version": "%s", "source": "install.sh", "installed_at": "%s", "signed": false}\n' "$VERSION" "$STAMP" > "$REL/.installed-from-source"
-    if [ -z "$TESTING" ]; then chown -R root:root "$REL"; fi
+    if [ -z "$TESTING" ]; then chown -Rh root:root "$REL"; fi
     chmod -R go-w "$REL"
   else
     note "    $REL is already installed"

@@ -147,6 +147,26 @@ class Redactor:
         return "\n".join(lines) + "\n"
 
 
+APP_LOG_LEVELS = ("WARN", "WARNING", "ERROR", "CRIT", "CRITICAL", "FATAL")
+
+
+def filter_app_journal(text, correlation_id=None, cap=200):
+    """The application's own log is free text we cannot fully scrub (sync progress, display names, folder names). Keep only
+    JSON lines at WARN or above, or carrying this upgrade's correlation id, at most `cap` (the newest)."""
+    keep = []
+    for line in text.splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        level = str(rec.get("level", "")).upper()
+        if level in APP_LOG_LEVELS or (correlation_id and rec.get("correlation_id") == correlation_id):
+            keep.append(line)
+    return "\n".join(keep[-cap:]) + ("\n" if keep else "")
+
+
 def collect_env_names(audit_entries):
     """Environment / tenant names found in audit entries' details (values of ENV_KEYS)."""
     found = set()

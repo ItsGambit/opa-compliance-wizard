@@ -186,10 +186,16 @@ def revocation_base():
     return base if base.endswith("/") else base + "/"
 
 
-def revocation_sources():
+def revocation_sources(applied_serial=None):
     """[(name, url)]: the revocation.json asset of the project's `revocation`
-    release, and an optional owner-controlled static URL (OPA_REVOCATION_URL)."""
+    release, the asset of a per-serial release `revocation-<next serial>` (GitHub's
+    immutable releases allow one publication per tag, so a second revocation cannot
+    reuse the first tag), and an optional owner-controlled static URL
+    (OPA_REVOCATION_URL)."""
     sources = [("release_assets", revocation_base() + keylib.REVOCATION_FILE_NAME)]
+    base = revocation_base()
+    if applied_serial is not None and base.endswith("/revocation/"):
+        sources.append(("release_assets_next", f"{base[:-len('revocation/')]}revocation-{int(applied_serial) + 1}/{keylib.REVOCATION_FILE_NAME}"))
     static = os.environ.get(REVOCATION_URL_ENV)
     if static:
         sources.append(("static_url", static))
@@ -378,7 +384,11 @@ def _revocation_step(st, installed_user_agent):
     of short outcome strings (one per source) for the audit row."""
     allowed = _allowed_hosts()
     outcomes = []
-    for name, url in revocation_sources():
+    try:
+        serial = keylib.effective_key_list()["serial"]
+    except keylib.KeyListError:
+        serial = None
+    for name, url in revocation_sources(serial):
         got = check.fetch(url, allowed, st["revocation_etags"].get(name), installed_user_agent,
                           max_bytes=keylib.MAX_JSON_BYTES, accept="application/octet-stream")
         if got.status == "not_modified":

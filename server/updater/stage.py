@@ -11,15 +11,16 @@ never by root's own code path directly). It:
   2. verifies the signature against root's trust list (updater/trust.json,
      the same list root will use) with this install's own verifier, and that
      the version is newer than the installed one;
-  3. unpacks into releases/<version>/ with the safe extractor (only regular
+  3. unpacks into staging/<version>/ with the safe extractor (only regular
      files, every file matched to the signed manifest);
   4. builds the virtual environment there with
      `pip install --require-hashes -r requirements.lock`;
-  5. writes releases/<version>/.staged LAST: a release directory without it is
+  5. writes staging/<version>/.staged LAST: a release directory without it is
      incomplete and is deleted and redone on the next attempt.
 
-This account is NOT trusted: root re-verifies the signature and every file
-again before switching (ocw_activate.py) and then makes the tree root-owned.
+This account is NOT trusted and cannot write releases/ (root-owned): root moves
+staging/<version> to releases/<version> first, then makes the tree root-owned
+and re-verifies the signature and every file before switching (ocw_activate.py).
 On failure it writes upgrade/artifacts/<version>.stage-error.json with a
 stable reason code for root to audit, and removes what it built.
 
@@ -64,6 +65,40 @@ def _dirs():
     return Path(opt), Path(os.environ.get("OCW_ARTIFACTS_DIR", "/var/lib/ocw-updater/artifacts")), Path(opt) / "updater" / "trust.json"
 
 
+def _adopt_handoff(opt, art_dir, version):
+    """An operator's file (`ocw-updater stage <file>`) arrives in the root-owned handoff directory; copy it into this
+    account's own artifacts directory. The handoff copy wins over anything already there."""
+    hand = Path(os.environ.get("OCW_HANDOFF_DIR", str(opt / "handoff")))
+    names = (f"ocw-{version}.tar.gz", f"ocw-{version}.tar.gz.minisig")
+    if not all((hand / n).is_file() and not (hand / n).is_symlink() for n in names):
+        return False
+    art_dir.mkdir(parents=True, exist_ok=True)
+    for n in names:
+        tmp = art_dir / (n + ".part")
+        shutil.copyfile(hand / n, tmp)
+        os.replace(tmp, art_dir / n)
+    return True
+
+
+def _relocate_venv(venv, old_root, new_root):
+    """The environment is built under staging/<v> but will live under releases/<v>: rewrite the absolute path in the
+    text files that carry it (console-script shebangs, activate scripts, pyvenv.cfg). Links and binaries are left alone."""
+    old, new = str(old_root).encode(), str(new_root).encode()
+    candidates = [venv / "pyvenv.cfg"] + sorted((venv / "bin").glob("*"))
+    for p in candidates:
+        try:
+            if p.is_symlink() or not p.is_file() or p.stat().st_size > 1 << 20:
+                continue
+            data = p.read_bytes()
+            if b"\0" in data[:512] or old not in data:
+                continue
+            mode = p.stat().st_mode
+            p.write_bytes(data.replace(old, new))
+            os.chmod(p, mode & 0o7777)
+        except OSError:
+            continue
+
+
 def _faults():
     if os.environ.get("OCW_TEST_MODE") != "1":
         return set()
@@ -75,7 +110,8 @@ def key_list_from_trust(path):
     try:
         obj = json.loads(Path(path).read_text(encoding="utf-8"))
         entries = keylib._validate_entries(obj["keys"])
-        revoked = {r["key_id"]: {"key_id": r["key_id"], "revoked_at": r["revoked_at"], "last_good_version": r.get("last_good_version")}
+        revoked = {r["key_id"]: {"key_id": r["key_id"], "revoked_at": r["revoked_at"], "last_good_version": r.get("last_good_version"),
+                                 **({"known_good": keylib.parse_known_good(r["known_good"])} if r.get("known_good") else {})}
                    for r in obj.get("revoked", [])}
         return {"schema": 1, "serial": int(obj.get("serial", 0)), "keys": entries, "revoked": revoked}
     except (OSError, ValueError, KeyError, keylib.KeyListError) as exc:
@@ -98,7 +134,7 @@ def _download(version, art_dir):
         os.replace(tmp, art_dir / name)
 
 
-def _fetch_revocations(art_dir):
+def _fetch_revocations(art_dir, kl_serial=None):
     """Best effort, like the update check: a published revocation (the `revocation` release, and the owner's static URL if
     one is configured) goes into <artifacts>/revocations/. Root re-verifies it itself before the install and applies it
     if it is genuine, so a release signed by a stolen key cannot be installed on a server that has not heard of the
@@ -106,7 +142,7 @@ def _fetch_revocations(art_dir):
     from . import service  # noqa: PLC0415 - the same source list the update check uses
     try:
         hosts = service._allowed_hosts()
-        for name, url in service.revocation_sources():
+        for name, url in service.revocation_sources(kl_serial):
             got = check.fetch(url, hosts, None, check.USER_AGENT, max_bytes=keylib.MAX_JSON_BYTES, accept="application/octet-stream")
             if got.status == "ok" and got.body:
                 d = art_dir / "revocations"
@@ -119,8 +155,8 @@ def _fetch_revocations(art_dir):
 def stage(version):
     opt, art_dir, trust_path = _dirs()
     faults = _faults()
-    releases = opt / "releases"
-    target = releases / version
+    staging = opt / "staging"
+    target = staging / version
     tar_path = art_dir / f"ocw-{version}.tar.gz"
     sig_path = art_dir / f"ocw-{version}.tar.gz.minisig"
     err_path = art_dir / f"{version}.stage-error.json"
@@ -128,8 +164,13 @@ def stage(version):
         err_path.unlink()
     except FileNotFoundError:
         pass
+    _adopt_handoff(opt, art_dir, version)
     if not (tar_path.exists() and sig_path.exists()):
-        _fetch_revocations(art_dir)
+        try:
+            serial = key_list_from_trust(trust_path)["serial"]
+        except StageError:
+            serial = None
+        _fetch_revocations(art_dir, serial)
         _download(version, art_dir)
     installed = verifylib.installed_version_from_tree(keylib.REPO_ROOT)
     kl = key_list_from_trust(trust_path)
@@ -162,7 +203,7 @@ def stage(version):
         venv = target / ".venv"
         subprocess.run([base_python, "-m", "venv", str(venv)], check=True, capture_output=True, text=True, timeout=600)
         env = dict(os.environ, PIP_DISABLE_PIP_VERSION_CHECK="1", PIP_NO_INPUT="1")
-        proc = subprocess.run([str(venv / "bin" / "pip"), "install", "-q", "--require-hashes", "-r", str(lock)], cwd=str(target),
+        proc = subprocess.run([str(venv / "bin" / "pip"), "install", "-q", "--require-hashes", "--only-binary=:all:", "-r", str(lock)], cwd=str(target),
                               capture_output=True, text=True, timeout=3000, env=env)
         if proc.returncode != 0:
             raise StageError("pip_failed", "pip install --require-hashes failed: " + (proc.stderr or proc.stdout)[-400:])
@@ -174,6 +215,7 @@ def stage(version):
                 if d == "__pycache__":
                     shutil.rmtree(os.path.join(base, d), ignore_errors=True)
                     dirs.remove(d)
+        _relocate_venv(venv, target, opt / "releases" / version)
         record = {"version": version, "sha256": info.sha256, "key_id": info.key_id,
                   "staged_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "files": n, "pip_freeze": freeze,
                   "pip_freeze_sha256": hashlib.sha256("\n".join(freeze).encode()).hexdigest(), "verifier": "ok"}

@@ -23,10 +23,12 @@ Rules this module enforces
     the lists from every source are merged and the strictest status wins, and
     the revoked ids are remembered in this install's own state file
     (release_keys.local.json), so no later list can bring a key back.
-  * A revoked release key stays known so releases it signed BEFORE the
-    revocation (and, when the revocation names one, no newer than its
-    `last_good_version`) still verify; anything it signs afterwards is refused.
-    A retired or revoked standby never verifies a revocation.
+  * A revoked release key never verifies a release (a timestamp or version
+    number inside its signature is chosen by whoever holds the key, so neither
+    is trusted). The one exception: the revocation may pin known-good
+    releases in `known_good` ({"x.y.z": "<sha256 of the tarball>"}); a file
+    whose version AND sha256 match a pin still verifies. A retired or revoked
+    standby never verifies a revocation.
 
 Compromise recovery: a revocation envelope (revocation.json, see below) signed
 by an active standby key. The install keeps the highest `serial` it applied; a
@@ -37,7 +39,7 @@ role over; the old one is revoked in the same revocation).
     {"format": "ocw-revocation/1", "payload": "<base64url of the UTF-8 JSON>",
      "signatures": [{"key_id": "<standby id>", "alg": "es256", "sig": "<base64url R||S>"}]}
     payload: {"serial": int, "issued_at": "<RFC 3339 UTC>",
-              "revoke": ["<key_id>" | {"key_id": ..., "last_good_version": "x.y.z"}],
+              "revoke": ["<key_id>" | {"key_id": ..., "known_good": {"x.y.z": "<sha256>"}, "last_good_version": "x.y.z" (informational)}],
               "add_keys": [<key entries>], "reason": "...", "advisory_url": "https://..."}
     signed value: SHA-256("ocw-revocation/1\\n" || payload bytes)
 
@@ -162,6 +164,17 @@ def validate_key_list(obj):
     return {"schema": SCHEMA, "keys": _validate_entries(obj["keys"])}
 
 
+def parse_known_good(kg):
+    """{version: sha256 hex of the tarball} pinned by a revocation."""
+    if not isinstance(kg, dict) or len(kg) > 200:
+        raise _bad("known_good must be a short map of version to sha256")
+    for v, d in kg.items():
+        parse_version(v)
+        if not isinstance(d, str) or not re.match(r"^[0-9a-f]{64}$", d):
+            raise _bad("known_good digests must be lower-case sha256 hex")
+    return dict(kg)
+
+
 def validate_state(obj):
     if not isinstance(obj, dict) or not {"schema", "serial", "keys", "revoked"} <= set(obj) <= {"schema", "serial", "keys", "revoked", "history"} \
             or obj["schema"] != SCHEMA:
@@ -170,14 +183,17 @@ def validate_state(obj):
         raise _bad("serial must be a non-negative whole number")
     revoked = []
     for r in obj["revoked"] if isinstance(obj["revoked"], list) else [None]:
-        if not isinstance(r, dict) or not {"key_id", "revoked_at"} <= set(r) <= {"key_id", "revoked_at", "last_good_version"}:
-            raise _bad("each revoked record needs key_id and revoked_at (and optionally last_good_version)")
+        if not isinstance(r, dict) or not {"key_id", "revoked_at"} <= set(r) <= {"key_id", "revoked_at", "last_good_version", "known_good"}:
+            raise _bad("each revoked record needs key_id and revoked_at (and optionally last_good_version, known_good)")
         if not isinstance(r["key_id"], str) or not _ID_RE.match(r["key_id"]):
             raise _bad("revoked key_id must be 16 upper-case hex digits")
         parse_timestamp(r["revoked_at"])
         if r.get("last_good_version") is not None:
             parse_version(r["last_good_version"])
-        revoked.append({"key_id": r["key_id"], "revoked_at": r["revoked_at"], "last_good_version": r.get("last_good_version")})
+        rec = {"key_id": r["key_id"], "revoked_at": r["revoked_at"], "last_good_version": r.get("last_good_version")}
+        if r.get("known_good") is not None:
+            rec["known_good"] = parse_known_good(r["known_good"])
+        revoked.append(rec)
     return {"schema": SCHEMA, "serial": obj["serial"], "keys": _validate_entries(obj["keys"]), "revoked": revoked,
             "history": _validate_history(obj.get("history", []))}
 
@@ -305,10 +321,10 @@ def has_active(eff, role):
     return any(usable(k, role) for k in eff["keys"])
 
 
-def pick_signer(eff, key_id, role, signed_at=None, version=None):
+def pick_signer(eff, key_id, role, signed_at=None, version=None, sha256=None):
     """The public key allowed to make this signature, or KeyListError. role
-    'release': a release signature (`signed_at` = trusted-comment timestamp,
-    `version` = the release version, both used if the key is revoked). role
+    'release': a release signature (`signed_at` is ignored on purpose;
+    `version` and `sha256` (of the tarball) are used only to match a revoked key's `known_good` pins). role
     'standby': a revocation."""
     if not eff["keys"]:
         raise KeyListError("no_key_pinned", "no release key pinned: this install has no signing key to check against, so it "
@@ -328,19 +344,13 @@ def pick_signer(eff, key_id, role, signed_at=None, version=None):
     if entry["status"] == "retired":
         raise KeyListError("retired_key", f"key {key_id} is retired and no longer signs releases. Use a release signed by a current key.")
     if entry["status"] == "revoked":
-        record = eff["revoked"].get(key_id)
         if role != "release":
             raise KeyListError("revoked_key", f"key {key_id} has been revoked and may not sign a revocation.")
-        if record is None or not signed_at:
-            raise KeyListError("revoked_key", f"key {key_id} is revoked and this signature cannot be shown to predate the "
-                               "revocation. Do not install this file.")
-        if parse_timestamp(signed_at) >= parse_timestamp(record["revoked_at"]):
-            raise KeyListError("revoked_key", f"key {key_id} was revoked at {record['revoked_at']}; this release was signed "
-                               "after that. Do not install it.")
-        lgv = record.get("last_good_version")
-        if lgv and version is not None and parse_version(version) > parse_version(lgv):
-            raise KeyListError("revoked_key", f"key {key_id} was revoked and is only trusted up to version {lgv}; this is "
-                               f"{version}. Do not install it.")
+        record = eff["revoked"].get(key_id) or {}
+        pinned = (record.get("known_good") or {}).get(version)
+        if not pinned or sha256 is None or pinned != sha256:
+            raise KeyListError("revoked_key", f"key {key_id} was revoked: releases it signed are refused unless the revocation "
+                               "pins this exact file. Do not install it.")
     if entry["alg"] == "es256":
         return p256.parse_public_key(entry["public_key"])[1]
     return minisign.PubKey(key_id, base64.b64decode(entry["public_key"]))
@@ -458,14 +468,23 @@ def apply_revocation(eff, raw):
     revoked = {k: dict(v) for k, v in eff["revoked"].items()}
     newly = []
     for item in payload["revoke"]:
-        key_id, lgv = (item, None) if isinstance(item, str) else (item.get("key_id"), item.get("last_good_version")) if isinstance(item, dict) else (None, None)
+        kg = None
+        if isinstance(item, dict) and set(item) <= {"key_id", "last_good_version", "known_good"}:
+            key_id, lgv = item.get("key_id"), item.get("last_good_version")
+            kg = parse_known_good(item["known_good"]) if item.get("known_good") is not None else None
+        elif isinstance(item, str):
+            key_id, lgv = item, None
+        else:
+            key_id, lgv = None, None
         if lgv is not None:
             parse_version(lgv)
-        if key_id not in keys:
+        if not isinstance(key_id, str) or key_id not in keys:
             raise _bad_rev(f"cannot revoke {key_id!r}: not a pinned key")
         if key_id in revoked:
             raise _bad_rev(f"{key_id} is already revoked")
         revoked[key_id] = {"key_id": key_id, "revoked_at": issued, "last_good_version": lgv}
+        if kg:
+            revoked[key_id]["known_good"] = kg
         keys[key_id]["status"] = "revoked"
         newly.append(key_id)
     added = []

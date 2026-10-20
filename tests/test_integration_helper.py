@@ -63,3 +63,28 @@ def test_the_broken_variants_are_broken_and_the_good_one_is_not(built):
         names = t.getnames()
         assert "manifest.json" in names and "server/updater/root/ocw_activate.py" in names and "frontend/dist/index.html" in names
         assert not [n for n in names if n.endswith((".db", ".pyc")) or ".git/" in n or n.startswith(".venv")]
+
+
+def test_the_crash_release_exits_instead_of_starting_the_server(built):
+    with tarfile.open(built / "out" / "ocw-98.0.3.tar.gz") as t:
+        text = t.extractfile("server/serve.py").read().decode()
+    block = text[text.rindex('if __name__ == "__main__":'):]
+    assert "deliberately refuses to start" in block and "main()" not in block
+
+
+def test_the_template_comment_release_bakes_and_the_test_revocation_applies(built, tmp_path):
+    import sys
+    sys.path.insert(0, str(REPO / "server"))
+    import nginx_bake
+    run("build", str(REPO), str(built / "keys"), str(tmp_path / "out"), "98.0.8", "--template-comment")
+    with tarfile.open(tmp_path / "out" / "ocw-98.0.8.tar.gz") as t:
+        tpl = t.extractfile("server/nginx-opa-secrets-wizard.conf").read().decode()
+    assert tpl.rstrip().endswith("# vm test: template changed")
+    live_tpl = (REPO / "server" / "nginx-opa-secrets-wizard.conf").read_text()
+    live = live_tpl.replace("REPLACE_WITH_SERVER_NAME", "vm.example.com").replace("REPLACE_WITH_NGINX_PROXY_SECRET_VALUE", "s3cret")
+    baked, problems = nginx_bake.bake(live, tpl)
+    assert not problems and baked != live and "template changed" in baked
+    run("revoke", str(built / "keys"), str(tmp_path / "revocation.json"))
+    trust = {"schema": 1, "serial": 0, "keys": ocw_trust.parse_key_list((built / "keys" / "release_keys.json").read_bytes()), "revoked": []}
+    new, details = ocw_trust.apply_revocation(trust, (tmp_path / "revocation.json").read_bytes())
+    assert details["to_serial"] == 1 and len(details["revoked"]) == 1
