@@ -259,7 +259,7 @@ own() { # own <owner:group> <mode> <path>
 }
 mkd() { mkdir -p "$3"; own "$1" "$2" "$3"; }
 render() { # render <template> <output>: fill in the __NAME__ words
-  sed -e "s|__OPT_DIR__|$OPT_DIR|g" -e "s|__DATA_DIR__|$DATA_DIR|g" -e "s|__APP_USER__|$APP_USER|g" -e "s|__PYTHON3__|$PY3|g" "$1" > "$2"
+  sed -e "s|__OPT_DIR__|$OPT_DIR|g" -e "s|__DATA_DIR__|$DATA_DIR|g" -e "s|__APP_USER__|$APP_USER|g" -e "s|__PYTHON3__|$PY3|g" -e "s|__ARTIFACTS_DIR__|$ARTIFACTS_DIR|g" -e "s|__ENV_FILE__|$ENV_FILE|g" "$1" > "$2"
 }
 run_as() { # run_as <user> <cmd...>
   local _u="$1"; shift
@@ -333,7 +333,8 @@ _cfg_tmp="$OPT_DIR/updater/config.json.tmp"
 cat > "$_cfg_tmp" <<EOF
 {"app_user": "$APP_USER", "app_group": "$APP_GROUP", "stage_user": "$UPDATER_USER",
  "backend_service": "${SERVICE_NAME:-opa-compliance-wizard}", "gate_service": "opa-auth-gate",
- "nginx_site": "$CONF_NGINX_SITE", "backend_port": $CONF_PORT}
+ "nginx_site": "$CONF_NGINX_SITE", "backend_port": $CONF_PORT,
+ "artifacts_dir": "$ARTIFACTS_DIR", "env_file": "$ENV_FILE"}
 EOF
 own root:root 0644 "$_cfg_tmp"
 mv "$_cfg_tmp" "$OPT_DIR/updater/config.json"

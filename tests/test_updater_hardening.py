@@ -465,3 +465,51 @@ def test_no_new_upgrade_while_the_last_one_needs_an_operator_until_clear_failure
     assert rej["code"] == "failed_before"
     assert cli(m, "clear-failure") == 0
     assert m.updater().apply(m.request("5.48.0", correlation_id="upg-00000303")) == "completed"
+
+
+# --- environment overrides are not honoured by a root process without the marker ----------------------------------------
+
+
+def _as_root(monkeypatch, marker=None):
+    import types
+    monkeypatch.setattr(act.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(act, "TEST_MARKER", str(marker) if marker else "/nonexistent/marker")
+    if marker:
+        real = os.lstat
+        monkeypatch.setattr(act.os, "lstat", lambda p, *a, **k: types.SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=0)
+                            if str(p) == str(marker) else real(p, *a, **k))
+
+
+def test_root_ignores_test_mode_and_path_overrides_without_the_marker(tmp_path, monkeypatch):
+    for k, v in (("OCW_TEST_MODE", "1"), ("OCW_FAST", "1"), ("OCW_UPDATER_FAULT", "after_switch"), ("OCW_OPT_DIR", str(tmp_path / "opt")),
+                 ("OCW_UPDATER_DIR", str(tmp_path / "evil")), ("OCW_ENV_FILE", str(tmp_path / "evil.env")),
+                 ("OCW_ARTIFACTS_DIR", str(tmp_path / "art")), ("OCW_DATA_DIR", str(tmp_path / "data"))):
+        monkeypatch.setenv(k, v)
+    _as_root(monkeypatch)
+    cfg = act.Cfg()
+    assert cfg.faults == set() and cfg.fast is False
+    assert cfg.opt == str(tmp_path / "opt") and cfg.data == str(tmp_path / "data")      # where the wrapper and the units put them
+    assert cfg.updater_dir == str(tmp_path / "opt" / "updater")                          # derived, not taken from the environment
+    assert cfg.env_file == "/etc/opa-compliance-wizard.env" and cfg.artifacts == "/var/lib/ocw-updater/artifacts"
+
+
+def test_root_honours_them_only_with_a_root_owned_marker(tmp_path, monkeypatch):
+    marker = tmp_path / "marker"
+    marker.write_text("")
+    monkeypatch.setenv("OCW_TEST_MODE", "1")
+    monkeypatch.setenv("OCW_UPDATER_FAULT", "after_switch")
+    _as_root(monkeypatch, marker)
+    assert act.Cfg().faults == {"after_switch"}
+    _as_root(monkeypatch)             # marker missing
+    assert act.Cfg().faults == set()
+    monkeypatch.undo()
+    monkeypatch.setattr(act.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(act, "TEST_MARKER", str(marker))       # a real file owned by this (non-root) user: refused
+    monkeypatch.setenv("OCW_TEST_MODE", "1")
+    monkeypatch.setenv("OCW_UPDATER_FAULT", "after_switch")
+    assert act.Cfg().faults == set()
+
+
+def test_the_wrapper_runs_the_root_updater_with_a_clean_environment():
+    text = (REPO / "server" / "ocw-updater.sh").read_text()
+    assert 'exec env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin' in text and '"$PY3" -I -B "$OPT/updater/ocw_activate.py" cli' in text

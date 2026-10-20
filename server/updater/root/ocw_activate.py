@@ -100,19 +100,41 @@ class StepFailed(Exception):
 # --- configuration ---------------------------------------------------------------------
 
 
+# A root-owned file whose presence allows the OCW_* test and path overrides for a process running as root. Nothing in a
+# normal install creates it; the VM test does (and removes it).
+TEST_MARKER = "/etc/ocw-updater-test-mode"
+
+
+def env_overrides_allowed():
+    """Root honours test-mode and path overrides from the environment only when the marker exists, is a plain file owned by
+    root and not writable by others. A non-root process (the unit tests) is never privileged, so it may use them freely."""
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return True
+    try:
+        st = os.lstat(TEST_MARKER)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o022
+
+
 class Cfg:
     def __init__(self, environ=None):
-        env = environ if environ is not None else os.environ
+        if environ is None:
+            environ = dict(os.environ)
+            if not env_overrides_allowed():  # only where the wrapper and the units put them: the install location
+                environ = {k: v for k, v in environ.items() if k in ("OCW_OPT_DIR", "OCW_DATA_DIR")}
+        env = environ
         self.opt = env.get("OCW_OPT_DIR", "/opt/opa-compliance-wizard")
         self.data = env.get("OCW_DATA_DIR", "/var/lib/opa-compliance-wizard")
         self.updater_dir = env.get("OCW_UPDATER_DIR", os.path.join(self.opt, "updater"))
-        self.env_file = env.get("OCW_ENV_FILE", "/etc/opa-compliance-wizard.env")
+        self.env_file = env.get("OCW_ENV_FILE", "")
         c = {}
         try:
             with open(os.path.join(self.updater_dir, "config.json"), encoding="utf-8") as fh:
                 c = json.load(fh)
         except (OSError, ValueError):
             pass
+        self.env_file = self.env_file or c.get("env_file") or "/etc/opa-compliance-wizard.env"
         self.app_user = c.get("app_user", "")
         self.app_group = c.get("app_group", "")
         self.stage_user = c.get("stage_user", "ocw-updater")
@@ -133,7 +155,7 @@ class Cfg:
         self.maintenance_page = os.path.join(self.maintenance_dir, "active.html")
         self.upgrade = os.path.join(self.data, "upgrade")
         self.requests = os.path.join(self.upgrade, "inbox", "requests")
-        self.artifacts = env.get("OCW_ARTIFACTS_DIR", "/var/lib/ocw-updater/artifacts")
+        self.artifacts = env.get("OCW_ARTIFACTS_DIR") or c.get("artifacts_dir") or "/var/lib/ocw-updater/artifacts"
         self.verified = os.path.join(self.upgrade, "verified")
         self.state_path = os.path.join(self.upgrade, "state.json")
         self.history_path = os.path.join(self.upgrade, "history.jsonl")
