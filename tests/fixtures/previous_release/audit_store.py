@@ -262,7 +262,8 @@ def _audit_db_path():
     override = os.environ.get("OPA_AUDIT_DB_PATH")
     if override:
         return override
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit_store.db")
+    data_dir = os.environ.get("OPA_DATA_DIR")  # 5.47.0: the /var/lib layout (see create_secret_folders._data_dir)
+    return os.path.join(data_dir or os.path.dirname(os.path.abspath(__file__)), "audit_store.db")
 
 
 # DATA-14: the archive holds names, e-mails, client IPs and pending admin
@@ -787,6 +788,108 @@ def _migration_009_shared_permission_grants_and_known_identities(conn):
            )"""
     )
 
+
+def _migration_010_snapshots_polling_sync_and_correlation(conn):
+    """5.50.0. Three additions, every statement guarded or IF NOT EXISTS:
+
+    - config_snapshots / config_snapshot_items: chained configuration
+      snapshots (see record_config_snapshot). A snapshot is sealed into
+      ingestion_manifests (source "snapshot:<kind>") in the same
+      transaction that stores it. Like the archive tables there is NO
+      foreign key to app_environments: deleting an environment's
+      configuration must not erase its evidence.
+    - sync_state.poll_cursor / sync_mode: the System Log polling cursor
+      (the `next` link of the last page read) and which sync mode the
+      environment is in. An existing install has neither, so its next
+      sync resumes from its stored watermark in polling mode (see
+      sync_okta_events): no gap, and the 1-hour overlap is deduplicated
+      by event uuid.
+    - mfa_week_totals / mfa_week_user / mfa_agg_state: the weekly sign-in and
+      MFA aggregates behind the Overview (see signin_mfa.py), refreshed
+      incrementally from the archive; derived data, rebuildable from events.
+    - events.transaction_id / root_session_id / api_token_id: the
+      System Log correlation fields (transaction.id,
+      authenticationContext.rootSessionId, transaction.detail.
+      requestApiTokenId) as indexed columns. Existing rows are filled in
+      by backfill_correlation_columns() at start-up.
+
+    A rollback to older code ignores all of it; the one thing older code
+    cannot do is deep-verify a snapshot manifest, which is why this
+    migration is declared not rollback-safe."""
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_manifest_entries_uuid ON manifest_entries (environment_id, uuid)")
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS config_snapshots (
+            snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            environment_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            captured_at TEXT NOT NULL,
+            source_endpoint TEXT,
+            item_count INTEGER NOT NULL DEFAULT 0,
+            sha256 TEXT NOT NULL,
+            meta_json TEXT,
+            manifest_id INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_config_snapshots_env_kind
+            ON config_snapshots (environment_id, kind, captured_at);
+        CREATE TABLE IF NOT EXISTS config_snapshot_items (
+            snapshot_id INTEGER NOT NULL,
+            environment_id TEXT NOT NULL,
+            item_key TEXT NOT NULL,
+            sha TEXT NOT NULL,
+            json TEXT NOT NULL,
+            PRIMARY KEY (snapshot_id, item_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_config_snapshot_items_env
+            ON config_snapshot_items (environment_id);
+        CREATE TABLE IF NOT EXISTS mfa_week_totals (
+            environment_id TEXT NOT NULL,
+            week TEXT NOT NULL,
+            key TEXT NOT NULL,
+            count INTEGER NOT NULL,
+            PRIMARY KEY (environment_id, week, key)
+        );
+        CREATE TABLE IF NOT EXISTS mfa_week_user (
+            environment_id TEXT NOT NULL,
+            week TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            actor_alt TEXT,
+            key TEXT NOT NULL,
+            count INTEGER NOT NULL,
+            PRIMARY KEY (environment_id, week, actor_id, key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfa_week_user_actor ON mfa_week_user (environment_id, actor_id);
+        CREATE INDEX IF NOT EXISTS idx_mfa_week_user_alt ON mfa_week_user (environment_id, actor_alt);
+        CREATE TABLE IF NOT EXISTS mfa_agg_state (
+            environment_id TEXT PRIMARY KEY,
+            last_rowid INTEGER NOT NULL DEFAULT 0,
+            events_used INTEGER NOT NULL DEFAULT 0,
+            built_at TEXT,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS backfill_markers (
+            name TEXT PRIMARY KEY,
+            completed_at TEXT NOT NULL
+        );
+    """)
+    state_cols = _table_columns(conn, "sync_state")
+    for column in ("poll_cursor TEXT", "sync_mode TEXT"):
+        if column.split()[0] not in state_cols:
+            conn.execute(f"ALTER TABLE sync_state ADD COLUMN {column}")
+    event_cols = _table_columns(conn, "events")
+    for column in ("transaction_id TEXT", "root_session_id TEXT", "api_token_id TEXT"):
+        if column.split()[0] not in event_cols:
+            conn.execute(f"ALTER TABLE events ADD COLUMN {column}")
+    conn.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_events_env_transaction
+            ON events (environment_id, transaction_id) WHERE transaction_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_events_env_root_session
+            ON events (environment_id, root_session_id) WHERE root_session_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_events_env_api_token
+            ON events (environment_id, api_token_id) WHERE api_token_id IS NOT NULL;
+    """)
+
+
 MIGRATIONS = {
     1: _migration_001_unified_schema,
     2: _migration_002_ingestion_manifests,
@@ -797,6 +900,7 @@ MIGRATIONS = {
     7: _migration_007_manifest_entries_and_chain_heads,
     8: _migration_008_shared_environment_permissions,
     9: _migration_009_shared_permission_grants_and_known_identities,
+    10: _migration_010_snapshots_polling_sync_and_correlation,
 }
 
 # DATA-08: migration 4 needs ALTER TABLE ... DROP COLUMN (SQLite 3.35.0,
@@ -856,14 +960,25 @@ def run_migrations():
                 raise
 
 
+def _ensure_manifest_entry_index():
+    """An archive already at schema 10 (an early 5.50.0 build) lacks the (environment, uuid) index on manifest_entries that the
+    unsealed-event check needs; creating it is idempotent."""
+    conn = _get_connection()
+    with _db_lock:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_manifest_entries_uuid ON manifest_entries (environment_id, uuid)")
+        conn.commit()
+
+
 def init_db():
     run_migrations()
+    _ensure_manifest_entry_index()
     import create_secret_folders
     create_secret_folders.migrate_legacy_environments_json()
     backfill_resource_columns()
     backfill_event_targets()
     canonicalize_stored_timestamps()
     reflag_curated_rows()
+    backfill_correlation_columns()
     _cleanup_expired_pending_admin_actions()
     _cleanup_retired_secrets_log_cache()
 
@@ -1165,16 +1280,18 @@ def _insert_rows(conn, environment_id, rows, ingestion_scope):
                 is_curated = 1 if event_type in COMPLIANCE_EVENT_TYPES else 0
                 if ingestion_scope == "curated" and not is_curated:
                     continue
+                transaction_id, root_session_id, api_token_id = _correlation_fields_from_json(raw_json)
                 cur = conn.execute(
                     """INSERT OR IGNORE INTO events
                        (uuid, environment_id, event_type, published, actor_id,
                         actor_display_name, actor_alternate_id, outcome_result,
                         is_curated, raw_json, resource_id, resource_alternate_id,
-                        resource_type_detail)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        resource_type_detail, transaction_id, root_session_id, api_token_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (uuid, environment_id, event_type, published, actor_id,
                      actor_name, actor_alt, outcome, is_curated, raw_json,
-                     resource_id, resource_alt_id, resource_type_detail),
+                     resource_id, resource_alt_id, resource_type_detail,
+                     transaction_id, root_session_id, api_token_id),
                 )
                 inserted += cur.rowcount
                 # Only fan out into event_targets on a genuine new insert
@@ -1198,6 +1315,88 @@ def _insert_rows(conn, environment_id, rows, ingestion_scope):
             conn.rollback()
             raise
     return inserted, max_published, new_entries
+
+
+def _correlation_fields(raw):
+    """(transaction.id, authenticationContext.rootSessionId,
+    transaction.detail.requestApiTokenId) of one raw System Log event, each
+    None unless it is a non-empty string (System Log query guide, "Event
+    correlation" and "Correlating events based on API token")."""
+    if not isinstance(raw, dict):
+        return None, None, None
+
+    def _text(value):
+        return value if isinstance(value, str) and value and len(value) <= 256 else None
+
+    transaction = raw.get("transaction") if isinstance(raw.get("transaction"), dict) else {}
+    detail = transaction.get("detail") if isinstance(transaction.get("detail"), dict) else {}
+    context = raw.get("authenticationContext") if isinstance(raw.get("authenticationContext"), dict) else {}
+    return _text(transaction.get("id")), _text(context.get("rootSessionId")), _text(detail.get("requestApiTokenId"))
+
+
+def _correlation_fields_from_json(raw_json):
+    try:
+        return _correlation_fields(json.loads(raw_json))
+    except (ValueError, TypeError):
+        return None, None, None
+
+
+def backfill_correlation_columns(batch_size=2000):
+    """Fills events.transaction_id / root_session_id / api_token_id for rows
+    stored before migration 010, in rowid batches (never one giant
+    transaction, never the whole table in memory), then records a marker so
+    later starts skip the scan. Safe to interrupt and re-run. Returns the
+    number of rows that received at least one value."""
+    conn = _get_connection()
+    if conn.execute("SELECT 1 FROM backfill_markers WHERE name = 'event_correlation_columns'").fetchone():
+        return 0
+    filled = 0
+    last_rowid = 0
+    while True:
+        with _db_lock:
+            rows = conn.execute(
+                "SELECT rowid AS rid, raw_json FROM events WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                (last_rowid, batch_size),
+            ).fetchall()
+            if not rows:
+                break
+            updates = []
+            for row in rows:
+                fields = _correlation_fields_from_json(row["raw_json"])
+                if any(fields):
+                    updates.append((*fields, row["rid"]))
+            if updates:
+                conn.executemany(
+                    "UPDATE events SET transaction_id = ?, root_session_id = ?, api_token_id = ? WHERE rowid = ?", updates
+                )
+                filled += len(updates)
+            conn.commit()
+            last_rowid = rows[-1]["rid"]
+    with _db_lock:
+        conn.execute(
+            "INSERT OR REPLACE INTO backfill_markers (name, completed_at) VALUES ('event_correlation_columns', ?)",
+            (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),),
+        )
+        conn.commit()
+    return filled
+
+
+def events_by_correlation(environment_id, transaction_id=None, root_session_id=None, api_token_id=None, limit=500):
+    """Events sharing one correlation value (exactly one of the three), newest
+    first, as raw dicts -- the index-backed lookup behind "same session as"
+    and "activity by this API token". Bounded by `limit`."""
+    given = [(c, v) for c, v in (("transaction_id", transaction_id), ("root_session_id", root_session_id),
+                                 ("api_token_id", api_token_id)) if v]
+    if len(given) != 1:
+        raise ValueError("pass exactly one correlation value")
+    _require_positive_limit(limit)
+    column, value = given[0]
+    conn = _get_connection()
+    rows = conn.execute(
+        f"SELECT raw_json FROM events WHERE environment_id = ? AND {column} = ? ORDER BY published DESC LIMIT ?",
+        (environment_id, value, limit),
+    ).fetchall()
+    return [json.loads(r["raw_json"]) for r in rows]
 
 
 def _content_sha256(raw_json):
@@ -1306,68 +1505,83 @@ def _record_ingestion_manifest(conn, environment_id, source, since, until, new_e
     two processes cannot fork the chain either. Caller must hold conn;
     commits on its own, after the row-insert transaction it covers."""
     entries = [tuple(e) for e in new_entries]
-    batch_hash = _sha256_of_lines(sorted(uuid for uuid, _c, _s in entries))
-    content_hash = _manifest_content_hash(entries)
-    created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     with _db_lock:
         try:
             if not conn.in_transaction:
                 conn.execute("BEGIN IMMEDIATE")
-            recorded = conn.execute(
-                "SELECT manifest_id, head_hash FROM chain_heads WHERE environment_id = ?", (environment_id,)
-            ).fetchone()
-            prev = conn.execute(
-                "SELECT batch_hash, entry_hash FROM ingestion_manifests WHERE environment_id = ? ORDER BY id DESC LIMIT 1",
-                (environment_id,),
-            ).fetchone()
-            last_hash = (prev["entry_hash"] or prev["batch_hash"]) if prev else None
-            if recorded is None or _recorded_head_is_stale(conn, environment_id, recorded):
-                prev_hash = last_hash
-            else:
-                prev_hash = recorded["head_hash"]
-            if EVIDENCE_CHAIN_V2:
-                entry_hash = _manifest_entry_hash(
-                    prev_hash, environment_id, source, since, until, len(entries), created_at, batch_hash, content_hash
-                )
-                v2_fields = (content_hash, entry_hash, None)  # entries go to manifest_entries (migration 007)
-            else:
-                entry_hash = batch_hash  # v1 head: the next row chains to batch_hash, exactly as before
-                v2_fields = (None, None, None)
-            cur = conn.execute(
-                """INSERT INTO ingestion_manifests
-                   (environment_id, source, since, until, row_count, batch_hash, prev_manifest_hash, created_at,
-                    content_hash, entry_hash, entries_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (environment_id, source, since, until, len(entries), batch_hash, prev_hash, created_at, *v2_fields),
-            )
-            manifest_id = cur.lastrowid
-            if EVIDENCE_CHAIN_V2:
-                conn.executemany(
-                    "INSERT INTO manifest_entries (environment_id, manifest_id, uuid, sha) VALUES (?, ?, ?, ?)",
-                    ((environment_id, manifest_id, u, s) for u, c, s in entries if c),
-                )
-            # The head is recorded in both modes, so a v1 row written with
-            # the flag off still keeps chain_heads current (the chain is
-            # reported as downgraded either way; it must not ALSO look cut short).
-            conn.execute(
-                """INSERT INTO chain_heads (environment_id, manifest_id, head_hash, updated_at) VALUES (?, ?, ?, ?)
-                   ON CONFLICT(environment_id) DO UPDATE SET
-                       manifest_id = excluded.manifest_id, head_hash = excluded.head_hash, updated_at = excluded.updated_at""",
-                (environment_id, manifest_id, entry_hash, created_at),
-            )
+            entry_hash, _manifest_id = _write_manifest_row(conn, environment_id, source, since, until, entries)
             conn.commit()
         except Exception:
             conn.rollback()
             raise
+    _anchor_chain_head(environment_id, source, len(entries), entry_hash)
+    return entry_hash
+
+
+def _anchor_chain_head(environment_id, source, row_count, entry_hash):
+    """The out-of-database anchor of a freshly sealed manifest (see
+    _record_ingestion_manifest). Never allowed to break an ingestion."""
     try:
         import create_secret_folders
         create_secret_folders.log_audit_event(
             None, None, "evidence_chain.sealed",
-            {"environment_id": environment_id, "source": source, "row_count": len(entries), "chain_head": entry_hash},
+            {"environment_id": environment_id, "source": source, "row_count": row_count, "chain_head": entry_hash},
         )
     except Exception:
         pass
-    return entry_hash
+
+
+def _write_manifest_row(conn, environment_id, source, since, until, entries):
+    """The chain write itself, for a caller that already holds _db_lock and an
+    open write transaction on `conn` (it neither locks nor commits, so a
+    snapshot can be stored and sealed in ONE transaction). Returns
+    (entry_hash, manifest_id)."""
+    batch_hash = _sha256_of_lines(sorted(uuid for uuid, _c, _s in entries))
+    content_hash = _manifest_content_hash(entries)
+    created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    recorded = conn.execute(
+        "SELECT manifest_id, head_hash FROM chain_heads WHERE environment_id = ?", (environment_id,)
+    ).fetchone()
+    prev = conn.execute(
+        "SELECT batch_hash, entry_hash FROM ingestion_manifests WHERE environment_id = ? ORDER BY id DESC LIMIT 1",
+        (environment_id,),
+    ).fetchone()
+    last_hash = (prev["entry_hash"] or prev["batch_hash"]) if prev else None
+    if recorded is None or _recorded_head_is_stale(conn, environment_id, recorded):
+        prev_hash = last_hash
+    else:
+        prev_hash = recorded["head_hash"]
+    if EVIDENCE_CHAIN_V2:
+        entry_hash = _manifest_entry_hash(
+            prev_hash, environment_id, source, since, until, len(entries), created_at, batch_hash, content_hash
+        )
+        v2_fields = (content_hash, entry_hash, None)  # entries go to manifest_entries (migration 007)
+    else:
+        entry_hash = batch_hash  # v1 head: the next row chains to batch_hash, exactly as before
+        v2_fields = (None, None, None)
+    cur = conn.execute(
+        """INSERT INTO ingestion_manifests
+           (environment_id, source, since, until, row_count, batch_hash, prev_manifest_hash, created_at,
+            content_hash, entry_hash, entries_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (environment_id, source, since, until, len(entries), batch_hash, prev_hash, created_at, *v2_fields),
+    )
+    manifest_id = cur.lastrowid
+    if EVIDENCE_CHAIN_V2:
+        conn.executemany(
+            "INSERT INTO manifest_entries (environment_id, manifest_id, uuid, sha) VALUES (?, ?, ?, ?)",
+            ((environment_id, manifest_id, u, sh) for u, c, sh in entries if c),
+        )
+    # The head is recorded in both modes, so a v1 row written with
+    # the flag off still keeps chain_heads current (the chain is
+    # reported as downgraded either way; it must not ALSO look cut short).
+    conn.execute(
+        """INSERT INTO chain_heads (environment_id, manifest_id, head_hash, updated_at) VALUES (?, ?, ?, ?)
+           ON CONFLICT(environment_id) DO UPDATE SET
+               manifest_id = excluded.manifest_id, head_hash = excluded.head_hash, updated_at = excluded.updated_at""",
+        (environment_id, manifest_id, entry_hash, created_at),
+    )
+    return entry_hash, manifest_id
 
 
 # DATA-04: new manifests are written in the v2 format (enabled 5.40.4,
@@ -1381,7 +1595,7 @@ def _record_ingestion_manifest(conn, environment_id, source, since, until, new_e
 EVIDENCE_CHAIN_V2 = True
 
 
-def verify_ingestion_chain(environment_id, deep=False):
+def verify_ingestion_chain(environment_id, deep=False, sync_in_progress=False):
     """Walks this environment's ingestion_manifests in insertion order
     and verifies the chain (DATA-04, see _record_ingestion_manifest):
     every row's prev_manifest_hash must equal the previous row's head
@@ -1439,13 +1653,13 @@ def verify_ingestion_chain(environment_id, deep=False):
     if own_txn:
         conn.execute("BEGIN")  # one WAL read snapshot for every read below
     try:
-        return _verify_ingestion_chain_snapshot(conn, environment_id, deep)
+        return _verify_ingestion_chain_snapshot(conn, environment_id, deep, sync_in_progress)
     finally:
         if own_txn:
             conn.rollback()
 
 
-def _verify_ingestion_chain_snapshot(conn, environment_id, deep):
+def _verify_ingestion_chain_snapshot(conn, environment_id, deep, sync_in_progress=False):
     rows = conn.execute(
         """SELECT id, environment_id, source, since, until, row_count, batch_hash, prev_manifest_hash,
                   created_at, content_hash, entry_hash
@@ -1499,15 +1713,32 @@ def _verify_ingestion_chain_snapshot(conn, environment_id, deep):
                 # Streamed in the content hash's own order: SQLite's default
                 # BINARY collation compares UTF-8 bytes, which orders the
                 # same as Python's code-point sort of the same strings.
-                sealed = (
-                    (r["line"], r["uuid"], r["sha"], r["raw_json"]) for r in conn.execute(
-                        """SELECT me.uuid || ':' || me.sha AS line, me.uuid, me.sha, e.raw_json
-                           FROM manifest_entries me
-                           LEFT JOIN events e ON e.environment_id = me.environment_id AND e.uuid = me.uuid
-                           WHERE me.manifest_id = ? ORDER BY line""",
-                        (row["id"],),
+                is_snapshot = (row["source"] or "").startswith(SNAPSHOT_SOURCE_PREFIX)
+                if is_snapshot:
+                    # 5.50.0: a snapshot's sealed objects live in config_snapshot_items (until = snapshot id).
+                    problem = _snapshot_seal_problem(conn, environment_id, row)
+                    if problem:
+                        return _broken(row, problem)
+                    sealed = (
+                        (r["line"], r["uuid"], r["sha"], r["json"]) for r in conn.execute(
+                            """SELECT me.uuid || ':' || me.sha AS line, me.uuid, me.sha, i.json
+                               FROM manifest_entries me
+                               LEFT JOIN config_snapshot_items i ON i.snapshot_id = CAST(? AS INTEGER)
+                                    AND i.environment_id = me.environment_id AND i.item_key = me.uuid
+                               WHERE me.manifest_id = ? ORDER BY line""",
+                            (row["until"], row["id"]),
+                        )
                     )
-                )
+                else:
+                    sealed = (
+                        (r["line"], r["uuid"], r["sha"], r["raw_json"]) for r in conn.execute(
+                            """SELECT me.uuid || ':' || me.sha AS line, me.uuid, me.sha, e.raw_json
+                               FROM manifest_entries me
+                               LEFT JOIN events e ON e.environment_id = me.environment_id AND e.uuid = me.uuid
+                               WHERE me.manifest_id = ? ORDER BY line""",
+                            (row["id"],),
+                        )
+                    )
             h = hashlib.sha256()
             count = 0
             first_event_problem = None
@@ -1518,9 +1749,14 @@ def _verify_ingestion_chain_snapshot(conn, environment_id, deep):
                 count += 1
                 if first_event_problem is None:
                     if raw_json is None:
-                        first_event_problem = f"curated event {uuid} is missing from the archive"
+                        first_event_problem = (
+                            f"snapshot object {uuid} is missing" if (row["source"] or "").startswith(SNAPSHOT_SOURCE_PREFIX)
+                            else f"curated event {uuid} is missing from the archive")
                     elif _content_sha256(raw_json) != sha:
-                        first_event_problem = f"event {uuid} content does not match its sealed hash"
+                        first_event_problem = (
+                            f"snapshot object {uuid} content does not match its sealed hash"
+                            if (row["source"] or "").startswith(SNAPSHOT_SOURCE_PREFIX)
+                            else f"event {uuid} content does not match its sealed hash")
             if count > row["row_count"]:
                 return _broken(row, "the manifest lists more sealed rows than row_count")
             # The sealed entries are the curated rows only, so the content
@@ -1552,7 +1788,385 @@ def _verify_ingestion_chain_snapshot(conn, environment_id, deep):
             "valid": False, "broken_at": rows[-1]["id"],
             "reason": "sealed (v2) manifests exist but the recorded chain head is missing",
         })
+    if deep and result["valid"]:
+        # 5.50.0: every curated event stored must be covered by a manifest. A sync killed between a page's commit and its
+        # seal leaves rows no manifest names; they used to verify as valid. A sync running right now has rows it has not
+        # sealed yet (it seals once, at its end): that is "pending", not a break.
+        unsealed = _count_unsealed_curated(conn, environment_id, result["legacy_manifests"])
+        result["unsealed_events"] = unsealed
+        if unsealed and sync_in_progress:
+            result["unsealed_pending"] = True
+        elif unsealed:
+            result.update({
+                "valid": False, "broken_at": None,
+                "reason": f"{unsealed} curated events are stored but not sealed into the evidence chain (a sync was interrupted, "
+                          "or events were re-flagged as curated after an upgrade); "
+                          "the next sync seals them in a recovery manifest",
+            })
     return result
+
+
+def _unsealed_boundary(conn, environment_id, legacy_manifests):
+    """rowid above which an unsealed curated event counts. With no legacy (pre-5.40.4, content-unsealed) manifests every
+    unsealed event counts (0). With legacy manifests, rows from before the first sealed event cannot be told from rows the
+    legacy chain never sealed, so only rows after the first sealed one count; with none sealed at all, nothing counts (None)."""
+    if not legacy_manifests:
+        return 0
+    row = conn.execute(
+        """SELECT e.rowid FROM events e WHERE e.environment_id = ? AND e.is_curated = 1
+           AND EXISTS (SELECT 1 FROM manifest_entries m WHERE m.environment_id = e.environment_id AND m.uuid = e.uuid)
+           ORDER BY e.rowid LIMIT 1""", (environment_id,)).fetchone()
+    return row[0] if row else None
+
+
+_UNSEALED_SQL = """FROM events e WHERE e.environment_id = ? AND e.is_curated = 1 AND e.rowid > ?
+                   AND NOT EXISTS (SELECT 1 FROM manifest_entries m WHERE m.environment_id = e.environment_id AND m.uuid = e.uuid)"""
+
+
+def _entries_json_uuids(conn, environment_id):
+    """uuids sealed through the 5.40.2-format entries_json cell (a hand-enabled v2 install), which manifest_entries does not hold."""
+    out = set()
+    for r in conn.execute("SELECT entries_json FROM ingestion_manifests WHERE environment_id = ? AND entries_json IS NOT NULL", (environment_id,)):
+        try:
+            out.update(str(pair[0]) for pair in json.loads(r[0]))
+        except (ValueError, TypeError, IndexError):
+            pass
+    return out
+
+
+def _count_unsealed_curated(conn, environment_id, legacy_manifests=None):
+    if legacy_manifests is None:
+        legacy_manifests = conn.execute(
+            "SELECT COUNT(*) FROM ingestion_manifests WHERE environment_id = ? AND entry_hash IS NULL", (environment_id,)).fetchone()[0]
+    boundary = _unsealed_boundary(conn, environment_id, legacy_manifests)
+    if boundary is None:
+        return 0
+    extra = _entries_json_uuids(conn, environment_id)
+    if not extra:
+        return conn.execute("SELECT COUNT(*) " + _UNSEALED_SQL, (environment_id, boundary)).fetchone()[0]
+    return sum(1 for r in conn.execute("SELECT e.uuid " + _UNSEALED_SQL, (environment_id, boundary)) if r["uuid"] not in extra)
+
+
+RECOVERY_BATCH = 100000
+
+
+def seal_unsealed_events(environment_id, limit=RECOVERY_BATCH):
+    """Seals the curated events no manifest names -- what a sync that was killed mid-run leaves behind -- into ONE recovery
+    manifest (source "sync_recovery", since/until the published range of the rows), so the chain says plainly that this is the
+    recovery of an interrupted run and covers exactly those rows. The rows are sealed as they are stored now: the recovery
+    proves them from this moment, not from their original sync. Returns {"sealed": n, "since", "until", "chain_head"} or
+    {"sealed": 0}. Bounded by `limit` rows per call (the next sync continues)."""
+    conn = _get_connection()
+    legacy = conn.execute("SELECT COUNT(*) FROM ingestion_manifests WHERE environment_id = ? AND entry_hash IS NULL", (environment_id,)).fetchone()[0]
+    boundary = _unsealed_boundary(conn, environment_id, legacy)
+    if boundary is None:
+        return {"sealed": 0}
+    extra = _entries_json_uuids(conn, environment_id)
+    rows = [r for r in conn.execute("SELECT e.uuid, e.published, e.raw_json " + _UNSEALED_SQL + " ORDER BY e.rowid LIMIT ?", (environment_id, boundary, limit))
+            if r["uuid"] not in extra]
+    if not rows:
+        return {"sealed": 0}
+    entries = [(r["uuid"], 1, _content_sha256(r["raw_json"])) for r in rows]
+    since = min(r["published"] for r in rows)
+    until = max(r["published"] for r in rows)
+    head = _record_ingestion_manifest(conn, environment_id, "sync_recovery", since, until, entries)
+    return {"sealed": len(entries), "since": since, "until": until, "chain_head": head}
+
+
+# ---------------------------------------------------------------------------
+# Chained configuration snapshots (5.50.0)
+# ---------------------------------------------------------------------------
+# A snapshot is the state of one kind of Okta configuration (e.g. who holds an
+# admin role) at one moment, stored as one row per object and sealed into the
+# same hash chain as the System Log archive: ONE ingestion_manifests row with
+# source "snapshot:<kind>", whose sealed entries are the objects
+# (manifest_entries.uuid = the object key, sha = sha256 of its canonical JSON).
+# `until` of that manifest is the snapshot id, so deep verification can find
+# the rows to re-hash. The snapshot and its seal are written in one
+# transaction: a snapshot without a seal cannot exist.
+#
+# What the seal proves, stated plainly (same threat model as the event chain,
+# see verify_ingestion_chain): editing, deleting or adding an object of a past
+# snapshot, deleting a snapshot, or reordering them is detected by a deep
+# integrity check; someone who also recomputes every hash and the recorded
+# head is not.
+SNAPSHOT_STATUSES = ("ok", "refused", "error")
+SNAPSHOT_SOURCE_PREFIX = "snapshot:"
+SNAPSHOT_MAX_ITEMS = 200000
+SNAPSHOT_MAX_ITEM_BYTES = 256 * 1024
+SNAPSHOT_MAX_KEY_CHARS = 512
+_SNAPSHOT_KIND_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$", re.ASCII)
+
+
+def _canonical_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _snapshot_sha(item_shas):
+    """sha256 over the sorted `key:sha` lines of a snapshot's objects."""
+    return _sha256_of_lines(sorted(f"{key}:{sha}" for key, sha in item_shas))
+
+
+def record_config_snapshot(environment_id, kind, items, status="ok", source_endpoint=None, meta=None, captured_at=None):
+    """Stores one snapshot and seals it into the evidence chain. `items` is an
+    iterable of (item_key, object) pairs (object: any JSON-able dict; the
+    caller has already removed anything that must not be kept, e.g. user
+    `credentials`). status "refused"/"error" records an attempt that read
+    nothing (zero items) -- also sealed, so "the token could not read this on
+    that date" is evidence too. Returns the snapshot dict (see
+    get_config_snapshot, without items)."""
+    if not _SNAPSHOT_KIND_RE.match(str(kind or "")):
+        raise ValueError("snapshot kind must be lower-case letters, digits and underscores")
+    if status not in SNAPSHOT_STATUSES:
+        raise ValueError(f"snapshot status must be one of {SNAPSHOT_STATUSES}")
+    prepared = {}
+    for key, obj in items:
+        if not isinstance(key, str) or not key or len(key) > SNAPSHOT_MAX_KEY_CHARS or "\n" in key:
+            raise ValueError("a snapshot item needs a non-empty key of at most 512 characters")
+        if key in prepared:
+            raise ValueError(f"duplicate snapshot item key {key!r}")
+        text = _canonical_json(obj)
+        if len(text.encode("utf-8")) > SNAPSHOT_MAX_ITEM_BYTES:
+            raise ValueError(f"snapshot item {key!r} is larger than {SNAPSHOT_MAX_ITEM_BYTES} bytes")
+        prepared[key] = (text, _content_sha256(text))
+        if len(prepared) > SNAPSHOT_MAX_ITEMS:
+            raise ValueError(f"more than {SNAPSHOT_MAX_ITEMS} items in one snapshot")
+    if status != "ok" and prepared:
+        raise ValueError("a refused or failed snapshot holds no items")
+    captured_at = _canonical_published(captured_at) if captured_at else datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    if captured_at is None:
+        raise ValueError("captured_at is not a timestamp")
+    snapshot_sha = _snapshot_sha((k, v[1]) for k, v in prepared.items())
+    meta_json = _canonical_json(meta) if meta else None
+    entries = [(k, 1, v[1]) for k, v in prepared.items()]
+    conn = _get_connection()
+    with _db_lock:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                """INSERT INTO config_snapshots
+                   (environment_id, kind, status, captured_at, source_endpoint, item_count, sha256, meta_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (environment_id, kind, status, captured_at, source_endpoint, len(prepared), snapshot_sha, meta_json),
+            )
+            snapshot_id = cur.lastrowid
+            conn.executemany(
+                "INSERT INTO config_snapshot_items (snapshot_id, environment_id, item_key, sha, json) VALUES (?, ?, ?, ?, ?)",
+                ((snapshot_id, environment_id, k, v[1], v[0]) for k, v in prepared.items()),
+            )
+            chain_head, manifest_id = _write_manifest_row(
+                conn, environment_id, SNAPSHOT_SOURCE_PREFIX + kind, captured_at, str(snapshot_id), entries
+            )
+            conn.execute("UPDATE config_snapshots SET manifest_id = ? WHERE snapshot_id = ?", (manifest_id, snapshot_id))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    _anchor_chain_head(environment_id, SNAPSHOT_SOURCE_PREFIX + kind, len(entries), chain_head)
+    return {
+        "snapshot_id": snapshot_id, "environment_id": environment_id, "kind": kind, "status": status,
+        "captured_at": captured_at, "source_endpoint": source_endpoint, "item_count": len(prepared),
+        "sha256": snapshot_sha, "meta": meta or None, "manifest_id": manifest_id, "chain_head": chain_head,
+    }
+
+
+def _snapshot_row(row):
+    out = dict(row)
+    meta = out.pop("meta_json", None)
+    try:
+        out["meta"] = json.loads(meta) if meta else None
+    except ValueError:
+        out["meta"] = None
+    return out
+
+
+def list_config_snapshots(environment_id, kind=None, limit=200):
+    """Newest first, without items."""
+    _require_positive_limit(limit)
+    conn = _get_connection()
+    sql = "SELECT * FROM config_snapshots WHERE environment_id = ?"
+    params = [environment_id]
+    if kind:
+        sql += " AND kind = ?"
+        params.append(kind)
+    sql += " ORDER BY captured_at DESC, snapshot_id DESC LIMIT ?"
+    params.append(min(int(limit), 1000))
+    return [_snapshot_row(r) for r in conn.execute(sql, params)]
+
+
+def config_series(environment_id, kind, as_of=None, limit_snapshots=1000):
+    """Time series from the objects of successful snapshots of one kind whose objects each carry a
+    numeric "count": {"snapshots": [{snapshot_id, captured_at, meta}], "series": {item_key: [(captured_at, count)]}},
+    oldest first, at most the newest `limit_snapshots` snapshots up to `as_of`. One indexed read; the
+    objects are tiny (counts only)."""
+    _require_positive_limit(limit_snapshots)
+    conn = _get_connection()
+    sql = "SELECT snapshot_id, captured_at, meta_json FROM config_snapshots WHERE environment_id = ? AND kind = ? AND status = 'ok'"
+    params = [environment_id, kind]
+    if as_of:
+        sql += " AND captured_at <= ?"
+        params.append(normalize_window(None, as_of)[1])
+    sql += " ORDER BY captured_at DESC, snapshot_id DESC LIMIT ?"
+    params.append(min(int(limit_snapshots), 5000))
+    snaps = list(reversed(conn.execute(sql, params).fetchall()))
+    out = {"snapshots": [], "series": {}}
+    for snap in snaps:
+        meta = None
+        try:
+            meta = json.loads(snap["meta_json"]) if snap["meta_json"] else None
+        except ValueError:
+            pass
+        out["snapshots"].append({"snapshot_id": snap["snapshot_id"], "captured_at": snap["captured_at"], "meta": meta})
+        for r in conn.execute("SELECT item_key, json FROM config_snapshot_items WHERE snapshot_id = ? AND environment_id = ?",
+                              (snap["snapshot_id"], environment_id)):
+            try:
+                obj = json.loads(r["json"])
+            except ValueError:
+                continue
+            count = obj.get("count") if isinstance(obj, dict) else None
+            if isinstance(count, int) and not isinstance(count, bool):
+                out["series"].setdefault(r["item_key"], []).append((snap["captured_at"], count))
+    return out
+
+
+def get_config_snapshot(environment_id, snapshot_id, with_items=True):
+    """The snapshot (scoped to this environment -- another environment's id
+    answers None) with, by default, `items`: [{"key", "sha", "object"}]."""
+    conn = _get_connection()
+    try:
+        snapshot_id = int(snapshot_id)
+    except (TypeError, ValueError):
+        return None
+    row = conn.execute(
+        "SELECT * FROM config_snapshots WHERE environment_id = ? AND snapshot_id = ?", (environment_id, snapshot_id)
+    ).fetchone()
+    if row is None:
+        return None
+    out = _snapshot_row(row)
+    if with_items:
+        items = []
+        for r in conn.execute(
+                "SELECT item_key, sha, json FROM config_snapshot_items WHERE snapshot_id = ? AND environment_id = ? ORDER BY item_key",
+                (snapshot_id, environment_id)):
+            try:
+                obj = json.loads(r["json"])
+            except ValueError:
+                obj = None
+            items.append({"key": r["item_key"], "sha": r["sha"], "object": obj})
+        out["items"] = items
+    return out
+
+
+def latest_config_snapshot(environment_id, kind, as_of=None, with_items=True, only_ok=True):
+    """The newest snapshot of `kind` captured at or before `as_of` (a date or
+    timestamp; a bare date means the end of that day), or the newest of all.
+    Only successful captures unless only_ok=False."""
+    conn = _get_connection()
+    sql = "SELECT snapshot_id FROM config_snapshots WHERE environment_id = ? AND kind = ?"
+    params = [environment_id, kind]
+    if only_ok:
+        sql += " AND status = 'ok'"
+    if as_of:
+        bound = normalize_window(None, as_of)[1]  # a bad value raises ValueError (HTTP 400 at the route)
+        sql += " AND captured_at <= ?"
+        params.append(bound)
+    sql += " ORDER BY captured_at DESC, snapshot_id DESC LIMIT 1"
+    row = conn.execute(sql, params).fetchone()
+    return get_config_snapshot(environment_id, row["snapshot_id"], with_items) if row else None
+
+
+def diff_config_snapshots(environment_id, older_id, newer_id):
+    """added / removed / changed objects between two snapshots of the same kind
+    (and environment). `changed` lists the keys whose canonical JSON differs,
+    with the field names that differ at the top level. Raises ValueError for an
+    unknown snapshot or two different kinds."""
+    a = get_config_snapshot(environment_id, older_id)
+    b = get_config_snapshot(environment_id, newer_id)
+    if a is None or b is None:
+        raise ValueError("snapshot not found")
+    if a["kind"] != b["kind"]:
+        raise ValueError("the two snapshots are of different kinds")
+    before = {i["key"]: i for i in a["items"]}
+    after = {i["key"]: i for i in b["items"]}
+    added = sorted(set(after) - set(before))
+    removed = sorted(set(before) - set(after))
+    changed = []
+    for key in sorted(set(before) & set(after)):
+        if before[key]["sha"] != after[key]["sha"]:
+            x, y = before[key]["object"] or {}, after[key]["object"] or {}
+            fields = sorted(f for f in set(x) | set(y) if x.get(f) != y.get(f)) if isinstance(x, dict) and isinstance(y, dict) else []
+            changed.append({"key": key, "fields": fields, "before": before[key]["object"], "after": after[key]["object"]})
+    return {
+        "kind": a["kind"], "older": {k: a[k] for k in ("snapshot_id", "captured_at", "status", "item_count")},
+        "newer": {k: b[k] for k in ("snapshot_id", "captured_at", "status", "item_count")},
+        "added": [{"key": k, "object": after[k]["object"]} for k in added],
+        "removed": [{"key": k, "object": before[k]["object"]} for k in removed],
+        "changed": changed,
+        "unchanged": len(set(before) & set(after)) - len(changed),
+    }
+
+
+def export_config_snapshot(environment_id, snapshot_id):
+    """Everything an auditor needs to re-check one snapshot offline: the
+    snapshot, its objects with their sha256, the sha256 over the set, and the
+    chain link that sealed it. None if it is not this environment's."""
+    snap = get_config_snapshot(environment_id, snapshot_id)
+    if snap is None:
+        return None
+    conn = _get_connection()
+    manifest = conn.execute(
+        "SELECT id, source, since, until, row_count, batch_hash, prev_manifest_hash, created_at, content_hash, entry_hash "
+        "FROM ingestion_manifests WHERE id = ? AND environment_id = ?", (snap["manifest_id"], environment_id)
+    ).fetchone()
+    snap["manifest"] = dict(manifest) if manifest else None
+    snap["format"] = "opa-compliance-wizard-config-snapshot/1"
+    return snap
+
+
+def verify_config_snapshot(environment_id, snapshot_id):
+    """Re-hashes one snapshot's stored objects against their recorded sha256
+    and the snapshot's own sha256/item_count. {"valid", "reason"}. (The chain
+    seal over the same hashes is checked by verify_ingestion_chain(deep=True).)"""
+    snap = get_config_snapshot(environment_id, snapshot_id)
+    if snap is None:
+        return {"valid": False, "reason": "snapshot not found"}
+    conn = _get_connection()
+    pairs = []
+    for r in conn.execute("SELECT item_key, sha, json FROM config_snapshot_items WHERE snapshot_id = ? AND environment_id = ?",
+                          (snap["snapshot_id"], environment_id)):
+        if _content_sha256(r["json"]) != r["sha"]:
+            return {"valid": False, "reason": f"object {r['item_key']} does not match its recorded hash"}
+        pairs.append((r["item_key"], r["sha"]))
+    if len(pairs) != snap["item_count"]:
+        return {"valid": False, "reason": "the number of stored objects differs from the snapshot's item count"}
+    if _snapshot_sha(pairs) != snap["sha256"]:
+        return {"valid": False, "reason": "the objects do not match the snapshot's recorded hash"}
+    return {"valid": True, "reason": None}
+
+
+def _snapshot_seal_problem(conn, environment_id, manifest_row):
+    """Deep-check helper: the snapshot a snapshot manifest sealed must still
+    exist, point back at this manifest, and hold exactly the number of objects
+    the manifest counted (an object ADDED after sealing is as much a change as
+    one edited or removed). Returns a reason or None."""
+    try:
+        snapshot_id = int(manifest_row["until"])
+    except (TypeError, ValueError):
+        return "a snapshot manifest does not name its snapshot"
+    snap = conn.execute(
+        "SELECT manifest_id, item_count, kind FROM config_snapshots WHERE snapshot_id = ? AND environment_id = ?",
+        (snapshot_id, environment_id),
+    ).fetchone()
+    if snap is None:
+        return f"snapshot {snapshot_id} was removed after it was sealed"
+    if snap["manifest_id"] != manifest_row["id"] or SNAPSHOT_SOURCE_PREFIX + snap["kind"] != manifest_row["source"]:
+        return f"snapshot {snapshot_id} does not match the manifest that sealed it"
+    stored = conn.execute(
+        "SELECT COUNT(*) FROM config_snapshot_items WHERE snapshot_id = ? AND environment_id = ?", (snapshot_id, environment_id)
+    ).fetchone()[0]
+    if stored != manifest_row["row_count"] or stored != snap["item_count"]:
+        return f"snapshot {snapshot_id} holds {stored} objects but {manifest_row['row_count']} were sealed"
+    return None
 
 
 def _stored_raw(conn, environment_id, uuid):
@@ -1733,6 +2347,7 @@ def get_sync_state(environment_id):
     if row is None:
         return None
     result = dict(row)
+    result.pop("poll_cursor", None)  # an internal resume point (an Okta paging link), not something to show or export
     result["total_events_ingested"] = conn.execute(
         "SELECT COUNT(*) FROM events WHERE environment_id = ?", (environment_id,)
     ).fetchone()[0]
@@ -1742,6 +2357,7 @@ def get_sync_state(environment_id):
 _SYNC_STATE_FIELDS = (
     "last_synced_at", "last_sync_completed_at", "last_sync_status", "last_sync_error",
     "total_events_ingested", "ingestion_scope", "last_sync_attempt_at", "last_import_at",
+    "poll_cursor", "sync_mode",
 )
 
 
@@ -1779,7 +2395,8 @@ def reset_sync_watermark(environment_id):
     conn = _get_connection()
     state = get_sync_state(environment_id)
     previous = (state or {}).get("last_synced_at")
-    _upsert_sync_state(conn, environment_id, last_synced_at=None, last_sync_status=None, last_sync_error=None)
+    _upsert_sync_state(conn, environment_id, last_synced_at=None, last_sync_status=None, last_sync_error=None,
+                       poll_cursor=None, sync_mode=None)
     return previous
 
 
@@ -1847,53 +2464,119 @@ SAFETY_LAG_SECONDS = 5 * 60
 WATERMARK_OVERLAP_SECONDS = 60 * 60
 
 
+MAX_TIMEOUTS_PER_RUN = 8  # Okta 30-second timeouts one run tolerates (each costs several retried requests) before it stops as partial
+SYSTEM_LOG_PATH = "/api/v1/logs"  # equals create_secret_folders.SYSTEM_LOG_PATH (a test pins it)
+SYSTEM_LOG_MAX_SINCE_DAYS = 180  # Okta: "The since parameter is over 180 days prior to the current day" (HTTP 400)
+POLL_LIMIT = 1000
+POLL_MIN_LIMIT = 50  # the page size a timed-out poll shrinks to before giving up
+POLL_MAX_PAGES = 2000  # per run; a longer catch-up resumes from the saved cursor on the next run
+POLL_CURSOR_MAX_CHARS = 4096
+
+
+def clamp_system_log_since(since_iso, now=None):
+    """(since, clamped). Okta refuses a `since` more than 180 days back with a
+    400, and keeps only 90 days of events anyway, so an older `since` (a stale
+    watermark, a hand-entered date) is moved to 179 days back instead of
+    failing the sync. `clamped` tells the caller to say so."""
+    now = now or datetime.now(timezone.utc)
+    floor = _iso_ms(now - timedelta(days=SYSTEM_LOG_MAX_SINCE_DAYS - 1))
+    canonical = _canonical_published(since_iso)
+    if canonical is None or canonical < floor:
+        return floor, True
+    return canonical, False
+
+
+def _is_timeout_error(exc):
+    """Okta answers a System Log query that ran past its 30-second limit with
+    HTTP 500 and error code E0000009. That is "ask for less", never "no
+    events"."""
+    return str(getattr(exc, "status", "")) == "500" and "E0000009" in str(getattr(exc, "body", ""))
+
+
+def _poll_start_path(since_iso, limit=POLL_LIMIT):
+    from urllib.parse import urlencode
+    return f"{SYSTEM_LOG_PATH}?" + urlencode({"limit": str(limit), "sortOrder": "ASCENDING", "since": since_iso})
+
+
+def _path_with_limit(path, limit):
+    """`path` with its limit parameter replaced (every other parameter, the
+    paging cursor included, untouched)."""
+    from urllib.parse import parse_qsl, urlencode, urlsplit
+    parts = urlsplit(path)
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "limit"]
+    query.insert(0, ("limit", str(limit)))
+    return f"{parts.path}?{urlencode(query)}"
+
+
+def _query_limit(path):
+    from urllib.parse import parse_qs, urlsplit
+    try:
+        return int((parse_qs(urlsplit(path).query).get("limit") or [POLL_LIMIT])[0])
+    except ValueError:
+        return POLL_LIMIT
+
+
+def _usable_poll_cursor(value):
+    """A stored cursor is used only if it still looks like one of our own
+    System Log paging links (a relative /api/v1/logs path with a bounded
+    length): the archive file is data, and a cursor is a request path."""
+    return (isinstance(value, str) and 0 < len(value) <= POLL_CURSOR_MAX_CHARS
+            and value.startswith(SYSTEM_LOG_PATH + "?") and "\n" not in value and "\r" not in value)
+
+
+def _read_poll_cursor(conn, environment_id):
+    row = conn.execute("SELECT poll_cursor FROM sync_state WHERE environment_id = ?", (environment_id,)).fetchone()
+    value = row["poll_cursor"] if row else None
+    return value if _usable_poll_cursor(value) else None
+
+
 def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, on_progress=None):
-    """Pulls System Log events from the real Okta API via the EXISTING
-    OktaClient.get_system_log (pagination + rate-limit handling already
-    built in, shared with every other Okta call in this project) and
-    ingests them. `since` defaults to 90 days ago if this is the first
-    sync for `environment_id`, else resumes from just before the last
-    watermark (see WATERMARK_OVERLAP_SECONDS above).
+    """Pulls System Log events from the real Okta API and archives them.
 
-    Walks the window one day at a time (via get_system_log's `until`)
-    rather than one unbounded call -- confirmed live 2026-09-29: a
-    genuinely busy tenant's automatic OPA credential-rotation traffic
-    alone produces >1,100 raw events/day, so a 90-day backfill can
-    exceed max_pages=200 (200k events) within a SINGLE unbounded call,
-    silently truncating the sync short of "now" even though every
-    individual API call succeeded. Chunking bounds each day's page count
-    well under that cap, and -- just as importantly -- advances and
-    persists the watermark after EVERY chunk (not just at the very end),
-    so a mid-run crash/restart resumes from the last completed day
-    instead of re-fetching the whole window or silently losing progress.
-    The walk never reaches literal "now" -- see SAFETY_LAG_SECONDS above.
+    Two modes (5.50.0, from Okta's System Log query guide):
 
-    Returns {"inserted": int, "scanned": int, "since": str, "chunks": int,
-    "complete": bool, "incomplete_chunks": int, "chain_head": str}.
+    * POLLING (the steady state). Okta orders a request with `since` and no
+      `until` by when each event was PERSISTED, "returns every event that
+      occurs in your org", and always carries a `next` link. Following those
+      links and saving the last one as a cursor (sync_state.poll_cursor)
+      therefore catches an event that was persisted long after its
+      `published` time, which the old bounded since/until day-walk skipped
+      for good once it had walked past that day ("Don't transfer data by
+      manually paginating using `since` and `until`, as this may lead to
+      skipped or duplicated events"). A run stops at the first empty page.
+      The cursor is saved after every page, so a restart continues from it.
+      If Okta rejects a stored cursor (HTTP 400) the run falls back, once,
+      to `since` = the watermark minus WATERMARK_OVERLAP_SECONDS; events are
+      deduplicated by uuid, so the overlap costs nothing.
+    * BOUNDED, day by day, only for the first run on an environment with no
+      watermark (a 90-day backfill, where the page cap is the real
+      constraint) and for a caller-supplied `since`. The first-run backfill
+      is followed by one polling pass, which also sets the cursor.
 
-    Incomplete chunks (DATA-09, external review, 2026-10-05): when a
-    day-chunk hits get_system_log's max_pages cap, the fetch is ASCENDING,
-    so everything up to the newest `published` actually returned is known
-    complete. The sync now persists the watermark at exactly that
-    timestamp and carries on from there (re-reading that one inclusive
-    instant, which INSERT OR IGNORE dedupes) instead of stopping -- the
-    old "stop and retry the same day tomorrow" could never get past a day
-    busier than the cap and let everything after it age out of Okta's
-    90-day window. Only a chunk that returns NO progress at all (every
-    page carried the same instant) stops the run with last_sync_status
-    "error", since re-reading it would loop forever.
+    An install upgraded from before 5.50.0 has a watermark and no cursor: its
+    next sync starts a polling pass at watermark minus the overlap. Nothing is
+    skipped and nothing is stored twice.
 
-    Failure (DATA-05): a chunk's rows commit as they land, so an exception
-    on a later chunk used to leave rows that no manifest covered and a
-    sync_state stuck at "running" with no error. Any exception now
-    records the manifest for every row already inserted, writes
-    last_sync_status="error" + last_sync_error, and re-raises. Exactly
-    one manifest is written per call (5.40.6): a failure after this
-    call's manifest committed (e.g. the final sync_state write) marks the
-    sync "error" but never seals the same rows a second time.
-    last_sync_completed_at is written ONLY by a successful completion;
-    last_sync_attempt_at records every start (the scheduler keys its
-    retry back-off off the attempt, not the completion)."""
+    `since` is clamped to Okta's 180-day limit (clamp_system_log_since). A
+    System Log query that Okta times out (HTTP 500 E0000009) is retried with
+    a smaller page (polling) or a smaller window (bounded); a refused query
+    (HTTP 400, e.g. E0000053 / E0000031 for a bad filter) is an error, never
+    an empty result. `last_synced_at` (the published watermark) advances only
+    after a pass is complete.
+
+    The bounded walk (BUG FIX DATA-02 / DATA-09, unchanged): one day per
+    chunk, never closer than SAFETY_LAG_SECONDS to now, the watermark
+    persisted after every chunk, a chunk that hits the page cap resumes from
+    the newest instant it returned, and a chunk with no progress at all
+    stops the run with last_sync_status "error".
+
+    Returns {"inserted", "scanned", "since", "chunks", "complete",
+    "incomplete_chunks", "chain_head", "mode", "pages", "since_clamped",
+    "cursor_reset"} (plus "error" when incomplete). Exactly one manifest is
+    written per call (5.40.6). Failure (DATA-05): any exception records the
+    manifest for rows already inserted, writes last_sync_status="error" and
+    re-raises. last_sync_completed_at is written only by a successful
+    completion; last_sync_attempt_at records every start."""
     if ingestion_scope not in INGESTION_SCOPES:
         raise ValueError(f"ingestion_scope must be one of {INGESTION_SCOPES}")
     conn = _get_connection()
@@ -1907,7 +2590,19 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
         last_sync_status="running", last_sync_error=None, ingestion_scope=ingestion_scope,
     )
 
-    if since is None:
+    # 5.50.0: rows a killed run committed but never sealed get their own recovery manifest before anything new is fetched.
+    recovered_events = 0
+    try:
+        recovered_events = seal_unsealed_events(environment_id)["sealed"]
+    except Exception as recovery_exc:  # never blocks the sync; the integrity check keeps reporting them
+        recovered_events = None
+        import create_secret_folders
+        create_secret_folders.log("WARN", f"sealing unsealed events of an interrupted run failed: {type(recovery_exc).__name__}")
+
+    explicit_since = since is not None
+    stored = None
+    cursor_path = None
+    if not explicit_since:
         state = get_sync_state(environment_id)
         stored = (state or {}).get("last_synced_at")
         if stored:
@@ -1925,24 +2620,46 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
                 )
                 _upsert_sync_state(conn, environment_id, last_sync_status="error", last_sync_error=message)
                 raise ValueError(message)
-            watermark_dt = datetime.fromisoformat(canonical.replace("Z", "+00:00"))
-            since = (watermark_dt - timedelta(seconds=WATERMARK_OVERLAP_SECONDS)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        else:
-            since = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            stored = canonical
+            cursor_path = _read_poll_cursor(conn, environment_id)
 
-    original_since = since
-    safe_now_dt = datetime.now(timezone.utc) - timedelta(seconds=SAFETY_LAG_SECONDS)
+    now_dt = datetime.now(timezone.utc)
+    safe_now_dt = now_dt - timedelta(seconds=SAFETY_LAG_SECONDS)
+    since_clamped = False
+    bounded = True       # run the day-by-day walk
+    poll_after = True    # then (or instead) a polling pass
+    poll_path = None
+    if explicit_since:
+        since, since_clamped = clamp_system_log_since(since, now_dt)
+        poll_after = False  # the caller asked for a specific window; the next scheduled run switches to polling
+    elif stored:
+        bounded = False
+        watermark_dt = datetime.fromisoformat(stored.replace("Z", "+00:00"))
+        resume_since = _iso_ms(watermark_dt - timedelta(seconds=WATERMARK_OVERLAP_SECONDS))
+        resume_since, since_clamped = clamp_system_log_since(resume_since, now_dt)
+        since = resume_since
+        poll_path = cursor_path or _poll_start_path(resume_since)
+    else:
+        since = _iso_ms(now_dt - timedelta(days=90))
+
     cursor = datetime.fromisoformat(since.replace("Z", "+00:00"))
+    if not bounded and cursor_path:
+        # The run continues from the saved cursor, not from a date: report that, not a `since` it never used.
+        since_clamped = False
+        original_since = None
+    else:
+        original_since = since
     total_inserted = 0
     total_scanned = 0  # rows fetched, INCLUDING any re-read after a page-cap resume (see DATA-09 above)
     chunks = 0
     incomplete_chunks = 0
-    all_new_entries = []  # Phase 6: accumulated across every day-chunk, sealed into ONE manifest row for this whole call
+    pages_polled = 0
+    cursor_reset = False
+    all_new_entries = []  # Phase 6: accumulated across every chunk and page, sealed into ONE manifest row for this whole call
+    poll_max_published = None
+    timeouts = {"n": 0}  # Okta timeouts this run, polling and bounded together
     # Exactly one manifest per call (5.40.6): once this call's rows are
-    # sealed, nothing may seal them again. Before this, a failure AFTER the
-    # success manifest committed (the final _upsert_sync_state) fell into
-    # the except below, whose _fail wrote a second manifest for the same
-    # rows -- the chain stayed valid but row_count was counted twice.
+    # sealed, nothing may seal them again.
     sealed = {"head": None, "done": False}
 
     def _seal(until):
@@ -1961,23 +2678,122 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
         except Exception:
             _seal(until)  # the rows still get sealed when the status write (or the callback) fails
             raise
-        # An interrupted sync still produced real inserted rows (across
-        # however many chunks completed) -- those must be in the chain
-        # too, same "nothing new is silently invisible" reasoning as a
-        # zero-new-rows batch. A no-op if this call already sealed them.
+        # An interrupted sync still produced real inserted rows -- those
+        # must be in the chain too, same "nothing new is silently
+        # invisible" reasoning as a zero-new-rows batch. A no-op if this
+        # call already sealed them.
         return _seal(until)
 
+    def _result(complete, chain_head, error=None):
+        out = {
+            "inserted": total_inserted, "scanned": total_scanned, "since": original_since, "chunks": chunks,
+            "complete": complete, "incomplete_chunks": incomplete_chunks, "chain_head": chain_head,
+            "mode": "bounded" if explicit_since else ("bounded+polling" if bounded else "polling"),
+            "pages": pages_polled, "since_clamped": since_clamped, "cursor_reset": cursor_reset,
+            "recovered_events": recovered_events, "from_cursor": bool(not bounded and cursor_path),
+        }
+        if error:
+            out["error"] = error
+        return out
+
+    def _fallback_since():
+        base = datetime.fromisoformat(stored.replace("Z", "+00:00")) if stored else now_dt - timedelta(days=90)
+        return clamp_system_log_since(_iso_ms(base - timedelta(seconds=WATERMARK_OVERLAP_SECONDS)), now_dt)[0]
+
+    def _poll_pass(start_path):
+        """Follows the System Log `next` links from start_path until an
+        empty page. Returns (complete, error_message)."""
+        nonlocal total_inserted, total_scanned, pages_polled, cursor_reset, poll_max_published
+        path = start_path
+        fell_back = False
+        shrinks = 0
+        while pages_polled < POLL_MAX_PAGES:
+            try:
+                events, next_path = okta_client.get_system_log_page(path)
+            except Exception as exc:
+                if _is_timeout_error(exc):
+                    timeouts["n"] += 1
+                    if timeouts["n"] > MAX_TIMEOUTS_PER_RUN:
+                        return False, (f"partial: Okta timed out {timeouts['n']} times in this run; progress is saved and the next sync continues "
+                                       "from the saved cursor.")
+                    current = _query_limit(path)
+                    smaller = max(POLL_MIN_LIMIT, current // 4)
+                    if smaller >= current or shrinks >= 3:
+                        raise
+                    shrinks += 1
+                    if on_progress:
+                        on_progress("fetch", "progress", f"Okta timed the request out; retrying with pages of {smaller}")
+                    path = _path_with_limit(path, smaller)
+                    continue
+                if str(getattr(exc, "status", "")) == "400" and cursor_path and path == cursor_path and not fell_back:
+                    # Okta rejected the saved cursor: start again from the watermark (events dedupe by uuid).
+                    fell_back = cursor_reset = True
+                    path = _poll_start_path(_fallback_since())
+                    if on_progress:
+                        on_progress("fetch", "progress", "The saved System Log cursor was refused; resuming from the watermark")
+                    continue
+                raise
+            pages_polled += 1
+            total_scanned += len(events)
+            if events:
+                rows = [_normalize_live_event(e) for e in events if isinstance(e, dict)]
+                inserted, max_published, new_entries = _insert_rows(conn, environment_id, rows, ingestion_scope)
+                total_inserted += inserted
+                all_new_entries.extend(new_entries)
+                if max_published and (poll_max_published is None or max_published > poll_max_published):
+                    poll_max_published = max_published
+                if next_path is not None and _path_with_limit(next_path, 0) == _path_with_limit(path, 0):
+                    return False, "Okta returned the same System Log page again; stopping instead of looping."
+            stored_path = next_path
+            if next_path and _query_limit(next_path) != POLL_LIMIT:
+                # Okta echoes the page size in its `next` link: a size shrunk after a timeout must not be saved, or every later
+                # healthy run would keep asking for small pages. Only `limit` changes.
+                stored_path = _path_with_limit(next_path, POLL_LIMIT)
+            if stored_path and _usable_poll_cursor(stored_path):
+                # Saved after the page's rows are committed: a crash between the two re-reads one page, which dedupes.
+                _upsert_sync_state(conn, environment_id, poll_cursor=stored_path, sync_mode="polling")
+            if next_path and _query_limit(next_path) != _query_limit(path):
+                next_path = _path_with_limit(next_path, _query_limit(path))  # within this run keep the size that just worked
+            if on_progress and events:
+                on_progress("fetch", "progress", f"polling: page {pages_polled}, {total_scanned} event(s) read")
+            if not events or not next_path:
+                return True, None
+            path = next_path
+        return False, (
+            f"Read {POLL_MAX_PAGES} System Log pages in one run; the cursor is saved, so the next sync continues "
+            "from where this one stopped."
+        )
+
+    chunk_span = timedelta(days=CHUNK_DAYS)
+    failed_floor = None  # the smallest window that timed out in this run: the walk never grows back to it
     try:
-        while cursor < safe_now_dt:
-            chunk_until_dt = min(cursor + timedelta(days=CHUNK_DAYS), safe_now_dt)
+        while bounded and cursor < safe_now_dt:
+            chunk_until_dt = min(cursor + chunk_span, safe_now_dt)
             chunk_since = _iso_ms(cursor)  # millisecond-exact, so "no progress" below compares like with like
             chunk_until = _iso_ms(chunk_until_dt)
 
             if on_progress:
                 on_progress("fetch", "progress", f"{chunk_since} .. {chunk_until}")
-            events, complete = okta_client.get_system_log(
-                since=chunk_since, until=chunk_until, limit=1000, sort_order="ASCENDING", max_pages=200
-            )
+            try:
+                events, complete = okta_client.get_system_log(
+                    since=chunk_since, until=chunk_until, limit=1000, sort_order="ASCENDING", max_pages=200
+                )
+            except Exception as exc:
+                if _is_timeout_error(exc) and chunk_span > timedelta(minutes=1):
+                    timeouts["n"] += 1
+                    failed_floor = chunk_span if failed_floor is None else min(failed_floor, chunk_span)
+                    if timeouts["n"] > MAX_TIMEOUTS_PER_RUN:
+                        error_message = (f"partial: Okta timed out {timeouts['n']} times in this run; progress up to {_iso_ms(cursor)} is saved "
+                                         "and the next sync continues from there.")
+                        chain_head = _fail(error_message, chunk_since)
+                        return _result(False, chain_head, error_message)
+                    chunk_span = max(timedelta(minutes=1), chunk_span / 4)  # ask for a smaller window, not for nothing
+                    continue
+                raise
+            grown = min(timedelta(days=CHUNK_DAYS), chunk_span * 1.5)  # recover gradually, and never back to a size that failed here
+            if failed_floor is not None and grown >= failed_floor:
+                grown = chunk_span
+            chunk_span = grown
             total_scanned += len(events)
 
             rows = [_normalize_live_event(e) for e in events]
@@ -1995,11 +2811,7 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
                         f"Watermark left at {chunk_since}; the next sync will retry it."
                     )
                     chain_head = _fail(error_message, chunk_until)
-                    return {
-                        "inserted": total_inserted, "scanned": total_scanned, "since": original_since,
-                        "chunks": chunks, "complete": False, "incomplete_chunks": incomplete_chunks,
-                        "error": error_message, "chain_head": chain_head,
-                    }
+                    return _result(False, chain_head, error_message)
                 # Everything up to max_published is complete (ascending
                 # fetch); resume from exactly there, same day.
                 if on_progress:
@@ -2013,6 +2825,19 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
             watermark = max_published or chunk_until
             _upsert_sync_state(conn, environment_id, last_synced_at=watermark, last_sync_status="running")
             cursor = chunk_until_dt
+
+        if poll_after:
+            if poll_path is None:  # first run: poll from just before where the bounded walk stopped
+                poll_path = _poll_start_path(clamp_system_log_since(
+                    _iso_ms(min(cursor, safe_now_dt) - timedelta(seconds=WATERMARK_OVERLAP_SECONDS)), now_dt)[0])
+            complete, poll_error = _poll_pass(poll_path)
+            if not complete:
+                chain_head = _fail(poll_error, _iso_ms(safe_now_dt))
+                return _result(False, chain_head, poll_error)
+            if poll_max_published:
+                current = (get_sync_state(environment_id) or {}).get("last_synced_at")
+                if not current or poll_max_published > current:
+                    _upsert_sync_state(conn, environment_id, last_synced_at=poll_max_published)
 
         # Still inside the try: a failure sealing the manifest or writing
         # the final state must also end as "error", never a silent "running".
@@ -2030,11 +2855,8 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
         raise
 
     if on_progress:
-        on_progress("ingest", "done", f"{total_inserted} new row(s) inserted across {chunks} day-chunk(s)")
-    return {
-        "inserted": total_inserted, "scanned": total_scanned, "since": original_since, "chunks": chunks,
-        "complete": True, "incomplete_chunks": incomplete_chunks, "chain_head": chain_head,
-    }
+        on_progress("ingest", "done", f"{total_inserted} new row(s) inserted across {chunks} day-chunk(s) and {pages_polled} polled page(s)")
+    return _result(True, chain_head)
 
 
 def import_from_csv(csv_path, environment_id, ingestion_scope, on_progress=None):
@@ -2100,6 +2922,12 @@ def _delete_pruned_targets(conn, environment_id, events_where_sql, events_where_
     )
 
 
+def _week_monday(published):
+    """The Monday (YYYY-MM-DD) of the week a canonical timestamp falls in: weeks labelled before it ended before it."""
+    dt = datetime.strptime(published[:10], "%Y-%m-%d")
+    return (dt - timedelta(days=dt.weekday())).strftime("%Y-%m-%d")
+
+
 def prune_events(environment_id, retention_days=None, max_size_mb=None):
     """Deletes non-curated rows older than retention_days. Curated rows
     (is_curated=1) are NEVER auto-pruned regardless of ingestion_scope --
@@ -2137,6 +2965,9 @@ def prune_events(environment_id, retention_days=None, max_size_mb=None):
                     (environment_id, cutoff),
                 )
                 pruned_total += cur.rowcount
+                # 5.50.0: the per-person weekly sign-in rows follow the events they were counted from (weeks that ended before
+                # the cutoff go; the all-people totals hold no names and stay). Snapshots are not touched: they are curated.
+                conn.execute("DELETE FROM mfa_week_user WHERE environment_id = ? AND week < ?", (environment_id, _week_monday(cutoff)))
                 conn.commit()
             except Exception:
                 conn.rollback()  # DATA-11
@@ -2230,7 +3061,8 @@ def list_orphaned_archives():
                UNION SELECT environment_id FROM sync_state
                UNION SELECT environment_id FROM ingestion_manifests
                UNION SELECT environment_id FROM chain_heads
-               UNION SELECT environment_id FROM manifest_entries"""
+               UNION SELECT environment_id FROM manifest_entries
+               UNION SELECT environment_id FROM config_snapshots"""
         )
     } - {r[0] for r in conn.execute("SELECT environment_id FROM app_environments")}
     out = []
@@ -2246,12 +3078,14 @@ def list_orphaned_archives():
         out.append({
             "environment_id": environment_id, "event_count": stats[0], "bytes": stats[1],
             "oldest_published": stats[2], "newest_published": stats[3], "manifest_count": manifests,
+            "snapshot_count": conn.execute(
+                "SELECT COUNT(*) FROM config_snapshots WHERE environment_id = ?", (environment_id,)).fetchone()[0],
         })
     return out
 
 
 # Every table holding one environment's archive, in purge order (children first).
-ARCHIVE_TABLES = ("event_targets", "events", "sync_state", "manifest_entries", "chain_heads", "ingestion_manifests")
+ARCHIVE_TABLES = ("event_targets", "events", "sync_state", "config_snapshot_items", "config_snapshots", "mfa_week_user", "mfa_week_totals", "mfa_agg_state", "manifest_entries", "chain_heads", "ingestion_manifests")
 
 
 def archive_has_rows(environment_id):

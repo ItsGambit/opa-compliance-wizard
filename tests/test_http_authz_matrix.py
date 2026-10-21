@@ -74,6 +74,9 @@ ROUTES = {
     ("GET", "path == '/api/whoami'"): Route("GET", "/api/whoami", "open", None, 200),
     ("GET", "path == '/api/environments'"): Route("GET", "/api/environments", "open", None, 200),
     ("GET", "path == '/api/banner'"): Route("GET", "/api/banner", "open", None, 200),
+    # 5.51.0: the combined Refresh job's progress (a read of the job's own state, counts and wording only).
+    ("GET", "path.startswith('/api/environments/') and path.endswith('/refresh/status')"):
+        Route("GET", "/api/environments/dev/refresh/status", "env", None, 200, caps=('live_read',)),
     ("GET", "path.startswith('/api/environments/') and path.endswith('/sync/status')"):
         Route("GET", "/api/environments/dev/sync/status", "env", None, 200, caps=('view_archive',)),
     ("GET", "path.startswith('/api/environments/') and path.endswith('/integrity')"):
@@ -116,6 +119,8 @@ ROUTES = {
         Route("GET", f"/api/resource_groups/{RG}/security_policies", "session", None, 502, caps=('live_read',)),
     ("GET", "path == '/api/workload_roles'"): Route("GET", "/api/workload_roles", "session", None, 502, caps=('live_read',)),
     ("GET", "path == '/api/service_account'"): Route("GET", "/api/service_account", "session", None, 502, caps=('live_read',)),
+    # 5.51.0: the stored OPA scan; the seeded session already holds a model.
+    ("GET", "path == '/api/access/model'"): Route("GET", "/api/access/model", "session", None, 200, caps=('live_read',)),
     ("GET", "path == '/api/access/bootstrap/status'"): Route("GET", "/api/access/bootstrap/status", "session", None, 200, caps=('live_read',)),
     ("GET", "path == '/api/access/bootstrap/result'"): Route("GET", "/api/access/bootstrap/result", "session", None, 200, caps=('live_read',)),
     ("GET", "path == '/api/csv_files'"): Route("GET", "/api/csv_files", "open", None, 200),
@@ -160,6 +165,11 @@ ROUTES = {
         Route("POST", "/api/environments/dev/sync/reset_watermark", "env", {}, 200, caps=('reset_watermark',), stepup='sync.reset_watermark'),
     ("POST", "path.startswith('/api/environments/') and path.endswith('/sync_schedule')"):
         Route("POST", "/api/environments/dev/sync_schedule", "env", {"enabled": False}, 200, caps=('sync_settings',), stepup='sync_schedule.update'),
+    # 5.51.0: one Refresh (parts default to all three, so it checks every part's capabilities) and its Stop.
+    ("POST", "path.startswith('/api/environments/') and path.endswith('/refresh/cancel')"):
+        Route("POST", "/api/environments/dev/refresh/cancel", "env", {}, 200, caps=('live_read', 'sync_now')),
+    ("POST", "path.startswith('/api/environments/') and path.endswith('/refresh')"):
+        Route("POST", "/api/environments/dev/refresh", "env", {}, 200, caps=('live_read', 'sync_now')),
     ("POST", "path.startswith('/api/environments/') and path.endswith('/sync/start')"):
         Route("POST", "/api/environments/dev/sync/start", "env", {}, 200, caps=('sync_now',)),
     ("POST", "path.startswith('/api/environments/') and path.endswith('/sync/import_csv')"):

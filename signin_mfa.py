@@ -115,7 +115,9 @@ def refresh(environment_id, max_batches=None):
     state = conn.execute("SELECT last_rowid, events_used FROM mfa_agg_state WHERE environment_id = ?", (environment_id,)).fetchone()
     last, used = (state["last_rowid"], state["events_used"]) if state else (0, 0)
     scanned = counted = batches = 0
+    from create_secret_folders import checkpoint
     while max_batches is None or batches < max_batches:
+        checkpoint()  # 5.51.0: between batches (each batch commits on its own, so a stop loses nothing)
         rows = conn.execute(
             "SELECT rowid AS rid, event_type, published, raw_json FROM events WHERE environment_id = ? "
             "AND event_type IN (?, ?) AND rowid > ? ORDER BY rowid LIMIT ?",

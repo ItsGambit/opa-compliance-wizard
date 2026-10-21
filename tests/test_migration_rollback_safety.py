@@ -79,3 +79,28 @@ def test_previous_release_runs_on_a_database_migrated_by_this_release(tmp_path, 
     for table in ("sync_state", "chain_heads", "ingestion_manifests", "events", "app_environments", "banner_config", "shared_permission_grants", "known_identities"):
         conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
     conn.close()
+
+
+def test_5_50_code_on_a_5_51_database_keeps_working_and_the_next_start_sweeps_the_scan(tmp_path, monkeypatch, tmp_audit_store):
+    """5.51.0: a rollback to 5.50.x finds the stored-scan table and the daily access-state snapshots it knows nothing
+    about. It must start, verify the chain deeply (a snapshot of a new kind is sealed like any other), and an environment
+    it deletes leaves a scan row that the next 5.51 start removes."""
+    prev = _load_previous(tmp_path)
+    audit_store.run_migrations()
+    audit_store.record_config_snapshot("env-1", "opa_access_state", [("user:u1", {"id": "u1"}), ("summary:counts", {"users": 1})])
+    audit_store.store_opa_model_cache("env-1", {"users": [], "groups": []})
+    assert audit_store.verify_ingestion_chain("env-1", deep=True)["valid"]
+    audit_store._get_connection().execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    monkeypatch.setenv("OPA_AUDIT_DB_PATH", str(tmp_audit_store))
+    import threading
+    monkeypatch.setattr(prev, "_thread_local", threading.local())
+    prev.run_migrations()
+    verdict = prev.verify_ingestion_chain("env-1", deep=True)
+    assert verdict["valid"], verdict
+    prev_conn = prev._get_connection()
+    prev_conn.execute("DELETE FROM app_environments WHERE environment_id = 'env-1'")  # what its delete leaves behind
+    prev_conn.commit()
+    prev_conn.close()
+    assert audit_store.load_opa_model_cache("env-1") is not None  # the row survives the old release's delete
+    assert audit_store.sweep_orphaned_opa_model_caches() == ["env-1"]
+    assert audit_store.load_opa_model_cache("env-1") is None

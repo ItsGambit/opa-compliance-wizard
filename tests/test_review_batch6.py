@@ -31,7 +31,8 @@ def tick(monkeypatch):
 
     monkeypatch.setattr(engine, "get_sync_schedule_by_id", get_schedule)
     monkeypatch.setattr(audit_store, "get_sync_state", lambda env_id: states.get(env_id))
-    monkeypatch.setattr(serve, "_start_sync_job", lambda *a, **k: started.append((a, k)))
+    # 5.51.0: the scheduled run is the combined refresh (all three parts), started by id
+    monkeypatch.setattr(serve, "_start_refresh_job", lambda *a, **k: started.append((a, k)))
 
     def run(now):
         started.clear()

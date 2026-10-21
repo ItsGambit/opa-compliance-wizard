@@ -58,7 +58,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.50.1
+# Version     : 5.51.0
 # =============================================================================
 
 import argparse
@@ -84,7 +84,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.50.1"
+SCRIPT_VERSION = "5.51.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 # ENG2-12: OPA's spec documents no pattern or length for a secret-folder
 # name (SecretFolderCreateRequest.name is a bare string); 255 is the limit
@@ -1538,8 +1538,15 @@ def delete_environment(name, owner=LOCAL_OWNER_KEY, is_admin=False, environment_
         conn.commit()
     for field in ENVIRONMENT_SECRET_FIELDS:
         keyring_delete(target_id, field)
+    # 5.51.0: the stored OPA scan is derived data holding names and e-mails: it goes with the environment whether or not the
+    # archive (the evidence) is kept. If this fails the environment stays deleted and the start-up sweep removes the row.
+    cache_removed = False
+    try:
+        cache_removed = audit_store.delete_opa_model_cache(target_id)
+    except Exception as exc:
+        log("WARN", f"The stored OPA scan of a deleted environment could not be removed now ({type(exc).__name__}); the next start-up removes it.")
     archive_counts = audit_store.purge_environment_archive(target_id) if purge_archive else None
-    return {"was_active": was_active, "environment_id": target_id, "archive": archive_counts}
+    return {"was_active": was_active, "environment_id": target_id, "archive": archive_counts, "opa_scan_removed": cache_removed}
 
 
 def get_environment_credentials(name, owner=LOCAL_OWNER_KEY):
@@ -2287,6 +2294,43 @@ _rate_limit_state = {}  # host -> {"remaining": int, "reset": int}
 CORRELATION_ID = contextvars.ContextVar("correlation_id", default=None)
 
 
+# 5.51.0: cooperative cancellation for the long background jobs (the OPA scan, the System Log sync, the Okta captures).
+# A job's thread sets CANCEL_FLAG to a threading.Event; the walkers call checkpoint() between units of work and every long
+# rate-limit wait is sliced so a cancel is noticed within about half a second. JobCancelled derives from BaseException on
+# purpose: the many `except Exception` handlers that tolerate one failed read must not swallow a cancel and carry on.
+CANCEL_FLAG = contextvars.ContextVar("cancel_flag", default=None)
+
+
+class JobCancelled(BaseException):
+    """Raised at a checkpoint when the running job was asked to stop."""
+
+
+def cancel_requested():
+    flag = CANCEL_FLAG.get()
+    return flag is not None and flag.is_set()
+
+
+def checkpoint():
+    if cancel_requested():
+        raise JobCancelled("cancelled")
+
+
+def _cancellable_sleep(seconds):
+    """time.sleep, except that a job with a cancel flag wakes up (and stops) when the flag is set."""
+    flag = CANCEL_FLAG.get()
+    if flag is None:
+        time.sleep(seconds)
+        return
+    end = time.monotonic() + seconds
+    while True:
+        if flag.is_set():
+            raise JobCancelled("cancelled")
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.5, remaining))
+
+
 def log(level, message):
     """Writes one JSON-line log record to stdout (WARN/ERROR to stderr,
     matching this function's pre-Phase-8 stream split) -- machine-
@@ -2430,7 +2474,7 @@ def _wait_if_rate_limited(url):
     if wait_secs > RATE_LIMIT_WAIT_BUFFER_SECS:
         log("WARN", f"Rate limit nearly exhausted for {_rate_limit_host(url)} "
                      f"({state['remaining']} request(s) left) -- waiting {wait_secs:.0f}s for the window to reset...")
-        time.sleep(wait_secs)
+        _cancellable_sleep(wait_secs)
         return wait_secs
     return 0.0
 
@@ -2715,7 +2759,7 @@ def http_json_request(method, url, headers=None, body=None, error_cls=OpaApiErro
                     log("WARN", f"{method} {url} -> HTTP 429 (rate limited); "
                                 f"waiting {wait_secs:.0f}s before retry "
                                 f"({rate_limit_attempt}/{MAX_RATE_LIMIT_RETRIES})...")
-                    time.sleep(wait_secs)
+                    _cancellable_sleep(wait_secs)
                     waited += wait_secs
                     continue
                 if not rate_limit_wait:
@@ -2728,7 +2772,7 @@ def http_json_request(method, url, headers=None, body=None, error_cls=OpaApiErro
                 error_attempt += 1
                 if error_attempt <= MAX_RETRIES:
                     log("WARN", f"{method} {url} -> HTTP {e.code}, retrying ({error_attempt}/{MAX_RETRIES})...")
-                    time.sleep(RETRY_BACKOFF_SECS * error_attempt)
+                    _cancellable_sleep(RETRY_BACKOFF_SECS * error_attempt)
                     continue
             raise error_cls(e.code, url, raw_body) from None
         except urllib.error.URLError as e:
@@ -2736,7 +2780,7 @@ def http_json_request(method, url, headers=None, body=None, error_cls=OpaApiErro
                 error_attempt += 1
                 if error_attempt <= MAX_RETRIES:
                     log("WARN", f"{method} {url} -> network error ({e.reason!r}), retrying ({error_attempt}/{MAX_RETRIES})...")
-                    time.sleep(RETRY_BACKOFF_SECS * error_attempt)
+                    _cancellable_sleep(RETRY_BACKOFF_SECS * error_attempt)
                     continue
             raise error_cls(API_STATUS_NETWORK, url, f"{type(e.reason).__name__}: {e.reason}") from e
         except (OSError, http.client.HTTPException) as e:
@@ -2747,7 +2791,7 @@ def http_json_request(method, url, headers=None, body=None, error_cls=OpaApiErro
                 if error_attempt <= MAX_RETRIES:
                     log("WARN", f"{method} {url} -> {type(e).__name__} reading the response, retrying "
                                 f"({error_attempt}/{MAX_RETRIES})...")
-                    time.sleep(RETRY_BACKOFF_SECS * error_attempt)
+                    _cancellable_sleep(RETRY_BACKOFF_SECS * error_attempt)
                     continue
             raise error_cls(API_STATUS_NETWORK, url, f"{type(e).__name__} while reading the response") from e
         try:
@@ -6411,14 +6455,17 @@ def build_access_model(client, okta_client=None, on_progress=None):
     endpoint. If this function raises, the last step reported "start"
     without a matching "done" is the one that failed.
     """
+    checkpoint()
     _report(on_progress, "resource_groups", "start")
     resource_groups = client.list_resource_groups()
     _report(on_progress, "resource_groups", "done", f"{len(resource_groups)} resource group(s)")
 
+    checkpoint()
     _report(on_progress, "groups", "start")
     groups = client.list_groups()
     _report(on_progress, "groups", "done", f"{len(groups)} group(s)")
 
+    checkpoint()
     _report(on_progress, "users", "start")
     users = client.list_users()
     _report(on_progress, "users", "done", f"{len(users)} user(s)")
@@ -6449,6 +6496,7 @@ def build_access_model(client, okta_client=None, on_progress=None):
                 return []
             raise
 
+    checkpoint()
     _report(on_progress, "workload_roles", "start")
     workload_roles = _optional("workload roles", client.list_workload_roles)
     workload_connections = _optional("workload connections", client.list_workload_connections)
@@ -6472,6 +6520,7 @@ def build_access_model(client, okta_client=None, on_progress=None):
     assignment_summaries = _optional("assignments", client.list_assignments)
     assignments = []
     for summary in assignment_summaries:
+        checkpoint()
         if isinstance(summary, dict) and summary.get("id"):
             label = f"assignment {summary.get('name') or summary['id']}"
             detail = _optional(label, lambda assignment_id=summary["id"]: [client.get_assignment(assignment_id)])
@@ -6510,17 +6559,22 @@ def build_access_model(client, okta_client=None, on_progress=None):
             f"{len(active_directory_connections)} AD connection(s), "
             f"{len(assignments)} assignment(s), {len(relationships)} relationship(s)")
 
+    checkpoint()
     _report(on_progress, "clients", "start")
     clients = _optional("enrolled clients", client.list_clients)
     _report(on_progress, "clients", "done", f"{len(clients)} enrolled client(s)")
 
+    checkpoint()
     _report(on_progress, "devices", "start")
     devices = okta_client.list_devices() if okta_client else []
     _report(on_progress, "devices", "done",
             f"{len(devices)} device(s)" if okta_client else "skipped (no Okta credentials configured)")
 
     _report(on_progress, "projects", "start")
-    projects_by_rg = [(rg, client.list_projects(rg["id"])) for rg in resource_groups]
+    projects_by_rg = []
+    for rg in resource_groups:
+        checkpoint()  # between resource groups
+        projects_by_rg.append((rg, client.list_projects(rg["id"])))
     total_projects = sum(len(ps) for _rg, ps in projects_by_rg)
     _report(on_progress, "projects", "done",
             f"{total_projects} project(s) across {len(resource_groups)} resource group(s)")
@@ -6546,6 +6600,7 @@ def build_access_model(client, okta_client=None, on_progress=None):
     folder_total = secret_total = 0  # 5.50.0: counts for the inventory time series (the model itself keeps only id lookups)
     for rg, rg_projects in projects_by_rg:
         for project in rg_projects:
+            checkpoint()  # between projects in the index walk
             project = dict(project)
             project["resource_group_id"] = rg["id"]
             projects.append(project)
@@ -6633,6 +6688,7 @@ def build_access_model(client, okta_client=None, on_progress=None):
     users_with_groups = []
 
     def _user_groups(user):
+        checkpoint()  # between users: queued lookups stop at once after a cancel, the running ones finish their call
         try:
             return client.list_user_groups(user.get("name"))
         except OpaApiError as exc:
@@ -6675,6 +6731,7 @@ def build_access_model(client, okta_client=None, on_progress=None):
     _report(on_progress, "resolve", "start")
     policies_out = []
     for policy in all_policies:
+        checkpoint()  # between policies in the resolve loop
         # Relationship-based policy (confirmed live 2026-09-30 -- see
         # ASSIGNMENTS_PATH's docstring): a policy with a non-empty
         # `relationships[]` uses this as an ALTERNATE way to specify both
@@ -6793,6 +6850,141 @@ def build_access_model(client, okta_client=None, on_progress=None):
         # may not read them -- the UI shows these instead of implying "none".
         "warnings": warnings,
     }
+
+
+# ---------------------------------------------------------------------------
+# Storing the scan (5.51.0): what may be written to disk
+# ---------------------------------------------------------------------------
+# The OPA scan is kept in the local archive so the Access Explorer, the Overview and the cross-checks open without
+# reading OPA again. It holds names and e-mails (it always did, in memory); it must never hold a credential. The
+# redaction pass below runs before ANY write (the cache row, the sealed daily snapshot) and its result is also the model
+# the running process keeps, so nothing the screens do not show stays in memory either.
+MODEL_REDACTED_KEYS = frozenset((
+    "credentials", "password", "secret", "secret_value", "value", "key_secret", "api_token", "token", "access_token",
+    "refresh_token", "private_key", "client_secret", "authorization", "cookie", "jwt",
+))
+# Okta device fields the Resources tab renders (plus the id); everything else a device profile carries is dropped.
+DEVICE_ALLOWED_FIELDS = ("id", "status", "created", "lastUpdated", "profile", "authenticator_enrollments", "users")
+DEVICE_ALLOWED_PROFILE_FIELDS = (
+    "displayName", "platform", "manufacturer", "model", "osVersion", "serialNumber", "registered",
+    "secureHardwarePresent", "diskEncryptionType",
+)
+DEVICE_ALLOWED_ENROLLMENT_FIELDS = ("id", "key", "name", "status")
+_MODEL_MAX_DEPTH = 40
+_JWT_SHAPE = re.compile(r"^eyJ[A-Za-z0-9_-]{10,}\.")
+_SSWS_SHAPE = re.compile(r"^00[A-Za-z0-9_-]{40,}$")
+_TOKEN_PREFIX_SHAPE = re.compile(r"^(?:opk_|sk-|ghp_|xox[abpr]-)[A-Za-z0-9_-]{8,}")
+_LONG_SECRET_SHAPE = re.compile(r"^[A-Za-z0-9+/_=-]{40,}$")
+
+
+class ModelRedactionError(ValueError):
+    """The scan holds a value shaped like a credential (or something that cannot be stored). `key_path` names where,
+    never the value."""
+
+    def __init__(self, key_path, kind="credential"):
+        self.key_path = key_path
+        self.kind = kind
+        if kind == "credential":
+            message = f"model contains a credential-shaped value at {key_path}"
+        else:
+            message = f"model contains a value that cannot be stored at {key_path}"
+        super().__init__(message)
+
+
+def _entropy_bits_per_char(text):
+    from collections import Counter
+    counts = Counter(text)
+    total = len(text)
+    return -sum((n / total) * math.log2(n / total) for n in counts.values())
+
+
+def _credential_shaped(text):
+    """True for a JWT, an Okta SSWS token, a well-known token prefix, or a long single-token string with mixed case,
+    digits and high entropy (an API key secret). Ids (UUIDs are 36 characters; Okta ids 20), hex digests (entropy of at most
+    4 bits per character), names and URLs (spaces, dots) do not match."""
+    if _JWT_SHAPE.match(text) or _SSWS_SHAPE.match(text) or _TOKEN_PREFIX_SHAPE.match(text):
+        return True
+    if len(text) >= 40 and _LONG_SECRET_SHAPE.match(text):
+        has_lower = any(c.islower() for c in text)
+        has_upper = any(c.isupper() for c in text)
+        has_digit = any(c.isdigit() for c in text)
+        return has_lower and has_upper and has_digit and _entropy_bits_per_char(text) >= 4.3
+    return False
+
+
+def _path_segment(key):
+    text = str(key)
+    return text if len(text) <= 40 else text[:40] + "..."
+
+
+def _redact_value(value, path, depth):
+    if depth > _MODEL_MAX_DEPTH:
+        raise ModelRedactionError(path, kind="unstorable")
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ModelRedactionError(path, kind="unstorable")
+            lowered = key.lower()
+            if lowered in MODEL_REDACTED_KEYS:
+                # `value` is also the name of a policy condition's operand ({"account_name_format": ..., "value": ...}):
+                # kept there (the canary below still reads it); dropped everywhere else.
+                if not (lowered == "value" and "account_name_format" in value):
+                    continue
+            out[key] = _redact_value(item, f"{path}.{_path_segment(key)}" if path else _path_segment(key), depth + 1)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_redact_value(item, f"{path}[{i}]", depth + 1) for i, item in enumerate(value)]
+    if isinstance(value, str):
+        if _credential_shaped(value):
+            raise ModelRedactionError(path)
+        return value
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ModelRedactionError(path, kind="unstorable")
+        return value
+    raise ModelRedactionError(path, kind="unstorable")
+
+
+def _allowed_device(device, path):
+    if not isinstance(device, dict):
+        raise ModelRedactionError(path, kind="unstorable")
+    out = {}
+    for field in DEVICE_ALLOWED_FIELDS:
+        if field not in device:
+            continue
+        item = device[field]
+        if field == "profile" and isinstance(item, dict):
+            item = {k: item[k] for k in DEVICE_ALLOWED_PROFILE_FIELDS if k in item}
+        elif field == "authenticator_enrollments" and isinstance(item, list):
+            item = [{k: e[k] for k in DEVICE_ALLOWED_ENROLLMENT_FIELDS if k in e} for e in item if isinstance(e, dict)]
+        elif field == "users" and isinstance(item, list):
+            item = [u for u in item if isinstance(u, str)]
+        out[field] = item
+    return out
+
+
+def redact_model_for_storage(model):
+    """A copy of an Access Explorer model that is safe to keep on disk, or ModelRedactionError.
+
+    * Every dict key on a deny-list (credentials, passwords, tokens, key secrets, cookies, ...) is dropped, at any depth.
+    * Okta devices keep only the fields the Resources tab renders.
+    * Any string value shaped like a credential makes the whole scan fail: nothing is stored. A false positive costs one
+      refused scan; a stored secret costs far more. The error names the key path, never the value.
+    The input is not modified."""
+    if not isinstance(model, dict):
+        raise ModelRedactionError("", kind="unstorable")
+    prepared = dict(model)
+    if isinstance(prepared.get("devices"), list):
+        prepared["devices"] = [_allowed_device(d, f"devices[{i}]") for i, d in enumerate(prepared["devices"])]
+    return _redact_value(prepared, "", 0)
+
+
+def canonical_model_json(model):
+    """The canonical text a stored scan is hashed and compressed as: sorted keys, no spaces, non-ASCII kept."""
+    return json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
 def get_ad_connection_discovery_config(client, ad_connection_id):

@@ -44,6 +44,7 @@ from urllib.parse import urlparse, parse_qs, unquote, urlencode
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 import create_secret_folders as engine  # noqa: E402
+from server import refresh_jobs as rj  # noqa: E402
 from server.updater import service as update_service  # noqa: E402
 from server.updater import upgrade as upgrade_service  # noqa: E402
 
@@ -510,7 +511,9 @@ def _ingest_running(environment_id):
     slot (DATA-11: the two must never interleave writes, and a purge must
     not race either)."""
     with _sync_jobs_lock:
-        return _sync_jobs.get(environment_id, {}).get("status") == "running"
+        if _sync_jobs.get(environment_id, {}).get("status") == "running":
+            return True
+    return _refresh_running(environment_id)  # 5.51.0: a refresh job in flight owns the archive too
 
 
 def _session_snapshot(owner_key):
@@ -584,23 +587,128 @@ def _job_error_message(exc):
     return f"Internal error (reference {correlation_id}). The details are in the server log."
 
 
-def _run_access_job(storage_name, job_client, job_okta_client, correlation_id=None):
+def _failed_step(steps):
+    """The step that was started and never finished (the one a failed scan stopped in), or None."""
+    current = None
+    for step in steps or []:
+        if step.get("status") == "start":
+            current = step.get("key")
+        elif step.get("status") == "done" and step.get("key") == current:
+            current = None
+    return current
+
+
+def _utc_now_ms_iso():
+    import audit_store
+    return audit_store._iso_ms(datetime.now(timezone.utc))
+
+
+def _audit_for(audit_ctx, action, details):
+    """One counts-only audit entry for a background job; a no-op without context (a test calling the job body directly)."""
+    if not audit_ctx:
+        return
+    engine.log_audit_event(audit_ctx.get("actor_email"), audit_ctx.get("actor_sub"), action,
+                           {"name": audit_ctx.get("name"), "trigger": audit_ctx.get("trigger"), **details},
+                           client_ip=audit_ctx.get("client_ip"), user_agent=audit_ctx.get("user_agent"))
+
+
+def _run_access_job(storage_name, job_client, job_okta_client, correlation_id=None, audit_ctx=None):
+    """The OPA scan: build the model, strip it for storage (a credential-shaped value fails the scan and nothing is
+    stored), replace the stored scan, and publish the result to _access_jobs. The previous result stays readable
+    (`previous`) while this one runs and after it fails. Runs in the caller's thread, which may carry a cancel flag."""
     # A new thread does NOT inherit the parent thread's contextvars, so
     # the triggering request's own id (if any) has to be set again here
     # explicitly -- same reasoning as _run_sync_job below.
     engine.CORRELATION_ID.set(correlation_id)
+    import audit_store
+    started = time.monotonic()
     try:
         result = engine.build_access_model(
             job_client, okta_client=job_okta_client, on_progress=_access_job_progress(storage_name)
         )
+        built_at = _utc_now_ms_iso()
+        duration = round(time.monotonic() - started, 1)
+        engine.checkpoint()  # a stop (or a deadline) that arrived while the last call ran: nothing is stored
+        redacted = engine.redact_model_for_storage(result)
+        del result
+        stored, store_problem = "memory_only", None
+        try:
+            put = audit_store.store_opa_model_cache(
+                storage_name, redacted, built_at=built_at, duration_seconds=duration, already_redacted=True)
+            if put["stored"]:
+                stored = "cache"
+            else:
+                store_problem = put["reason"]
+        except Exception as store_exc:  # the scan is still good in memory: say so rather than fail it
+            store_problem = type(store_exc).__name__
+            engine.log("WARN", f"The OPA scan could not be stored ({store_problem}); it stays in memory until the next scan.")
+        counts = audit_store.opa_model_counts(redacted)
+        warnings = len(redacted.get("warnings") or [])
         with _access_jobs_lock:
-            _access_jobs[storage_name]["status"] = "done"
-            _access_jobs[storage_name]["result"] = result
-            _access_jobs[storage_name]["result_at"] = _utc_now_iso()  # 5.50.0: when the Overview says the OPA roster was read
+            job = _access_jobs.setdefault(storage_name, {"status": "running", "steps": [], "error": None, "result": None})
+            job.update(status="done", result=redacted, result_at=built_at, error=None, error_kind=None, source="scan",
+                       stored=stored, store_problem=store_problem, duration_seconds=duration, warnings=warnings,
+                       counts=counts, previous=None)
+        _audit_for(audit_ctx, "access_scan.completed", {"seconds": duration, **counts, "warnings": warnings, "stored": stored})
+    except engine.JobCancelled:
+        _record_access_failure(storage_name, "The scan was stopped before it finished.", "cancelled", None, audit_ctx, None)
+        _audit_for(audit_ctx, "access_scan.failed", {"reason": "cancelled"})
+    except engine.ModelRedactionError as exc:
+        _record_access_failure(storage_name, str(exc), "redaction", None, audit_ctx, exc)
+        _audit_for(audit_ctx, "access_scan.failed", {"error": _failure_summary(exc), "reason": "redaction", "key_path": exc.key_path})
     except Exception as exc:
-        with _access_jobs_lock:
-            _access_jobs[storage_name]["status"] = "error"
-            _access_jobs[storage_name]["error"] = _job_error_message(exc)
+        status = getattr(exc, "status", None)
+        kind = "refused" if isinstance(exc, engine.OpaApiError) and status in (401, 403) else "error"
+        _record_access_failure(storage_name, _job_error_message(exc), kind, status, audit_ctx, exc)
+        _audit_for(audit_ctx, "access_scan.failed", {"error": _failure_summary(exc)})
+
+
+def _record_access_failure(storage_name, message, kind, status, audit_ctx, exc):
+    with _access_jobs_lock:
+        job = _access_jobs.setdefault(storage_name, {"status": "running", "steps": [], "error": None, "result": None})
+        job.update(status="error", error=message, error_kind=kind, error_status=status, failed_step=_failed_step(job.get("steps")),
+                   error_class=_failure_summary(exc) if exc is not None else None,
+                   key_path=getattr(exc, "key_path", None))
+
+
+def _scan_slot_previous(job):
+    """What to keep readable while a new scan replaces `job` (an _access_jobs entry, or None)."""
+    if not job:
+        return None
+    if job.get("status") == "done" and isinstance(job.get("result"), dict):
+        return {"result": job["result"], "result_at": job.get("result_at"), "source": job.get("source") or "memory",
+                "modified_at": job.get("modified_at"), "stored": job.get("stored")}
+    return job.get("previous")
+
+
+def _access_model_view(environment_id, hydrate=True):
+    """The OPA model to show for this environment, from memory (the last finished scan, or the one kept while a new scan runs
+    or after one failed), else the stored scan. {"model", "built_at", "source": "memory"|"cache", "modified_at"} or None."""
+    import audit_store
+    with _access_jobs_lock:
+        job = _access_jobs.get(environment_id)
+        if job:
+            held = _scan_slot_previous(job)
+            if held and isinstance(held.get("result"), dict):
+                return {"model": held["result"], "built_at": held.get("result_at"),
+                        "source": "cache" if held.get("source") == "cache" else "memory", "modified_at": held.get("modified_at")}
+    if not hydrate:
+        return None
+    try:
+        cached = audit_store.load_opa_model_cache(environment_id)
+    except Exception as exc:
+        engine.log("WARN", f"The stored OPA scan could not be read ({type(exc).__name__}).")
+        cached = None
+    if cached is None:
+        return None
+    held = {"result": cached["model"], "result_at": cached["built_at"], "source": "cache", "modified_at": cached.get("modified_at"), "stored": "cache"}
+    with _access_jobs_lock:
+        job = _access_jobs.get(environment_id)
+        if job is None:
+            _access_jobs[environment_id] = {"status": "done", "steps": [], "error": None, **held, "previous": None}
+        elif _scan_slot_previous(job) is None:
+            job["previous"] = held
+    return {"model": cached["model"], "built_at": cached["built_at"], "source": "cache", "modified_at": cached.get("modified_at")}
 
 
 # ENG2-05: wizard writes to one security policy are serialised (see the
@@ -799,6 +907,9 @@ def _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, trigger
             with _sync_jobs_lock:
                 _sync_jobs[storage_name]["status"] = "error"
                 _sync_jobs[storage_name]["error"] = result.get("error") or "Sync stopped early: see sync_state for details."
+                _sync_jobs[storage_name]["partial"] = True  # progress is saved; the next run continues (5.51.0: the refresh reports it as such)
+                if result.get("cancelled"):
+                    _sync_jobs[storage_name]["cancelled"] = True
             engine.log_audit_event(
                 actor_email, actor_sub, f"{action_prefix}_failed", {"name": env_name, **result},
                 client_ip=client_ip, user_agent=user_agent,
@@ -819,55 +930,27 @@ def _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, trigger
             actor_email, actor_sub, f"{action_prefix}_completed", {"name": env_name, **result, **prune_result},
             client_ip=client_ip, user_agent=user_agent,
         )
-        # 5.50.0: after the log sync, record who holds an Okta admin role (a chained snapshot), at most
-        # every few hours. Never allowed to fail the sync that just finished.
-        try:
-            import okta_admins
-            snap = okta_admins.capture_if_due(env_id, okta_client)
-            if snap:
-                engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.captured", {
-                    "name": env_name, "kind": snap["kind"], "snapshot_id": snap["snapshot_id"], "status": snap["status"],
-                    "item_count": snap["item_count"], "error_code": (snap.get("meta") or {}).get("error_code"), "trigger": trigger,
-                }, client_ip=client_ip, user_agent=user_agent)
-        except Exception as snap_exc:
-            engine.log("WARN", f"okta admin snapshot after the sync of '{env_name}' failed: {type(snap_exc).__name__}")
-            engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.failed", {"name": env_name, "kind": "okta_admins", "trigger": trigger, "error": _failure_summary(snap_exc)},
-                                   client_ip=client_ip, user_agent=user_agent)
-        # Daily inventory counts (OPA and Okta, counts only) and the incremental sign-in / MFA aggregates.
-        inventory_started = time.monotonic()
-        try:
-            import inventory_counts
-            creds = engine.get_environment_credentials_by_id(env_id, owner=owner)
-            opa_client = engine.OpaClient(creds["base_domain"], creds["team_name"], creds["key_id"], creds["key_secret"])
-            inv = inventory_counts.capture_if_due(env_id, okta_client=okta_client, opa_client=opa_client, model=_access_model_for(env_id))
-            if inv:
-                seconds = round(time.monotonic() - inventory_started, 1)
-                engine.log("INFO", f"inventory counts for '{env_name}': {inv['item_count']} series in {seconds}s")
-                engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.captured", {
-                    "name": env_name, "kind": inv["kind"], "snapshot_id": inv["snapshot_id"], "status": inv["status"],
-                    "item_count": inv["item_count"], "trigger": trigger, "inventory_seconds": seconds}, client_ip=client_ip, user_agent=user_agent)
-        except Exception as inv_exc:
-            engine.log("WARN", f"inventory counts after the sync of '{env_name}' failed after {round(time.monotonic() - inventory_started, 1)}s: {type(inv_exc).__name__}")
-            engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.failed", {"name": env_name, "kind": "inventory_counts", "trigger": trigger, "error": _failure_summary(inv_exc)},
-                                   client_ip=client_ip, user_agent=user_agent)
-        try:
-            import signin_mfa
-            signin_mfa.refresh(env_id)
-        except Exception as mfa_exc:
-            engine.log("WARN", f"sign-in / MFA aggregates after the sync of '{env_name}' failed: {type(mfa_exc).__name__}")
-            engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.failed", {"name": env_name, "kind": "mfa_aggregates", "trigger": trigger, "error": _failure_summary(mfa_exc)},
-                                   client_ip=client_ip, user_agent=user_agent)
+        # 5.51.0: the Okta admin snapshot, the inventory counts, the Okta status of OPA principals and the sign-in / MFA
+        # figures no longer run inside this thread, unseen: they are the refresh job's `okta` part (_refresh_part_okta), which
+        # reports each of them. A sync started on its own (the footer's Sync now, the legacy route) is the log part only.
     except Exception as exc:
         with _sync_jobs_lock:
             _sync_jobs[storage_name]["status"] = "error"
             _sync_jobs[storage_name]["error"] = _job_error_message(exc)
+            # 5.51.0: what the refresh job needs to word the outcome without the exception (and without its URL)
+            _sync_jobs[storage_name]["error_status"] = getattr(exc, "status", None)
+            _sync_jobs[storage_name]["error_class"] = _failure_summary(exc)
+            _sync_jobs[storage_name]["error_deliberate"] = isinstance(exc, ValueError) and not isinstance(exc, (UnicodeError, json.JSONDecodeError))
+        with _sync_jobs_lock:
+            deliberate = _sync_jobs[storage_name].get("error_deliberate")
         engine.log_audit_event(
-            actor_email, actor_sub, f"{action_prefix}_failed", {"name": env_name, "error": str(exc)},
+            # 5.51.0: an upstream error's text carries the request URL (the Okta host); the audit line gets the class and status
+            actor_email, actor_sub, f"{action_prefix}_failed", {"name": env_name, "error": str(exc) if deliberate else _failure_summary(exc)},
             client_ip=client_ip, user_agent=user_agent,
         )
 
 
-def _start_sync_job(env_id, env_name, ingestion_scope, owner=engine.LOCAL_OWNER_KEY, trigger="manual", actor_email=None, actor_sub=None, client_ip=None, user_agent=None, minutes_late=None, correlation_id=None):
+def _start_sync_job(env_id, env_name, ingestion_scope, owner=engine.LOCAL_OWNER_KEY, trigger="manual", actor_email=None, actor_sub=None, client_ip=None, user_agent=None, minutes_late=None, correlation_id=None, inline=False):
     """Starts (or no-ops if already running) a background sync for one
     environment. Returns True if actually started. Builds a fresh
     OktaClient directly from stored credentials -- deliberately NOT
@@ -943,7 +1026,7 @@ def _start_sync_job(env_id, env_name, ingestion_scope, owner=engine.LOCAL_OWNER_
     try:
         return _launch_claimed_sync(
             env_id, env_name, ingestion_scope, owner, trigger, actor_email, actor_sub, client_ip, user_agent,
-            minutes_late, correlation_id, action_prefix, _refuse,
+            minutes_late, correlation_id, action_prefix, _refuse, inline=inline,
         )
     except BaseException as exc:
         # The slot was claimed above: never leave it "running" with no
@@ -955,9 +1038,10 @@ def _start_sync_job(env_id, env_name, ingestion_scope, owner=engine.LOCAL_OWNER_
 
 
 def _launch_claimed_sync(env_id, env_name, ingestion_scope, owner, trigger, actor_email, actor_sub, client_ip,
-                         user_agent, minutes_late, correlation_id, action_prefix, _refuse):
+                         user_agent, minutes_late, correlation_id, action_prefix, _refuse, inline=False):
     """Second half of _start_sync_job, run once the slot is claimed:
-    resolve credentials (refusing cleanly) and start the worker thread."""
+    resolve credentials (refusing cleanly) and start the worker thread. `inline` (5.51.0, the refresh job's log part) runs
+    the sync in the calling thread instead, so the part's cancel flag and deadline govern it."""
     try:
         # By id, under the environment's real owner (5.42.0): a shared
         # user's "Sync now" runs with the owner's stored token, and display
@@ -980,10 +1064,13 @@ def _launch_claimed_sync(env_id, env_name, ingestion_scope, owner, trigger, acto
         # "the scheduler correctly caught up after the server was down."
         start_details["minutes_late"] = minutes_late
     engine.log_audit_event(actor_email, actor_sub, f"{action_prefix}_start", start_details, client_ip=client_ip, user_agent=user_agent)
+    sync_kwargs = {"trigger": trigger, "actor_email": actor_email, "actor_sub": actor_sub, "client_ip": client_ip, "user_agent": user_agent, "correlation_id": correlation_id}
+    if inline:
+        _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, **sync_kwargs)
+        return True
     threading.Thread(
         target=_run_sync_job, args=(env_id, env_name, okta_client, ingestion_scope, owner),
-        kwargs={"trigger": trigger, "actor_email": actor_email, "actor_sub": actor_sub, "client_ip": client_ip, "user_agent": user_agent, "correlation_id": correlation_id},
-        daemon=True,
+        kwargs=sync_kwargs, daemon=True,
     ).start()
     return True
 
@@ -1012,21 +1099,48 @@ def _okta_host(environment_id, meta):
     return host
 
 
+OPA_SCAN_STALE_HOURS = 24      # an amber "Stale" badge from here (shared with the Overview)
+OPA_SCAN_VERY_STALE_DAYS = 7   # a red "Very stale" badge from here
+
+
+def _scan_age_seconds(built_at, now=None):
+    try:
+        built = datetime.fromisoformat(str(built_at).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return max(0, int(((now or datetime.now(timezone.utc)) - built).total_seconds()))
+
+
+def _scan_staleness(age_seconds):
+    """(stale, very_stale) for a scan of this age; both False when the age is unknown."""
+    if age_seconds is None:
+        return False, False
+    return age_seconds >= OPA_SCAN_STALE_HOURS * 3600, age_seconds >= OPA_SCAN_VERY_STALE_DAYS * 86400
+
+
+def _access_model_payload(view):
+    """GET /api/access/model: the model with when it was read. The browser derives the label from built_at; age_seconds and
+    the stale flags are the server's reading at this moment (the thresholds are the same constants the Overview uses)."""
+    import audit_store
+    model = view["model"]
+    age = _scan_age_seconds(view["built_at"])
+    stale, very_stale = _scan_staleness(age)
+    return {"model": model, "built_at": view["built_at"], "age_seconds": age, "source": view["source"], "stale": stale,
+            "very_stale": very_stale, "counts": audit_store.opa_model_counts(model), "warnings": len(model.get("warnings") or []),
+            "modified_at": view.get("modified_at")}
+
+
 def _access_model_time(environment_id):
-    with _access_jobs_lock:
-        job = _access_jobs.get(environment_id)
-        return job.get("result_at") if job else None
+    view = _access_model_view(environment_id)
+    return view["built_at"] if view else None
 
 
 def _access_model_for(environment_id):
-    """The last finished Access Explorer model for this environment (the OPA
-    roster: users, groups with roles, Okta-UD accounts), or None when it has
-    not been loaded in this server process."""
-    with _access_jobs_lock:
-        job = _access_jobs.get(environment_id)
-        if job and job.get("status") == "done" and isinstance(job.get("result"), dict):
-            return job["result"]
-    return None
+    """The Access Explorer model for this environment (the OPA roster: users, groups with roles, Okta-UD accounts): the last
+    finished scan in this process, the one kept while a new scan runs, else the stored scan (so a restart no longer loses
+    it). None only when no scan has ever been stored."""
+    view = _access_model_view(environment_id)
+    return view["model"] if view else None
 
 
 def _run_capture_job(env_id, env_name, owner, kind, model, correlation_id, actor_email, actor_sub, client_ip, user_agent):
@@ -1091,11 +1205,555 @@ def _start_capture_job(env_id, env_name, owner, kind, model, actor_email, actor_
     return True
 
 
+# ---------------------------------------------------------------------------
+# The combined Refresh (5.51.0): one job per environment, three parts, two lanes
+# ---------------------------------------------------------------------------
+# POST /api/environments/<name>/refresh starts ONE job that conducts the existing background jobs: the OPA scan
+# (_access_jobs / _run_access_job), the System Log sync (_sync_jobs / _start_sync_job) and the Okta captures
+# (_capture_jobs). Those dicts, their routes and their tests keep working: the refresh job is a conductor, not a rewrite.
+#
+#   OPA lane   the `opa` part
+#   Okta lane  the `log` part, then the `okta` part (admins, sign-in figures, then principal status and inventory once the
+#              OPA lane has the model ready)
+#
+# The two lanes have separate rate budgets and the OPA scan is the slow part, so they run side by side. One refresh per
+# environment at a time (a second request attaches to the running one). Every part has its own deadline and cancel flag; a
+# part that fails, is refused, times out or is stopped never hides the others. The daily scheduled run is this same job.
+_refresh_jobs_lock = threading.Lock()
+_refresh_jobs = {}  # environment_id -> refresh_jobs.RefreshJob (the running one, or the last finished one)
+REFRESH_ADOPT_POLL_SECS = 2.0
+REFRESH_SUPERVISE_POLL_SECS = 1.0
+REFRESH_CANCEL_WAIT_SECS = 30.0
+OKTA_SUB_KINDS = {"admins": "okta_admins", "principal_status": "opa_principal_status", "inventory": "inventory_counts",
+                  "mfa_aggregates": "mfa_aggregates"}
+
+
+def _refresh_running(environment_id):
+    with _refresh_jobs_lock:
+        job = _refresh_jobs.get(environment_id)
+    return job is not None and job.status == "running"
+
+
+def _refresh_current(job):
+    """False once this job was removed or replaced (a deleted environment, a test's reset): its threads then stop at once."""
+    with _refresh_jobs_lock:
+        return _refresh_jobs.get(job.environment_id) is job
+
+
+def _refresh_audit(job, ctx):
+    return {"name": ctx["env_name"], "trigger": job.trigger, "actor_email": ctx.get("actor_email"), "actor_sub": ctx.get("actor_sub"),
+            "client_ip": ctx.get("client_ip"), "user_agent": ctx.get("user_agent")}
+
+
+def _snapshot_trigger(job):
+    if job.trigger == "scheduled":
+        return "scheduled"
+    return "refresh" if len(job.parts) > 1 else "manual"
+
+
+def _scan_time(environment_id):
+    """When the scan now on offer for this environment was read: memory first, else the stored scan's recorded time."""
+    import audit_store
+    view = _access_model_view(environment_id, hydrate=False)
+    if view:
+        return view["built_at"]
+    try:
+        info = audit_store.opa_model_cache_info(environment_id)
+    except Exception:
+        info = None
+    return info["built_at"] if info else None
+
+
+def _refresh_status(environment_id):
+    """The JSON for GET .../refresh/status: the job's record with the live step lists of the parts that are running."""
+    with _refresh_jobs_lock:
+        job = _refresh_jobs.get(environment_id)
+    if job is None:
+        return rj.idle_view()
+    steps = {}
+    running = job.running_parts()
+    if "opa" in running:
+        with _access_jobs_lock:
+            steps["opa"] = list((_access_jobs.get(environment_id) or {}).get("steps") or [])
+    if "log" in running:
+        with _sync_jobs_lock:
+            steps["log"] = list((_sync_jobs.get(environment_id) or {}).get("steps") or [])
+    return job.status_view(steps)
+
+
+def _start_refresh_job(env_id, env_name, parts=None, trigger="manual", owner=engine.LOCAL_OWNER_KEY, ingestion_scope=None,
+                       options=None, actor_email=None, actor_sub=None, client_ip=None, user_agent=None, minutes_late=None,
+                       correlation_id=None):
+    """Starts the refresh for one environment, or attaches to the one running. Returns
+    {"started", "already_running", "upgrade_starting", "job_id"}. `parts` is validated by the caller (rj.normalize_parts)."""
+    parts = rj.normalize_parts(parts)
+    audit = {"name": env_name, "trigger": trigger, "actor_email": actor_email, "actor_sub": actor_sub, "client_ip": client_ip, "user_agent": user_agent}
+    if upgrade_service.quiesced():
+        # An upgrade was just handed to the updater: no new refresh starts while it runs (a running one finishes first).
+        if trigger == "scheduled":
+            engine.log_audit_event(actor_email, actor_sub, "sync.scheduled_skipped", {"name": env_name, "reason": "an upgrade is starting"},
+                                   client_ip=client_ip, user_agent=user_agent)
+        return {"started": False, "already_running": False, "upgrade_starting": True, "job_id": None}
+    with _refresh_jobs_lock:
+        current = _refresh_jobs.get(env_id)
+        if current is not None and current.status == "running":
+            if trigger == "scheduled":
+                engine.log_audit_event(actor_email, actor_sub, "sync.scheduled_skipped", {"name": env_name, "reason": "already running"},
+                                       client_ip=client_ip, user_agent=user_agent)
+            return {"started": False, "already_running": True, "upgrade_starting": False, "job_id": current.job_id}
+        # Claimed under the lock that checked it (FE-04): two requests in the same tick can never both start a job.
+        job = rj.RefreshJob(env_id, parts, trigger, options=options)
+        _refresh_jobs[env_id] = job
+    ctx = {"env_name": env_name, "owner": owner, "ingestion_scope": ingestion_scope or "curated", "actor_email": actor_email,
+           "actor_sub": actor_sub, "client_ip": client_ip, "user_agent": user_agent, "minutes_late": minutes_late,
+           "correlation_id": correlation_id}
+    try:
+        engine.log_audit_event(actor_email, actor_sub, "refresh.started", {"name": env_name, "parts": parts, "trigger": trigger},
+                               client_ip=client_ip, user_agent=user_agent)
+        threading.Thread(target=_run_refresh_job, args=(job, ctx), daemon=True, name=f"refresh-{env_id[:8]}").start()
+    except BaseException:
+        # The slot was claimed above: never leave it "running" with no thread behind it.
+        with _refresh_jobs_lock:
+            if _refresh_jobs.get(env_id) is job:
+                _refresh_jobs.pop(env_id, None)
+        raise
+    return {"started": True, "already_running": False, "upgrade_starting": False, "job_id": job.job_id}
+
+
+def _cancel_refresh(environment_id, by=None, audit_ctx=None):
+    """Asks the running refresh to stop. Returns {"cancelling": bool, "job_id"}; nothing running -> cancelling False."""
+    with _refresh_jobs_lock:
+        job = _refresh_jobs.get(environment_id)
+    if job is None or job.status != "running":
+        return {"cancelling": False, "job_id": job.job_id if job else None}
+    running = job.running_parts()
+    if job.request_cancel(by=by) and audit_ctx:
+        _audit_for(audit_ctx, "refresh.cancelled", {"by": by, "parts_running": running})
+    return {"cancelling": True, "job_id": job.job_id}
+
+
+def _cancel_refresh_and_wait(environment_id, timeout=None):
+    """For an environment delete: stop its refresh and wait (bounded) until its parts have stopped. True when nothing is running."""
+    timeout = REFRESH_CANCEL_WAIT_SECS if timeout is None else timeout
+    _cancel_refresh(environment_id, by=None)
+    end = time.monotonic() + timeout
+    while _refresh_running(environment_id) and time.monotonic() < end:
+        time.sleep(0.05)
+    return not _refresh_running(environment_id)
+
+
+def _forget_environment_jobs(environment_id):
+    """Drops every in-memory job record of an environment (it was deleted)."""
+    with _refresh_jobs_lock:
+        _refresh_jobs.pop(environment_id, None)
+    with _access_jobs_lock:
+        _access_jobs.pop(environment_id, None)
+    with _sync_jobs_lock:
+        _sync_jobs.pop(environment_id, None)
+    with _capture_jobs_lock:
+        _capture_jobs.pop(environment_id, None)
+
+
+# -- the supervisor ----------------------------------------------------------------------------------------------------
+def _run_refresh_job(job, ctx):
+    engine.CORRELATION_ID.set(ctx.get("correlation_id"))
+    lanes = []  # [(thread, [parts])]
+    try:
+        if "opa" in job.parts:
+            lanes.append((threading.Thread(target=_run_lane, args=(job, ctx, ["opa"]), daemon=True, name="refresh-opa"), ["opa"]))
+        okta_lane = [p for p in ("log", "okta") if p in job.parts]
+        if okta_lane:
+            lanes.append((threading.Thread(target=_run_lane, args=(job, ctx, okta_lane), daemon=True, name="refresh-okta"), okta_lane))
+        for thread, _parts in lanes:
+            thread.start()
+        _supervise(job, lanes)
+    except BaseException as exc:  # a failure of the conductor itself must still end every part and the job
+        engine.log("ERROR", f"Refresh supervisor failed with {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+        for part in job.parts:
+            job.finish(part, "error", f"Internal error (reference {engine.CORRELATION_ID.get()}). The details are in the server log.")
+    finally:
+        _conclude_refresh(job, ctx)
+
+
+def _supervise(job, lanes):
+    grace_until = {}
+    while _refresh_current(job):
+        for part in job.overdue():
+            minutes = rj.PART_DEADLINES_SECS[part] // 60
+            if job.finish(part, "timed_out", rj.timed_out_message(part, minutes)):
+                job.cancel_events[part].set()
+                grace_until[part] = time.monotonic() + rj.KILL_GRACE_SECS
+        alive = [thread for thread, _p in lanes if thread.is_alive()]
+        if not alive:
+            break
+        if job.all_terminal() and all(time.monotonic() >= grace_until.get(p, 0) for p in job.parts if p in grace_until):
+            break  # every part has an outcome and any part we timed out has had its grace
+        time.sleep(REFRESH_SUPERVISE_POLL_SECS)
+    for part in job.parts:  # anything that never got to run (a lane that stopped, a part behind a timed-out one)
+        if job.part_state(part) in rj.ACTIVE_STATES:
+            job.finish(part, "cancelled" if job.is_cancelled() else "skipped",
+                       rj.cancelled_message() if job.is_cancelled() else "Did not run: an earlier part of this refresh did not finish.")
+
+
+def _run_lane(job, ctx, parts):
+    engine.CORRELATION_ID.set(ctx.get("correlation_id"))
+    runners = {"opa": _refresh_part_opa, "log": _refresh_part_log, "okta": _refresh_part_okta}
+    for part in parts:
+        if not _refresh_current(job):
+            return
+        try:
+            runners[part](job, ctx)
+        except engine.JobCancelled:
+            _finish_cancelled(job, part)
+        except BaseException as exc:
+            engine.log("ERROR", f"Refresh part '{part}' failed with {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+            job.finish(part, "error", f"Internal error (reference {engine.CORRELATION_ID.get()}). The details are in the server log.")
+
+
+def _finish_cancelled(job, part):
+    """A part that stopped at a checkpoint: a deadline already recorded timed_out (then this is a no-op); a Stop is cancelled."""
+    job.finish(part, "cancelled", rj.cancelled_message() if job.is_cancelled() else "Stopped.")
+
+
+def _conclude_refresh(job, ctx):
+    job.conclude()
+    outcome = job.outcome()
+    seconds = round(time.monotonic() - job.started_mono, 1)
+    try:
+        engine.log_audit_event(ctx.get("actor_email"), ctx.get("actor_sub"), "refresh.completed",
+                               {"name": ctx["env_name"], "trigger": job.trigger, "seconds": seconds, "outcome": outcome},
+                               client_ip=ctx.get("client_ip"), user_agent=ctx.get("user_agent"))
+    except Exception as exc:
+        engine.log("WARN", f"The refresh outcome could not be written to the audit log ({type(exc).__name__}).")
+    try:
+        _persist_last_refresh(job)
+    except Exception as exc:
+        engine.log("WARN", f"The refresh outcome could not be recorded ({type(exc).__name__}).")
+
+
+def _persist_last_refresh(job):
+    """Remember what the last scheduled and the last other refresh did, per part (state and a short message, no names), so the
+    Overview can still say a scheduled run did not read OPA after a restart."""
+    import audit_store
+    view = job.status_view()
+    record = {"job_id": job.job_id, "trigger": job.trigger, "finished_at": view["finished_at"],
+              "parts": {p: {"state": view["parts"][p]["state"], "message": (view["parts"][p].get("message") or "")[:300]} for p in job.parts}}
+    state = audit_store.get_sync_state(job.environment_id) or {}
+    stored = state.get("last_refresh") if isinstance(state.get("last_refresh"), dict) else {}
+    stored["scheduled" if job.trigger == "scheduled" else "manual"] = record
+    audit_store._upsert_sync_state(audit_store._get_connection(), job.environment_id, last_refresh_json=json.dumps(stored, sort_keys=True))
+
+
+# -- waiting for something another thread is doing ------------------------------------------------------------------------
+def _wait_until(job, part, condition, deadline_mono=None):
+    """Polls `condition()` until true. Returns "done", "cancelled" (this part's cancel flag), "abandoned" (the job record was
+    removed) or "deadline"."""
+    flag = job.cancel_events[part]
+    while True:
+        if condition():
+            return "done"
+        if not _refresh_current(job):
+            return "abandoned"
+        if flag.is_set():
+            return "cancelled"
+        if deadline_mono is not None and time.monotonic() >= deadline_mono:
+            return "deadline"
+        time.sleep(REFRESH_ADOPT_POLL_SECS)
+
+
+def _store_clients(job, ctx):
+    """(OpaClient, OktaClient|None) built from the environment's stored credentials, by id, under its real owner: a refresh
+    never shares a client with a request, and a session switch cannot affect it."""
+    creds = engine.get_environment_credentials_by_id(job.environment_id, owner=ctx["owner"])
+    opa_client = engine.OpaClient(creds["base_domain"], creds["team_name"], creds["key_id"], creds["key_secret"])
+    okta_client = engine.OktaClient(creds["okta_url"], creds["okta_api_token"]) if creds.get("okta_url") and creds.get("okta_api_token") else None
+    return opa_client, okta_client
+
+
+# -- the opa part ------------------------------------------------------------------------------------------------------
+def _refresh_part_opa(job, ctx):
+    part, env_id = "opa", job.environment_id
+    if not job.begin(part):
+        return
+    flag = job.cancel_events[part]
+    engine.CANCEL_FLAG.set(flag)
+    previous_at = _scan_time(env_id)
+    if flag.is_set():
+        job.finish(part, "cancelled", rj.cancelled_message())
+        return
+    try:
+        opa_client, okta_client = _store_clients(job, ctx)
+    except (KeyError, engine.CredentialStoreUnavailable) as exc:
+        job.finish(part, "error", f"The saved credentials could not be read: {exc} Nothing was changed.")
+        return
+    adopted = False
+    with _access_jobs_lock:
+        current = _access_jobs.get(env_id)
+        if current is not None and current.get("status") == "running":
+            adopted = True  # a scan another caller started (an older tab) is already running: use its result
+        else:
+            _access_jobs[env_id] = {"status": "running", "steps": [], "error": None, "result": None, "previous": _scan_slot_previous(current)}
+    if adopted:
+        reason = _wait_until(job, part, lambda: (_access_jobs.get(env_id) or {}).get("status") != "running",
+                             time.monotonic() + rj.PART_DEADLINES_SECS[part])
+        if reason != "done":
+            if reason == "cancelled":
+                job.finish(part, "cancelled", "Stopped waiting for the scan that was already running; it continues.")
+            return
+    else:
+        _run_access_job(env_id, opa_client, okta_client, correlation_id=ctx.get("correlation_id"), audit_ctx=_refresh_audit(job, ctx))
+    with _access_jobs_lock:
+        entry = dict(_access_jobs.get(env_id) or {})
+    steps = list(entry.get("steps") or [])
+    status = entry.get("status")
+    if status == "done" and isinstance(entry.get("result"), dict):
+        job.fresh_model = entry["result"]
+        job.finish(part, "ok", rj.opa_success_message(entry.get("counts") or {}, entry.get("warnings") or 0, entry.get("stored")),
+                   built_at=entry.get("result_at"), counts=entry.get("counts") or {}, warnings=entry.get("warnings") or 0,
+                   stored=entry.get("stored"), steps=steps)
+    elif status == "running":
+        return  # still going (the job record was dropped under it, or a stubbed body returned): the supervisor decides
+    else:
+        state, message = rj.opa_failure(entry.get("error_kind") or "error", entry.get("error_status"), entry.get("failed_step"),
+                                        previous_at, entry.get("error_class") or "an error", entry.get("key_path"))
+        job.finish(part, state, message, steps=steps, previous_built_at=previous_at)
+
+
+# -- the log part ------------------------------------------------------------------------------------------------------
+def _refresh_part_log(job, ctx):
+    part, env_id = "log", job.environment_id
+    if not job.begin(part):
+        return
+    flag = job.cancel_events[part]
+    engine.CANCEL_FLAG.set(flag)
+    if flag.is_set():
+        job.finish(part, "cancelled", rj.cancelled_message())
+        return
+    trigger = "scheduled" if job.trigger == "scheduled" else "manual"
+    # The sync's own start/skip/refusal logic (slot claim under the lock, upgrade quiesce, a refused credential recorded as an
+    # attempt) is reused whole; it runs here, in the lane's thread, so this part's cancel flag and deadline govern it.
+    started = _start_sync_job(
+        env_id, ctx["env_name"], ctx["ingestion_scope"], owner=ctx["owner"], trigger=trigger, actor_email=ctx.get("actor_email"),
+        actor_sub=ctx.get("actor_sub"), client_ip=ctx.get("client_ip"), user_agent=ctx.get("user_agent"),
+        minutes_late=ctx.get("minutes_late"), correlation_id=ctx.get("correlation_id"), inline=True)
+    adopted = False
+    with _sync_jobs_lock:
+        entry = dict(_sync_jobs.get(env_id) or {})
+    if not started and entry.get("status") == "running":
+        adopted = True
+        job.annotate(part, adopted=True, note="A sync was already running; this refresh used its result.")
+    elif not started and upgrade_service.quiesced():
+        job.finish(part, "skipped", "An upgrade is starting; refreshes are paused until it finishes (a few minutes).")
+        return
+    if entry.get("status") == "running":  # an adopted sync, or a body that has not finished
+        reason = _wait_until(job, part, lambda: (_sync_jobs.get(env_id) or {}).get("status") != "running",
+                             time.monotonic() + rj.PART_DEADLINES_SECS[part])
+        if reason != "done":
+            if reason == "cancelled":
+                job.finish(part, "cancelled", "Stopped waiting for the sync that was already running; it continues." if adopted
+                           else rj.cancelled_message())
+            return
+        with _sync_jobs_lock:
+            entry = dict(_sync_jobs.get(env_id) or {})
+    steps = list(entry.get("steps") or [])
+    status = entry.get("status")
+    if status == "done":
+        result = entry.get("result") or {}
+        inserted = int(result.get("inserted") or 0)
+        job.finish(part, "ok", f"{inserted} new event{'s' if inserted != 1 else ''} stored.", events_new=inserted,
+                   mode=result.get("mode"), steps=steps)
+        return
+    if status == "error":
+        error_status = entry.get("error_status")
+        if entry.get("cancelled"):
+            state, message = rj.log_failure("cancelled", None)
+        elif entry.get("partial"):
+            state, message = rj.log_failure("partial", None, entry.get("error"))
+        elif error_status in (401, 403):
+            state, message = rj.log_failure("refused", error_status)
+        else:
+            safe = entry.get("error") if (entry.get("error_deliberate") or "error_class" not in entry) else entry.get("error_class")
+            state, message = rj.log_failure("error", error_status, safe)
+        job.finish(part, state, message, steps=steps)
+
+
+# -- the okta part -----------------------------------------------------------------------------------------------------
+def _claim_capture(job, kind, deadline_mono):
+    """Takes the environment's capture slot for one capture; waits (bounded) while a manual 'Capture now' holds it."""
+    env_id = job.environment_id
+    while True:
+        with _capture_jobs_lock:
+            if (_capture_jobs.get(env_id) or {}).get("status") != "running":
+                _capture_jobs[env_id] = {"status": "running", "kind": kind, "error": None, "finished_at": None}
+                return True
+        if _wait_until(job, "okta", lambda: (_capture_jobs.get(env_id) or {}).get("status") != "running", deadline_mono) != "done":
+            return False
+
+
+def _release_capture(env_id, kind, error=None):
+    with _capture_jobs_lock:
+        _capture_jobs[env_id] = {"status": "error" if error else "done", "kind": kind, "error": error, "finished_at": _utc_now_iso()}
+
+
+def _refresh_part_okta(job, ctx):
+    import audit_store
+    import inventory_counts
+    import okta_admins
+    part, env_id = "okta", job.environment_id
+    if not job.begin(part):
+        return
+    flag = job.cancel_events[part]
+    engine.CANCEL_FLAG.set(flag)
+    wanted = [s for s in rj.OKTA_SUBS if s in (job.options.get("okta_subs") or rj.OKTA_SUBS)]
+    for sub in rj.OKTA_SUBS:
+        job.set_sub(sub, "pending" if sub in wanted else "not_requested")
+    if flag.is_set():
+        job.finish(part, "cancelled", rj.cancelled_message())
+        return
+    try:
+        _opa_client, okta_client = _store_clients(job, ctx)
+    except (KeyError, engine.CredentialStoreUnavailable) as exc:
+        job.finish(part, "error", f"The saved credentials could not be read: {exc} Nothing was changed.")
+        return
+    if okta_client is None:
+        job.finish(part, "skipped", "No Okta URL or API token is configured for this environment, so the Okta scan did not run.")
+        for sub in wanted:
+            job.set_sub(sub, "skipped")
+        return
+    forced = job.trigger != "scheduled"  # a person pressing Refresh is never held back by a cadence gate
+    trigger = _snapshot_trigger(job)
+    audit = _refresh_audit(job, ctx)
+    deadline = job.part_data[part]["_started_mono"] + rj.PART_DEADLINES_SECS[part]
+
+    def model_for_counts():
+        """The model the principal-status and inventory captures read: this refresh's fresh scan, or - when the OPA part was not
+        part of this refresh - the stored scan. None when the OPA part ran and did not finish: nothing stale is passed off as today's."""
+        if "opa" in job.parts:
+            return getattr(job, "fresh_model", None) if job.part_state("opa") == "ok" else None
+        return _access_model_for(env_id)
+
+    def sub_runner(sub, fn):
+        kind = OKTA_SUB_KINDS[sub]
+        job.set_sub(sub, "running")
+        if not _claim_capture(job, kind, deadline):
+            job.set_sub(sub, "cancelled")
+            raise engine.JobCancelled("cancelled")
+        try:
+            state, message, extra = fn()
+            _release_capture(env_id, kind)
+        except engine.JobCancelled:
+            _release_capture(env_id, kind, "Stopped.")
+            job.set_sub(sub, "cancelled", rj.cancelled_message())
+            raise
+        except Exception as exc:
+            message_out = _job_error_message(exc) if isinstance(exc, ValueError) else f"{rj.OKTA_SUB_LABELS[sub]} failed ({_failure_summary(exc)}). Nothing was changed."
+            _release_capture(env_id, kind, message_out)
+            engine.log("WARN", f"Okta {sub} capture for '{ctx['env_name']}' failed: {type(exc).__name__}")
+            _audit_for(audit, "okta_snapshot.failed", {"kind": kind, "error": _failure_summary(exc)})
+            if okta_admins.is_refused(exc):
+                job.set_sub(sub, "refused", message_out)
+            else:
+                job.set_sub(sub, "error", message_out)
+            return
+        job.set_sub(sub, state, message, **extra)
+
+    def snapshot_audit(snap, kind, **more):
+        _audit_for(audit, "okta_snapshot.captured", {
+            "kind": kind, "snapshot_id": snap["snapshot_id"], "status": snap["status"], "item_count": snap["item_count"],
+            "error_code": (snap.get("meta") or {}).get("error_code"), "trigger": trigger, **more})
+
+    def snapshot_result(snap, ok_message):
+        if snap["status"] == "ok":
+            return "ok", ok_message, {"snapshot_id": snap["snapshot_id"], "items": snap["item_count"]}
+        if snap["status"] == "refused":
+            return "refused", okta_admins.MISSING_ROLES_MESSAGE if snap["kind"] == okta_admins.KIND_ADMINS else \
+                "Okta refused the read (the token cannot read users). The refusal was recorded.", {"snapshot_id": snap["snapshot_id"]}
+        return "error", "Okta did not answer; the failure was recorded.", {"snapshot_id": snap["snapshot_id"]}
+
+    def do_admins():
+        snap = okta_admins.capture_and_store(env_id, okta_client) if forced else okta_admins.capture_if_due(env_id, okta_client)
+        if snap is None:
+            return "skipped", "Admin roles were recorded recently; they are read again after the next interval.", {}
+        snapshot_audit(snap, snap["kind"])
+        return snapshot_result(snap, f"{snap['item_count']} item(s) recorded.")
+
+    def do_mfa():
+        import signin_mfa
+        result = signin_mfa.refresh(env_id)
+        _audit_for(audit, "okta_snapshot.captured", {"kind": "mfa_aggregates", "events_scanned": result["events_scanned"], "trigger": trigger})
+        return "ok", f"{result['events_scanned']} archived event(s) folded in.", {"events_scanned": result["events_scanned"]}
+
+    def do_principals():
+        model = model_for_counts()
+        if model is None:
+            why = "the OPA scan did not finish" if "opa" in job.parts else "no OPA scan is stored yet; run the OPA scan first"
+            return "skipped", f"Not run: {why}.", {}
+        cap = okta_admins.capture_principal_status(okta_client, model)
+        snap = audit_store.record_config_snapshot(env_id, okta_admins.KIND_PRINCIPAL_STATUS, cap["items"], status=cap["status"],
+                                                  source_endpoint=cap["source_endpoint"], meta=cap["meta"])
+        snapshot_audit(snap, okta_admins.KIND_PRINCIPAL_STATUS)
+        return snapshot_result(snap, f"{snap['item_count']} OPA user(s) looked up in Okta.")
+
+    def do_inventory():
+        model = model_for_counts()
+        started = time.monotonic()
+        if forced:
+            snap = inventory_counts.capture_inventory(env_id, okta_client=okta_client, opa_client=None, model=model)
+        else:
+            snap = inventory_counts.capture_if_due(env_id, okta_client=okta_client, opa_client=None, model=model)
+        if snap is None:
+            return "skipped", "An inventory point was recorded in the last 20 hours; the next one is taken after that.", {}
+        snapshot_audit(snap, snap["kind"], inventory_seconds=round(time.monotonic() - started, 1))
+        text = f"{snap['item_count']} series recorded."
+        if model is None:
+            text = "Okta counts recorded; OPA counts missing today because the OPA scan did not finish." if "opa" in job.parts \
+                else "Okta counts recorded; OPA counts missing because no OPA scan is stored yet."
+        return "ok", text, {"snapshot_id": snap["snapshot_id"], "items": snap["item_count"], "okta_only": model is None}
+
+    def await_model():
+        if "opa" in job.parts and not job.model_ready.is_set():
+            reason = _wait_until(job, part, job.model_ready.is_set, deadline)
+            if reason == "cancelled":
+                raise engine.JobCancelled("cancelled")
+            if reason != "done":
+                raise engine.JobCancelled("cancelled")
+
+    try:
+        if "admins" in wanted:
+            sub_runner("admins", do_admins)
+        if "mfa_aggregates" in wanted:
+            sub_runner("mfa_aggregates", do_mfa)
+        if "principal_status" in wanted or "inventory" in wanted:
+            for sub in ("principal_status", "inventory"):
+                if sub in wanted:
+                    job.set_sub(sub, "waiting" if "opa" in job.parts and not job.model_ready.is_set() else "pending")
+            await_model()
+            if "principal_status" in wanted:
+                sub_runner("principal_status", do_principals)
+            if "inventory" in wanted:
+                sub_runner("inventory", do_inventory)
+    except engine.JobCancelled:
+        _finish_cancelled(job, part)
+        return
+    subs = {s: job.sub_data[s] for s in wanted}
+    refused = [s for s in wanted if subs[s]["state"] == "refused"]
+    failed = [s for s in wanted if subs[s]["state"] == "error"]
+    if refused:
+        job.finish(part, "refused", subs[refused[0]].get("message"))
+    elif failed:
+        job.finish(part, "error", subs[failed[0]].get("message"))
+    else:
+        recorded = [rj.OKTA_SUB_LABELS[s] for s in wanted if subs[s]["state"] == "ok"]
+        job.finish(part, "ok", ("Recorded: " + ", ".join(recorded) + ".") if recorded else "Nothing was due; the Okta scan has no new data to record yet.")
+
+
 def _upgrade_context():
     """What the upgrade preflight and the schedule tick need to know about this process."""
     import audit_store
     with _sync_jobs_lock:
         running = any(j.get("status") == "running" for j in _sync_jobs.values())
+    with _refresh_jobs_lock:
+        running = running or any(j.status == "running" for j in _refresh_jobs.values())  # 5.51.0: the OPA scan is included
     try:
         db_bytes = os.path.getsize(audit_store._audit_db_path())
     except OSError:
@@ -1219,8 +1877,11 @@ def _scheduler_tick(now_utc):
                 pass  # unparseable attempt timestamp -- don't let it block the retry
 
         minutes_late = (now_utc.hour * 60 + now_utc.minute) - (run_hour * 60 + run_minute)
-        _start_sync_job(
-            environment_id, env_name, schedule.get("ingestion_scope", "curated"), owner=owner, trigger="scheduled",
+        # 5.51.0: the daily run is the same job as the Overview's Refresh (OPA scan, Okta scan, System Log), on a timer. The
+        # back-off above is keyed off the log part's sync_state; a failed OPA part alone never delays tomorrow's run.
+        _start_refresh_job(
+            environment_id, env_name, parts=list(rj.PARTS), trigger="scheduled", owner=owner,
+            ingestion_scope=schedule.get("ingestion_scope", "curated"),
             minutes_late=minutes_late if minutes_late > SCHEDULER_LATE_THRESHOLD_MINUTES else None,
             correlation_id=engine.CORRELATION_ID.get(),
         )
@@ -1621,7 +2282,7 @@ class Handler(SimpleHTTPRequestHandler):
     # -----------------------------------------------------------------
     # Shared-environment permissions (5.42.0)
     # -----------------------------------------------------------------
-    def _capability_refused(self, engine_owner, environment_id, capabilities):
+    def _capability_refused(self, engine_owner, environment_id, capabilities, part=None):
         """THE route-side shared-environment check: every route that reads
         or acts on an environment (by name, or through the caller's active
         session) calls this with its fixed capability tuple, AFTER its own
@@ -1644,6 +2305,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self._send_json(403, {
                     "error": _shared_permission_message(capability),
                     "reason": "shared_permission_denied", "capability": capability,
+                    **({"part": part} if part else {}),  # 5.51.0: the refresh part the caller may not run
                 })
                 return True
         return False
@@ -1925,6 +2587,9 @@ class Handler(SimpleHTTPRequestHandler):
         bound = params.get("bound")
         if bound is not None and bound.get("environment_id") != checked:
             return self._target_changed()
+        # 5.51.0: a refresh in flight owns this environment's archive and stored scan: stop it and wait (bounded) first.
+        if not _cancel_refresh_and_wait(checked):
+            return 409, {"error": "A refresh of this environment is still stopping. Try again in a minute.", "reason": "refresh_stopping"}
         try:
             result = engine.delete_environment(
                 name, owner=engine_owner, is_admin=is_admin, environment_id=environment_id,
@@ -1946,6 +2611,10 @@ class Handler(SimpleHTTPRequestHandler):
         # now stale (its cached client still holds the old credentials
         # in memory) -- drop them all, not just the caller's.
         _drop_sessions_for_environment(result["environment_id"])
+        _forget_environment_jobs(result["environment_id"])
+        if result.get("opa_scan_removed"):
+            self._log_audit_event(actor_email, actor_sub, "access_scan.cache_purged",
+                                  {"environment_id": result["environment_id"], "reason": "archive_purged" if purge_archive else "environment_deleted"})
         details = {"name": name, "admin_override": is_admin, "purge_archive": purge_archive}
         if result["archive"]:
             details["archive_purged"] = result["archive"]
@@ -2737,6 +3406,16 @@ class Handler(SimpleHTTPRequestHandler):
                 # tenant data of its own.
                 return self._send_json(200, engine.get_banner_config())
 
+            if path.startswith("/api/environments/") and path.endswith("/refresh/status"):
+                # 5.51.0: the combined Refresh job's progress and per-part outcomes (never a name or a URL).
+                found = self._environment_from_tail(path, "/refresh/status", engine_owner)
+                if found is None:
+                    return
+                _name, meta = found
+                if self._capability_refused(engine_owner, meta["environment_id"], ("live_read",)):
+                    return
+                return self._send_json(200, _refresh_status(meta["environment_id"]))
+
             if path.startswith("/api/environments/") and path.endswith("/sync/status"):
                 name = unquote(path[len("/api/environments/"):-len("/sync/status")])
                 import audit_store
@@ -3205,6 +3884,18 @@ class Handler(SimpleHTTPRequestHandler):
                     "group_ids": group_ids,
                 })
 
+            if path == "/api/access/model":
+                # 5.51.0: the stored OPA scan (memory, else the local archive) with when it was read, so the Access Explorer
+                # opens at once after a restart. 404 no_scan only when no scan has ever been stored for this environment.
+                if not local_env_id:
+                    return self._send_json(409, {"error": "No active environment."})
+                if self._capability_refused(engine_owner, local_env_id, ("live_read",)):
+                    return
+                view = _access_model_view(local_env_id)
+                if view is None:
+                    return self._send_json(404, {"error": "No stored OPA scan for this environment yet.", "reason": "no_scan"})
+                return self._send_json(200, _access_model_payload(view))
+
             if path == "/api/access/bootstrap/status":
                 if not local_env_id:
                     return self._send_json(200, {"status": "idle", "steps": [], "error": None})
@@ -3656,6 +4347,61 @@ class Handler(SimpleHTTPRequestHandler):
                 name = unquote(path[len("/api/environments/"):-len("/sync_schedule")])
                 return self._environment_change("sync_schedule.update", {"name": name, "body": payload})
 
+            if path.startswith("/api/environments/") and path.endswith("/refresh/cancel"):
+                found = self._environment_from_tail(path, "/refresh/cancel", engine_owner)
+                if found is None:
+                    return
+                name, meta = found
+                with _refresh_jobs_lock:
+                    running_job = _refresh_jobs.get(meta["environment_id"])
+                running_parts = list(running_job.parts) if running_job is not None and running_job.status == "running" else list(rj.PARTS)
+                # Stopping needs what starting the running parts needed (every part's when nothing is running).
+                if "opa" in running_parts and self._capability_refused(engine_owner, meta["environment_id"], ("live_read",), part="opa"):
+                    return
+                if "log" in running_parts and self._capability_refused(engine_owner, meta["environment_id"], ("sync_now",), part="log"):
+                    return
+                if "okta" in running_parts and self._capability_refused(engine_owner, meta["environment_id"], ("live_read", "sync_now"), part="okta"):
+                    return
+                return self._send_json(200, _cancel_refresh(meta["environment_id"], by=actor_sub, audit_ctx={
+                    "name": name, "trigger": None, "actor_email": actor_email, "actor_sub": actor_sub,
+                    "client_ip": self._request_client_ip(), "user_agent": self.headers.get("User-Agent")}))
+
+            if path.startswith("/api/environments/") and path.endswith("/refresh"):
+                # 5.51.0: one Refresh for the OPA scan, the Okta scan and the System Log sync (see _start_refresh_job). Each
+                # part needs what its single-purpose button needs; a request naming a part the caller may not run is refused whole.
+                found = self._environment_from_tail(path, "/refresh", engine_owner)
+                if found is None:
+                    return
+                name, meta = found
+                try:
+                    parts = rj.normalize_parts(payload.get("parts"))
+                except ValueError as exc:
+                    return self._send_json(400, {"error": str(exc)})
+                if "opa" in parts and self._capability_refused(engine_owner, meta["environment_id"], ("live_read",), part="opa"):
+                    return
+                if "log" in parts and self._capability_refused(engine_owner, meta["environment_id"], ("sync_now",), part="log"):
+                    return
+                if "okta" in parts and self._capability_refused(engine_owner, meta["environment_id"], ("live_read", "sync_now"), part="okta"):
+                    return
+                options = {}
+                subs = payload.get("okta_subs")
+                if subs is not None:
+                    if not isinstance(subs, list) or not subs or not all(isinstance(x, str) and x in rj.OKTA_SUBS for x in subs):
+                        return self._send_json(400, {"error": f"okta_subs must be a non-empty list drawn from {list(rj.OKTA_SUBS)}"})
+                    options["okta_subs"] = [x for x in rj.OKTA_SUBS if x in subs]
+                trigger = "explorer" if parts == ["opa"] else "manual"
+                # The owner's saved sync settings (by id), as Sync now uses them: a shared user never chooses the scope.
+                schedule = engine.get_sync_schedule_by_id(meta["environment_id"])
+                outcome = _start_refresh_job(
+                    meta["environment_id"], name, parts=parts, trigger=trigger, owner=meta.get("owner"),
+                    ingestion_scope=schedule.get("ingestion_scope", "curated"), options=options,
+                    actor_email=actor_email, actor_sub=actor_sub, client_ip=self._request_client_ip(),
+                    user_agent=self.headers.get("User-Agent"), correlation_id=engine.CORRELATION_ID.get())
+                if outcome["upgrade_starting"]:
+                    return self._send_json(409, {"error": "An upgrade is starting; refreshes are paused until it finishes (a few minutes).",
+                                                 "reason": "upgrade_starting", **outcome})
+                return self._send_json(200, outcome)
+
             if path.startswith("/api/environments/") and path.endswith("/sync/start"):
                 name = unquote(path[len("/api/environments/"):-len("/sync/start")])
                 meta = engine.list_environments_for(engine_owner).get(name)
@@ -3727,8 +4473,8 @@ class Handler(SimpleHTTPRequestHandler):
                 if kind == "opa_principal_status":
                     model = _access_model_for(meta["environment_id"])
                     if model is None:
-                        return self._send_json(409, {"error": "The OPA roster is not loaded yet. Open the Access Explorer once, then try again.",
-                                                     "reason": "roster_not_loaded"})
+                        return self._send_json(409, {"error": "No OPA scan stored yet. Refresh from the Overview first.",
+                                                     "reason": "no_scan"})
                 started = _start_capture_job(
                     meta["environment_id"], name, meta.get("owner"), kind, model, actor_email, actor_sub,
                     self._request_client_ip(), self.headers.get("User-Agent"))
@@ -3756,17 +4502,23 @@ class Handler(SimpleHTTPRequestHandler):
                     return
                 if self._capability_refused(engine_owner, _local_env_id, ("live_read",)):
                     return
+                # 5.51.0: older tabs still start the scan here; it is the refresh job's `opa` part, so the stored scan, the
+                # coalescing and the deadline are the same for every way of starting one.
                 with _access_jobs_lock:
                     if _access_jobs.get(_local_env_id, {}).get("status") == "running":
                         # UI-10: the step list too, so a page that attaches to
                         # a job already running can still show its progress.
                         return self._send_json(200, {"started": False, "already_running": True, "steps": engine.ACCESS_MODEL_STEPS})
-                    _access_jobs[_local_env_id] = {"status": "running", "steps": [], "error": None, "result": None}
-                threading.Thread(
-                    target=_run_access_job, args=(_local_env_id, local_client, local_okta_client),
-                    kwargs={"correlation_id": engine.CORRELATION_ID.get()}, daemon=True
-                ).start()
-                return self._send_json(200, {"started": True, "steps": engine.ACCESS_MODEL_STEPS})
+                local_meta = engine.list_all_environments().get(_local_env_id) or {}
+                outcome = _start_refresh_job(
+                    _local_env_id, _local_env_name, parts=["opa"], trigger="explorer", owner=local_meta.get("owner"),
+                    actor_email=actor_email, actor_sub=actor_sub, client_ip=self._request_client_ip(),
+                    user_agent=self.headers.get("User-Agent"), correlation_id=engine.CORRELATION_ID.get())
+                if outcome["upgrade_starting"]:
+                    return self._send_json(409, {"error": "An upgrade is starting; refreshes are paused until it finishes (a few minutes).",
+                                                 "reason": "upgrade_starting"})
+                return self._send_json(200, {"started": outcome["started"], "already_running": outcome["already_running"],
+                                             "job_id": outcome["job_id"], "steps": engine.ACCESS_MODEL_STEPS})
 
             if path == "/api/resource_groups":
                 if not _require_client(self._send_json, local_client):
@@ -4315,6 +5067,16 @@ def _ensure_session_initialized(owner_key, headers=None):
         _try_activate_saved_environment(owner_key)
 
 
+def _sweep_orphaned_scans():
+    """5.51.0: removes any stored OPA scan whose environment is gone (an older release's delete, a restored backup), audited."""
+    import audit_store
+    try:
+        for environment_id in audit_store.sweep_orphaned_opa_model_caches():
+            engine.log_audit_event(None, None, "access_scan.cache_purged", {"environment_id": environment_id, "reason": "orphan"})
+    except Exception as exc:
+        engine.log("WARN", f"The stored-scan clean-up at start-up failed ({type(exc).__name__}); it is tried again at the next start.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Local server for the OPA Compliance Wizard dashboard.")
     parser.add_argument("--port", type=int, default=8766)
@@ -4331,6 +5093,7 @@ def main():
     # crash-looped with "no such table: active_environments."
     import audit_store
     audit_store.init_db()
+    _sweep_orphaned_scans()
 
     _seen_owners.add(LOCAL_OWNER_KEY_HEADER)
     _try_activate_saved_environment(LOCAL_OWNER_KEY_HEADER)

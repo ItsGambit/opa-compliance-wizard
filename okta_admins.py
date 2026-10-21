@@ -197,7 +197,9 @@ def capture_okta_admins(okta_client, max_admins=MAX_ADMINS):
         ids = ids[:max_admins]
     items = []
     governance_state = "unknown"  # unknown -> enabled | not_enabled | refused (decided on the first assignment)
+    from create_secret_folders import checkpoint
     for uid in ids:
+        checkpoint()  # 5.51.0: between admins, so a Stop (or a deadline) is noticed within a call or two
         user = {"id": uid}
         try:
             user = _clean_user(okta_client.get_user(uid)) or {"id": uid}
@@ -639,7 +641,9 @@ def capture_principal_status(okta_client, model, limit=MAX_PRINCIPALS):
     principals, skipped = opa_principals(model, limit)
     meta = {"principals": len(principals), "skipped_service_users": skipped, "unreadable": 0, "truncated": False}
     items = []
+    from create_secret_folders import checkpoint
     for p in principals:
+        checkpoint()  # 5.51.0: between principals
         entry = {k: p.get(k) for k in ("source", "opa_id", "name", "email", "project", "okta_lookup_id")}
         tried, found, failure = [], None, None
         for key in p.get("lookup_keys") or [{"kind": "login", "value": p["lookup"]}]:

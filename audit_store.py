@@ -33,6 +33,7 @@ import secrets
 import sqlite3
 import threading
 import uuid
+import zlib
 from datetime import datetime, timedelta, timezone
 
 # ---------------------------------------------------------------------------
@@ -890,6 +891,32 @@ def _migration_010_snapshots_polling_sync_and_correlation(conn):
     """)
 
 
+def _migration_011_opa_model_cache(conn):
+    """5.51.0. The stored OPA scan: one replaceable row per environment holding the Access Explorer model (redacted,
+    canonical JSON, zlib-compressed). Derived data, not evidence: it is overwritten by every successful scan and is not
+    chained. Like the archive tables it has NO foreign key to app_environments (an environment's delete removes the row
+    explicitly; a start-up sweep removes any left behind). A rollback to 5.50.x ignores the table, so this migration is
+    rollback-safe."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS opa_model_cache (
+            environment_id   TEXT PRIMARY KEY,
+            built_at         TEXT NOT NULL,
+            duration_seconds REAL,
+            source_version   TEXT NOT NULL,
+            sha256           TEXT NOT NULL,
+            raw_bytes        INTEGER NOT NULL,
+            model_zlib       BLOB NOT NULL,
+            warnings_json    TEXT,
+            counts_json      TEXT NOT NULL,
+            modified_at      TEXT
+        );
+    """)
+    # What the last refresh job did, per part (counts and state names only), so the Overview can say a scheduled run did not
+    # read OPA even after a restart. Older code ignores the column.
+    if "last_refresh_json" not in _table_columns(conn, "sync_state"):
+        conn.execute("ALTER TABLE sync_state ADD COLUMN last_refresh_json TEXT")
+
+
 MIGRATIONS = {
     1: _migration_001_unified_schema,
     2: _migration_002_ingestion_manifests,
@@ -901,6 +928,7 @@ MIGRATIONS = {
     8: _migration_008_shared_environment_permissions,
     9: _migration_009_shared_permission_grants_and_known_identities,
     10: _migration_010_snapshots_polling_sync_and_correlation,
+    11: _migration_011_opa_model_cache,
 }
 
 # DATA-08: migration 4 needs ALTER TABLE ... DROP COLUMN (SQLite 3.35.0,
@@ -2348,6 +2376,11 @@ def get_sync_state(environment_id):
         return None
     result = dict(row)
     result.pop("poll_cursor", None)  # an internal resume point (an Okta paging link), not something to show or export
+    raw_refresh = result.pop("last_refresh_json", None)  # 5.51.0: parsed below as `last_refresh`
+    try:
+        result["last_refresh"] = json.loads(raw_refresh) if raw_refresh else None
+    except ValueError:
+        result["last_refresh"] = None
     result["total_events_ingested"] = conn.execute(
         "SELECT COUNT(*) FROM events WHERE environment_id = ?", (environment_id,)
     ).fetchone()[0]
@@ -2357,7 +2390,7 @@ def get_sync_state(environment_id):
 _SYNC_STATE_FIELDS = (
     "last_synced_at", "last_sync_completed_at", "last_sync_status", "last_sync_error",
     "total_events_ingested", "ingestion_scope", "last_sync_attempt_at", "last_import_at",
-    "poll_cursor", "sync_mode",
+    "poll_cursor", "sync_mode", "last_refresh_json",
 )
 
 
@@ -2661,6 +2694,13 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
     # Exactly one manifest per call (5.40.6): once this call's rows are
     # sealed, nothing may seal them again.
     sealed = {"head": None, "done": False}
+    stopped = {"on_request": False}  # 5.51.0: the refresh job asked this run to stop (progress is saved, as for any partial run)
+
+    def _stop_requested():
+        import create_secret_folders as engine
+        if engine.cancel_requested():
+            stopped["on_request"] = True
+        return stopped["on_request"]
 
     def _seal(until):
         if not sealed["done"]:
@@ -2694,6 +2734,8 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
         }
         if error:
             out["error"] = error
+        if stopped["on_request"]:
+            out["cancelled"] = True
         return out
 
     def _fallback_since():
@@ -2708,6 +2750,9 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
         fell_back = False
         shrinks = 0
         while pages_polled < POLL_MAX_PAGES:
+            if _stop_requested():
+                return False, ("Stopped on request: the events read so far are stored and the cursor is saved, so the next sync "
+                               "continues from where this one stopped.")
             try:
                 events, next_path = okta_client.get_system_log_page(path)
             except Exception as exc:
@@ -2768,6 +2813,10 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
     failed_floor = None  # the smallest window that timed out in this run: the walk never grows back to it
     try:
         while bounded and cursor < safe_now_dt:
+            if _stop_requested():
+                error_message = (f"Stopped on request: progress up to {_iso_ms(cursor)} is saved and the next sync continues from there.")
+                chain_head = _fail(error_message, _iso_ms(cursor))
+                return _result(False, chain_head, error_message)
             chunk_until_dt = min(cursor + chunk_span, safe_now_dt)
             chunk_since = _iso_ms(cursor)  # millisecond-exact, so "no progress" below compares like with like
             chunk_until = _iso_ms(chunk_until_dt)
@@ -2853,6 +2902,16 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
         except Exception:
             pass  # the original exception is the one worth surfacing
         raise
+    except BaseException as exc:
+        import create_secret_folders as engine
+        if not isinstance(exc, engine.JobCancelled):
+            raise
+        # A cancel noticed inside a rate-limit wait: end like any other stopped run (stored rows sealed, status written).
+        stopped["on_request"] = True
+        error_message = ("Stopped on request: the events read so far are stored, so the next sync continues from where this one "
+                         "stopped.")
+        chain_head = _fail(error_message, _iso_ms(cursor))
+        return _result(False, chain_head, error_message)
 
     if on_progress:
         on_progress("ingest", "done", f"{total_inserted} new row(s) inserted across {chunks} day-chunk(s) and {pages_polled} polled page(s)")
@@ -3062,7 +3121,8 @@ def list_orphaned_archives():
                UNION SELECT environment_id FROM ingestion_manifests
                UNION SELECT environment_id FROM chain_heads
                UNION SELECT environment_id FROM manifest_entries
-               UNION SELECT environment_id FROM config_snapshots"""
+               UNION SELECT environment_id FROM config_snapshots
+               UNION SELECT environment_id FROM opa_model_cache"""
         )
     } - {r[0] for r in conn.execute("SELECT environment_id FROM app_environments")}
     out = []
@@ -3080,12 +3140,14 @@ def list_orphaned_archives():
             "oldest_published": stats[2], "newest_published": stats[3], "manifest_count": manifests,
             "snapshot_count": conn.execute(
                 "SELECT COUNT(*) FROM config_snapshots WHERE environment_id = ?", (environment_id,)).fetchone()[0],
+            "opa_scan_cached": conn.execute(
+                "SELECT 1 FROM opa_model_cache WHERE environment_id = ?", (environment_id,)).fetchone() is not None,
         })
     return out
 
 
 # Every table holding one environment's archive, in purge order (children first).
-ARCHIVE_TABLES = ("event_targets", "events", "sync_state", "config_snapshot_items", "config_snapshots", "mfa_week_user", "mfa_week_totals", "mfa_agg_state", "manifest_entries", "chain_heads", "ingestion_manifests")
+ARCHIVE_TABLES = ("event_targets", "events", "sync_state", "config_snapshot_items", "config_snapshots", "mfa_week_user", "mfa_week_totals", "mfa_agg_state", "manifest_entries", "chain_heads", "ingestion_manifests", "opa_model_cache")
 
 
 def archive_has_rows(environment_id):
@@ -3120,6 +3182,154 @@ def purge_environment_archive(environment_id):
             conn.rollback()
             raise
     return counts
+
+
+# ---------------------------------------------------------------------------
+# The stored OPA scan (5.51.0)
+# ---------------------------------------------------------------------------
+# One replaceable row per environment: the Access Explorer model after the redaction pass (create_secret_folders.
+# redact_model_for_storage), canonical JSON, zlib. It is what the screens open from after a restart. It is NOT evidence
+# (the sealed daily snapshot is); it is never exported or returned as a blob by any route.
+OPA_MODEL_CACHE_MAX_BYTES = 96 * 1024 * 1024
+OPA_MODEL_COUNT_KEYS = ("users", "groups", "policies", "projects", "servers")
+
+
+def _model_shape(version):
+    """The part of a release number the model's shape is tied to: patch releases never change the shape, a minor release may."""
+    parts = str(version or "").split(".")
+    return ".".join(parts[:2]) if len(parts) >= 2 else str(version or "")
+
+
+def opa_model_counts(model):
+    return {key: len(model[key]) for key in OPA_MODEL_COUNT_KEYS if isinstance(model.get(key), list)}
+
+
+def store_opa_model_cache(environment_id, model, built_at=None, duration_seconds=None, source_version=None, already_redacted=False):
+    """Replaces this environment's stored scan with `model`. Redacts first (idempotent; `already_redacted` skips the work
+    when the caller just did it) -- raises create_secret_folders.ModelRedactionError and writes nothing when the model holds
+    a credential-shaped value.
+
+    Returns {"stored": True, "built_at", "sha256", "raw_bytes", "model"} (model: the redacted copy) or, over
+    OPA_MODEL_CACHE_MAX_BYTES, {"stored": False, "reason": "too_large", "raw_bytes", "model"} with nothing written (the scan
+    stays usable in memory)."""
+    import create_secret_folders as engine
+    redacted = model if already_redacted else engine.redact_model_for_storage(model)
+    text = engine.canonical_model_json(redacted)
+    raw = text.encode("utf-8")
+    if len(raw) > OPA_MODEL_CACHE_MAX_BYTES:
+        return {"stored": False, "reason": "too_large", "raw_bytes": len(raw), "model": redacted}
+    built_at = built_at or _iso_ms(datetime.now(timezone.utc))
+    digest = hashlib.sha256(raw).hexdigest()
+    blob = zlib.compress(raw, 6)
+    warnings = redacted.get("warnings") if isinstance(redacted.get("warnings"), list) else []
+    conn = _get_connection()
+    with _db_lock:
+        conn.execute(
+            "INSERT OR REPLACE INTO opa_model_cache (environment_id, built_at, duration_seconds, source_version, sha256, "
+            "raw_bytes, model_zlib, warnings_json, counts_json, modified_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            (environment_id, built_at, duration_seconds, source_version or engine.SCRIPT_VERSION, digest, len(raw), blob,
+             json.dumps(warnings, sort_keys=True), json.dumps(opa_model_counts(redacted), sort_keys=True)),
+        )
+        conn.commit()
+    return {"stored": True, "built_at": built_at, "sha256": digest, "raw_bytes": len(raw), "model": redacted}
+
+
+def _cache_info_row(row):
+    try:
+        counts = json.loads(row["counts_json"])
+    except (TypeError, ValueError):
+        counts = {}
+    try:
+        warnings = json.loads(row["warnings_json"]) if row["warnings_json"] else []
+    except ValueError:
+        warnings = []
+    return {
+        "built_at": row["built_at"], "duration_seconds": row["duration_seconds"], "source_version": row["source_version"],
+        "sha256": row["sha256"], "raw_bytes": row["raw_bytes"], "counts": counts,
+        "warnings_count": len(warnings) if isinstance(warnings, list) else 0, "modified_at": row["modified_at"],
+    }
+
+
+def opa_model_cache_info(environment_id):
+    """What is stored for this environment, without the model: None when nothing usable is stored (no row, or a row built by
+    a release whose model shape differs)."""
+    import create_secret_folders as engine
+    row = _get_connection().execute(
+        "SELECT built_at, duration_seconds, source_version, sha256, raw_bytes, warnings_json, counts_json, modified_at "
+        "FROM opa_model_cache WHERE environment_id = ?", (environment_id,)).fetchone()
+    if row is None or _model_shape(row["source_version"]) != _model_shape(engine.SCRIPT_VERSION):
+        return None
+    return _cache_info_row(row)
+
+
+def load_opa_model_cache(environment_id):
+    """The stored scan as {**info, "model": dict}, or None when there is none, it was built by a different model shape, or
+    the stored bytes no longer match their recorded hash (a damaged row is treated as absent and logged, never served)."""
+    import create_secret_folders as engine
+    row = _get_connection().execute(
+        "SELECT built_at, duration_seconds, source_version, sha256, raw_bytes, warnings_json, counts_json, modified_at, model_zlib "
+        "FROM opa_model_cache WHERE environment_id = ?", (environment_id,)).fetchone()
+    if row is None or _model_shape(row["source_version"]) != _model_shape(engine.SCRIPT_VERSION):
+        return None
+    try:
+        raw = zlib.decompress(row["model_zlib"])
+        if hashlib.sha256(raw).hexdigest() != row["sha256"]:
+            raise ValueError("hash mismatch")
+        model = json.loads(raw.decode("utf-8"))
+        if not isinstance(model, dict):
+            raise ValueError("not an object")
+    except (zlib.error, ValueError, UnicodeDecodeError) as exc:
+        engine.log("WARN", f"The stored OPA scan for an environment could not be read ({type(exc).__name__}); it is ignored until the next scan.")
+        return None
+    return {**_cache_info_row(row), "model": model}
+
+
+def update_opa_model_cache(environment_id, model, modified_at=None):
+    """Replaces the stored model of an existing row after a local correction (a user removed from a group), keeping when the
+    scan was built and recording `modified_at`. False when there is no usable row."""
+    import create_secret_folders as engine
+    info = opa_model_cache_info(environment_id)
+    if info is None:
+        return False
+    redacted = engine.redact_model_for_storage(model)
+    raw = engine.canonical_model_json(redacted).encode("utf-8")
+    if len(raw) > OPA_MODEL_CACHE_MAX_BYTES:
+        return False
+    conn = _get_connection()
+    with _db_lock:
+        conn.execute(
+            "UPDATE opa_model_cache SET sha256 = ?, raw_bytes = ?, model_zlib = ?, counts_json = ?, modified_at = ? WHERE environment_id = ?",
+            (hashlib.sha256(raw).hexdigest(), len(raw), zlib.compress(raw, 6), json.dumps(opa_model_counts(redacted), sort_keys=True),
+             modified_at or _iso_ms(datetime.now(timezone.utc)), environment_id))
+        conn.commit()
+    return True
+
+
+def delete_opa_model_cache(environment_id):
+    """Removes this environment's stored scan. True if a row was removed."""
+    conn = _get_connection()
+    with _db_lock:
+        removed = conn.execute("DELETE FROM opa_model_cache WHERE environment_id = ?", (environment_id,)).rowcount
+        conn.commit()
+    return removed > 0
+
+
+def sweep_orphaned_opa_model_caches():
+    """Deletes every stored scan whose environment no longer exists (a delete under an older release, a rollback, a
+    restored backup). Returns the environment ids removed, for the caller to audit."""
+    conn = _get_connection()
+    with _db_lock:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            ids = [r[0] for r in conn.execute(
+                "SELECT environment_id FROM opa_model_cache WHERE environment_id NOT IN (SELECT environment_id FROM app_environments)")]
+            for environment_id in ids:
+                conn.execute("DELETE FROM opa_model_cache WHERE environment_id = ?", (environment_id,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return ids
 
 
 def _normalize_until(until):

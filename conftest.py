@@ -168,6 +168,8 @@ def reset_serve_module_state(monkeypatch):
             mod._access_jobs.clear()
         with mod._sync_jobs_lock:
             mod._sync_jobs.clear()
+        with mod._refresh_jobs_lock:
+            mod._refresh_jobs.clear()
     yield
     mod = sys.modules.get("server.serve")
     if mod is not None:
@@ -177,6 +179,8 @@ def reset_serve_module_state(monkeypatch):
             mod._access_jobs.clear()
         with mod._sync_jobs_lock:
             mod._sync_jobs.clear()
+        with mod._refresh_jobs_lock:
+            mod._refresh_jobs.clear()  # a refresh thread left behind by a test notices this and stops
 
 
 @pytest.fixture(autouse=True)

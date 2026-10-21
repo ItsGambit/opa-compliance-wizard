@@ -51,6 +51,11 @@
       "since": "5.50.0",
       "rollback_safe": false,
       "description": "Adds chained configuration snapshots, the System Log polling cursor and indexed correlation fields"
+    },
+    "11": {
+      "since": "5.51.0",
+      "rollback_safe": true,
+      "description": "Adds the stored OPA scan (a replaceable copy of the Access Explorer data)"
     }
   }
 }

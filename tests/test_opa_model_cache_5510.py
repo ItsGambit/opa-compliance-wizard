@@ -1,0 +1,326 @@
+"""5.51.0 (work package A1): the stored OPA scan. The redaction pass (a deny-list of keys and a canary on credential-shaped
+values), the cache round trip, its size and shape limits, and its lifecycle (replace, delete with the environment,
+purge parity, orphan sweep, retention). Every identity here is a placeholder."""
+import copy
+import json
+import sqlite3
+import zlib
+
+import pytest
+
+import audit_store
+import create_secret_folders as engine
+
+ENV = "55555555-5555-5555-5555-555555555555"
+OTHER = "66666666-6666-6666-6666-666666666666"
+JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl"
+SSWS = "00" + "aB3_-" * 9  # 47 characters, starts with 00
+LONG_SECRET = "Zq8vK2mXp9LrT4wYb7NcD1fHj6GsA3eUi5OoV0xRn2Qk8MtB"  # 50 characters, mixed case and digits
+
+
+def _model(**extra):
+    model = {
+        "resource_groups": [{"id": "11111111-1111-1111-1111-111111111111", "name": "Platform"}],
+        "projects": [{"id": "22222222-2222-2222-2222-222222222222", "name": "Core", "resource_group_id": "11111111-1111-1111-1111-111111111111"}],
+        "groups": [{"id": "g1", "name": "Admins", "roles": ["resource_admin"]}],
+        "users": [{"id": "u1", "name": "alex", "user_type": "human", "details": {"email": "alex@example.com"}, "groups": [{"id": "g1", "name": "Admins"}]}],
+        "policies": [{"id": "p1", "name": "Policy One", "active": True, "rules": [{"name": "r", "conditions": [
+            {"account_name_format": "STARTS_WITH", "value": "svc"}], "resolutions": [{"kind": "resolved", "sha": "a" * 64}]}]}],
+        "servers": [], "devices": [], "warnings": [],
+        "inventory_totals": {"secret_folders": 3, "secrets": 9},
+    }
+    model.update(extra)
+    return model
+
+
+@pytest.fixture
+def db(tmp_audit_store, tmp_environments_file):
+    audit_store.run_migrations()
+
+
+# -- redaction -------------------------------------------------------------------------------------------------------
+def test_denied_keys_are_dropped_at_every_depth():
+    model = _model(users=[{"id": "u1", "name": "alex", "credentials": {"password": {"value": "x"}}, "details": {
+        "api_token": "t", "nested": [{"Authorization": "Bearer x", "cookie": "c", "keep": "me"}]}}])
+    out = engine.redact_model_for_storage(model)
+    user = out["users"][0]
+    assert "credentials" not in user and "api_token" not in user["details"]
+    assert user["details"]["nested"] == [{"keep": "me"}]
+    assert user["id"] == "u1" and user["name"] == "alex"
+
+
+@pytest.mark.parametrize("key", sorted(engine.MODEL_REDACTED_KEYS - {"value"}))
+def test_every_denied_key_is_dropped_whatever_its_case(key):
+    out = engine.redact_model_for_storage(_model(extra_section=[{key.upper(): "anything", "id": "k"}]))
+    assert out["extra_section"] == [{"id": "k"}]
+
+
+def test_a_bare_value_key_is_dropped_but_a_name_condition_operand_is_kept():
+    out = engine.redact_model_for_storage(_model(groups=[{"id": "g", "value": "should-go"}]))
+    assert out["groups"] == [{"id": "g"}]
+    kept = out["policies"][0]["rules"][0]["conditions"][0]
+    assert kept == {"account_name_format": "STARTS_WITH", "value": "svc"}
+
+
+def test_collection_names_that_contain_secret_are_not_confused_with_the_key():
+    model = _model(secret_folders=[{"id": "f"}], secrets=[{"id": "s"}], privileges=[{"privilege_type": "secret"}])
+    out = engine.redact_model_for_storage(model)
+    assert out["secret_folders"] == [{"id": "f"}] and out["secrets"] == [{"id": "s"}]
+    assert out["privileges"] == [{"privilege_type": "secret"}]
+
+
+def test_the_input_is_not_modified():
+    model = _model(users=[{"id": "u1", "password": "p"}])
+    before = copy.deepcopy(model)
+    engine.redact_model_for_storage(model)
+    assert model == before
+
+
+@pytest.mark.parametrize("secret", [JWT, SSWS, LONG_SECRET, "opk_abcdefghijkl", "ghp_abcdefghijklmnop"])
+def test_a_credential_shaped_value_refuses_the_scan_and_names_the_path_not_the_value(secret):
+    model = _model(users=[{"id": "u1", "name": "alex"}, {"id": "u2", "details": {"notes": [{"free_text": secret}]}}])
+    with pytest.raises(engine.ModelRedactionError) as caught:
+        engine.redact_model_for_storage(model)
+    assert caught.value.key_path == "users[1].details.notes[0].free_text"
+    assert secret not in str(caught.value) and caught.value.key_path in str(caught.value)
+    assert isinstance(caught.value, ValueError)
+
+
+@pytest.mark.parametrize("fine", [
+    "11111111-1111-1111-1111-111111111111",  # an id
+    "a" * 64,  # a hex digest
+    "00uabcdefghijklmnopq",  # an Okta id
+    "https://example.okta.com/api/v1/users/00uabcdefghijklmnopq?after=abc",
+    "Production Linux servers owned by the platform team and reviewed every quarter",
+    "alex@example.com",
+])
+def test_ordinary_values_pass_the_canary(fine):
+    assert engine.redact_model_for_storage(_model(users=[{"id": "u1", "name": fine}]))["users"][0]["name"] == fine
+
+
+def test_a_credential_under_a_denied_key_is_dropped_not_refused():
+    # the key is removed before its value is read: nothing of it can reach the disk either way
+    out = engine.redact_model_for_storage(_model(users=[{"id": "u1", "token": JWT}]))
+    assert out["users"] == [{"id": "u1"}]
+
+
+def test_devices_keep_only_what_the_resources_tab_shows():
+    device = {"id": "d1", "status": "ACTIVE", "created": "2026-01-01T00:00:00.000Z", "lastUpdated": "2026-01-02T00:00:00.000Z",
+              "profile": {"displayName": "Laptop", "platform": "MACOS", "osVersion": "15", "serialNumber": "SERIAL1", "registered": True,
+                          "imei": "123456789012345", "udid": "UDID-1", "secureHardwarePresent": True, "diskEncryptionType": "ALL_INTERNAL_VOLUMES"},
+              "authenticator_enrollments": [{"id": "e", "key": "okta_verify", "name": "Okta Verify", "status": "ACTIVE", "devicePushToken": "zzz"}],
+              "users": ["alex@example.com"], "_links": {"self": {"href": "https://example.okta.com/api/v1/devices/d1"}}, "resourceId": "r"}
+    out = engine.redact_model_for_storage(_model(devices=[device]))["devices"][0]
+    assert set(out) == {"id", "status", "created", "lastUpdated", "profile", "authenticator_enrollments", "users"}
+    assert "imei" not in out["profile"] and "udid" not in out["profile"] and out["profile"]["serialNumber"] == "SERIAL1"
+    assert out["authenticator_enrollments"] == [{"id": "e", "key": "okta_verify", "name": "Okta Verify", "status": "ACTIVE"}]
+
+
+@pytest.mark.parametrize("bad", [{"x": {1, 2}}, {"x": float("nan")}, {"x": object()}, {1: "numeric key"}])
+def test_values_that_cannot_be_stored_are_refused(bad):
+    with pytest.raises(engine.ModelRedactionError):
+        engine.redact_model_for_storage(_model(extra=bad))
+
+
+def test_absurd_nesting_is_refused_not_a_recursion_error():
+    deep = current = {}
+    for _ in range(100):
+        current["n"] = {}
+        current = current["n"]
+    with pytest.raises(engine.ModelRedactionError):
+        engine.redact_model_for_storage(_model(deep=deep))
+
+
+def test_the_path_never_carries_an_unbounded_key():
+    long_key = "k" * 500
+    with pytest.raises(engine.ModelRedactionError) as caught:
+        engine.redact_model_for_storage(_model(extra={long_key: JWT}))
+    assert len(caught.value.key_path) < 100
+
+
+# -- the cache -------------------------------------------------------------------------------------------------------
+def test_a_clean_model_round_trips_byte_identical(db):
+    model = _model()
+    stored = audit_store.store_opa_model_cache(ENV, model, built_at="2026-10-21T02:20:00.000Z", duration_seconds=41.5)
+    assert stored["stored"] and stored["built_at"] == "2026-10-21T02:20:00.000Z"
+    loaded = audit_store.load_opa_model_cache(ENV)
+    assert loaded["model"] == model
+    assert engine.canonical_model_json(loaded["model"]) == engine.canonical_model_json(model)
+    import hashlib
+    assert loaded["sha256"] == stored["sha256"] == hashlib.sha256(engine.canonical_model_json(model).encode("utf-8")).hexdigest()
+    assert loaded["counts"] == {"users": 1, "groups": 1, "policies": 1, "projects": 1, "servers": 0}
+    assert loaded["duration_seconds"] == 41.5 and loaded["source_version"] == engine.SCRIPT_VERSION and loaded["warnings_count"] == 0
+
+
+def test_the_stored_bytes_are_compressed_canonical_json(db):
+    audit_store.store_opa_model_cache(ENV, _model())
+    row = audit_store._get_connection().execute("SELECT model_zlib, raw_bytes FROM opa_model_cache").fetchone()
+    raw = zlib.decompress(row["model_zlib"])
+    assert len(raw) == row["raw_bytes"] and json.loads(raw)["users"][0]["name"] == "alex"
+
+
+def test_a_credential_in_the_model_stores_nothing(db):
+    with pytest.raises(engine.ModelRedactionError):
+        audit_store.store_opa_model_cache(ENV, _model(users=[{"id": "u", "name": JWT}]))
+    assert audit_store.load_opa_model_cache(ENV) is None
+    assert audit_store._get_connection().execute("SELECT COUNT(*) FROM opa_model_cache").fetchone()[0] == 0
+
+
+def test_denied_keys_never_reach_the_disk(db):
+    audit_store.store_opa_model_cache(ENV, _model(users=[{"id": "u1", "name": "alex", "credentials": {"password": "hunter2-hunter2"}}]))
+    row = audit_store._get_connection().execute("SELECT model_zlib FROM opa_model_cache").fetchone()
+    assert b"hunter2" not in zlib.decompress(row["model_zlib"]) and b"credentials" not in zlib.decompress(row["model_zlib"])
+
+
+def test_a_new_scan_replaces_the_old_one(db):
+    audit_store.store_opa_model_cache(ENV, _model(), built_at="2026-10-20T02:00:00.000Z")
+    audit_store.store_opa_model_cache(ENV, _model(groups=[]), built_at="2026-10-21T02:00:00.000Z")
+    loaded = audit_store.load_opa_model_cache(ENV)
+    assert loaded["built_at"] == "2026-10-21T02:00:00.000Z" and loaded["model"]["groups"] == []
+    assert audit_store._get_connection().execute("SELECT COUNT(*) FROM opa_model_cache").fetchone()[0] == 1
+
+
+def test_over_the_size_limit_nothing_is_stored_and_the_model_stays_usable(db, monkeypatch):
+    monkeypatch.setattr(audit_store, "OPA_MODEL_CACHE_MAX_BYTES", 50)
+    result = audit_store.store_opa_model_cache(ENV, _model())
+    assert result["stored"] is False and result["reason"] == "too_large" and result["raw_bytes"] > 50
+    assert result["model"]["users"][0]["name"] == "alex"
+    assert audit_store.load_opa_model_cache(ENV) is None
+
+
+def test_a_scan_over_the_limit_leaves_the_previous_row_alone(db, monkeypatch):
+    audit_store.store_opa_model_cache(ENV, _model(), built_at="2026-10-20T02:00:00.000Z")
+    monkeypatch.setattr(audit_store, "OPA_MODEL_CACHE_MAX_BYTES", 50)
+    assert audit_store.store_opa_model_cache(ENV, _model(groups=[]))["stored"] is False
+    assert audit_store.load_opa_model_cache(ENV)["built_at"] == "2026-10-20T02:00:00.000Z"
+
+
+def test_environments_never_share_a_scan(db):
+    audit_store.store_opa_model_cache(ENV, _model())
+    audit_store.store_opa_model_cache(OTHER, _model(users=[]))
+    assert audit_store.load_opa_model_cache(ENV)["model"]["users"] and audit_store.load_opa_model_cache(OTHER)["model"]["users"] == []
+
+
+def test_a_scan_built_by_another_model_shape_is_treated_as_absent(db):
+    audit_store.store_opa_model_cache(ENV, _model(), source_version="5.52.0")
+    assert audit_store.load_opa_model_cache(ENV) is None and audit_store.opa_model_cache_info(ENV) is None
+    audit_store.store_opa_model_cache(ENV, _model(), source_version="5.51.7")  # a patch release shares the shape
+    assert audit_store.load_opa_model_cache(ENV) is not None
+
+
+def test_a_damaged_row_is_ignored_not_served(db):
+    audit_store.store_opa_model_cache(ENV, _model())
+    conn = audit_store._get_connection()
+    conn.execute("UPDATE opa_model_cache SET model_zlib = ?", (zlib.compress(b'{"users": []}'),))
+    conn.commit()
+    assert audit_store.load_opa_model_cache(ENV) is None  # hash mismatch
+    conn.execute("UPDATE opa_model_cache SET model_zlib = ?", (b"not zlib",))
+    conn.commit()
+    assert audit_store.load_opa_model_cache(ENV) is None
+
+
+def test_info_never_carries_the_model(db):
+    audit_store.store_opa_model_cache(ENV, _model(warnings=[{"section": "gateways", "status": 403, "message": "m"}]))
+    info = audit_store.opa_model_cache_info(ENV)
+    assert "model" not in info and info["warnings_count"] == 1 and info["counts"]["users"] == 1
+
+
+def test_a_local_correction_keeps_the_scan_time_and_records_the_edit(db):
+    audit_store.store_opa_model_cache(ENV, _model(), built_at="2026-10-20T02:00:00.000Z")
+    corrected = _model()
+    corrected["users"][0]["groups"] = []
+    assert audit_store.update_opa_model_cache(ENV, corrected, modified_at="2026-10-21T09:00:00.000Z")
+    loaded = audit_store.load_opa_model_cache(ENV)
+    assert loaded["built_at"] == "2026-10-20T02:00:00.000Z" and loaded["modified_at"] == "2026-10-21T09:00:00.000Z"
+    assert loaded["model"]["users"][0]["groups"] == []
+    assert audit_store.update_opa_model_cache(OTHER, corrected) is False
+
+
+# -- lifecycle -------------------------------------------------------------------------------------------------------
+def _register(name="dev"):
+    return engine.upsert_environment(
+        name, {"base_domain": "a.example.com", "team_name": "team-a", "key_id": "k", "key_secret": "s"}, owner=engine.LOCAL_OWNER_KEY)[1]
+
+
+def test_deleting_an_environment_removes_its_scan_and_keeps_the_sealed_evidence(db, fake_keyring):
+    env_id = _register()
+    audit_store.store_opa_model_cache(env_id, _model())
+    audit_store.record_config_snapshot(env_id, "opa_access_state", [("k", {"a": 1})])
+    result = engine.delete_environment("dev", owner=engine.LOCAL_OWNER_KEY)
+    assert result["opa_scan_removed"] is True
+    assert audit_store.load_opa_model_cache(env_id) is None
+    assert len(audit_store.list_config_snapshots(env_id)) == 1  # evidence kept as an orphan archive
+
+
+def test_deleting_with_the_archive_removes_both(db, fake_keyring):
+    env_id = _register()
+    audit_store.store_opa_model_cache(env_id, _model())
+    audit_store.record_config_snapshot(env_id, "opa_access_state", [("k", {"a": 1})])
+    engine.delete_environment("dev", owner=engine.LOCAL_OWNER_KEY, purge_archive=True)
+    assert audit_store.load_opa_model_cache(env_id) is None and audit_store.list_config_snapshots(env_id) == []
+
+
+def test_a_failure_removing_the_scan_does_not_undo_the_delete(db, fake_keyring, monkeypatch):
+    env_id = _register()
+    monkeypatch.setattr(audit_store, "delete_opa_model_cache", lambda _id: (_ for _ in ()).throw(sqlite3.OperationalError("locked")))
+    result = engine.delete_environment("dev", owner=engine.LOCAL_OWNER_KEY)
+    assert result["environment_id"] == env_id and result["opa_scan_removed"] is False
+    assert engine.list_all_environments().get(env_id) is None
+
+
+def test_purging_an_orphan_archive_empties_the_scan_table_too(db):
+    audit_store.store_opa_model_cache(ENV, _model())
+    assert audit_store.archive_has_rows(ENV)
+    assert [o["environment_id"] for o in audit_store.list_orphaned_archives()] == [ENV]
+    assert audit_store.list_orphaned_archives()[0]["opa_scan_cached"] is True
+    counts = audit_store.purge_environment_archive(ENV)
+    assert counts["opa_model_cache"] == 1 and audit_store.load_opa_model_cache(ENV) is None
+    assert not audit_store.archive_has_rows(ENV)
+
+
+def test_purging_one_environment_leaves_another_scan(db):
+    audit_store.store_opa_model_cache(ENV, _model())
+    audit_store.store_opa_model_cache(OTHER, _model())
+    audit_store.purge_environment_archive(ENV)
+    assert audit_store.load_opa_model_cache(OTHER) is not None
+
+
+def test_the_start_up_sweep_removes_only_scans_of_environments_that_are_gone(db, fake_keyring):
+    live = _register()
+    audit_store.store_opa_model_cache(live, _model())
+    audit_store.store_opa_model_cache(ENV, _model())
+    audit_store.store_opa_model_cache(OTHER, _model())
+    assert sorted(audit_store.sweep_orphaned_opa_model_caches()) == sorted([ENV, OTHER])
+    assert audit_store.load_opa_model_cache(live) is not None and audit_store.load_opa_model_cache(ENV) is None
+    assert audit_store.sweep_orphaned_opa_model_caches() == []
+
+
+def test_retention_never_touches_the_scan_or_the_daily_access_state(db):
+    audit_store.store_opa_model_cache(ENV, _model())
+    audit_store.record_config_snapshot(ENV, "opa_access_state", [("user:u1", {"id": "u1"})], captured_at="2020-01-01T00:00:00.000Z")
+    audit_store.prune_events(ENV, retention_days=1, max_size_mb=0.001)
+    assert audit_store.load_opa_model_cache(ENV) is not None
+    assert len(audit_store.list_config_snapshots(ENV, kind="opa_access_state")) == 1
+
+
+# -- the migration ---------------------------------------------------------------------------------------------------
+def test_migration_eleven_upgrades_a_5_50_database_without_touching_its_data(tmp_audit_store, tmp_environments_file, monkeypatch):
+    full = dict(audit_store.MIGRATIONS)
+    monkeypatch.setattr(audit_store, "MIGRATIONS", {k: v for k, v in full.items() if k <= 10})
+    audit_store.run_migrations()
+    conn = audit_store._get_connection()
+    assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 10
+    assert conn.execute("SELECT name FROM sqlite_master WHERE name = 'opa_model_cache'").fetchone() is None
+    audit_store.record_config_snapshot(ENV, "okta_admins", [("u", {"a": 1})])
+    monkeypatch.setattr(audit_store, "MIGRATIONS", full)
+    audit_store.run_migrations()
+    assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 11
+    assert conn.execute("SELECT name FROM sqlite_master WHERE name = 'opa_model_cache'").fetchone() is not None
+    assert len(audit_store.list_config_snapshots(ENV)) == 1 and audit_store.verify_ingestion_chain(ENV, deep=True)["valid"]
+    audit_store.run_migrations()  # idempotent
+
+
+def test_a_scan_row_does_not_disturb_deep_verification(db):
+    audit_store.store_opa_model_cache(ENV, _model())
+    audit_store.record_config_snapshot(ENV, "opa_access_state", [("user:u1", {"id": "u1"})])
+    assert audit_store.verify_ingestion_chain(ENV, deep=True)["valid"]

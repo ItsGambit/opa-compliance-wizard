@@ -74,7 +74,7 @@ def test_capture_validation_and_missing_credentials(matrix_server, monkeypatch):
     with serve._access_jobs_lock:
         serve._access_jobs.pop(env_id)
     r = _call(base_url, "POST", url, {"kind": "opa_principal_status"}, _who(OWNER_A))
-    assert r.status_code == 409 and r.json()["reason"] == "roster_not_loaded"
+    assert r.status_code == 409 and r.json()["reason"] == "no_scan"
     engine.upsert_environment("dev", {"base_domain": "a.example.com", "team_name": "t", "key_id": "k", "key_secret": "s",
                                       "okta_url": "", "okta_api_token": ""}, owner=OWNER_A, environment_id=env_id)
     _call(base_url, "POST", url, {"kind": "okta_admins"}, _who(OWNER_A))
