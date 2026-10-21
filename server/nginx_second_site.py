@@ -153,7 +153,7 @@ def _location_blocks(text):
 # request never reaches the backend. Admins change these from the main
 # gate's site.
 #
-# 5.50.0: the executive overview (/api/overview) joins the list; a site generated before 5.50.0 lacks its block
+# 5.50.0: the admin-only Overview (/api/overview, including /people and /privileged) joins the list; a site generated before 5.50.0 lacks its block
 # (run `sudo server/install.sh --regenerate-second-sites`, README "Upgrading").
 #
 # 5.47.0: host upgrades are a property of the whole backend as well: the update
@@ -181,7 +181,7 @@ _ACCESS_CONTROL_BLOCK = (
     "    location /api/upgrade {\n"
     "        return 403;\n"
     "    }\n"
-    "    # 5.50.0: the executive overview spans the whole backend (admin-only), so it is read from the main site only.\n"
+    "    # 5.50.0: the Overview (admin-only, with its people lists) is read from the main site only.\n"
     "    location /api/overview {\n"
     "        return 403;\n"
     "    }\n"

@@ -42,7 +42,7 @@
 #                              the updater refuses a release whose newest change to those files is newer than that version.
 #                              Touches no data. This is the command a refused upgrade asks for ("needs_install_sh").
 #   --regenerate-second-sites  regenerate the nginx site of every additional login gate (opa-auth-gate-*) from the live main site
-#                              with this release's rules (the /api/upgrade deny), with `nginx -t` first and a restore on failure
+#                              with this release's deny rules (every denied route), with `nginx -t` first and a restore on failure
 #   --yes                      do not ask for confirmation
 #
 # Everything below that is a path can be redirected for testing (OCW_OPT_DIR, OCW_DATA_DIR, OCW_UNIT_DIR, OCW_BIN_DIR,
@@ -171,6 +171,9 @@ rewrite_unit() {
 
 # the additional login gates (setup-second-gate.sh): units opa-auth-gate-<name>, nginx site <sites dir>/opa-<name>
 SECOND_GATES="$(systemctl list-unit-files 'opa-auth-gate-*.service' --no-legend 2>/dev/null | awk '{print $1}' | sed -e 's/\.service$//' -e 's/^opa-auth-gate-//' | tr '\n' ' ' || true)"
+# every route an additional gate's site must answer 403 on, read from the one list the generator and the check use
+DENIED_PREFIXES="$("$PY3" -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import nginx_second_site as n; print(", ".join(n.SECOND_SITE_DENIED_PREFIXES))' "$SOURCE_DIR/server" 2>/dev/null || true)"
+[ -n "$DENIED_PREFIXES" ] || DENIED_PREFIXES="/api/access_control, /api/shared_permissions, /api/archives, /api/upgrade, /api/overview"
 second_site_status() { # second_site_status <name>: prints ok | missing-deny | no-site | unreadable
   local _site="$NGINX_SITES_DIR/opa-$1" _rc=0
   [ -f "$_site" ] || { echo "no-site"; return 0; }
@@ -304,10 +307,10 @@ if [ -n "$SECOND_GATES" ]; then
   note "!! ADDITIONAL LOGIN GATES FOUND: $SECOND_GATES"
   for _g in $SECOND_GATES; do
     case "$(second_site_status "$_g")" in
-      ok) note "   opa-$_g ($NGINX_SITES_DIR/opa-$_g): already denies /api/upgrade" ;;
+      ok) note "   opa-$_g ($NGINX_SITES_DIR/opa-$_g): already denies every route in the current deny rules ($DENIED_PREFIXES)" ;;
       no-site) note "   opa-$_g: no nginx site at $NGINX_SITES_DIR/opa-$_g (OCW_NGINX_SITES_DIR=<dir> if it lives elsewhere); check it by hand" ;;
       unreadable) note "   opa-$_g: $NGINX_SITES_DIR/opa-$_g could not be read or parsed; check it by hand" ;;
-      *) note "   opa-$_g: $NGINX_SITES_DIR/opa-$_g does NOT deny /api/upgrade: through that hostname an admin of that org could reach this server's upgrade routes" ;;
+      *) note "   opa-$_g: $NGINX_SITES_DIR/opa-$_g does NOT deny every route in the current deny rules ($DENIED_PREFIXES): through that hostname an admin of that org could reach the whole-backend admin routes among them" ;;
     esac
   done
   if [ -n "$REGEN_SECOND" ]; then
@@ -688,8 +691,8 @@ if [ -n "$SECOND_GATES" ]; then
   for _g in $SECOND_GATES; do [ "$(second_site_status "$_g")" = "ok" ] || _unfixed="$_unfixed $_g"; done
   if [ -n "$_unfixed" ]; then
     note ""
-    note "!! ACTION NEEDED: the nginx site of these additional login gates does not deny /api/upgrade:$_unfixed"
-    note "!! Through that hostname an administrator of that org could reach this server's upgrade routes. Run"
+    note "!! ACTION NEEDED: the nginx site of these additional login gates does not deny every route in the current deny rules ($DENIED_PREFIXES):$_unfixed"
+    note "!! Through that hostname an administrator of that org could reach the whole-backend admin routes among them (host upgrades, shared permissions, the Overview). Run"
     note "!!     sudo bash $SOURCE_DIR/server/install.sh --regenerate-second-sites"
     note "!! (it rebuilds each site from the live main site, runs nginx -t, and puts the old site back if it fails)."
   fi

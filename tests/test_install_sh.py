@@ -426,7 +426,7 @@ def test_second_gates_are_announced_loudly_in_the_dry_run_and_the_real_run(world
     site, _unit = _add_second_gate(world)
     d = world.run("--dry-run")
     assert d.returncode == 0, d.stdout + d.stderr
-    assert "ADDITIONAL LOGIN GATES FOUND: second" in d.stdout and "does NOT deny /api/upgrade" in d.stdout
+    assert "ADDITIONAL LOGIN GATES FOUND: second" in d.stdout and "does NOT deny every route in the current deny rules" in d.stdout and all(p in d.stdout for p in ("/api/access_control", "/api/shared_permissions", "/api/archives", "/api/upgrade", "/api/overview"))
     assert f"server/install.sh --regenerate-second-sites" in d.stdout
     p = world.run()
     assert p.returncode == 0, p.stdout + p.stderr
@@ -486,4 +486,4 @@ def test_a_second_site_that_already_denies_upgrade_is_reported_ok(world):
     Backend.version = "5.47.0"
     _add_second_gate(world, with_deny=True)
     p = world.run("--dry-run")
-    assert "already denies /api/upgrade" in p.stdout and "does NOT" not in p.stdout
+    assert "already denies every route in the current deny rules" in p.stdout and "does NOT" not in p.stdout

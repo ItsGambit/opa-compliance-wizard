@@ -201,8 +201,9 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
      `/var/lib/opa-compliance-wizard`; the backend unit also has `ProtectSystem=strict` (the gate unit does not: it creates its
      session key under `/etc` on first start);
    * the app's archive path (`OPA_AUDIT_DB_PATH`, below) and every other data file follow `OPA_DATA_DIR`;
-   * a second gate's site generated before 5.50.0 also lacks the `/api/overview` deny block (the admin-only Overview, which spans the
-     whole backend); regenerate as below (the installer's note names `/api/upgrade`; the check covers both);
+   * a second gate's site generated before 5.50.0 also lacks the `/api/overview` deny block (the admin-only Overview, with its people lists); regenerate as below (the installer's note now names every denied route);
+   * the per-environment routes of 5.50.0 (Okta Admins, cross-checks, snapshots, capture) are shared-environment routes like the reports: through an
+     additional gate they answer only for a verified-issuer per-user exception that holds the capability they check (`view_archive` plus `live_read`);
    * a second gate's site generated before 5.47.0 lacks the `/api/upgrade` deny block. `setup-second-gate.sh` never rewrites an existing
      site, and neither `install.sh` nor the updater changes one by itself: `install.sh` lists every `opa-auth-gate-*` unit with the status of
      its site, and `sudo server/install.sh --regenerate-second-sites` rebuilds them from the live main site (add `--apply-nginx` to apply the

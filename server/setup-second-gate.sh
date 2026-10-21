@@ -259,7 +259,7 @@ else
   ok "$NEW_SITE already exists (left as is; this script never regenerates an existing site)"
   # a site generated before a release added a deny stays without it: say so and name the fix (read-only check)
   if ! python3 "$APP/server/nginx_second_site.py" --check "$NEW_SITE" >/dev/null 2>&1; then
-    warn "$NEW_SITE is missing a 403 deny the current rules add (for example /api/upgrade). Regenerate it with: sudo bash $APP/server/install.sh --regenerate-second-sites"
+    warn "$NEW_SITE is missing a 403 deny the current rules add (the current rules deny every route listed in server/nginx_second_site.py SECOND_SITE_DENIED_PREFIXES). Regenerate it with: sudo bash $APP/server/install.sh --regenerate-second-sites"
   fi
 fi
 # OPS-14: never leave a site enabled that breaks `nginx -t` -- every later reload (deploy.sh's included) and
