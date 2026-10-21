@@ -1167,6 +1167,26 @@ def _access_model_payload(view):
             "modified_at": view.get("modified_at")}
 
 
+def _scan_overview_block(environment_id):
+    """What the Overview's sources strip says about the stored OPA scan: when, from where, how old, how big. None without a scan."""
+    import audit_store
+    view = _access_model_view(environment_id)
+    if not view:
+        return None
+    age = _scan_age_seconds(view["built_at"])
+    stale, very_stale = _scan_staleness(age)
+    model = view["model"]
+    return {"built_at": view["built_at"], "age_seconds": age, "source": view["source"], "stale": stale, "very_stale": very_stale,
+            "counts": audit_store.opa_model_counts(model), "warnings_count": len(model.get("warnings") or []), "modified_at": view.get("modified_at")}
+
+
+def _sync_schedule_or_none(environment_id):
+    try:
+        return engine.get_sync_schedule_by_id(environment_id)
+    except KeyError:
+        return None
+
+
 def _access_model_time(environment_id):
     view = _access_model_view(environment_id)
     return view["built_at"] if view else None
@@ -2411,6 +2431,7 @@ class Handler(SimpleHTTPRequestHandler):
             overview = okta_admins.build_overview(
                 env_id, as_of=as_of, access_model=model, service_accounts_total=accounts, weeks=weeks,
                 model_time=_access_model_time(env_id), okta_host=_okta_host(env_id, meta),
+                scan=_scan_overview_block(env_id), schedule=_sync_schedule_or_none(env_id),
                 integrity={k: chain.get(k) for k in ("valid", "manifest_count", "reason", "head_hash")})
         except ValueError as exc:
             return self._send_json(400, {"error": str(exc)})

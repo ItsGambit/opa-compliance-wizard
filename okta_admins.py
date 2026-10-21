@@ -854,7 +854,7 @@ def privileged_identity_sets(environment_id, access_model=None, as_of=None):
     return ids, logins, sources
 
 
-def build_overview(environment_id, as_of=None, access_model=None, service_accounts_total=None, now=None, integrity=None, weeks=26, model_time=None, okta_host=None):
+def build_overview(environment_id, as_of=None, access_model=None, service_accounts_total=None, now=None, integrity=None, weeks=26, model_time=None, okta_host=None, scan=None, schedule=None):
     """Counts for the executive dashboard, one cheap aggregate. Every Okta-derived
     block carries its own state ("ok" | "refused" | "never_captured" | "error" |
     "not_loaded") so a block whose Okta read was refused says so instead of
@@ -918,7 +918,7 @@ def build_overview(environment_id, as_of=None, access_model=None, service_accoun
     admin_users = [i["object"] for i in (snap_for_tiles["items"] if snap_for_tiles else []) if isinstance(i["object"], dict) and i["object"].get("kind") == "user" and i["object"].get("roles")]
     eff = effective_access(access_model)
     c5_card = _c5_card(admins, index)
-    src = ox.sources(environment_id, end, as_of, admins, model_time, (len(eff[0]) + len(eff[1])) if eff else None, inv_summary, integrity)
+    src = ox.sources(environment_id, end, as_of, admins, model_time, (len(eff[0]) + len(eff[1])) if eff else None, inv_summary, integrity, scan=scan, schedule=schedule)
     tl = ox.tiles(admin_users, index, cross, admins["separation_of_duties"], access_model, inv_summary, src["archive"]["days_held"])
     weekly_priv = ox.weekly_event_counts(environment_id, list(GRANT_EVENT_TYPES), end)
     req_types = ["access.request.create", "access.request.resolve", "access.request.expire"]
@@ -929,9 +929,9 @@ def build_overview(environment_id, as_of=None, access_model=None, service_accoun
         k = {"access.request.create": "created", "access.request.resolve": "resolved", "access.request.expire": "expired"}[r["event_type"]]
         req30[k] += 1
     opa_pts = next((x["points"] for x in inv_summary["series"] if x["key"] == "opa.privileged_users"), [])
-    attention = ox.attention(src)
+    attention = ox.attention(src, now=end)
     para = ox.paragraph({"tiles": tl, "okta_state": admins["state"], "okta_host": okta_host, "archive": src["archive"], "chain": integrity,
-                         "requests30": req30, "attention_sync": next((a["text"] for a in attention if a["kind"] == "sync"), None)})
+                         "requests30": req30, "attention_sync": next((a.get("short") or a["text"] for a in attention if a["kind"] == "sync"), None)})
     return {
         "environment_id": environment_id, "as_of": as_of, "generated_at": _iso(now),
         "sources": src, "attention": attention, "tiles": tl, "paragraph": para, "viewing_as_of": as_of if as_of and (admins.get("as_of_snapshot") or {}).get("snapshot_id") != (admins.get("last_attempt") or {}).get("snapshot_id") else None,

@@ -80,7 +80,7 @@ def test_attention_names_a_failing_sync_and_a_stale_snapshot(db):
     oa.capture_and_store(ENV, FakeOkta(), captured_at="2026-10-18T02:14:00.000Z")
     o = oa.build_overview(ENV, now=NOW)
     kinds = {a["kind"]: a["text"] for a in o["attention"]}
-    assert "3 day(s)" in kinds["sync"] and "rate limited" in kinds["sync"] and "3 days old" in kinds["snapshot"]
+    assert "3 days" in kinds["sync"] and "rate limited" in kinds["sync"] and "still inside Okta's 90-day window" in kinds["sync"] and "3 days old" in kinds["snapshot"]
     assert "last synced 3 day(s) ago" in o["paragraph"] or "has not succeeded for 3 day(s)" in o["paragraph"]
 
 

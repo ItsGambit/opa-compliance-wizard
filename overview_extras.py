@@ -55,7 +55,36 @@ def admin_holder_points(environment_id, as_of=None):
     return [{"t": r["t"], "count": r["n"]} for r in conn.execute(sql, params)]
 
 
-def sources(environment_id, now, as_of, admins_report, model_time, effective_principals, inventory_series, integrity):
+def _refresh_view(sync, schedule):
+    """What the Overview says about the daily refresh: the schedule and what the last scheduled and the last other refresh
+    did to each part (state only; the messages stay in the job record)."""
+    stored = sync.get("last_refresh") if isinstance(sync.get("last_refresh"), dict) else {}
+
+    def one(record):
+        if not isinstance(record, dict):
+            return None
+        return {"finished_at": record.get("finished_at"), "trigger": record.get("trigger"),
+                "parts": {p: {"state": (d or {}).get("state"), "message": (d or {}).get("message")} for p, d in (record.get("parts") or {}).items()}}
+    schedule = schedule or {}
+    return {"schedule": {"enabled": bool(schedule.get("enabled")), "run_time": schedule.get("run_time") or "02:00"},
+            "last_scheduled": one(stored.get("scheduled")), "last_manual": one(stored.get("manual"))}
+
+
+def _opa_model_block(model_time, effective_principals, scan, refresh):
+    """sources.opa_model (5.51.0): when the stored scan was read, where it came from, how old it is. The old keys stay."""
+    out = {"loaded": model_time is not None or effective_principals is not None, "refreshed_at": model_time,
+           "principals_effective": effective_principals, "built_at": None, "age_seconds": None, "source": "none", "stale": False,
+           "very_stale": False, "counts": {}, "warnings_count": 0, "modified_at": None, "last_scan_outcome": None}
+    if scan:
+        out.update({k: scan.get(k) for k in ("built_at", "age_seconds", "source", "stale", "very_stale", "counts", "warnings_count", "modified_at")})
+    last = [r for r in (refresh.get("last_scheduled"), refresh.get("last_manual")) if r and (r.get("parts") or {}).get("opa")]
+    if last:
+        newest = max(last, key=lambda r: r.get("finished_at") or "")
+        out["last_scan_outcome"] = newest["parts"]["opa"]["state"]
+    return out
+
+
+def sources(environment_id, now, as_of, admins_report, model_time, effective_principals, inventory_series, integrity, scan=None, schedule=None):
     snaps = audit_store.list_config_snapshots(environment_id, kind="okta_admins", limit=1000)
     ok = [s for s in snaps if s["status"] == "ok"]
     ok.sort(key=lambda s: s["captured_at"])
@@ -65,6 +94,7 @@ def sources(environment_id, now, as_of, admins_report, model_time, effective_pri
     sync = audit_store.get_sync_state(environment_id) or {}
     newest_snapshot = snaps[0] if snaps else None
     users_series = next((x for x in (inventory_series or {}).get("series", []) if x["key"] == "okta.users"), None)
+    refresh = _refresh_view(sync, schedule)
     return {
         "okta_snapshot": {
             "captured_at": (admins_report.get("as_of_snapshot") or {}).get("captured_at"), "index": index, "snapshots_total": len(ok),
@@ -83,25 +113,65 @@ def sources(environment_id, now, as_of, admins_report, model_time, effective_pri
             "days_since_sync": _days_between(sync["last_sync_completed_at"], now) if sync.get("last_sync_completed_at") else None,
         },
         "chain": integrity,
-        "opa_model": {"loaded": model_time is not None or effective_principals is not None, "refreshed_at": model_time, "principals_effective": effective_principals},
+        "opa_model": _opa_model_block(model_time, effective_principals, scan, refresh),
+        "refresh": refresh,
         "okta_org": {"users": users_series["latest"] if users_series else None},
     }
 
 
-def attention(src):
+OKTA_LOG_WINDOW_DAYS = 90  # Okta keeps System Log events for 90 days (the same window the sync's first backfill uses)
+OKTA_WINDOW_WARN_DAYS = 80  # from here the message says the oldest unfetched events are about to leave the window
+
+
+def _day_label(iso):
+    parsed = audit_store._canonical_published(iso) if iso else None
+    if not parsed:
+        return None
+    dt = datetime.fromisoformat(parsed.replace("Z", "+00:00"))
+    return f"{dt.day} {dt.strftime('%b %Y')}"
+
+
+def _sync_attention_text(archive, now):
+    """The banner sentence for a sync that has not succeeded: what happened, what is at stake (it depends on how long ago the
+    last success was, because Okta only keeps 90 days), and what to do."""
+    days = archive.get("days_since_sync")
+    if days is None:
+        return "The archive has not synced yet. Select Refresh to read the System Log now, or check the sync settings (Overview, Schedule)."
+    error = f" ({archive['last_sync_error']})" if archive.get("last_sync_error") else ""
+    since = _day_label(archive.get("last_sync_completed_at"))
+    if days >= OKTA_LOG_WINDOW_DAYS:
+        gap_end = _day_label(_iso(now - timedelta(days=OKTA_LOG_WINDOW_DAYS)))
+        return (f"Archive sync has not succeeded for {days} days{error}. Events from {since} to {gap_end} are no longer available from Okta; "
+                "the archive has a gap there. Select Refresh to fetch what Okta still holds.")
+    if days >= OKTA_WINDOW_WARN_DAYS:
+        left = OKTA_LOG_WINDOW_DAYS - days
+        return (f"Archive sync has not succeeded for {days} days{error}. Events from {since} leave Okta's 90-day window in {left} day{'s' if left != 1 else ''}. "
+                "Select Refresh soon, or check the sync settings (Overview, Schedule).")
+    lead = f"Archive sync has not succeeded for {days} day{'s' if days != 1 else ''}{error}." if days else f"The last archive sync failed{error}."
+    return (lead + " Events since then are still inside Okta's 90-day window and will be fetched by the next successful run. "
+            "Select Refresh now, or check the sync settings (Overview, Schedule).")
+
+
+def attention(src, now=None):
     """Plain sentences for the banner: what is stale or failing, in the order a reader needs them."""
     out = []
+    now = now or datetime.now(timezone.utc)
     a, o = src["archive"], src["okta_snapshot"]
     if a.get("last_sync_status") == "error" or (a.get("days_since_sync") or 0) >= 2:
         days = a.get("days_since_sync")
-        out.append({"kind": "sync", "text": f"Archive sync has not succeeded for {days} day(s)" + (f" ({a['last_sync_error']})" if a.get("last_sync_error") else "") + "." if days is not None
-                    else "Archive sync has not completed yet."})
+        short = (f"Archive sync has not succeeded for {days} day(s)" + (f" ({a['last_sync_error']})" if a.get("last_sync_error") else "") + "."
+                 if days is not None else "Archive sync has not completed yet.")  # the one-pager's wording: no button names
+        out.append({"kind": "sync", "text": _sync_attention_text(a, now), "short": short})
     if o.get("newest_attempt_status") in ("refused", "error") and o.get("newest_attempt_at"):
         out.append({"kind": "snapshot", "text": "The newest Okta configuration capture " + ("was refused by Okta." if o["newest_attempt_status"] == "refused" else "failed.")})
     elif (o.get("days_old") or 0) >= 2:
         out.append({"kind": "snapshot", "text": f"The Okta configuration snapshot is {o['days_old']} days old."})
     if src.get("chain") and src["chain"].get("valid") is False:
         out.append({"kind": "chain", "text": "The evidence chain check found a break: " + str(src["chain"].get("reason"))})
+    scheduled = (src.get("refresh") or {}).get("last_scheduled")
+    opa_part = ((scheduled or {}).get("parts") or {}).get("opa") or {}
+    if opa_part.get("state") and opa_part["state"] != "ok":
+        out.append({"kind": "scheduled_opa", "text": "The last scheduled refresh did not read OPA" + (f": {opa_part['message']}" if opa_part.get("message") else ".")})
     return out
 
 
