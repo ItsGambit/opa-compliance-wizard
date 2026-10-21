@@ -155,8 +155,9 @@ def _location_blocks(text):
 #
 # 5.47.0: host upgrades are a property of the whole backend as well: the update
 # status and settings (5.46.0) and the upgrade support-bundle download. A site
-# generated before 5.47.0 lacks this block; run setup-second-gate.sh again to
-# regenerate it (README, "Upgrading").
+# generated before 5.47.0 lacks this block; setup-second-gate.sh never rewrites an
+# existing site, so run `sudo server/install.sh --regenerate-second-sites`
+# (README, "Upgrading").
 SECOND_SITE_DENIED_PREFIXES = ("/api/access_control", "/api/shared_permissions", "/api/archives", "/api/upgrade")
 
 _ACCESS_CONTROL_BLOCK = (

@@ -164,7 +164,7 @@ if [ ! -f "$NEW_ENV" ]; then
     echo "OPA_ACCESS_CONTROL_PATH=$KEY_DIR/access_control.json"
     echo "DEPLOYMENT_MODE=hosted"
     # Shared with the main gate: the same keyring unlock password and nginx-to-backend secret.
-    grep -E '^(KEYRING_UNLOCK_PASSWORD|NGINX_PROXY_SECRET)=' "$MAIN_ENV"
+    grep -E '^[[:space:]]*(KEYRING_UNLOCK_PASSWORD|NGINX_PROXY_SECRET)=' "$MAIN_ENV"
   } > "$tmp"
   sudo install -o "$APP_USER" -g "$APP_GROUP" -m 600 "$tmp" "$NEW_ENV"; rm -f "$tmp"
   ok "created $NEW_ENV (600)"
@@ -183,7 +183,7 @@ if [ ! -f "$AC_FILE" ]; then
 else
   ok "own access control $AC_FILE already exists (left as is)"
 fi
-if ! grep -q "^OPA_ACCESS_CONTROL_PATH=" "$NEW_ENV"; then
+if ! grep -Eq "^[[:space:]]*OPA_ACCESS_CONTROL_PATH=" "$NEW_ENV"; then
   echo "OPA_ACCESS_CONTROL_PATH=$AC_FILE" >> "$NEW_ENV"
   ok "added OPA_ACCESS_CONTROL_PATH to $NEW_ENV"
 fi
@@ -256,7 +256,11 @@ if [ ! -f "$NEW_SITE" ]; then
   ok "created $NEW_SITE"
 else
   [ -e "$LINK" ] || sudo ln -sf "$NEW_SITE" "$LINK"
-  ok "$NEW_SITE already exists"
+  ok "$NEW_SITE already exists (left as is; this script never regenerates an existing site)"
+  # a site generated before a release added a deny stays without it: say so and name the fix (read-only check)
+  if ! python3 "$APP/server/nginx_second_site.py" --check "$NEW_SITE" >/dev/null 2>&1; then
+    warn "$NEW_SITE is missing a 403 deny the current rules add (for example /api/upgrade). Regenerate it with: sudo bash $APP/server/install.sh --regenerate-second-sites"
+  fi
 fi
 # OPS-14: never leave a site enabled that breaks `nginx -t` -- every later reload (deploy.sh's included) and
 # nginx's own start at boot would fail. If the config is invalid, find out whether this site is the cause by
@@ -288,12 +292,12 @@ say "6. Allow $ORIGIN in the backend"
 # The origin must be a whole comma-separated item (OPS-14: `opa.example.com` used to match an existing
 # `xopa.example.com`).
 _origin_already_allowed() {
-  grep -Eq "^EXTRA_ALLOWED_ORIGINS=(.*,)?https://${1//./\\.}(,|$)" "$2"
+  grep -Eq "^[[:space:]]*EXTRA_ALLOWED_ORIGINS=(.*,)?https://${1//./\\.}(,|$)" "$2"
 }
 if _origin_already_allowed "$HOST" "$MAIN_ENV"; then
   ok "already allowed"
-elif grep -q "^EXTRA_ALLOWED_ORIGINS=" "$MAIN_ENV"; then
-  sudo sed -i "s#^EXTRA_ALLOWED_ORIGINS=\(.*\)#EXTRA_ALLOWED_ORIGINS=\1,$ORIGIN#" "$MAIN_ENV"
+elif grep -Eq "^[[:space:]]*EXTRA_ALLOWED_ORIGINS=" "$MAIN_ENV"; then
+  sudo sed -i "s#^\([[:space:]]*\)EXTRA_ALLOWED_ORIGINS=\(.*\)#\1EXTRA_ALLOWED_ORIGINS=\2,$ORIGIN#" "$MAIN_ENV"
   sudo systemctl restart "$MAIN_SERVICE"; ok "added; backend restarted"
 else
   echo "EXTRA_ALLOWED_ORIGINS=$ORIGIN" | sudo tee -a "$MAIN_ENV" >/dev/null
