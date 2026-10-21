@@ -88,6 +88,17 @@ describe('OverviewPage', () => {
     await waitFor(() => expect(fetchOverview).toHaveBeenLastCalledWith('prod-example', '2026-10-02T00:00:00.000Z', undefined))
   })
 
+  it('labels a capped Okta count as a lower bound', async () => {
+    const base = overview()
+    vi.mocked(fetchOverview).mockResolvedValue({ ...base, inventory: { ...base.inventory, problems: [{ series: 'okta.users', state: 'capped' }] } })
+    renderWithClient(<OverviewPage onOpenReports={vi.fn()} />)
+    await screen.findByText(/14 people hold/)
+    const inv = screen.getByRole('region', { name: 'Inventory over time' })
+    expect(within(inv).getByText(/lower bound, stopped at 50,000/, { selector: 'span.sr-only' })).toBeTruthy()
+    expect(within(inv).getByText(/a lower bound, counting stopped at 50,000/)).toBeTruthy()
+    expect(within(inv).getByText(/≥/)).toBeTruthy()
+  })
+
   it('selects the inventory series from a row', async () => {
     renderWithClient(<OverviewPage onOpenReports={vi.fn()} />)
     await screen.findByText(/14 people hold/)

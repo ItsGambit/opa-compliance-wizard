@@ -197,6 +197,7 @@ def test_first_run_walks_the_ninety_days_in_chunks_then_polls_once(db):
     client = PollingFake(bounded=[([event], True)])
     result = audit_store.sync_okta_events(client, ENV, "all")
     assert result["chunks"] >= 80 and result["inserted"] == 1 and client.paths  # chunked backfill, then a polling pass
+    assert result["mode"] == "bounded+polling"  # said as it is: the first run is a backfill AND a polling pass
     assert audit_store._read_poll_cursor(audit_store._get_connection(), ENV) is not None or client.paths[-1]
     assert audit_store.verify_ingestion_chain(ENV, deep=True)["valid"]
 

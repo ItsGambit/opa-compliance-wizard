@@ -1012,7 +1012,11 @@ def people_list(environment_id, which, access_model=None, as_of=None):
     if which in ("mfa_nonpr", "mfa_smsvoice"):
         import signin_mfa
         pids, plogins, _ = privileged_identity_sets(environment_id, access_model, as_of)
-        people = signin_mfa.non_pr_people(environment_id, pids, plogins, 13, None, "nonpr" if which == "mfa_nonpr" else "smsvoice")
+        end = None
+        if as_of:
+            parsed = audit_store._canonical_published(audit_store.normalize_window(None, as_of)[1])
+            end = min(_now(), datetime.fromisoformat(parsed.replace("Z", "+00:00"))) if parsed else None
+        people = signin_mfa.non_pr_people(environment_id, pids, plogins, 13, end, "nonpr" if which == "mfa_nonpr" else "smsvoice")
         return {"list": which, "state": "ok", "message": None, "snapshot": None, "people": people,
                 "note": "Privileged people with at least one successful multi-factor sign-in by that kind of factor in the period. An estimate: the factor comes from debugData.factor."}
     if which == "c5":

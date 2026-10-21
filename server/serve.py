@@ -3736,6 +3736,8 @@ class Handler(SimpleHTTPRequestHandler):
                 as_of = payload.get("as_of")
                 if fmt not in ("csv", "md") or (as_of is not None and not isinstance(as_of, str)):
                     return self._send_json(400, {"error": "format must be csv or md"})
+                if as_of is not None and len(as_of) > 40:  # reaches the audit log: bounded like its other fields
+                    return self._send_json(400, {"error": "as_of is too long"})
                 self._log_audit_event(actor_email, actor_sub, "okta_admins.report_exported", {"name": name, "format": fmt, "as_of": as_of})
                 return self._send_json(200, {"logged": True})
 

@@ -350,3 +350,12 @@ def test_automatic_capture_failures_are_audited_with_the_trigger_and_the_invento
     rows = [json.loads(line) for line in open(tmp_audit_log, encoding="utf-8") if line.strip()]
     captured = [r for r in rows if r["action"] == "okta_snapshot.captured" and r["details"]["kind"] == "inventory_counts"]
     assert captured and isinstance(captured[-1]["details"]["inventory_seconds"], float)
+
+
+def test_export_log_bounds_as_of_before_it_reaches_the_audit_log(matrix_server, tmp_audit_log):
+    base_url, serve = matrix_server
+    _seed_owner_a_with_session(serve)
+    url = "/api/environments/dev/okta_admins/export_log"
+    assert _call(base_url, "POST", url, {"format": "csv", "as_of": "2026-10-01" + "x" * 5000}, _who(OWNER_A)).status_code == 400
+    assert _call(base_url, "POST", url, {"format": "csv", "as_of": "2026-10-01T00:00:00.000Z"}, _who(OWNER_A)).status_code == 200
+    assert max(len(json.dumps(json.loads(line))) for line in open(tmp_audit_log, encoding="utf-8") if line.strip()) < 2000

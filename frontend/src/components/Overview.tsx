@@ -385,6 +385,8 @@ function Inventory({ o }: { o: OverviewData }) {
     )
   }
   const options = series.map(s => ({ value: s.key, label: `${s.label} (${s.side === 'opa' ? 'OPA' : 'Okta'})` }))
+  // An Okta count stops at 50,000 (Okta has no count endpoint): say so where the number is shown, not only below.
+  const capped = new Set(o.inventory.problems.filter(p => p.state === 'capped').map(p => p.series))
   const sideTable = (side: 'opa' | 'okta', heading: string, sub: string) => (
     <div className="min-w-0">
       <h3 className="text-xs font-semibold uppercase tracking-wide text-muted">{heading}</h3>
@@ -397,7 +399,7 @@ function Inventory({ o }: { o: OverviewData }) {
               <th scope="row" className="py-0.5 pr-1 text-left font-normal">
                 <button type="button" onClick={() => setSelected(s.key)} aria-pressed={s.key === current.key} className="text-left text-text-dim hover:text-text w-full py-1">{s.label}</button>
               </th>
-              <td className="py-1 pr-1 text-right tabular-nums text-text">{s.latest.toLocaleString()}</td>
+              <td className="py-1 pr-1 text-right tabular-nums text-text" title={capped.has(s.key) ? 'Lower bound: counting stopped at 50,000' : undefined}>{capped.has(s.key) ? '≥ ' : ''}{s.latest.toLocaleString()}{capped.has(s.key) && <span className="sr-only"> (lower bound, stopped at 50,000)</span>}</td>
               <td className="py-1 pr-1 text-right tabular-nums">{signed(s.delta_7d)}</td>
               <td className="py-1 pr-1 text-right tabular-nums text-text-faint">{signed(s.delta_30d)}</td>
               <td className="py-1 pr-1 text-right tabular-nums">{signed(s.latest - (s.points[0]?.count ?? s.latest))}</td>
@@ -422,7 +424,7 @@ function Inventory({ o }: { o: OverviewData }) {
         {sideTable('opa', 'OPA', 'From the same access-model run the snapshot seals; counts only')}
         {sideTable('okta', 'Okta', 'Read-only; apps and policies are new reads in 5.50.0')}
       </div>
-      {o.inventory.problems.length > 0 && <p className="text-xs text-warn" role="status">Some series could not be read in the latest snapshot: {o.inventory.problems.map(p => `${p.series} (${p.state})`).join(', ')}.</p>}
+      {o.inventory.problems.length > 0 && <p className="text-xs text-warn" role="status">{o.inventory.problems.some(p => p.state !== 'capped') && <>Some series could not be read in the latest snapshot: {o.inventory.problems.filter(p => p.state !== 'capped').map(p => `${p.series} (${p.state})`).join(', ')}. </>}{capped.size > 0 && <>{[...capped].map(k => series.find(s => s.key === k)?.label ?? k).join(', ')}: a lower bound, counting stopped at 50,000.</>}</p>}
       <p className="text-xs text-muted">Definitions: group memberships are user-to-group links across all OPA groups; policy grants are security-policy rules resolved to a specific resource (the Access Explorer's resolutions); assignments are OPA relationship assignments. Okta users and devices are informational. Kubernetes and cloud-infrastructure resources are not part of the product's model.</p>
     </section>
   )

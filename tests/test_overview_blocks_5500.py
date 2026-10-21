@@ -142,3 +142,16 @@ def test_people_counts_and_lists_for_the_privileged_cohort(db):
     assert {x["login"] for x in nonpr["people"]} == {"alex@example.com", "sam@example.com"}
     sms = oa.people_list(ENV, "mfa_smsvoice", access_model=_model())
     assert [x["login"] for x in sms["people"]] == ["sam@example.com"]
+
+
+def test_mfa_people_lists_honour_as_of(db):
+    ev = {"uuid": "a1", "eventType": "user.authentication.auth_via_mfa", "published": "2026-09-01T10:00:00.000Z", "actor": {"id": "00u1", "alternateId": "alex@example.com"},
+          "outcome": {"result": "SUCCESS"}, "debugContext": {"debugData": {"factor": "SMS_FACTOR"}}, "target": []}
+    audit_store._insert_rows(audit_store._get_connection(), ENV, [audit_store._normalize_live_event(ev)], "all")
+    sm.refresh(ENV)
+    oa.capture_and_store(ENV, FakeOkta(), captured_at="2026-09-02T00:00:00.000Z")
+    # as of 5 Sep the SMS sign-in of 1 Sep is inside the last five weeks; read today it is long past
+    then = oa.people_list(ENV, "mfa_smsvoice", access_model=_model(), as_of="2026-09-05")
+    assert [p["login"] for p in then["people"]] == ["alex@example.com"]
+    assert oa.people_list(ENV, "mfa_smsvoice", access_model=_model())["people"] == []
+    assert [p["login"] for p in oa.people_list(ENV, "mfa_nonpr", access_model=_model(), as_of="2026-09-05")["people"]] == ["alex@example.com"]

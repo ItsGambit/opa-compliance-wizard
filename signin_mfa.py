@@ -306,6 +306,6 @@ def people_counts(environment_id, weeks=13, now=None, actor_ids=None, actor_alts
 def non_pr_people(environment_id, actor_ids, actor_alts, weeks=13, now=None, which="nonpr"):
     """Privileged people (figures per person) who used a non-phishing-resistant factor ('nonpr') or SMS / voice in the last five weeks
     ('smsvoice'), for the audited people list."""
-    people = privileged_people(environment_id, actor_ids, actor_alts, weeks, now)
+    people = privileged_people(environment_id, actor_ids, actor_alts, weeks if which == "nonpr" else 5, now)  # the SMS/voice figure is the last five weeks
     keys = NON_PHISHING_RESISTANT if which == "nonpr" else ("sms", "voice")
     return [p for p in people if any(p["by_class"].get(k, 0) > 0 for k in keys)]

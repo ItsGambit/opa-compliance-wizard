@@ -2579,7 +2579,7 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
         out = {
             "inserted": total_inserted, "scanned": total_scanned, "since": original_since, "chunks": chunks,
             "complete": complete, "incomplete_chunks": incomplete_chunks, "chain_head": chain_head,
-            "mode": "bounded" if explicit_since else "polling",
+            "mode": "bounded" if explicit_since else ("bounded+polling" if bounded else "polling"),
             "pages": pages_polled, "since_clamped": since_clamped, "cursor_reset": cursor_reset,
         }
         if error:
