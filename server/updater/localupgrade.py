@@ -321,6 +321,8 @@ def do_upgrade(args, root, host, say):
         else:
             if args.to:
                 version = args.to
+                if not _VERSION_RE.match(version):   # checked before the version is used in a URL or file name
+                    raise Refused("usage", "The version must look like 5.49.0.")
             else:
                 say("Checking for a new release ...")
                 out = service.run_check(installed, force=True, trigger=_actor(), channel=args.channel)

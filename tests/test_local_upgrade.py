@@ -861,10 +861,39 @@ def test_the_outer_launcher_finishes_a_pending_swap_only_for_upgrade(monkeypatch
     monkeypatch.setattr(launch, "PROJECT_ROOT", world.root)
     done = []
     monkeypatch.setattr(localswap, "run_pending_plan", lambda root, say=print: done.append(root) or 0)
-    assert launch._finish_pending_swap_if_asked(86, ["py", "launch.py", "upgrade", "--to", "5.49.0"]) == 0 and done == [world.root]
-    assert launch._finish_pending_swap_if_asked(86, ["py", "launch.py"]) == 86      # an ordinary run is untouched
-    assert launch._finish_pending_swap_if_asked(1, ["py", "launch.py", "upgrade"]) == 1
+    # The outer launcher passes sys.argv: [script, command, ...]
+    assert launch._finish_pending_swap_if_asked(86, ["launch.py", "upgrade", "--to", "5.49.0"]) == 0 and done == [world.root]
+    assert launch._finish_pending_swap_if_asked(86, ["launch.py"]) == 86      # an ordinary run is untouched
+    assert launch._finish_pending_swap_if_asked(1, ["launch.py", "upgrade"]) == 1
 
+
+def test_the_outer_launcher_runs_the_pending_swap_when_the_inner_upgrade_asks(monkeypatch, world):
+    """End to end through _run_child_and_exit with the real sys.argv shape: the inner (venv) process exits 86."""
+    import launch
+    monkeypatch.setattr(launch, "PROJECT_ROOT", world.root)
+    done = []
+    monkeypatch.setattr(localswap, "run_pending_plan", lambda root, say=print: done.append(root) or 0)
+
+    class FakeChild:
+        def __init__(self, argv):
+            self.argv = argv
+
+        def wait(self, timeout=None):
+            return localswap.EXIT_SWAP_PENDING
+
+    monkeypatch.setattr(launch.subprocess, "Popen", FakeChild)
+    monkeypatch.setattr(sys, "argv", ["launch.py", "upgrade", "--to", "5.49.0"])
+    with pytest.raises(SystemExit) as exc:
+        launch._run_child_and_exit([".venv/Scripts/python.exe", "launch.py", "upgrade", "--to", "5.49.0"], owns_shutdown=False)
+    assert exc.value.code == 0 and done == [world.root]
+
+
+def test_a_malformed_version_is_refused_before_any_download(monkeypatch, world):
+    called = []
+    monkeypatch.setattr(localupgrade, "_download", lambda *a, **k: called.append(a))
+    monkeypatch.setattr(localupgrade, "_refresh_revocations", lambda say: None)
+    code, out = go(world, "--to", "../../x", "--confirm", "x")
+    assert code == localupgrade.EXIT_REFUSED and called == [] and "must look like" in out
 
 def test_launch_upgrade_without_cryptography_explains(monkeypatch, capsys):
     import launch

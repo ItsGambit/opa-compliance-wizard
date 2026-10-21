@@ -255,7 +255,7 @@ def _swap_pending_code():
 def _finish_pending_swap_if_asked(code, argv):
     """Windows, outer launcher: an `upgrade` run in the venv asks for the folder renames to be done from here, where no
     file of the project's .venv is open (a Windows folder cannot be renamed while one is)."""
-    if len(argv) > 2 and argv[2] == "upgrade" and code == _swap_pending_code():
+    if len(argv) > 1 and argv[1] == "upgrade" and code == _swap_pending_code():   # argv is sys.argv: [script, command, ...]
         from server.updater import localswap
         return localswap.run_pending_plan(PROJECT_ROOT)
     return code
