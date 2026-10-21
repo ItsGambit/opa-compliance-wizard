@@ -97,7 +97,7 @@ function C1Card({ card, onRun, running, rosterLoaded }: { card: CrossCheckCard; 
                         <td className="px-2 py-1 text-text-dim">{r.source === 'opa_user' ? 'OPA user' : 'Okta service account'}</td>
                         <td className="px-2 py-1">
                           <StatusBadge label={FLAG_LABEL[r.flag as CrossCheckRow['flag']]} variant={r.flag === 'unknown' ? 'unknown' : 'deleted'} />
-                          <div className="text-xs text-text-faint">{oktaStateText(r.okta_state)}</div>
+                          <div className="text-xs text-text-faint">{r.flag === 'absent' && r.absent_text ? r.absent_text : oktaStateText(r.okta_state)}</div>
                         </td>
                         <td className="px-2 py-1 text-xs">
                           {r.opa_powerful_roles.length > 0 && <div className="text-warn">{r.opa_powerful_roles.join(', ')}</div>}

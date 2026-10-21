@@ -106,7 +106,7 @@ function PeopleDrawer({ environment, list, asOf, onClose }: { environment: strin
                 {(data.people as (CrossCheckRow & { footprint?: { groups?: number; policies?: number; resources?: number } | null; okta_status_changed?: string | null })[]).map((r, i) => (
                   <tr key={`${r.opa_id}:${i}`} className="border-b border-border/50 align-top">
                     <td className="py-1.5 pr-2"><div className="text-text-dim">{r.name}{r.source === 'okta_ud_account' ? ' (Okta UD service account)' : ''}</div>{r.email && <div className="text-xs text-text-faint">{r.email}</div>}</td>
-                    <td className="py-1.5 pr-2"><StatusBadge label={r.flag === 'absent' ? 'Not found in Okta' : oktaStateText(r.okta_state)} variant="deleted" />{r.okta_status_changed && <div className="text-xs text-text-faint">since {formatDateTime(r.okta_status_changed)}</div>}</td>
+                    <td className="py-1.5 pr-2"><StatusBadge label={r.flag === 'absent' ? 'Not found in Okta' : oktaStateText(r.okta_state)} variant="deleted" />{r.flag === 'absent' && r.absent_text && <div className="text-xs text-text-faint">{r.absent_text}</div>}{r.okta_status_changed && <div className="text-xs text-text-faint">since {formatDateTime(r.okta_status_changed)}</div>}</td>
                     <td className="py-1.5 text-xs text-text-dim">{r.footprint ? [r.footprint.groups ? `${r.footprint.groups} group(s)` : null, r.footprint.policies ? `${r.footprint.policies} polic${r.footprint.policies === 1 ? 'y' : 'ies'}` : null, r.footprint.resources ? `${r.footprint.resources} resource(s)` : null].filter(Boolean).join(' → ') : '—'}</td>
                   </tr>
                 ))}

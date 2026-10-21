@@ -510,3 +510,66 @@ def test_ids_are_percent_quoted_in_paths(monkeypatch):
     c = _client(monkeypatch, [({"id": "x"}, None)])
     c.get_user("../../etc?x=1")
     assert c.seen[0] == "/api/v1/users/..%2F..%2Fetc%3Fx%3D1"
+
+
+# --- H1: the lookup tries the Okta login (the OPA user name) first, then the e-mail --------------------------------
+class LoginOnlyOkta:
+    """Matches profile.login only, as GET /api/v1/users/{x} does; an e-mail that is not also a login is a 404."""
+    def __init__(self, users):
+        self.users, self.calls = users, []
+
+    def get_user(self, key):
+        self.calls.append(key)
+        if key in self.users:
+            return {"id": "00u" + key[:3], "status": self.users[key], "profile": {"login": key}}
+        raise _err(404, "E0000007", "Not found")
+
+
+def _one_user_model(name, email):
+    return {"users": [{"id": "ou1", "name": name, "user_type": "human", "details": {"email": email}, "groups": []}], "okta_accounts": []}
+
+
+def test_c1_login_differs_from_email_is_found_by_login_not_absent():
+    okta = LoginOnlyOkta({"jdoe@example.com": "ACTIVE"})
+    cap = oa.capture_principal_status(okta, _one_user_model("jdoe@example.com", "john.doe@example.com"))
+    entry = cap["items"][0][1]
+    assert entry["okta_state"] == "ACTIVE" and okta.calls == ["jdoe@example.com"]  # found by the login; the e-mail never needed
+    assert entry["lookup_keys"] == [{"kind": "login", "value": "jdoe@example.com"}]
+
+
+def test_c1_falls_back_to_the_email_when_the_login_finds_nothing():
+    okta = LoginOnlyOkta({"john.doe@example.com": "DEPROVISIONED"})
+    entry = oa.capture_principal_status(okta, _one_user_model("jdoe@example.com", "john.doe@example.com"))["items"][0][1]
+    assert okta.calls == ["jdoe@example.com", "john.doe@example.com"] and entry["okta_state"] == "DEPROVISIONED"
+
+
+def test_c1_login_only_and_email_only_principals():
+    okta = LoginOnlyOkta({"only@example.com": "ACTIVE"})
+    assert oa.capture_principal_status(okta, _one_user_model("only@example.com", None))["items"][0][1]["okta_state"] == "ACTIVE"
+    okta = LoginOnlyOkta({"mail@example.com": "SUSPENDED"})
+    entry = oa.capture_principal_status(okta, _one_user_model(None, "mail@example.com"))["items"][0][1]
+    assert entry["okta_state"] == "SUSPENDED" and okta.calls == ["mail@example.com"]
+
+
+def test_c1_neither_key_finds_a_user_is_absent_and_names_both_keys(db):
+    okta = LoginOnlyOkta({})
+    cap = oa.capture_principal_status(okta, _one_user_model("gone@example.com", "g.one@example.com"))
+    entry = cap["items"][0][1]
+    assert entry["okta_state"] == "ABSENT" and okta.calls == ["gone@example.com", "g.one@example.com"]
+    audit_store.record_config_snapshot(ENV, oa.KIND_PRINCIPAL_STATUS, cap["items"])
+    row = oa.build_cross_checks(ENV, access_model=_one_user_model("gone@example.com", "g.one@example.com"))["rows"][0]
+    assert row["absent_text"] == "no Okta user with login gone@example.com or e-mail g.one@example.com"
+
+
+def test_c1_same_login_and_email_is_looked_up_once_and_a_server_error_stops_the_chain():
+    okta = LoginOnlyOkta({})
+    oa.capture_principal_status(okta, _one_user_model("same@example.com", "same@example.com"))
+    assert okta.calls == ["same@example.com"]
+
+    class Boom(LoginOnlyOkta):
+        def get_user(self, key):
+            self.calls.append(key)
+            raise _err(500, "E0000009")
+    boom = Boom({})
+    entry = oa.capture_principal_status(boom, _one_user_model("a@example.com", "b@example.com"))["items"][0][1]
+    assert entry["okta_state"] == "UNREADABLE" and boom.calls == ["a@example.com"]  # a failure is not "not found": no fallback, no "absent"

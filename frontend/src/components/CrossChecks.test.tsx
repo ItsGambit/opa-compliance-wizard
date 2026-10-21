@@ -24,6 +24,7 @@ describe('CrossChecks', () => {
     expect(screen.getAllByText('Inactive in Okta').length).toBeGreaterThan(0)  // the tile and the row badge
     expect(screen.getAllByText('Not found in Okta').length).toBeGreaterThan(0)
     expect(screen.getByText('pam_admin')).toBeTruthy()
+    expect(screen.getByText('no Okta user with login svc-okta or e-mail svc@example.com')).toBeTruthy()
     expect(screen.getByText(/1 OPA service user\(s\) have no Okta identity/)).toBeTruthy()
   })
 

@@ -606,14 +606,20 @@ def opa_principals(model, limit=MAX_PRINCIPALS):
             skipped += 1
             continue
         details = u.get("details") if isinstance(u.get("details"), dict) else {}
-        lookup = details.get("email") or u.get("name")
-        if isinstance(lookup, str) and lookup.strip():
+        # GET /api/v1/users/{x} matches Okta's profile.login (or an id), not the e-mail. An Okta-provisioned OPA user's name is
+        # the Okta login, so the login is tried first and the e-mail only when the login finds nothing.
+        keys = []
+        for kind, value in (("login", u.get("name")), ("email", details.get("email"))):
+            if isinstance(value, str) and value.strip() and value.strip() not in [k["value"] for k in keys]:
+                keys.append({"kind": kind, "value": value.strip()})
+        if keys:
             principals.append({"key": f"opa_user:{u.get('id')}", "source": "opa_user", "opa_id": u.get("id"),
-                               "name": u.get("name"), "email": details.get("email"), "lookup": lookup.strip()})
+                               "name": u.get("name"), "email": details.get("email"), "lookup": keys[0]["value"], "lookup_keys": keys})
     for a in model.get("okta_accounts") or []:
         if isinstance(a, dict) and isinstance(a.get("okta_user_id"), str) and a["okta_user_id"]:
             principals.append({"key": f"okta_ud_account:{a.get('id')}", "source": "okta_ud_account", "opa_id": a.get("id"),
                                "name": a.get("name") or a.get("username"), "email": None, "lookup": a["okta_user_id"], "okta_lookup_id": a["okta_user_id"],
+                               "lookup_keys": [{"kind": "id", "value": a["okta_user_id"]}],
                                "project": a.get("project_name")})
     return principals[:limit], skipped
 
@@ -629,22 +635,33 @@ def capture_principal_status(okta_client, model, limit=MAX_PRINCIPALS):
     items = []
     for p in principals:
         entry = {k: p.get(k) for k in ("source", "opa_id", "name", "email", "project", "okta_lookup_id")}
-        try:
-            raw_user = okta_client.get_user(p["lookup"])
-            user = _clean_user(raw_user)
-            changed = raw_user.get("statusChanged") if isinstance(raw_user, dict) and isinstance(raw_user.get("statusChanged"), str) else None
+        tried, found, failure = [], None, None
+        for key in p.get("lookup_keys") or [{"kind": "login", "value": p["lookup"]}]:
+            tried.append(key)
+            try:
+                found = okta_client.get_user(key["value"])
+                break
+            except OktaApiError as exc:
+                kind = _classify(exc)
+                if kind == "not_found":
+                    continue  # try the next key (the e-mail after the login)
+                failure = (kind, exc)
+                break
+        entry["lookup_keys"] = tried
+        if found is not None:
+            user = _clean_user(found)
+            changed = found.get("statusChanged") if isinstance(found, dict) and isinstance(found.get("statusChanged"), str) else None
             entry.update({"okta_state": user.get("status") or "UNREADABLE", "okta_id": user.get("id"), "okta_login": user.get("login"),
                           "okta_status_changed": changed})
-        except OktaApiError as exc:
-            kind = _classify(exc)
+        elif failure is None:
+            entry.update({"okta_state": "ABSENT", "okta_id": None, "okta_login": None})
+        else:
+            kind, exc = failure
             if kind == "refused" and not items:
                 meta.update({"error_code": error_code(exc)})
                 return {"status": "refused", "items": [], "meta": meta, "source_endpoint": "/api/v1/users/{id}"}
-            if kind == "not_found":
-                entry.update({"okta_state": "ABSENT", "okta_id": None, "okta_login": None})
-            else:
-                meta["unreadable"] += 1
-                entry.update({"okta_state": "UNREADABLE", "okta_id": None, "okta_login": None})
+            meta["unreadable"] += 1
+            entry.update({"okta_state": "UNREADABLE", "okta_id": None, "okta_login": None})
         items.append((p["key"], entry))
     return {"status": "ok", "items": items, "meta": meta, "source_endpoint": "/api/v1/users/{id}"}
 
@@ -687,6 +704,13 @@ def effective_access(model):
             if n:
                 ud[a["okta_user_id"]] = {"policies": n}
     return users, ud
+
+
+def absent_text(entry):
+    """'no Okta user with login X or e-mail Y': the keys the lookup tried."""
+    keys = entry.get("lookup_keys") or []
+    parts = [f"{'login' if k.get('kind') == 'login' else 'e-mail' if k.get('kind') == 'email' else 'id'} {k.get('value')}" for k in keys if isinstance(k, dict)]
+    return "no Okta user with " + " or ".join(parts) if parts else "no Okta user found"
 
 
 def build_cross_checks(environment_id, access_model=None, now=None):
@@ -741,7 +765,7 @@ def build_cross_checks(environment_id, access_model=None, now=None):
             if flag in ("inactive", "absent") and effective is not None and footprint:
                 counts["effective"] += 1
                 counts["effective_people" if e.get("source") == "opa_user" else "effective_accounts"] += 1
-            rows.append({**e, "flag": flag, "opa_roles": (opa or {}).get("roles", []),
+            rows.append({**e, "absent_text": absent_text(e) if flag == "absent" else None, "flag": flag, "opa_roles": (opa or {}).get("roles", []),
                          "opa_powerful_roles": (opa or {}).get("powerful_roles", []),
                          "access_effective": None if effective is None else bool(footprint), "footprint": footprint})
     rows.sort(key=lambda r: ({"inactive": 0, "absent": 1, "unknown": 2}[r["flag"]], (r.get("name") or "").lower()))

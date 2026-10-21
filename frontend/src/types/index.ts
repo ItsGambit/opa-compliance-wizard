@@ -1504,6 +1504,8 @@ export interface CrossCheckRow {
   okta_id: string | null
   okta_login: string | null
   flag: 'inactive' | 'absent' | 'unknown'
+  /** For a 'not found' row: the keys the lookup tried ("no Okta user with login X or e-mail Y"). */
+  absent_text?: string | null
   opa_roles: string[]
   opa_powerful_roles: string[]
 }

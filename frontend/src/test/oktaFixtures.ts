@@ -40,7 +40,7 @@ export function c1Card(over: Partial<CrossCheckCard> = {}): CrossCheckCard {
     counts: { checked: 3, inactive_in_okta: 1, absent_in_okta: 1, unreadable: 0, active: 1 },
     rows: [
       { source: 'opa_user', opa_id: 'ou1', name: 'alex@example.com', email: 'alex@example.com', okta_state: 'DEPROVISIONED', okta_id: '00u1', okta_login: 'alex@example.com', flag: 'inactive', opa_roles: ['pam_admin', 'end_user'], opa_powerful_roles: ['pam_admin'] },
-      { source: 'okta_ud_account', opa_id: 'acct1', name: 'svc-okta', email: null, project: 'Prod', okta_state: 'ABSENT', okta_id: null, okta_login: null, flag: 'absent', opa_roles: [], opa_powerful_roles: [] },
+      { source: 'okta_ud_account', opa_id: 'acct1', name: 'svc-okta', email: null, project: 'Prod', okta_state: 'ABSENT', okta_id: null, okta_login: null, flag: 'absent', absent_text: 'no Okta user with login svc-okta or e-mail svc@example.com', opa_roles: [], opa_powerful_roles: [] },
     ], ...over,
   }
 }
