@@ -784,13 +784,15 @@ class Updater:
             raise StepFailed("tree_mismatch", f"{len(missing)} file(s) the manifest lists are missing (first: {missing[0]})", "staged")
         self.check_venv(root)
 
-    _INTERPRETER_NAME = re.compile(r"python[0-9]*(\.[0-9]+)?")
+    _INTERPRETER_NAME = re.compile(r"python[0-9]*(\.[0-9]+)?t?")   # t: free-threaded builds (python3.14t)
 
     def _is_base_interpreter_link(self, root, rel, target):
         """A link in .venv/bin may leave the release only if it is the venv's base interpreter: whatever its own name
         (python, python3, python3.14, Python 3.14's \U0001d70bthon, ...) it must resolve to a regular, executable file named
         like a Python interpreter, located under /usr or in the base-interpreter directory the venv records in its
-        pyvenv.cfg ("home"), so a Python installed in /opt, /usr/local or a per-user prefix works too."""
+        pyvenv.cfg ("home"), so a Python installed in /opt, /usr/local or a framework build works too. "home" is written
+        by the staging account, so this is a consistency check; the venv stays outside the signed manifest (a known
+        limitation: whoever controls staging can already change what the application account runs)."""
         if not rel.startswith(".venv/bin/") or rel.count("/") != 2:
             return False
         if not self._INTERPRETER_NAME.fullmatch(os.path.basename(target)):
@@ -831,7 +833,7 @@ class Updater:
 
     def check_venv(self, root):
         """The virtualenv is not in the manifest (pip built it), but it is walked too: no link may resolve outside the release
-        directory (except bin/python* and Python 3.14's bin/\U0001d70bthon pointing into /usr, the base interpreter), no hard links, no setuid/setgid/group- or
+        directory (except a link in bin/ to the base interpreter: see _is_base_interpreter_link), no hard links, no setuid/setgid/group- or
         world-writable entry, nothing but plain files, directories and links."""
         venv = os.path.join(root, ".venv")
         if os.path.islink(venv):

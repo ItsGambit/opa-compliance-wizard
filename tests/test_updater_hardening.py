@@ -397,6 +397,14 @@ def test_a_real_virtualenv_built_by_this_python_passes_the_root_check(m, tmp_pat
     m.updater().check_venv(str(root))
 
 
+def test_interpreter_names_include_free_threaded_builds():
+    rx = act.Updater._INTERPRETER_NAME
+    for ok in ("python", "python3", "python3.14", "python3.14t", "python3t"):
+        assert rx.fullmatch(ok), ok
+    for bad in ("env", "python3.14x", "pythonw", "sh"):
+        assert not rx.fullmatch(bad), bad
+
+
 def test_an_interpreter_link_outside_usr_is_accepted_only_into_the_recorded_home(m, tmp_path):
     root = tmp_path / "release"
     (root / ".venv" / "bin").mkdir(parents=True)
