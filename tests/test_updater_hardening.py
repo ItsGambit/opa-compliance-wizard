@@ -360,7 +360,7 @@ def test_check_tree_walks_the_virtualenv_and_refuses_escaping_links_and_setuid_b
     up = m.updater()
     manifest = json.loads(__import__("tarfile").open(m.releases_dir / "ocw-5.47.0.tar.gz").extractfile("manifest.json").read())
     up.check_tree(str(root), manifest)
-    os.symlink("/usr/bin/env", root / ".venv" / "bin" / "python3")                   # the base interpreter: allowed
+    os.symlink("/usr/bin/python3", root / ".venv" / "bin" / "python3")               # the base interpreter: allowed
     up.check_tree(str(root), manifest)
     os.symlink("/etc", root / ".venv" / "lib-evil")
     with pytest.raises(act.StepFailed) as e:
@@ -371,10 +371,56 @@ def test_check_tree_walks_the_virtualenv_and_refuses_escaping_links_and_setuid_b
     with pytest.raises(act.StepFailed):
         up.check_tree(str(root), manifest)
     os.unlink(root / ".venv" / "bin" / "helper")
+    # Python 3.14 venvs add a "𝜋thon" link to the base interpreter (relative, via python3): allowed like bin/python*
+    os.symlink("python3", root / ".venv" / "bin" / "𝜋thon")
+    up.check_tree(str(root), manifest)
+    # ...but only when it resolves to the base interpreter under /usr
+    os.unlink(root / ".venv" / "bin" / "𝜋thon")
+    os.symlink("/etc/passwd", root / ".venv" / "bin" / "𝜋thon")
+    with pytest.raises(act.StepFailed):
+        up.check_tree(str(root), manifest)
+    os.unlink(root / ".venv" / "bin" / "𝜋thon")
     os.chmod(root / "requirements.lock", 0o4644)
     with pytest.raises(act.StepFailed) as e:
         up.check_tree(str(root), manifest)
     assert "setuid" in str(e.value)
+
+
+def test_a_real_virtualenv_built_by_this_python_passes_the_root_check(m, tmp_path):
+    """Built with whatever interpreter runs the suite (CI: every supported Python), so a new Python's venv layout
+    (for example 3.14's extra interpreter link) is checked for real, not only through hand-made fakes."""
+    import subprocess
+    import sys
+    root = tmp_path / "release"
+    root.mkdir()
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(root / ".venv")], check=True)
+    m.updater().check_venv(str(root))
+
+
+def test_an_interpreter_link_outside_usr_is_accepted_only_into_the_recorded_home(m, tmp_path):
+    root = tmp_path / "release"
+    (root / ".venv" / "bin").mkdir(parents=True)
+    base = tmp_path / "opt-python" / "bin"
+    base.mkdir(parents=True)
+    exe = base / "python3.14"
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    (root / ".venv" / "pyvenv.cfg").write_text("home = %s\n" % base)
+    os.symlink(str(exe), root / ".venv" / "bin" / "python3")
+    os.symlink("python3", root / ".venv" / "bin" / "\U0001d70bthon")
+    up = m.updater()
+    up.check_venv(str(root))                                    # base interpreter in pyvenv.cfg's home: allowed
+    (root / ".venv" / "pyvenv.cfg").write_text("home = /somewhere/else\n")
+    with pytest.raises(act.StepFailed):                          # same link, home no longer names it: refused
+        up.check_venv(str(root))
+    (root / ".venv" / "pyvenv.cfg").write_text("home = %s\n" % base)
+    other = base / "not-an-interpreter"
+    other.write_text("x")
+    other.chmod(0o755)
+    os.unlink(root / ".venv" / "bin" / "python3")
+    os.symlink(str(other), root / ".venv" / "bin" / "python3")
+    with pytest.raises(act.StepFailed):                          # resolves to something not named like Python: refused
+        up.check_venv(str(root))
 
 
 # --- a pipe or link in a directory root does not own must not block or redirect root --------------------------------

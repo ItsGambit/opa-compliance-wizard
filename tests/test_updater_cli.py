@@ -41,6 +41,15 @@ def test_status_shows_the_picture_in_the_artboard_format(m, capsys):
     assert data["installed"] == "5.46.0" and data["staged"] == [] and data["keys"]
 
 
+def test_status_does_not_call_a_maintenance_only_state_an_upgrade_in_progress(m, capsys):
+    # nginx-sync writes a state with a correlation id but no step and no result: that is not a run in progress
+    (m.data / "upgrade" / "state.json").write_text(json.dumps({"correlation_id": "upg-00000000", "version_from": "5.46.0",
+                                                                "version_to": "5.46.0", "result": None, "step": None}))
+    assert cli(m, "status") == 0
+    out = capsys.readouterr().out
+    assert "IN PROGRESS" not in out and "no upgrade in progress" in out
+
+
 def test_stage_from_a_file_then_apply_completes_with_the_artboard_steps(m, capsys):
     tar = prepare_release(m)
     assert cli(m, "stage", str(tar)) == 0

@@ -63,7 +63,7 @@ import ocw_bundle  # noqa: E402
 import ocw_host  # noqa: E402
 import ocw_trust  # noqa: E402
 
-ACTIVATOR_VERSION = "5.48.0"
+ACTIVATOR_VERSION = "5.50.1"
 STEP_ORDER = ["validated", "downloaded", "staged", "preflight", "backup", "switching", "restarting", "health_check", "completed"]
 STEP_LABEL = {"validated": "Received and validated", "downloaded": "Downloaded", "staged": "Verified and staged",
               "preflight": "Preflight", "backup": "Backup", "switching": "Switching", "restarting": "Restarting",
@@ -784,9 +784,54 @@ class Updater:
             raise StepFailed("tree_mismatch", f"{len(missing)} file(s) the manifest lists are missing (first: {missing[0]})", "staged")
         self.check_venv(root)
 
+    _INTERPRETER_NAME = re.compile(r"python[0-9]*(\.[0-9]+)?")
+
+    def _is_base_interpreter_link(self, root, rel, target):
+        """A link in .venv/bin may leave the release only if it is the venv's base interpreter: whatever its own name
+        (python, python3, python3.14, Python 3.14's \U0001d70bthon, ...) it must resolve to a regular, executable file named
+        like a Python interpreter, located under /usr or in the base-interpreter directory the venv records in its
+        pyvenv.cfg ("home"), so a Python installed in /opt, /usr/local or a per-user prefix works too."""
+        if not rel.startswith(".venv/bin/") or rel.count("/") != 2:
+            return False
+        if not self._INTERPRETER_NAME.fullmatch(os.path.basename(target)):
+            return False
+        try:
+            st = os.stat(target)
+        except OSError:
+            return False
+        if not stat.S_ISREG(st.st_mode) or not st.st_mode & 0o111:
+            return False
+        if target.startswith("/usr/"):
+            return True
+        # Otherwise it must be what one of the interpreters in pyvenv.cfg's "home" resolves to (home may itself hold
+        # links, e.g. into a framework or a version directory).
+        home = self._venv_home(root)
+        if not home:
+            return False
+        try:
+            names = os.listdir(home)
+        except OSError:
+            return False
+        return any(self._INTERPRETER_NAME.fullmatch(n) and os.path.realpath(os.path.join(home, n)) == target for n in names)
+
+    @staticmethod
+    def _venv_home(root):
+        """The real path of the "home" directory pyvenv.cfg names (the base interpreter's bin), or None."""
+        try:
+            fd = open_regular(os.path.join(root, ".venv", "pyvenv.cfg"))
+            with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read(16384)
+        except OSError:
+            return None
+        for line in text.splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key.strip() == "home" and value.strip().startswith("/"):
+                return os.path.realpath(value.strip())
+        return None
+
     def check_venv(self, root):
         """The virtualenv is not in the manifest (pip built it), but it is walked too: no link may resolve outside the release
-        directory (except bin/python* pointing into /usr, the base interpreter), no hard links, no setuid/setgid/group- or
+        directory (except bin/python* and Python 3.14's bin/\U0001d70bthon pointing into /usr, the base interpreter), no hard links, no setuid/setgid/group- or
         world-writable entry, nothing but plain files, directories and links."""
         venv = os.path.join(root, ".venv")
         if os.path.islink(venv):
@@ -800,7 +845,7 @@ class Updater:
                 if stat.S_ISLNK(st.st_mode):
                     target = os.path.realpath(p)
                     inside = target == real_root or target.startswith(real_root + os.sep)
-                    interpreter = rel.startswith(".venv/bin/python") and target.startswith("/usr/")
+                    interpreter = self._is_base_interpreter_link(root, rel, target)
                     if not (inside or interpreter):
                         raise StepFailed("tree_mismatch", f"{rel} is a link that leaves the release directory", "staged")
                     continue

@@ -170,7 +170,8 @@ def cmd_status(a, cfg, host):
                               else "not readable (run as root)"))
     st = s["state"]
     if st:
-        res = st.get("result") or f"IN PROGRESS at step {st.get('step')}"
+        # A state with neither a result nor a step was written by a maintenance action (e.g. nginx-sync), not an upgrade run.
+        res = st.get("result") or (f"IN PROGRESS at step {st.get('step')}" if st.get("step") else "no upgrade in progress")
         print(f"last run       {st.get('correlation_id')} {st.get('version_from')}→{st.get('version_to')} {res}"
               + (f" in {st['seconds']:.0f} s" if st.get("seconds") else "") + (f"  [{st['reason_code']}]" if st.get("reason_code") else ""))
         if st.get("result") == "failed_needs_operator":
