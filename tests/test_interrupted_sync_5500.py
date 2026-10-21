@@ -201,3 +201,17 @@ def test_a_page_size_shrunk_by_a_timeout_is_not_saved_in_the_cursor(db):
     again = Echo({})
     audit_store.sync_okta_events(again, ENV, "all")
     assert parse_qs(urlsplit(again.paths[0]).query)["limit"] == ["1000"]  # the first request of the next healthy run is at the normal size
+
+
+def test_the_deep_verify_route_tells_the_checker_when_a_sync_is_running(tmp_audit_store, tmp_environments_file, monkeypatch):
+    import server.serve as serve
+    seen = []
+    monkeypatch.setattr(audit_store, "verify_ingestion_chain", lambda env, deep=False, sync_in_progress=False: seen.append(sync_in_progress) or {"valid": True})
+    with serve._sync_jobs_lock:
+        serve._sync_jobs[ENV] = {"status": "running", "steps": [], "error": None}
+    try:
+        serve._run_deep_verify(ENV, {"event": __import__("threading").Event()}, None)
+    finally:
+        with serve._sync_jobs_lock:
+            serve._sync_jobs.pop(ENV, None)
+    assert seen == [True]

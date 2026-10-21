@@ -650,7 +650,7 @@ def _run_deep_verify(environment_id, job, correlation_id):
         with _sync_jobs_lock:
             syncing = (_sync_jobs.get(environment_id) or {}).get("status") == "running"
         # a sync running right now has events it has not sealed yet (it seals once, at its end): pending, not a break
-        result, error = audit_store.verify_ingestion_chain(environment_id, deep=True, sync_in_progress=syncing), None
+        result, error = audit_store.verify_ingestion_chain(environment_id, deep=True, **({"sync_in_progress": True} if syncing else {})), None
     except Exception as exc:
         result, error = None, _job_error_message(exc)
     with _deep_verify_lock:
