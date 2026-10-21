@@ -77,9 +77,12 @@ const roleText = (m: Record<string, number>) =>
   Object.entries(m).map(([k, v]) => `${v} ${k.replace(/_ADMIN$/, '').replace(/_/g, ' ').toLowerCase()}`).join(' · ')
 
 // ── People drawer ───────────────────────────────────────────────────────────────────────────────────────────────
-function PeopleDrawer({ environment, list, asOf, onClose }: { environment: string; list: 'c1' | 'c5' | null; asOf?: string; onClose: () => void }) {
+type DrawerList = 'c1' | 'c5' | 'mfa_nonpr' | 'mfa_smsvoice'
+
+function PeopleDrawer({ environment, list, asOf, onClose }: { environment: string; list: DrawerList | null; asOf?: string; onClose: () => void }) {
   const { data, isLoading, isError, error } = usePeopleList(environment, list, asOf)
-  const title = list === 'c1' ? 'Left Okta, still holds OPA access' : 'Okta admins who also hold an OPA admin role'
+  const title = list === 'c1' ? 'Left Okta, still holds OPA access' : list === 'c5' ? 'Okta admins who also hold an OPA admin role'
+    : list === 'mfa_nonpr' ? 'Privileged people who used a non-phishing-resistant factor' : 'Privileged people who used SMS or voice, last 5 weeks'
   return (
     <Dialog.Root open={list != null} onOpenChange={o => { if (!o) onClose() }}>
       <Dialog.Portal>
@@ -120,6 +123,16 @@ function PeopleDrawer({ environment, list, asOf, onClose }: { environment: strin
                     <td className="py-1.5 pr-2 text-text-dim">{o.okta_roles.join(', ')}</td>
                     <td className="py-1.5 font-mono text-xs">{o.opa_roles.join(', ')}<div className="text-text-faint">{Object.values(o.via_groups).flat().join(', ')}</div></td>
                   </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          {data && (list === 'mfa_nonpr' || list === 'mfa_smsvoice') && data.people.length > 0 && (
+            <table className="w-full text-sm">
+              <thead><tr className="text-left text-xs text-text-faint border-b border-border"><th className="py-1 pr-2 font-medium">Person</th><th className="py-1 pr-2 font-medium text-right">Sign-ins</th><th className="py-1 pr-2 font-medium text-right">MFA sign-ins</th><th className="py-1 pr-2 font-medium text-right">Phishing-resistant share</th><th className="py-1 font-medium text-right">SMS or voice</th></tr></thead>
+              <tbody>
+                {(data.people as { actor_id: string; login: string | null; signins: number; mfa_success: number; phishing_resistant_share: number | null; sms_voice: number }[]).map(p => (
+                  <tr key={p.actor_id} className="border-b border-border/50"><td className="py-1.5 pr-2 text-text-dim">{p.login ?? p.actor_id}</td><td className="py-1.5 pr-2 text-right tabular-nums">{p.signins}</td><td className="py-1.5 pr-2 text-right tabular-nums">{p.mfa_success}</td><td className="py-1.5 pr-2 text-right tabular-nums">{pct(p.phishing_resistant_share)}</td><td className="py-1.5 text-right tabular-nums">{p.sms_voice}</td></tr>
                 ))}
               </tbody>
             </table>
@@ -260,7 +273,7 @@ function CrossChecks({ o, onOpen }: { o: OverviewData; onOpen: (l: 'c1' | 'c5') 
   )
 }
 
-function SignIns({ o, environment }: { o: OverviewData; environment: string }) {
+function SignIns({ o, environment, onOpen }: { o: OverviewData; environment: string; onOpen: (l: DrawerList) => void }) {
   const [period, setPeriod] = useState('13')
   const s = o.signins_mfa
   const qc = useQueryClient()
@@ -285,7 +298,6 @@ function SignIns({ o, environment }: { o: OverviewData; environment: string }) {
   const thisWeek = every[every.length - 1]
   const privThis = priv[priv.length - 1]
   const first = every.find(w => w.phishing_resistant_share != null)
-  const recent30 = every.slice(-5)
   const series = (weeks: MfaWeek[], pick: (w: MfaWeek) => number | null, scale = 1) => weeks.map(w => { const v = pick(w); return v == null ? null : v * scale })
   const exportBits = overviewExportSections(o, 'Overview').filter(x => x.title.startsWith('Sign-ins'))
   return (
@@ -294,14 +306,16 @@ function SignIns({ o, environment }: { o: OverviewData; environment: string }) {
         <Select ariaLabel="Period" value={period} onValueChange={setPeriod} placeholder="Period" options={PERIODS} />
         <ExportButtons sections={exportBits} filenameBase="opa-signins-mfa-counts" />
       </SectionHead>
-      <p className="text-xs text-muted">From the System Log archive (complete through {formatDateTime(o.sources.archive.newest)}). Privileged people here means {s.privileged_cohort ? `${s.privileged_cohort.okta_admins} Okta admin role holders and ${s.privileged_cohort.opa_admin_logins} OPA privileged users` : 'nobody yet'}, matched to sign-in events by login or Okta user id. The factor used at sign-in comes from a diagnostic field of the log (debugData.factor) that Okta does not promise to keep stable, so every figure that depends on it is an estimate. Same definitions as the FastPass Deployment Tool.</p>
+      <p className="text-xs text-muted">From the System Log archive (complete through {formatDateTime(o.sources.archive.newest)}). Privileged people here means {s.privileged_cohort && s.people.privileged_total != null ? `${s.people.privileged_total} people: ${s.privileged_cohort.okta_admins} Okta admin role holders plus the OPA privileged users` : 'nobody yet'}, matched to sign-in events by login or Okta user id. The factor used at sign-in comes from a diagnostic field of the log (debugData.factor) that Okta does not promise to keep stable, so every figure that depends on it is an estimate. Same definitions as the FastPass Deployment Tool.</p>
       {s.privileged_message && <p className="text-xs text-warn">{s.privileged_message}</p>}
       <ul className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5 list-none p-0 m-0">
-        <Tile label={`Successful sign-ins, ${n} weeks`} value={ev.signins.toLocaleString()} sub={pv ? `${pv.signins.toLocaleString()} by privileged people` : undefined} />
+        <Tile label={`Successful sign-ins, ${n} weeks`} value={ev.signins.toLocaleString()} sub={`${pv ? `${pv.signins.toLocaleString()} by privileged people · ` : ''}${thisWeek ? `${thisWeek.password_only_derived.toLocaleString()} derived password-only this week` : ''}`} />
         <Tile label="Phishing-resistant share, this week" value={approx(thisWeek?.phishing_resistant_share)} sub={`everyone${privThis ? `; privileged people ${approx(privThis.phishing_resistant_share)}` : ''}${first && first !== thisWeek ? ` · ${pct(first.phishing_resistant_share)} at the start` : ''}`} />
+        <Tile label="Privileged people who used a non-phishing-resistant factor" value={s.people.privileged_non_pr ?? 'n/a'} flag={(s.people.privileged_non_pr ?? 0) > 0}
+          onOpen={(s.people.privileged_non_pr ?? 0) > 0 ? () => onOpen('mfa_nonpr') : undefined} sub={s.people.privileged_total != null ? `of ${s.people.privileged_total} privileged people, in the period · push, code, SMS or email` : 'no privileged people known yet'} />
+        <Tile label="People using SMS or voice, last 30 days" value={s.people.everyone_sms_voice_30d} flag={(s.people.privileged_sms_voice_30d ?? 0) > 0}
+          onOpen={(s.people.privileged_sms_voice_30d ?? 0) > 0 ? () => onOpen('mfa_smsvoice') : undefined} sub={s.people.privileged_sms_voice_30d != null ? `${s.people.privileged_sms_voice_30d} of them privileged (the list shows those)` : 'privileged people not known yet'} />
         <Tile label="MFA failure rate, this week" value={approx(thisWeek?.mfa_failure_rate)} sub={`${privThis ? `privileged people ${approx(privThis.mfa_failure_rate)} · ` : ''}rate only, no reasons`} />
-        <Tile label="SMS or voice sign-ins, last 5 weeks" value={sum5(recent30).toLocaleString()} sub={`${pv ? `${sum5(priv.slice(-5)).toLocaleString()} by privileged people` : 'sign-ins, not people'}`} />
-        <Tile label="Password-only sign-ins (derived), this week" value={thisWeek ? thisWeek.password_only_derived.toLocaleString() : 'n/a'} sub="sign-ins minus multi-factor sign-ins; not observed" />
       </ul>
       <div className="grid gap-3 md:grid-cols-2">
         <ChartCard title="Successful sign-ins per week" subtitle="Everyone · user.session.start with outcome SUCCESS" how="Successful user.session.start events in the archive by the week published: the same rows as the Session Activity report.">
@@ -325,10 +339,10 @@ function SignIns({ o, environment }: { o: OverviewData; environment: string }) {
       </div>
       <div>
         <h3 className="lbl text-xs font-semibold uppercase tracking-wide text-muted">Successful MFA sign-ins by factor, {n} weeks</h3>
-        <p className="text-xs text-muted mb-1">Sign-ins, not people. Counts only.</p>
+        <p className="text-xs text-muted mb-1">Sign-ins, not people, except the last column (distinct people).</p>
         <div className="overflow-x-auto">
           <table className="w-full text-xs">
-            <thead><tr className="text-left text-text-faint border-b border-border"><th className="py-1 pr-2 font-medium">Factor at sign-in</th><th className="py-1 pr-2 font-medium">Phishing-resistant</th><th className="py-1 pr-2 font-medium text-right">Everyone</th><th className="py-1 pr-2 font-medium text-right">Share</th><th className="py-1 pr-2 font-medium text-right">Privileged</th><th className="py-1 font-medium text-right">Share</th></tr></thead>
+            <thead><tr className="text-left text-text-faint border-b border-border"><th className="py-1 pr-2 font-medium">Factor at sign-in</th><th className="py-1 pr-2 font-medium">Phishing-resistant</th><th className="py-1 pr-2 font-medium text-right">Everyone</th><th className="py-1 pr-2 font-medium text-right">Share</th><th className="py-1 pr-2 font-medium text-right">Privileged</th><th className="py-1 pr-2 font-medium text-right">Share</th><th className="py-1 font-medium text-right">Privileged people</th></tr></thead>
             <tbody>
               {FACTOR_ROWS.filter(f => (ev.byClass[f.key] ?? 0) > 0 || ['fastpass', 'passkey', 'smart_card', 'sms', 'voice'].includes(f.key)).map(f => {
                 const classified = ev.mfa - ev.unclassified
@@ -340,11 +354,12 @@ function SignIns({ o, environment }: { o: OverviewData; environment: string }) {
                     <td className="py-1 pr-2 text-right tabular-nums">{ev.byClass[f.key].toLocaleString()}</td>
                     <td className="py-1 pr-2 text-right tabular-nums">{classified > 0 ? pctSmall(ev.byClass[f.key] / classified) : 'n/a'}</td>
                     <td className="py-1 pr-2 text-right tabular-nums">{pv ? pv.byClass[f.key].toLocaleString() : 'n/a'}</td>
-                    <td className="py-1 text-right tabular-nums">{pv && pClassified > 0 ? pctSmall(pv.byClass[f.key] / pClassified) : 'n/a'}</td>
+                    <td className="py-1 pr-2 text-right tabular-nums">{pv && pClassified > 0 ? pctSmall(pv.byClass[f.key] / pClassified) : 'n/a'}</td>
+                    <td className="py-1 text-right tabular-nums">{s.people.privileged_by_class ? s.people.privileged_by_class[f.key] ?? 0 : 'n/a'}</td>
                   </tr>
                 )
               })}
-              <tr><td className="py-1 pr-2 text-text-dim">No factor named (left out of the shares)</td><td /><td className="py-1 pr-2 text-right tabular-nums">{ev.unclassified.toLocaleString()}</td><td /><td className="py-1 pr-2 text-right tabular-nums">{pv ? pv.unclassified.toLocaleString() : 'n/a'}</td><td /></tr>
+              <tr><td className="py-1 pr-2 text-text-dim">No factor named (left out of the shares)</td><td /><td className="py-1 pr-2 text-right tabular-nums">{ev.unclassified.toLocaleString()}</td><td /><td className="py-1 pr-2 text-right tabular-nums">{pv ? pv.unclassified.toLocaleString() : 'n/a'}</td><td /><td /></tr>
             </tbody>
           </table>
         </div>
@@ -355,7 +370,6 @@ function SignIns({ o, environment }: { o: OverviewData; environment: string }) {
   )
 }
 
-const sum5 = (weeks: MfaWeek[]) => weeks.reduce((a, w) => a + w.sms_voice, 0)
 const pctSmall = (v: number) => (v > 0 && v < 0.01 ? '<1%' : `${Math.round(v * 100)}%`)
 
 function Inventory({ o }: { o: OverviewData }) {
@@ -462,7 +476,7 @@ export function OverviewPage({ onOpenReports }: { onOpenReports: () => void }) {
   const { data: environments } = useEnvironments()
   const environment = environments?.active ?? undefined
   const [asOf, setAsOf] = useState<string>(LATEST)
-  const [drawer, setDrawer] = useState<'c1' | 'c5' | null>(null)
+  const [drawer, setDrawer] = useState<DrawerList | null>(null)
   const [paper, setPaper] = useState<'A4' | 'Letter'>('A4')
   const [copied, setCopied] = useState(false)
   const effectiveAsOf = asOf === LATEST ? undefined : asOf
@@ -542,7 +556,7 @@ export function OverviewPage({ onOpenReports }: { onOpenReports: () => void }) {
 
       <Trends o={o} />
       <CrossChecks o={o} onOpen={setDrawer} />
-      <SignIns o={o} environment={environment} />
+      <SignIns o={o} environment={environment} onOpen={setDrawer} />
       <Inventory o={o} />
       <EvidenceReadiness o={o} environment={environment} onOpenReports={onOpenReports} />
       <PeopleDrawer environment={environment} list={drawer} asOf={effectiveAsOf} onClose={() => setDrawer(null)} />

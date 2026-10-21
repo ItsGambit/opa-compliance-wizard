@@ -96,7 +96,7 @@ export function overview(over: Partial<Overview> = {}): Overview {
         { key: 'okta.users', label: 'Users', side: 'okta', first_seen: '2026-10-09T02:05:00.000Z', latest: 1240, latest_at: snapshot.captured_at, delta_7d: 3, delta_30d: null, points: [{ t: '2026-10-09T02:05:00.000Z', count: 1231 }, { t: '2026-10-21T02:05:00.000Z', count: 1240 }] },
       ],
     },
-    signins_mfa: { state: 'ok', built_at: '2026-10-09T02:30:00.000Z', updated_at: '2026-10-21T02:30:00.000Z', events_used: 90000, weeks: WEEKS, everyone: WEEKS.map(mfaWeek), privileged: WEEKS.map(mfaWeek), privileged_cohort: { okta_admins: 14, opa_admin_logins: 9 }, scope: 'curated', notes: ['Password-only is derived.'] },
+    signins_mfa: { state: 'ok', built_at: '2026-10-09T02:30:00.000Z', updated_at: '2026-10-21T02:30:00.000Z', events_used: 90000, weeks: WEEKS, everyone: WEEKS.map(mfaWeek), privileged: WEEKS.map(mfaWeek), people: { everyone_sms_voice_30d: 38, privileged_sms_voice_30d: 2, privileged_non_pr: 5, privileged_by_class: { fastpass: 17, passkey: 12, smart_card: 0, okta_verify_push: 9, okta_verify_code: 4, sms: 2, voice: 0, email: 1, other_code: 0, security_question: 0, other: 0 }, privileged_total: 22 }, privileged_cohort: { okta_admins: 14, opa_admin_logins: 9 }, scope: 'curated', notes: ['Password-only is derived.'] },
     ...over,
   }
 }

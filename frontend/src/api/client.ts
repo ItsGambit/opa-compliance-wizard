@@ -687,7 +687,7 @@ export function fetchPrivilegedPeople(environment: string, asOf?: string, weeks?
 }
 
 /** The named list behind an Overview count (C1 or C5). Admin-only; every read is audited. */
-export function fetchPeopleList(environment: string, list: 'c1' | 'c5', asOf?: string): Promise<NamedPeopleList> {
+export function fetchPeopleList(environment: string, list: NamedPeopleList['list'], asOf?: string): Promise<NamedPeopleList> {
   const params = new URLSearchParams({ environment, list })
   if (asOf) params.set('as_of', asOf)
   return apiFetch(`/api/overview/people?${params.toString()}`)

@@ -1638,16 +1638,17 @@ export interface Overview {
     | { state: 'not_built'; message: string; weeks: [] }
     | {
         state: 'ok'; built_at: string | null; updated_at: string | null; events_used: number; weeks: string[]
+        people: { everyone_sms_voice_30d: number; privileged_sms_voice_30d: number | null; privileged_non_pr: number | null; privileged_by_class: Record<string, number> | null; privileged_total: number | null }
         everyone: MfaWeek[]; privileged: MfaWeek[]; privileged_cohort: { okta_admins: number; opa_admin_logins: number } | null
         scope: string | null; notes: string[]; privileged_message?: string
       }
 }
 
 export interface NamedPeopleList {
-  list: 'c1' | 'c5'
+  list: 'c1' | 'c5' | 'mfa_nonpr' | 'mfa_smsvoice'
   state: string
   message: string | null
   snapshot: SnapshotSummary | null
   note?: string
-  people: (CrossCheckRow & { footprint?: { groups?: number; policies?: number; resources?: number } | null; okta_status_changed?: string | null; access_effective?: boolean | null })[] | SodOverlap[]
+  people: (CrossCheckRow & { footprint?: { groups?: number; policies?: number; resources?: number } | null; okta_status_changed?: string | null; access_effective?: boolean | null })[] | SodOverlap[] | { actor_id: string; login: string | null; signins: number; mfa_success: number; phishing_resistant_share: number | null; sms_voice: number; mfa_failed: number; by_class: Record<string, number> }[]
 }

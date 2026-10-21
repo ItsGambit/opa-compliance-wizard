@@ -400,7 +400,7 @@ export function useOverview(environment: string | undefined, asOf?: string, enab
   })
 }
 
-export function usePeopleList(environment: string | undefined, list: 'c1' | 'c5' | null, asOf?: string) {
+export function usePeopleList(environment: string | undefined, list: 'c1' | 'c5' | 'mfa_nonpr' | 'mfa_smsvoice' | null, asOf?: string) {
   return useQuery({
     queryKey: ['people_list', environment, list, asOf ?? null],
     queryFn: () => fetchPeopleList(environment!, list!, asOf),

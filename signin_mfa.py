@@ -263,3 +263,49 @@ def privileged_people(environment_id, actor_ids, actor_alts, weeks=26, now=None)
             "signins", "mfa_success", "phishing_resistant_share", "sms_voice", "mfa_failed", "by_class")}})
     out.sort(key=lambda x: (x["login"] or x["actor_id"]))
     return out
+
+
+NON_PHISHING_RESISTANT = tuple(k for k, _ in FACTOR_CLASSES if k not in PHISHING_RESISTANT)
+
+
+def people_counts(environment_id, weeks=13, now=None, actor_ids=None, actor_alts=None):
+    """Distinct-people counts (no names): {"everyone_sms_voice_30d", "privileged_sms_voice_30d", "privileged_non_pr", "privileged_by_class",
+    "privileged_total"}. 'sms_voice_30d' covers the blocks of seven days that overlap the last 30 days (the last five weeks). The privileged
+    figures are for the cohort given by actor_ids / actor_alts (None when there is none)."""
+    now = now or datetime.now(timezone.utc)
+    labels = _weeks(now, max(1, min(int(weeks), 156)))
+    last5 = labels[-5:]
+    conn = audit_store._get_connection()
+    out = {"everyone_sms_voice_30d": 0, "privileged_sms_voice_30d": None, "privileged_non_pr": None, "privileged_by_class": None, "privileged_total": None}
+    out["everyone_sms_voice_30d"] = conn.execute(
+        "SELECT COUNT(DISTINCT actor_id) FROM mfa_week_user WHERE environment_id = ? AND week >= ? AND week <= ? AND key IN ('mfa_sms', 'mfa_voice')",
+        (environment_id, last5[0], last5[-1])).fetchone()[0]
+    ids, alts = sorted(set(actor_ids or ())), sorted({a.lower() for a in (actor_alts or ()) if a})
+    if not ids and not alts:
+        return out
+    by_class, nonpr, smsvoice, seen = {k: set() for k, _ in FACTOR_CLASSES}, set(), set(), set()
+    for column, values in (("actor_id", ids), ("actor_alt", alts)):
+        for i in range(0, len(values), 400):
+            chunk = values[i:i + 400]
+            marks = ",".join("?" for _ in chunk)
+            for r in conn.execute(
+                    f"SELECT week, actor_id, key FROM mfa_week_user WHERE environment_id = ? AND week >= ? AND week <= ? AND {column} IN ({marks}) AND key LIKE 'mfa_%'",
+                    (environment_id, labels[0], labels[-1], *chunk)):
+                cls = r["key"][4:]
+                if cls in by_class:
+                    by_class[cls].add(r["actor_id"])
+                    if cls in NON_PHISHING_RESISTANT:
+                        nonpr.add(r["actor_id"])
+                    if cls in ("sms", "voice") and r["week"] in last5:
+                        smsvoice.add(r["actor_id"])
+    out.update({"privileged_non_pr": len(nonpr), "privileged_sms_voice_30d": len(smsvoice),
+                "privileged_by_class": {k: len(v) for k, v in by_class.items()}})
+    return out
+
+
+def non_pr_people(environment_id, actor_ids, actor_alts, weeks=13, now=None, which="nonpr"):
+    """Privileged people (figures per person) who used a non-phishing-resistant factor ('nonpr') or SMS / voice in the last five weeks
+    ('smsvoice'), for the audited people list."""
+    people = privileged_people(environment_id, actor_ids, actor_alts, weeks, now)
+    keys = NON_PHISHING_RESISTANT if which == "nonpr" else ("sms", "voice")
+    return [p for p in people if any(p["by_class"].get(k, 0) > 0 for k in keys)]

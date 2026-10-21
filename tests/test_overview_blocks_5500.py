@@ -122,3 +122,23 @@ def test_people_endpoint_is_admin_only_and_audited(matrix_server, tmp_audit_log)
     assert _call(base_url, "GET", url + "bogus", headers=_who(ADMIN, admin=True)).status_code == 400
     assert _call(base_url, "GET", url + "c1", headers=_who(ADMIN, admin=True)).json()["state"] == "never_run"
     assert _audit_actions(tmp_audit_log).count("overview.people_read") == 2
+
+
+def test_people_counts_and_lists_for_the_privileged_cohort(db):
+    t = "2026-10-20T10:00:00.000Z"
+    evs = [("a1", "00u1", "alex@example.com", "SIGNED_NONCE"), ("a2", "00u1", "alex@example.com", "OKTA_VERIFY_PUSH"), ("b1", "00u2", "sam@example.com", "SMS_FACTOR"),
+           ("c1", "00uZ", "z@example.com", "SMS_FACTOR"), ("c2", "00uY", "y@example.com", "SIGNED_NONCE")]
+    for i, (u, actor, alt, factor) in enumerate(evs):
+        ev = {"uuid": u, "eventType": "user.authentication.auth_via_mfa", "published": t, "actor": {"id": actor, "alternateId": alt}, "outcome": {"result": "SUCCESS"},
+              "debugContext": {"debugData": {"factor": factor}}, "target": []}
+        audit_store._insert_rows(audit_store._get_connection(), ENV, [audit_store._normalize_live_event(ev)], "all")
+    sm.refresh(ENV)
+    oa.capture_and_store(ENV, FakeOkta(), captured_at="2026-10-21T01:00:00.000Z")
+    o = oa.build_overview(ENV, access_model=_model(), now=NOW)
+    p = o["signins_mfa"]["people"]
+    assert p["everyone_sms_voice_30d"] == 2 and p["privileged_sms_voice_30d"] == 1 and p["privileged_non_pr"] == 2
+    assert p["privileged_by_class"]["fastpass"] == 1 and p["privileged_by_class"]["sms"] == 1 and p["privileged_total"] == 2
+    nonpr = oa.people_list(ENV, "mfa_nonpr", access_model=_model())
+    assert {x["login"] for x in nonpr["people"]} == {"alex@example.com", "sam@example.com"}
+    sms = oa.people_list(ENV, "mfa_smsvoice", access_model=_model())
+    assert [x["login"] for x in sms["people"]] == ["sam@example.com"]

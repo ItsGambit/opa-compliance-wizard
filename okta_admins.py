@@ -860,7 +860,11 @@ def build_overview(environment_id, as_of=None, access_model=None, service_accoun
         pids, plogins, _src = privileged_identity_sets(environment_id, access_model, as_of)
         everyone = signin_mfa.weekly(environment_id, weeks, end)
         privileged = signin_mfa.weekly(environment_id, weeks, end, actor_ids=pids, actor_alts=plogins) if (pids or plogins) else []
+        counts = signin_mfa.people_counts(environment_id, max(weeks, 13), end, pids, plogins) if (pids or plogins) else signin_mfa.people_counts(environment_id, max(weeks, 13), end)
+        # people = distinct logins (an Okta admin's login is in the set too); an admin without a login still counts once
+        counts["privileged_total"] = max(len(plogins), len(pids)) if (pids or plogins) else None
         signins_mfa = {
+            "people": counts,
             "state": "ok", "built_at": mfa_state["built_at"], "updated_at": mfa_state["updated_at"], "events_used": mfa_state["events_used"],
             "weeks": [w["week"] for w in everyone], "everyone": everyone, "privileged": privileged,
             "privileged_cohort": {"okta_admins": len(pids), "opa_admin_logins": len(plogins)} if (pids or plogins) else None,
@@ -967,7 +971,7 @@ def privileged_people_report(environment_id, access_model=None, as_of=None, week
             "note": "Each person's figures are their own sign-ins and multi-factor events in the archive over the window."}
 
 
-PEOPLE_LISTS = ("c1", "c5")
+PEOPLE_LISTS = ("c1", "c5", "mfa_nonpr", "mfa_smsvoice")
 
 
 def people_list(environment_id, which, access_model=None, as_of=None):
@@ -975,6 +979,12 @@ def people_list(environment_id, which, access_model=None, as_of=None):
     user is gone and whose OPA access still resolves, 'c5' the Okta admins who also hold an OPA admin role."""
     if which not in PEOPLE_LISTS:
         raise ValueError("list must be one of " + ", ".join(PEOPLE_LISTS))
+    if which in ("mfa_nonpr", "mfa_smsvoice"):
+        import signin_mfa
+        pids, plogins, _ = privileged_identity_sets(environment_id, access_model, as_of)
+        people = signin_mfa.non_pr_people(environment_id, pids, plogins, 13, None, "nonpr" if which == "mfa_nonpr" else "smsvoice")
+        return {"list": which, "state": "ok", "message": None, "snapshot": None, "people": people,
+                "note": "Privileged people with at least one successful multi-factor sign-in by that kind of factor in the period. An estimate: the factor comes from debugData.factor."}
     if which == "c5":
         report = build_okta_admins_report(environment_id, as_of=as_of, access_model=access_model)
         return {"list": "c5", "state": report["state"] if report["state"] != "ok" else report["separation_of_duties"]["state"],
