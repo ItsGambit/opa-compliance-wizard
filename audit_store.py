@@ -816,6 +816,7 @@ def _migration_010_snapshots_polling_sync_and_correlation(conn):
     A rollback to older code ignores all of it; the one thing older code
     cannot do is deep-verify a snapshot manifest, which is why this
     migration is declared not rollback-safe."""
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_manifest_entries_uuid ON manifest_entries (environment_id, uuid)")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS config_snapshots (
             snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -959,8 +960,18 @@ def run_migrations():
                 raise
 
 
+def _ensure_manifest_entry_index():
+    """An archive already at schema 10 (an early 5.50.0 build) lacks the (environment, uuid) index on manifest_entries that the
+    unsealed-event check needs; creating it is idempotent."""
+    conn = _get_connection()
+    with _db_lock:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_manifest_entries_uuid ON manifest_entries (environment_id, uuid)")
+        conn.commit()
+
+
 def init_db():
     run_migrations()
+    _ensure_manifest_entry_index()
     import create_secret_folders
     create_secret_folders.migrate_legacy_environments_json()
     backfill_resource_columns()
@@ -1584,7 +1595,7 @@ def _write_manifest_row(conn, environment_id, source, since, until, entries):
 EVIDENCE_CHAIN_V2 = True
 
 
-def verify_ingestion_chain(environment_id, deep=False):
+def verify_ingestion_chain(environment_id, deep=False, sync_in_progress=False):
     """Walks this environment's ingestion_manifests in insertion order
     and verifies the chain (DATA-04, see _record_ingestion_manifest):
     every row's prev_manifest_hash must equal the previous row's head
@@ -1642,13 +1653,13 @@ def verify_ingestion_chain(environment_id, deep=False):
     if own_txn:
         conn.execute("BEGIN")  # one WAL read snapshot for every read below
     try:
-        return _verify_ingestion_chain_snapshot(conn, environment_id, deep)
+        return _verify_ingestion_chain_snapshot(conn, environment_id, deep, sync_in_progress)
     finally:
         if own_txn:
             conn.rollback()
 
 
-def _verify_ingestion_chain_snapshot(conn, environment_id, deep):
+def _verify_ingestion_chain_snapshot(conn, environment_id, deep, sync_in_progress=False):
     rows = conn.execute(
         """SELECT id, environment_id, source, since, until, row_count, batch_hash, prev_manifest_hash,
                   created_at, content_hash, entry_hash
@@ -1777,7 +1788,88 @@ def _verify_ingestion_chain_snapshot(conn, environment_id, deep):
             "valid": False, "broken_at": rows[-1]["id"],
             "reason": "sealed (v2) manifests exist but the recorded chain head is missing",
         })
+    if deep and result["valid"]:
+        # 5.50.0: every curated event stored must be covered by a manifest. A sync killed between a page's commit and its
+        # seal leaves rows no manifest names; they used to verify as valid. A sync running right now has rows it has not
+        # sealed yet (it seals once, at its end): that is "pending", not a break.
+        unsealed = _count_unsealed_curated(conn, environment_id, result["legacy_manifests"])
+        result["unsealed_events"] = unsealed
+        if unsealed and sync_in_progress:
+            result["unsealed_pending"] = True
+        elif unsealed:
+            result.update({
+                "valid": False, "broken_at": None,
+                "reason": f"{unsealed} events are stored but not sealed into the evidence chain (a sync was interrupted); "
+                          "the next sync seals them in a recovery manifest",
+            })
     return result
+
+
+def _unsealed_boundary(conn, environment_id, legacy_manifests):
+    """rowid above which an unsealed curated event counts. With no legacy (pre-5.40.4, content-unsealed) manifests every
+    unsealed event counts (0). With legacy manifests, rows from before the first sealed event cannot be told from rows the
+    legacy chain never sealed, so only rows after the first sealed one count; with none sealed at all, nothing counts (None)."""
+    if not legacy_manifests:
+        return 0
+    row = conn.execute(
+        """SELECT e.rowid FROM events e WHERE e.environment_id = ? AND e.is_curated = 1
+           AND EXISTS (SELECT 1 FROM manifest_entries m WHERE m.environment_id = e.environment_id AND m.uuid = e.uuid)
+           ORDER BY e.rowid LIMIT 1""", (environment_id,)).fetchone()
+    return row[0] if row else None
+
+
+_UNSEALED_SQL = """FROM events e WHERE e.environment_id = ? AND e.is_curated = 1 AND e.rowid > ?
+                   AND NOT EXISTS (SELECT 1 FROM manifest_entries m WHERE m.environment_id = e.environment_id AND m.uuid = e.uuid)"""
+
+
+def _entries_json_uuids(conn, environment_id):
+    """uuids sealed through the 5.40.2-format entries_json cell (a hand-enabled v2 install), which manifest_entries does not hold."""
+    out = set()
+    for r in conn.execute("SELECT entries_json FROM ingestion_manifests WHERE environment_id = ? AND entries_json IS NOT NULL", (environment_id,)):
+        try:
+            out.update(str(pair[0]) for pair in json.loads(r[0]))
+        except (ValueError, TypeError, IndexError):
+            pass
+    return out
+
+
+def _count_unsealed_curated(conn, environment_id, legacy_manifests=None):
+    if legacy_manifests is None:
+        legacy_manifests = conn.execute(
+            "SELECT COUNT(*) FROM ingestion_manifests WHERE environment_id = ? AND entry_hash IS NULL", (environment_id,)).fetchone()[0]
+    boundary = _unsealed_boundary(conn, environment_id, legacy_manifests)
+    if boundary is None:
+        return 0
+    extra = _entries_json_uuids(conn, environment_id)
+    if not extra:
+        return conn.execute("SELECT COUNT(*) " + _UNSEALED_SQL, (environment_id, boundary)).fetchone()[0]
+    return sum(1 for r in conn.execute("SELECT e.uuid " + _UNSEALED_SQL, (environment_id, boundary)) if r["uuid"] not in extra)
+
+
+RECOVERY_BATCH = 100000
+
+
+def seal_unsealed_events(environment_id, limit=RECOVERY_BATCH):
+    """Seals the curated events no manifest names -- what a sync that was killed mid-run leaves behind -- into ONE recovery
+    manifest (source "sync_recovery", since/until the published range of the rows), so the chain says plainly that this is the
+    recovery of an interrupted run and covers exactly those rows. The rows are sealed as they are stored now: the recovery
+    proves them from this moment, not from their original sync. Returns {"sealed": n, "since", "until", "chain_head"} or
+    {"sealed": 0}. Bounded by `limit` rows per call (the next sync continues)."""
+    conn = _get_connection()
+    legacy = conn.execute("SELECT COUNT(*) FROM ingestion_manifests WHERE environment_id = ? AND entry_hash IS NULL", (environment_id,)).fetchone()[0]
+    boundary = _unsealed_boundary(conn, environment_id, legacy)
+    if boundary is None:
+        return {"sealed": 0}
+    extra = _entries_json_uuids(conn, environment_id)
+    rows = [r for r in conn.execute("SELECT e.uuid, e.published, e.raw_json " + _UNSEALED_SQL + " ORDER BY e.rowid LIMIT ?", (environment_id, boundary, limit))
+            if r["uuid"] not in extra]
+    if not rows:
+        return {"sealed": 0}
+    entries = [(r["uuid"], 1, _content_sha256(r["raw_json"])) for r in rows]
+    since = min(r["published"] for r in rows)
+    until = max(r["published"] for r in rows)
+    head = _record_ingestion_manifest(conn, environment_id, "sync_recovery", since, until, entries)
+    return {"sealed": len(entries), "since": since, "until": until, "chain_head": head}
 
 
 # ---------------------------------------------------------------------------
@@ -2371,6 +2463,7 @@ SAFETY_LAG_SECONDS = 5 * 60
 WATERMARK_OVERLAP_SECONDS = 60 * 60
 
 
+MAX_TIMEOUTS_PER_RUN = 8  # Okta 30-second timeouts one run tolerates (each costs several retried requests) before it stops as partial
 SYSTEM_LOG_PATH = "/api/v1/logs"  # equals create_secret_folders.SYSTEM_LOG_PATH (a test pins it)
 SYSTEM_LOG_MAX_SINCE_DAYS = 180  # Okta: "The since parameter is over 180 days prior to the current day" (HTTP 400)
 POLL_LIMIT = 1000
@@ -2496,6 +2589,15 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
         last_sync_status="running", last_sync_error=None, ingestion_scope=ingestion_scope,
     )
 
+    # 5.50.0: rows a killed run committed but never sealed get their own recovery manifest before anything new is fetched.
+    recovered_events = 0
+    try:
+        recovered_events = seal_unsealed_events(environment_id)["sealed"]
+    except Exception as recovery_exc:  # never blocks the sync; the integrity check keeps reporting them
+        recovered_events = None
+        import create_secret_folders
+        create_secret_folders.log("WARN", f"sealing unsealed events of an interrupted run failed: {type(recovery_exc).__name__}")
+
     explicit_since = since is not None
     stored = None
     cursor_path = None
@@ -2539,8 +2641,13 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
     else:
         since = _iso_ms(now_dt - timedelta(days=90))
 
-    original_since = since
     cursor = datetime.fromisoformat(since.replace("Z", "+00:00"))
+    if not bounded and cursor_path:
+        # The run continues from the saved cursor, not from a date: report that, not a `since` it never used.
+        since_clamped = False
+        original_since = None
+    else:
+        original_since = since
     total_inserted = 0
     total_scanned = 0  # rows fetched, INCLUDING any re-read after a page-cap resume (see DATA-09 above)
     chunks = 0
@@ -2549,6 +2656,7 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
     cursor_reset = False
     all_new_entries = []  # Phase 6: accumulated across every chunk and page, sealed into ONE manifest row for this whole call
     poll_max_published = None
+    timeouts = {"n": 0}  # Okta timeouts this run, polling and bounded together
     # Exactly one manifest per call (5.40.6): once this call's rows are
     # sealed, nothing may seal them again.
     sealed = {"head": None, "done": False}
@@ -2581,6 +2689,7 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
             "complete": complete, "incomplete_chunks": incomplete_chunks, "chain_head": chain_head,
             "mode": "bounded" if explicit_since else ("bounded+polling" if bounded else "polling"),
             "pages": pages_polled, "since_clamped": since_clamped, "cursor_reset": cursor_reset,
+            "recovered_events": recovered_events, "from_cursor": bool(not bounded and cursor_path),
         }
         if error:
             out["error"] = error
@@ -2602,6 +2711,10 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
                 events, next_path = okta_client.get_system_log_page(path)
             except Exception as exc:
                 if _is_timeout_error(exc):
+                    timeouts["n"] += 1
+                    if timeouts["n"] > MAX_TIMEOUTS_PER_RUN:
+                        return False, (f"partial: Okta timed out {timeouts['n']} times in this run; progress is saved and the next sync continues "
+                                       "from the saved cursor.")
                     current = _query_limit(path)
                     smaller = max(POLL_MIN_LIMIT, current // 4)
                     if smaller >= current or shrinks >= 3:
@@ -2628,11 +2741,18 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
                 all_new_entries.extend(new_entries)
                 if max_published and (poll_max_published is None or max_published > poll_max_published):
                     poll_max_published = max_published
-                if next_path is not None and next_path == path:
+                if next_path is not None and _path_with_limit(next_path, 0) == _path_with_limit(path, 0):
                     return False, "Okta returned the same System Log page again; stopping instead of looping."
-            if next_path and _usable_poll_cursor(next_path):
+            stored_path = next_path
+            if next_path and _query_limit(next_path) != POLL_LIMIT:
+                # Okta echoes the page size in its `next` link: a size shrunk after a timeout must not be saved, or every later
+                # healthy run would keep asking for small pages. Only `limit` changes.
+                stored_path = _path_with_limit(next_path, POLL_LIMIT)
+            if stored_path and _usable_poll_cursor(stored_path):
                 # Saved after the page's rows are committed: a crash between the two re-reads one page, which dedupes.
-                _upsert_sync_state(conn, environment_id, poll_cursor=next_path, sync_mode="polling")
+                _upsert_sync_state(conn, environment_id, poll_cursor=stored_path, sync_mode="polling")
+            if next_path and _query_limit(next_path) != _query_limit(path):
+                next_path = _path_with_limit(next_path, _query_limit(path))  # within this run keep the size that just worked
             if on_progress and events:
                 on_progress("fetch", "progress", f"polling: page {pages_polled}, {total_scanned} event(s) read")
             if not events or not next_path:
@@ -2644,6 +2764,7 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
         )
 
     chunk_span = timedelta(days=CHUNK_DAYS)
+    failed_floor = None  # the smallest window that timed out in this run: the walk never grows back to it
     try:
         while bounded and cursor < safe_now_dt:
             chunk_until_dt = min(cursor + chunk_span, safe_now_dt)
@@ -2658,10 +2779,20 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
                 )
             except Exception as exc:
                 if _is_timeout_error(exc) and chunk_span > timedelta(minutes=1):
+                    timeouts["n"] += 1
+                    failed_floor = chunk_span if failed_floor is None else min(failed_floor, chunk_span)
+                    if timeouts["n"] > MAX_TIMEOUTS_PER_RUN:
+                        error_message = (f"partial: Okta timed out {timeouts['n']} times in this run; progress up to {_iso_ms(cursor)} is saved "
+                                         "and the next sync continues from there.")
+                        chain_head = _fail(error_message, chunk_since)
+                        return _result(False, chain_head, error_message)
                     chunk_span = max(timedelta(minutes=1), chunk_span / 4)  # ask for a smaller window, not for nothing
                     continue
                 raise
-            chunk_span = min(timedelta(days=CHUNK_DAYS), chunk_span * 2)
+            grown = min(timedelta(days=CHUNK_DAYS), chunk_span * 1.5)  # recover gradually, and never back to a size that failed here
+            if failed_floor is not None and grown >= failed_floor:
+                grown = chunk_span
+            chunk_span = grown
             total_scanned += len(events)
 
             rows = [_normalize_live_event(e) for e in events]
