@@ -286,20 +286,26 @@ def capture_and_store(environment_id, okta_client, kind=KIND_ADMINS, captured_at
 
 
 AUTO_CAPTURE_MIN_INTERVAL = timedelta(hours=6)
+AUTO_CAPTURE_RETRY_AFTER_FAILURE = timedelta(hours=24)  # a token that cannot read roles is not asked again every six hours
 
 
 def capture_if_due(environment_id, okta_client, now=None):
     """The automatic capture after a sync: skipped when a capture of any status
     (a refusal included) was recorded in the last AUTO_CAPTURE_MIN_INTERVAL, so
-    a busy 'Sync now' button cannot hammer Okta's role endpoints. Returns the
-    snapshot or None."""
+    a busy 'Sync now' button cannot hammer Okta's role endpoints. After a refused or
+    failed attempt the wait is 24 hours (the first refusal is sealed as evidence; a
+    token that cannot read roles would otherwise add a snapshot, a manifest and an
+    audit row four times a day). A manual capture (capture_and_store) is never held
+    back. Returns the snapshot or None."""
+    stamped = _iso(now) if now is not None else None  # a caller-supplied clock stamps the capture too
     now = now or _now()
     last = audit_store.list_config_snapshots(environment_id, kind=KIND_ADMINS, limit=1)
     if last:
         taken = audit_store._canonical_published(last[0]["captured_at"])
-        if taken and taken > _iso(now - AUTO_CAPTURE_MIN_INTERVAL):
+        wait = AUTO_CAPTURE_MIN_INTERVAL if last[0]["status"] == "ok" else AUTO_CAPTURE_RETRY_AFTER_FAILURE
+        if taken and taken > _iso(now - wait):
             return None
-    return capture_and_store(environment_id, okta_client)
+    return capture_and_store(environment_id, okta_client, captured_at=stamped)
 
 
 # ---------------------------------------------------------------------------

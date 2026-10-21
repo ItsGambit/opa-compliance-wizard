@@ -573,3 +573,22 @@ def test_c1_same_login_and_email_is_looked_up_once_and_a_server_error_stops_the_
     boom = Boom({})
     entry = oa.capture_principal_status(boom, _one_user_model("a@example.com", "b@example.com"))["items"][0][1]
     assert entry["okta_state"] == "UNREADABLE" and boom.calls == ["a@example.com"]  # a failure is not "not found": no fallback, no "absent"
+
+
+def test_after_a_refused_automatic_capture_the_next_one_waits_24_hours_but_manual_capture_does_not(db):
+    from datetime import datetime, timedelta, timezone
+    t0 = datetime(2026, 10, 21, 2, 0, tzinfo=timezone.utc)
+    refused = FakeOkta(fail={"assignees": REFUSED})
+    first = oa.capture_if_due(ENV, refused, now=t0)
+    assert first is not None and first["status"] == "refused"
+    for hours in (7, 13, 23):  # beyond the 6 h interval, inside 24 h: no new snapshot, no call to Okta
+        probe = FakeOkta(fail={"assignees": REFUSED})
+        assert oa.capture_if_due(ENV, probe, now=t0 + timedelta(hours=hours)) is None and probe.calls == []
+    assert len(audit_store.list_config_snapshots(ENV, kind=oa.KIND_ADMINS)) == 1
+    manual = oa.capture_and_store(ENV, FakeOkta(fail={"assignees": REFUSED}))  # never held back
+    assert manual["status"] == "refused" and len(audit_store.list_config_snapshots(ENV, kind=oa.KIND_ADMINS)) == 2
+    # a successful capture keeps the ordinary six-hour interval
+    ok_t = datetime(2026, 12, 1, 2, 0, tzinfo=timezone.utc)
+    assert oa.capture_if_due(ENV, FakeOkta(), now=ok_t)["status"] == "ok"
+    assert oa.capture_if_due(ENV, FakeOkta(), now=ok_t + timedelta(hours=5)) is None
+    assert oa.capture_if_due(ENV, FakeOkta(), now=ok_t + timedelta(hours=7)) is not None
