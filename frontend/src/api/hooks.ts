@@ -23,6 +23,7 @@ import {
   fetchCrossChecks,
   fetchOktaAdminsReport,
   fetchOverview,
+  fetchPeopleList,
   fetchUpgradeNotice,
   fetchUpgradeStatus,
   fetchUserResourceAccess,
@@ -395,6 +396,18 @@ export function useOverview(environment: string | undefined, asOf?: string, enab
     refetchInterval: (query: { state: { data?: { capture?: { status?: string } } } }) => (query.state.data?.capture?.status === 'running' ? 2000 : false),
     enabled: !!environment && enabled,
     retry: false,
+    refetchOnWindowFocus: false,
+  })
+}
+
+export function usePeopleList(environment: string | undefined, list: 'c1' | 'c5' | null, asOf?: string) {
+  return useQuery({
+    queryKey: ['people_list', environment, list, asOf ?? null],
+    queryFn: () => fetchPeopleList(environment!, list!, asOf),
+    enabled: !!environment && !!list,
+    retry: false,
+    staleTime: 0,
+    gcTime: 0, // names are not kept in the client cache once the drawer closes
     refetchOnWindowFocus: false,
   })
 }

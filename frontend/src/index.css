@@ -25,6 +25,12 @@
   --color-win:          #34d399;
   --color-loss:         #f87171;
   --color-warn:         #fb923c;
+  /* 5.50.0 chart series (validated on the card background) */
+  --color-s1:           #3987e5;
+  --color-s2:           #d95926;
+  --color-s3:           #199e70;
+  --color-grid:         #2a2a30;
+  --color-axis:         #9a9aa4;
 
   /* ── Shadow tokens ─────────────────────────────────── */
   --shadow-sm:  0 1px 3px 0 rgb(0 0 0 / 0.3), 0 1px 2px -1px rgb(0 0 0 / 0.3);
@@ -54,6 +60,11 @@ html[data-theme="light"] {
   --color-win:          #1E7A34;
   --color-loss:         #C1272D;
   --color-warn:         #8A5A00;
+  --color-s1:           #2a78d6;
+  --color-s2:           #eb6834;
+  --color-s3:           #1baf7a;
+  --color-grid:         #E1E4E9;
+  --color-axis:         #5a6173;
 
   --shadow-sm:  0 1px 2px rgba(16,24,40,0.04);
   --shadow-md:  0 4px 6px -1px rgba(16,24,40,0.07), 0 2px 4px -2px rgba(16,24,40,0.05);

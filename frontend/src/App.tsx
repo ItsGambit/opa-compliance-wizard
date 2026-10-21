@@ -21,6 +21,7 @@ import { OrphanedArchivesDialog } from './components/OrphanedArchivesDialog'
 import { SecretsAccessDashboard } from './components/SecretsAccessDashboard'
 import { ServiceAccountsDashboard } from './components/ServiceAccountsDashboard'
 import { OktaAdminsReport } from './components/OktaAdminsReport'
+import { OverviewPage } from './components/Overview'
 import { CrossChecks } from './components/CrossChecks'
 import { REPORTS_SUB_TABS, SideNav } from './components/SideNav'
 import { UserMenu } from './components/UserMenu'
@@ -38,7 +39,7 @@ import { clearPendingStepUp, readPendingStepUp, stepUpReturnAction, type Pending
 // keeps a history entry per in-app navigation -- the mouse back button on
 // a compliance report returns to the reports home, not out of the app.
 const ROUTE_VOCAB = {
-  tabs: ['reports', 'access', 'builder', 'audit_log', 'updates', 'update_keys'],
+  tabs: ['overview', 'reports', 'access', 'builder', 'audit_log', 'updates', 'update_keys'],
   reportsSubTabs: REPORTS_SUB_TABS.map(t => t.value),
   accessSubTabs: ACCESS_SUB_TABS.map(t => t.value),
 }
@@ -68,6 +69,10 @@ export default function App() {
   const isConfigured = !!environments?.active
   const { data: upgradeStatus } = useUpgradeStatus(canAdmin)
   const queryClient = useQueryClient()
+  // 5.50.0: the Overview is the home page for administrators; everyone else lands on Compliance Reports.
+  useEffect(() => {
+    if (whoami && !canAdmin && activeTab === 'overview') navigate({ tab: 'reports', reportsSubTab: 'browse' })
+  }, [whoami, canAdmin, activeTab, navigate])
 
   // UI-05: the content below is scoped to the active tenant (see
   // EnvironmentScope) -- its id plus the connection fields, so a
@@ -277,6 +282,7 @@ export default function App() {
           <header className="flex items-start justify-between">
             <div>
               <h1 className="text-lg font-semibold text-text">
+                {activeTab === 'overview' && 'Overview'}
                 {activeTab === 'reports' && reportsSubTab === 'browse' && 'Compliance Reports'}
                 {activeTab === 'reports' && reportsSubTab === 'secrets_access' && 'Secrets Access Dashboard'}
                 {activeTab === 'reports' && reportsSubTab === 'service_accounts' && 'Service Accounts Dashboard'}
@@ -289,6 +295,8 @@ export default function App() {
                 {activeTab === 'update_keys' && (<>Updates <span className="text-sm font-normal text-muted">› Release signing keys</span></>)}
               </h1>
               <p className="text-xs text-muted mt-1 max-w-[72ch]">
+                {activeTab === 'overview' &&
+                  'Okta and OPA privileged access in one place: who can change the gate, who can open the vault, who holds both, and whether the evidence behind it is complete. Counts of people open the list behind them. Home page for administrators.'}
                 {activeTab === 'reports' && reportsSubTab === 'browse' &&
                   'Audit evidence for SOC 2 / SOX / ISO 27001 and similar frameworks, generated from OPA + core Okta audit history.'}
                 {activeTab === 'reports' && reportsSubTab === 'secrets_access' &&
@@ -322,6 +330,7 @@ export default function App() {
 
           <SharedEnvironmentNotice />
 
+          {activeTab === 'overview' && canAdmin && <OverviewPage onOpenReports={() => navigate({ tab: 'reports', reportsSubTab: 'browse' })} />}
           {activeTab === 'reports' && reportsSubTab === 'browse' && (
             <ComplianceReports selectedReport={route.reportKey} onSelectReport={key => navigate({ tab: 'reports', reportsSubTab: 'browse', reportKey: key })} />
           )}

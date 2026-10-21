@@ -45,17 +45,58 @@ export function c1Card(over: Partial<CrossCheckCard> = {}): CrossCheckCard {
   }
 }
 
+const WEEKS = ['2026-07-27', '2026-08-03', '2026-08-10', '2026-08-17', '2026-08-24', '2026-08-31', '2026-09-07', '2026-09-14', '2026-09-21', '2026-09-28', '2026-10-05', '2026-10-12', '2026-10-19']
+
+function mfaWeek(week: string, i: number) {
+  const base = 2800 + i * 40
+  return {
+    week, signins: base, mfa_success: 900 + i * 10, by_class: { fastpass: 300 + i * 10, passkey: 200, smart_card: 0, okta_verify_push: 250, okta_verify_code: 80, sms: 40, voice: 3, email: 20, other_code: 0, security_question: 0, other: 0 },
+    unclassified: 7, phishing_resistant: 500 + i * 10, phishing_resistant_share: 0.5 + i * 0.012, sms_voice: 43, password_only_derived: base - 900 - i * 10, mfa_failed: 36, mfa_failure_rate: 0.04,
+  }
+}
+
 export function overview(over: Partial<Overview> = {}): Overview {
   return {
-    environment_id: 'e1', as_of: null, generated_at: '2026-10-03T00:00:00.000Z',
-    okta_admins: { state: 'ok', message: null, count: 2, by_role: { SUPER_ADMIN: 1 }, time_bound: 1, snapshot },
-    opa_privileged_users: { state: 'ok', count: 1, users_total: 3 }, sod_overlaps: { state: 'ok', count: 1 },
-    lifecycle_c1: { state: 'ok', message: null, inactive_in_okta: 1, absent_in_okta: 1, unreadable: 0, checked: 3, snapshot },
-    opa_service_accounts: { state: 'ok', count: 4 },
-    archive: { has_archive: true, coverage_days: 80, oldest_event: '2026-07-14T00:00:00.000Z', last_sync_completed_at: '2026-10-03T00:00:00.000Z', last_sync_status: 'success', ingestion_scope: 'curated', chain: null },
-    weekly_privilege_events: { grants: 2, revokes: 1, since: '2026-09-26T00:00:00.000Z', revokes_archived: true },
-    inventory: { state: 'never_captured', series: [], snapshots: 0, latest: null, problems: [] },
-    signins_mfa: { state: 'not_built', message: 'not built', weeks: [] },
-    snapshot_dates: [{ snapshot_id: 7, captured_at: snapshot.captured_at, status: 'ok' }], ...over,
+    environment_id: 'e1', as_of: null, generated_at: '2026-10-21T02:20:00.000Z', viewing_as_of: null, attention: [],
+    paragraph: '14 people hold an Okta admin role in example.okta.com (3 of them Super Administrator) and 9 hold a privileged OPA role (pam_admin, resource_admin or delegated_resource_admin). 1 person holds both and is listed for separation-of-duties review.',
+    sources: {
+      okta_snapshot: { captured_at: snapshot.captured_at, index: 13, snapshots_total: 13, first_at: '2026-10-09T02:05:00.000Z', state: 'ok', newest_attempt_status: 'ok', newest_attempt_at: snapshot.captured_at, days_old: 0 },
+      archive: { has_archive: true, oldest: '2025-09-04T00:00:00.000Z', newest: '2026-10-21T02:14:00.000Z', days_held: 412, events: 1284310, last_sync_completed_at: '2026-10-21T02:14:00.000Z', last_sync_status: 'success', last_sync_error: null, sync_mode: 'polling', scope: 'curated', days_since_sync: 0 },
+      chain: { valid: true, manifest_count: 418, reason: null, head_hash: '9f3a1c7e4d20b86f5a91c0e7d3b2a48f6e15c9d07a3b84e2f1d6c5a9b0e74f2d' },
+      opa_model: { loaded: true, refreshed_at: '2026-10-21T02:20:00.000Z', principals_effective: 212 }, okta_org: { users: 1240 },
+    },
+    tiles: {
+      okta_people: 14, okta_by_role: { SUPER_ADMIN: 3, ORG_ADMIN: 2, APP_ADMIN: 5, USER_ADMIN: 4, READ_ONLY_ADMIN: 3 }, opa_privileged: 9, opa_by_role: { pam_admin: 3, resource_admin: 4, delegated_resource_admin: 5 },
+      both: 1, left_okta: { people: 0, accounts: 0, state: 'ok', effective_known: true }, service: { saas: 19, okta_ud: 8, service_users: 4, total: 27 }, archive_days: 412,
+    },
+    trends: {
+      admin_holders: { okta: [{ t: '2026-10-09T02:05:00.000Z', count: 13 }, { t: '2026-10-16T02:05:00.000Z', count: 14 }, { t: '2026-10-21T02:05:00.000Z', count: 14 }], opa: [{ t: '2026-10-09T02:05:00.000Z', count: 9 }, { t: '2026-10-21T02:05:00.000Z', count: 9 }] },
+      privilege_events: WEEKS.map((week, i) => ({ week, granted: i % 4, revoked: i % 5 === 0 ? 1 : 0 })), revokes_archived: true,
+      access_requests: WEEKS.map((week, i) => ({ week, created: 20 + i, resolved: 18 + i, expired: 1 })),
+    },
+    cross_checks: [
+      { id: 'C1', title: 'Left Okta, still holds OPA access', statement: 'An OPA user whose Okta user is deprovisioned or suspended, whose access still resolves.', state: 'ok', message: null, inputs: { okta_snapshot: snapshot, opa_roster_loaded: true }, counts: {}, result: { state: 'ok', people: 0, accounts: 0, unreadable: 0, checked: 41 } },
+      { id: 'C5', title: 'Okta admin who is also an OPA admin (separation of duties)', statement: 'An Okta admin who also holds an OPA admin role.', state: 'ok', message: null, inputs: { okta_snapshot: snapshot, opa_roster_loaded: true }, counts: { people: 1 }, result: { state: 'ok', people: 1 } },
+    ],
+    evidence_readiness: [
+      { group: 'CC6 Access controls', reports: ['MFA Enforcement', 'Provisioning'], built_from: 'Archive', current_through: '2026-10-21T02:14:00.000Z' },
+      { group: 'Okta Admins', reports: ['User principals'], built_from: 'Snapshot + archive', current_through: snapshot.captured_at },
+    ],
+    okta_admins: { state: 'ok', message: null, count: 14, by_role: { SUPER_ADMIN: 3 }, time_bound: 1, snapshot },
+    opa_privileged_users: { state: 'ok', count: 9, users_total: 212 }, sod_overlaps: { state: 'ok', count: 1 },
+    lifecycle_c1: { state: 'ok', message: null, inactive_in_okta: 0, absent_in_okta: 0, unreadable: 0, checked: 41, snapshot },
+    opa_service_accounts: { state: 'ok', count: 27 },
+    archive: { has_archive: true, coverage_days: 412, oldest_event: '2025-09-04T00:00:00.000Z', last_sync_completed_at: '2026-10-21T02:14:00.000Z', last_sync_status: 'success', ingestion_scope: 'curated', chain: null },
+    weekly_privilege_events: { grants: 2, revokes: 1, since: '2026-10-14T00:00:00.000Z', revokes_archived: true },
+    snapshot_dates: [{ snapshot_id: 7, captured_at: snapshot.captured_at, status: 'ok' }],
+    inventory: {
+      state: 'ok', snapshots: 13, latest: snapshot.captured_at, problems: [],
+      series: [
+        { key: 'opa.servers', label: 'Servers', side: 'opa', first_seen: '2026-10-09T02:05:00.000Z', latest: 318, latest_at: snapshot.captured_at, delta_7d: 3, delta_30d: null, points: [{ t: '2026-10-09T02:05:00.000Z', count: 311 }, { t: '2026-10-21T02:05:00.000Z', count: 318 }] },
+        { key: 'okta.users', label: 'Users', side: 'okta', first_seen: '2026-10-09T02:05:00.000Z', latest: 1240, latest_at: snapshot.captured_at, delta_7d: 3, delta_30d: null, points: [{ t: '2026-10-09T02:05:00.000Z', count: 1231 }, { t: '2026-10-21T02:05:00.000Z', count: 1240 }] },
+      ],
+    },
+    signins_mfa: { state: 'ok', built_at: '2026-10-09T02:30:00.000Z', updated_at: '2026-10-21T02:30:00.000Z', events_used: 90000, weeks: WEEKS, everyone: WEEKS.map(mfaWeek), privileged: WEEKS.map(mfaWeek), privileged_cohort: { okta_admins: 14, opa_admin_logins: 9 }, scope: 'curated', notes: ['Password-only is derived.'] },
+    ...over,
   }
 }

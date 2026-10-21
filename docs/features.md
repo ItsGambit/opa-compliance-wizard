@@ -498,7 +498,7 @@ re-reads and re-hashes them, so an edited, added or removed object, or a removed
 an environment's archive removes its snapshots; retention never prunes them. The same threat model as the archived
 log applies (see the integrity check's description).
 
-**Overview data (counts only).** The admin-only `GET /api/overview` returns, per block, either its numbers or its
+**Overview** (the first sidebar item, home page for administrators). Everything on it is counts read from stored snapshots and the archive, stamped with its time and source; people are behind a click (drawer, audited). `GET /api/overview` returns, per block, either its numbers or its
 state (`never_captured`, `refused`, `not_loaded`...): Okta admin role holders, OPA privileged users, separation-of-duties
 overlaps, C1 counts, OPA service accounts, archive coverage and chain status, weekly privilege grant and revoke counts,
 snapshot dates, the **inventory** (daily counts per series with first-seen date and 7- and 30-day change) and the

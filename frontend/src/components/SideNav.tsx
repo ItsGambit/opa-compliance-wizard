@@ -5,6 +5,7 @@ import {
   ClipboardCheck,
   CircleArrowUp,
   FolderTree,
+  LayoutDashboard,
   Info,
   KeyRound,
   ListChecks,
@@ -322,6 +323,16 @@ export function SideNav({
         {collapsed && <div className="md:hidden px-2 mb-3"><Brand /></div>}
 
         <div className="flex flex-col gap-0.5">
+          {/* 5.50.0: the Overview is the home page for administrators (the counts endpoint behind it is admin-only). */}
+          {canAdmin && (
+            <NavItem
+              active={activeTab === 'overview'}
+              label="Overview"
+              icon={LayoutDashboard}
+              onClick={() => { onTabChange('overview'); closeDrawer() }}
+              collapsed={collapsed}
+            />
+          )}
           <NavItem
             active={activeTab === 'reports'}
             label={TOP_LEVEL_LABEL.reports}

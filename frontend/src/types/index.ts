@@ -1581,19 +1581,50 @@ export interface PrivilegedPerson {
   figures: { signins: number; mfa_success: number; phishing_resistant_share: number | null; sms_voice: number; mfa_failed: number; by_class: Record<string, number> } | null
 }
 
+export interface OverviewCrossCheck {
+  id: string
+  title: string
+  statement: string
+  state: OverviewBlockState
+  message: string | null
+  inputs: { okta_snapshot: SnapshotSummary | null; opa_roster_loaded: boolean; okta_snapshot_stale?: boolean }
+  counts: Record<string, number | null | undefined>
+  result: { state: OverviewBlockState; people: number | null; accounts?: number | null; unreadable?: number | null; checked?: number | null }
+}
+
 export interface Overview {
-  inventory: { state: 'ok' | 'never_captured'; series: InventorySeries[]; snapshots: number; latest: string | null; problems: { series: string; state: string }[] }
-  signins_mfa:
-    | { state: 'not_built'; message: string; weeks: [] }
-    | {
-        state: 'ok'; built_at: string | null; updated_at: string | null; events_used: number; weeks: string[]
-        everyone: MfaWeek[]; privileged: MfaWeek[]; privileged_cohort: { okta_admins: number; opa_admin_logins: number } | null
-        scope: string | null; notes: string[]; privileged_message?: string
-      }
-  capture?: CaptureJobState
   environment_id: string
   as_of: string | null
   generated_at: string
+  capture?: CaptureJobState
+  paragraph: string
+  viewing_as_of: string | null
+  attention: { kind: 'sync' | 'snapshot' | 'chain'; text: string }[]
+  sources: {
+    okta_snapshot: { captured_at: string | null; index: number | null; snapshots_total: number; first_at: string | null; state: string; newest_attempt_status: string | null; newest_attempt_at: string | null; days_old: number | null }
+    archive: { has_archive: boolean; oldest: string | null; newest: string | null; days_held: number | null; events: number | null; last_sync_completed_at: string | null; last_sync_status: string | null; last_sync_error: string | null; sync_mode: string | null; scope: string | null; days_since_sync: number | null }
+    chain: { valid: boolean | null; manifest_count: number | null; reason: string | null; head_hash: string | null } | null
+    opa_model: { loaded: boolean; refreshed_at: string | null; principals_effective: number | null }
+    okta_org: { users: number | null }
+  }
+  tiles: {
+    okta_people: number
+    okta_by_role: Record<string, number>
+    opa_privileged: number | null
+    opa_by_role: Record<string, number>
+    both: number | null
+    left_okta: { people: number | null; accounts: number | null; state: OverviewBlockState; effective_known: boolean }
+    service: { saas: number | null; okta_ud: number | null; service_users: number | null; total: number | null }
+    archive_days: number | null
+  }
+  trends: {
+    admin_holders: { okta: { t: string; count: number }[]; opa: { t: string; count: number }[] }
+    privilege_events: { week: string; granted: number; revoked: number }[]
+    revokes_archived: boolean
+    access_requests: { week: string; created: number; resolved: number; expired: number }[]
+  }
+  cross_checks: OverviewCrossCheck[]
+  evidence_readiness: { group: string; reports: string[]; built_from: string; current_through: string | null }[]
   okta_admins: { state: OverviewBlockState; message: string | null; count: number | null; by_role: Record<string, number>; time_bound: number | null; snapshot: SnapshotSummary | null }
   opa_privileged_users: { state: OverviewBlockState; count: number | null; users_total: number | null }
   sod_overlaps: { state: OverviewBlockState; count: number | null }
@@ -1602,4 +1633,21 @@ export interface Overview {
   archive: { has_archive: boolean; coverage_days: number | null; oldest_event: string | null; last_sync_completed_at: string | null; last_sync_status: string | null; ingestion_scope: string | null; chain: IntegrityResult | null }
   weekly_privilege_events: { grants: number; revokes: number; since: string; revokes_archived: boolean }
   snapshot_dates: { snapshot_id: number; captured_at: string; status: string }[]
+  inventory: { state: 'ok' | 'never_captured'; series: InventorySeries[]; snapshots: number; latest: string | null; problems: { series: string; state: string }[] }
+  signins_mfa:
+    | { state: 'not_built'; message: string; weeks: [] }
+    | {
+        state: 'ok'; built_at: string | null; updated_at: string | null; events_used: number; weeks: string[]
+        everyone: MfaWeek[]; privileged: MfaWeek[]; privileged_cohort: { okta_admins: number; opa_admin_logins: number } | null
+        scope: string | null; notes: string[]; privileged_message?: string
+      }
+}
+
+export interface NamedPeopleList {
+  list: 'c1' | 'c5'
+  state: string
+  message: string | null
+  snapshot: SnapshotSummary | null
+  note?: string
+  people: (CrossCheckRow & { footprint?: { groups?: number; policies?: number; resources?: number } | null; okta_status_changed?: string | null; access_effective?: boolean | null })[] | SodOverlap[]
 }
