@@ -219,6 +219,9 @@ sudo ocw-updater apply 5.48.0              # shows what changes, asks you to typ
 sudo server/deploy.sh --release 5.48.0     # the same two steps (this script is now a thin wrapper)
 ```
 
+When a release changes the updater's own units or the `ocw-updater` command (the release notes say so; 5.48.0 does), the updater refuses
+the upgrade with `needs_install_sh` until you run `sudo server/install.sh --refresh-updater` once from the new release's checkout.
+
 The sequence, with every step in the Audit Log (`upgrade.*`, one correlation id for the whole run) and
 the server journal (JSON lines): request accepted and validated; staged release re-verified by root (signature, version, every
 file against the signed manifest; the tree is made root-owned first, so nothing can change after the check); preflight (free disk
