@@ -2816,6 +2816,11 @@ class Handler(SimpleHTTPRequestHandler):
                     older, newer = int((qs.get("older") or [""])[0]), int((qs.get("newer") or [""])[0])
                 except ValueError:
                     return self._send_json(400, {"error": "older and newer must be snapshot ids"})
+                # Only the inventory counts are free of names and e-mails; every other snapshot kind carries the OPA roster or the
+                # Okta admins, which live_read guards everywhere else.
+                kinds = {(audit_store.get_config_snapshot(meta["environment_id"], i, with_items=False) or {}).get("kind") for i in (older, newer)}
+                if kinds - {"inventory_counts"} - {None} and self._capability_refused(engine_owner, meta["environment_id"], ("live_read",)):
+                    return
                 try:
                     return self._send_json(200, audit_store.diff_config_snapshots(meta["environment_id"], older, newer))
                 except ValueError as exc:
@@ -2836,6 +2841,8 @@ class Handler(SimpleHTTPRequestHandler):
                 exported = audit_store.export_config_snapshot(meta["environment_id"], snapshot_id)
                 if exported is None:
                     return self._send_json(404, {"error": "No such snapshot in this environment."})
+                if exported["kind"] != "inventory_counts" and self._capability_refused(engine_owner, meta["environment_id"], ("live_read",)):
+                    return
                 exported["verification"] = audit_store.verify_config_snapshot(meta["environment_id"], snapshot_id)
                 _o, _e, actor_email, actor_sub = self._caller()
                 self._log_audit_event(actor_email, actor_sub, "config_snapshot.exported", {

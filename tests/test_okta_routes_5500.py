@@ -289,3 +289,26 @@ def test_privileged_people_endpoint_is_admin_only_audited_and_separate(matrix_se
     assert "overview.privileged_read" in _audit_actions(tmp_audit_log)
     o = _call(base_url, "GET", "/api/overview?environment=dev", headers=_who(ADMIN, admin=True)).text
     assert "alex@example.com" not in o  # the people only come from the audited endpoint
+
+
+# --- M1: snapshot diff / export need live_read too, except for the counts-only inventory ------------------------------
+def test_snapshot_diff_and_export_need_live_read_for_every_kind_but_inventory(matrix_server):
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+    engine.set_environment_shared("dev", OWNER_A, True)
+    roster = audit_store.record_config_snapshot(env_id, "opa_principal_status", [("opa_user:1", {"name": "person@example.com", "email": "person@example.com"})])
+    roster2 = audit_store.record_config_snapshot(env_id, "opa_principal_status", [("opa_user:1", {"name": "person@example.com", "email": "person@example.com"})])
+    counts = audit_store.record_config_snapshot(env_id, "inventory_counts", [("opa.servers", {"count": 3})])
+    counts2 = audit_store.record_config_snapshot(env_id, "inventory_counts", [("opa.servers", {"count": 4})])
+    engine.set_shared_permissions({"live_read": "deny"}, environment_id=env_id)  # B may view the archive but not read live
+    base = "/api/environments/dev/config_snapshots"
+    b = lambda path: _call(base_url, "GET", base + path, headers=_who(OWNER_B))  # noqa: E731
+    for denied in (f"/export?snapshot_id={roster['snapshot_id']}", f"/diff?older={roster['snapshot_id']}&newer={roster2['snapshot_id']}"):
+        r = b(denied)
+        assert r.status_code == 403 and r.json()["capability"] == "live_read" and "person@example.com" not in r.text, denied
+    assert b(f"/export?snapshot_id={counts['snapshot_id']}").status_code == 200
+    assert b(f"/diff?older={counts['snapshot_id']}&newer={counts2['snapshot_id']}").status_code == 200
+    assert b("").status_code == 200  # the list carries no objects
+    engine.set_shared_permissions({"live_read": "allow"}, environment_id=env_id)
+    assert b(f"/export?snapshot_id={roster['snapshot_id']}").status_code == 200
+    assert _call(base_url, "GET", base + f"/export?snapshot_id={roster['snapshot_id']}", headers=_who(OWNER_A)).status_code == 200  # the owner always

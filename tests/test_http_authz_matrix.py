@@ -85,9 +85,9 @@ ROUTES = {
         Route("GET", "/api/environments/dev/cross_checks", "env", None, 200, caps=('view_archive', 'live_read')),
     # Past the visibility and capability checks the route's own 400 (no snapshot ids) answers the owner.
     ("GET", "path.startswith('/api/environments/') and path.endswith('/config_snapshots/diff')"):
-        Route("GET", "/api/environments/dev/config_snapshots/diff", "env", None, 400, caps=('view_archive',)),
+        Route("GET", "/api/environments/dev/config_snapshots/diff", "env", None, 400, caps=('view_archive', 'live_read')),
     ("GET", "path.startswith('/api/environments/') and path.endswith('/config_snapshots/export')"):
-        Route("GET", "/api/environments/dev/config_snapshots/export", "env", None, 400, caps=('view_archive',)),
+        Route("GET", "/api/environments/dev/config_snapshots/export", "env", None, 400, caps=('view_archive', 'live_read')),
     ("GET", "path.startswith('/api/environments/') and path.endswith('/config_snapshots')"):
         Route("GET", "/api/environments/dev/config_snapshots", "env", None, 200, caps=('view_archive',)),
     # Admin-only; with no environment named or active the route's own 400 answers (the data paths are in test_okta_routes_5500.py).
