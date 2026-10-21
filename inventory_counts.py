@@ -244,4 +244,6 @@ def capture_if_due(environment_id, okta_client=None, opa_client=None, model=None
         taken = audit_store._canonical_published(last[0]["captured_at"])
         if taken and taken > audit_store._iso_ms(now - MIN_INTERVAL):
             return None
-    return capture_inventory(environment_id, okta_client=okta_client, opa_client=opa_client, model=model, now=now)
+    # Stamp the snapshot with the same clock the interval check used, so the next check compares like with like.
+    return capture_inventory(environment_id, okta_client=okta_client, opa_client=opa_client, model=model, now=now,
+                             captured_at=audit_store._iso_ms(now))
