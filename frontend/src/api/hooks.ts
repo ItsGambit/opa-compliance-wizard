@@ -18,6 +18,11 @@ import {
   fetchSharedPermissions,
   fetchSyncStatus,
   fetchAuditLog,
+  fetchConfigSnapshotDiff,
+  fetchConfigSnapshots,
+  fetchCrossChecks,
+  fetchOktaAdminsReport,
+  fetchOverview,
   fetchUpgradeNotice,
   fetchUpgradeStatus,
   fetchUserResourceAccess,
@@ -332,5 +337,63 @@ export function useRunAudit(correlationId: string | null | undefined, enabled = 
     select: (entries: AuditLogEntry[]) => entries.filter(e => (e.details as { correlation_id?: unknown } | undefined)?.correlation_id === correlationId),
     enabled: enabled && !!correlationId,
     staleTime: 15_000,
+  })
+}
+
+// ── Okta Admins report, cross-checks, snapshots, overview (5.50.0) ────────
+// All read stored snapshots (no Okta call); a capture runs in the background on
+// the server, so these poll while one is running and stop when it finishes.
+const POLL_WHILE_CAPTURING = (query: { state: { data?: { capture?: { status?: string } } } }) =>
+  query.state.data?.capture?.status === 'running' ? 2000 : false
+
+export function useOktaAdminsReport(environment: string | undefined, asOf?: string) {
+  return useQuery({
+    queryKey: ['okta_admins_report', environment, asOf ?? null],
+    queryFn: () => fetchOktaAdminsReport(environment!, asOf),
+    enabled: !!environment,
+    retry: false,
+    refetchInterval: POLL_WHILE_CAPTURING,
+    refetchOnWindowFocus: false,
+  })
+}
+
+export function useCrossChecks(environment: string | undefined, enabled = true) {
+  return useQuery({
+    queryKey: ['cross_checks', environment],
+    queryFn: () => fetchCrossChecks(environment!),
+    enabled: !!environment && enabled,
+    retry: false,
+    refetchInterval: POLL_WHILE_CAPTURING,
+    refetchOnWindowFocus: false,
+  })
+}
+
+export function useConfigSnapshots(environment: string | undefined, kind?: string) {
+  return useQuery({
+    queryKey: ['config_snapshots', environment, kind ?? null],
+    queryFn: async () => (await fetchConfigSnapshots(environment!, kind)).snapshots,
+    enabled: !!environment,
+    retry: false,
+    refetchOnWindowFocus: false,
+  })
+}
+
+export function useConfigSnapshotDiff(environment: string | undefined, older: number | null, newer: number | null) {
+  return useQuery({
+    queryKey: ['config_snapshot_diff', environment, older, newer],
+    queryFn: () => fetchConfigSnapshotDiff(environment!, older!, newer!),
+    enabled: !!environment && older != null && newer != null && older !== newer,
+    retry: false,
+    refetchOnWindowFocus: false,
+  })
+}
+
+export function useOverview(environment: string | undefined, asOf?: string, enabled = true) {
+  return useQuery({
+    queryKey: ['overview', environment, asOf ?? null],
+    queryFn: () => fetchOverview(environment!, asOf),
+    enabled: !!environment && enabled,
+    retry: false,
+    refetchOnWindowFocus: false,
   })
 }

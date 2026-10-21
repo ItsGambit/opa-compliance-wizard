@@ -1408,3 +1408,151 @@ export interface SecretsAccessReport {
    * events, e.g. creates, are missing). Absent on older servers. */
   complete?: boolean
 }
+
+// ── Okta Admins report, snapshots, cross-checks, overview (5.50.0) ─────────
+
+export interface SnapshotSummary {
+  snapshot_id: number
+  captured_at: string
+  status: 'ok' | 'refused' | 'error'
+  item_count: number
+  sha256: string
+}
+
+export interface OktaGrantEvent {
+  type: 'grant' | 'revoke'
+  published: string
+  role: string | null
+  by: string | null
+}
+
+export type OktaAdminRowStatus = 'active' | 'removed' | 'unknown'
+
+export interface OktaAdminRow {
+  okta_user_id: string | null
+  login: string | null
+  email: string | null
+  name: string | null
+  user_status: string | null
+  role_assignment_id: string | null
+  role_type: string | null
+  role_label: string | null
+  assignment_type: string | null
+  role_status: string | null
+  assigned_at: string | null
+  custom_role: string | null
+  custom_role_permissions: string[] | null
+  resource_set: string | null
+  target_groups: string[]
+  target_apps: string[]
+  /** "org-wide" | "groups" | "apps" | "unscoped" (null for removed / unknown rows). */
+  scope: string | null
+  time_bound: boolean
+  expires: string | null
+  /** event: a grant/revoke event is in the archive; predates_archive: assigned before the archive began; none_in_archive. */
+  granted_evidence: 'event' | 'predates_archive' | 'none_in_archive'
+  last_grant_event: OktaGrantEvent | null
+  last_revoke_event?: OktaGrantEvent | null
+  status: OktaAdminRowStatus
+  removed_between?: [string, string]
+}
+
+export interface SodOverlap {
+  okta_user_id: string | null
+  login: string | null
+  okta_roles: string[]
+  opa_user_id: string | null
+  opa_user_name: string | null
+  opa_roles: string[]
+  via_groups: Record<string, string[]>
+}
+
+export interface OktaAdminsReport {
+  state: 'ok' | 'never_captured' | 'refused' | 'error' | 'no_snapshot_for_date'
+  /** Present when Okta refused (the exact, honest sentence) or when the newest capture failed. */
+  message: string | null
+  as_of: string | null
+  generated_at: string
+  as_of_snapshot: SnapshotSummary | null
+  previous_snapshot?: SnapshotSummary | null
+  last_attempt: { snapshot_id: number; captured_at: string; status: string; error_code: string | null } | null
+  admins: { okta_user_id: string | null; login: string | null; email: string | null; user_status: string | null; role_types: string[] }[]
+  rows: OktaAdminRow[]
+  custom_roles: { id: string; label: string | null; description: string | null; permissions: string[] | null }[]
+  resource_sets: { id: string; label: string | null; description: string | null }[]
+  summary: { admins?: number; assignments?: number; removed?: number; unknown?: number; time_bound?: number; by_role?: Record<string, number>; sod_overlaps?: number }
+  separation_of_duties: { state: 'ok' | 'partial' | 'not_loaded'; overlaps: SodOverlap[]; checked: number }
+  notes: string[]
+  archive?: { oldest_event: string | null; scope: string | null }
+  capture: CaptureJobState
+}
+
+export interface CaptureJobState {
+  status: 'idle' | 'running' | 'done' | 'error'
+  kind?: string
+  error?: string | null
+  finished_at?: string | null
+}
+
+export interface CrossCheckRow {
+  source: 'opa_user' | 'okta_ud_account'
+  opa_id: string | null
+  name: string | null
+  email: string | null
+  project?: string | null
+  okta_state: string | null
+  okta_id: string | null
+  okta_login: string | null
+  flag: 'inactive' | 'absent' | 'unknown'
+  opa_roles: string[]
+  opa_powerful_roles: string[]
+}
+
+export interface CrossCheckCard {
+  id: string
+  title: string
+  statement: string
+  state: 'ok' | 'never_run' | 'refused' | 'error'
+  message: string | null
+  inputs: { okta_snapshot: SnapshotSummary | null; opa_roster_loaded: boolean; okta_snapshot_stale?: boolean; skipped_service_users?: number }
+  counts: { checked?: number; inactive_in_okta?: number; absent_in_okta?: number; unreadable?: number; active?: number }
+  rows: CrossCheckRow[]
+}
+
+export interface CrossChecksResponse {
+  cards: CrossCheckCard[]
+  user_flags: { snapshot: SnapshotSummary | null; users: Record<string, { okta_state: string | null; flag: 'inactive' | 'absent' | 'unknown' | null }> }
+  capture: CaptureJobState
+}
+
+export interface ConfigSnapshotListEntry extends SnapshotSummary {
+  kind: string
+  source_endpoint: string | null
+  meta: Record<string, unknown> | null
+}
+
+export interface ConfigSnapshotDiff {
+  kind: string
+  older: SnapshotSummary
+  newer: SnapshotSummary
+  added: { key: string; object: Record<string, unknown> | null }[]
+  removed: { key: string; object: Record<string, unknown> | null }[]
+  changed: { key: string; fields: string[]; before: Record<string, unknown> | null; after: Record<string, unknown> | null }[]
+  unchanged: number
+}
+
+export type OverviewBlockState = 'ok' | 'never_captured' | 'refused' | 'error' | 'no_snapshot_for_date' | 'not_loaded' | 'partial' | 'never_run'
+
+export interface Overview {
+  environment_id: string
+  as_of: string | null
+  generated_at: string
+  okta_admins: { state: OverviewBlockState; message: string | null; count: number | null; by_role: Record<string, number>; time_bound: number | null; snapshot: SnapshotSummary | null }
+  opa_privileged_users: { state: OverviewBlockState; count: number | null; users_total: number | null }
+  sod_overlaps: { state: OverviewBlockState; count: number | null }
+  lifecycle_c1: { state: OverviewBlockState; message: string | null; inactive_in_okta: number | null; absent_in_okta: number | null; unreadable: number | null; checked: number | null; snapshot: SnapshotSummary | null }
+  opa_service_accounts: { state: OverviewBlockState; count: number | null }
+  archive: { has_archive: boolean; coverage_days: number | null; oldest_event: string | null; last_sync_completed_at: string | null; last_sync_status: string | null; ingestion_scope: string | null; chain: IntegrityResult | null }
+  weekly_privilege_events: { grants: number; revokes: number; since: string; revokes_archived: boolean }
+  snapshot_dates: { snapshot_id: number; captured_at: string; status: string }[]
+}

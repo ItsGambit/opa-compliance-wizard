@@ -4,6 +4,8 @@
 //   #/reports/browse/<report_key>    one report's detail view
 //   #/reports/secrets_access         Secrets Access Dashboard
 //   #/reports/service_accounts       Service Accounts Dashboard
+//   #/reports/okta_admins            Okta Admins report (5.50.0)
+//   #/reports/cross_checks           Cross-checks (5.50.0)
 //   #/access/<sub_tab>               Access Explorer sub-tab
 //   #/builder                        Folder Builder
 //   #/audit_log                      Audit Log (admin)

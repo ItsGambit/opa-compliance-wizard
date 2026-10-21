@@ -8,7 +8,7 @@ import { ProjectsTab } from './ProjectsTab'
 import { RelationshipsTab } from './RelationshipsTab'
 import { ResourceGroupsTab } from './ResourceGroupsTab'
 import { ResourcesTab } from './ResourcesTab'
-import { UsersTab } from './UsersTab'
+import { UsersView } from './UsersView'
 import { ExportButtons } from './ExportButtons'
 import { accessModelExportSections } from '../utils/exportSections'
 
@@ -86,7 +86,7 @@ export function AccessExplorer({ subTab }: Props) {
       {subTab === 'policies' && <PoliciesTab model={displayedModel} />}
       {subTab === 'relationships' && <RelationshipsTab model={displayedModel} />}
       {subTab === 'users' && (
-        <UsersTab
+        <UsersView
           model={displayedModel}
           onUserGroupRemoved={(userId, groupId) =>
             updateModel(prev => ({

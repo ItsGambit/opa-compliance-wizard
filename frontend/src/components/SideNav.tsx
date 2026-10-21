@@ -76,6 +76,8 @@ export const REPORTS_SUB_TABS = [
   { value: 'browse', label: 'Browse Reports' },
   { value: 'secrets_access', label: 'Secrets Access' },
   { value: 'service_accounts', label: 'Service Accounts' },
+  { value: 'okta_admins', label: 'Okta Admins' },
+  { value: 'cross_checks', label: 'Cross-checks' },
 ]
 
 interface Props {
@@ -334,7 +336,7 @@ export function SideNav({
                   key={sub.value}
                   active={reportsSubTab === sub.value}
                   label={sub.label}
-                  icon={sub.value === 'secrets_access' ? KeyRound : sub.value === 'service_accounts' ? UserCog : undefined}
+                  icon={sub.value === 'secrets_access' ? KeyRound : sub.value === 'service_accounts' ? UserCog : sub.value === 'okta_admins' ? ShieldCheck : sub.value === 'cross_checks' ? ListChecks : undefined}
                   onClick={() => { onReportsSubTabChange(sub.value); closeDrawer() }}
                 />
               ))}

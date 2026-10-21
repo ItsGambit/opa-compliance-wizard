@@ -7,6 +7,11 @@ import type {
   AuditLogEntry,
   BannerConfig,
   ComplianceReportDef,
+  ConfigSnapshotDiff,
+  ConfigSnapshotListEntry,
+  CrossChecksResponse,
+  OktaAdminsReport,
+  Overview,
   ComplianceReportResponse,
   CreateGroupResponse,
   CsvRow,
@@ -624,4 +629,48 @@ export function saveSharedPermissions(
     ? { environment_id: environmentId, changes, ...(user ? { user: { issuer: user.issuer, subject: user.subject } } : {}) }
     : { changes }
   return apiFetch('/api/shared_permissions', { method: 'POST', body: JSON.stringify(body) })
+}
+
+// ── Okta Admins report, snapshots, cross-checks, overview (5.50.0) ───────
+
+function envPath(environment: string, tail: string): string {
+  return `/api/environments/${encodeURIComponent(environment)}/${tail}`
+}
+
+/** Read from the stored snapshot (no Okta call). `asOf` is a date or timestamp. */
+export function fetchOktaAdminsReport(environment: string, asOf?: string): Promise<OktaAdminsReport> {
+  return apiFetch(envPath(environment, `okta_admins${asOf ? `?as_of=${encodeURIComponent(asOf)}` : ''}`))
+}
+
+export function fetchCrossChecks(environment: string): Promise<CrossChecksResponse> {
+  return apiFetch(envPath(environment, 'cross_checks'))
+}
+
+export function fetchConfigSnapshots(environment: string, kind?: string): Promise<{ snapshots: ConfigSnapshotListEntry[] }> {
+  return apiFetch(envPath(environment, `config_snapshots${kind ? `?kind=${encodeURIComponent(kind)}` : ''}`))
+}
+
+export function fetchConfigSnapshotDiff(environment: string, older: number, newer: number): Promise<ConfigSnapshotDiff> {
+  return apiFetch(envPath(environment, `config_snapshots/diff?older=${older}&newer=${newer}`))
+}
+
+export function fetchConfigSnapshotExport(environment: string, snapshotId: number): Promise<Record<string, unknown>> {
+  return apiFetch(envPath(environment, `config_snapshots/export?snapshot_id=${snapshotId}`))
+}
+
+/** Starts a background capture (Okta admins, or the Okta status of every OPA principal). */
+export function startOktaCapture(environment: string, kind: 'okta_admins' | 'opa_principal_status'): Promise<{ started: boolean; already_running: boolean }> {
+  return apiFetch(envPath(environment, 'okta_snapshots/capture'), { method: 'POST', body: JSON.stringify({ kind }) })
+}
+
+/** Records in the audit log that an export of the report was taken. */
+export function logOktaAdminsExport(environment: string, format: 'csv' | 'md', asOf?: string): Promise<{ logged: boolean }> {
+  return apiFetch(envPath(environment, 'okta_admins/export_log'), { method: 'POST', body: JSON.stringify({ format, as_of: asOf ?? null }) })
+}
+
+/** Admin-only aggregate of counts for the executive dashboard. */
+export function fetchOverview(environment: string, asOf?: string): Promise<Overview> {
+  const params = new URLSearchParams({ environment })
+  if (asOf) params.set('as_of', asOf)
+  return apiFetch(`/api/overview?${params.toString()}`)
 }

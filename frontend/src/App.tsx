@@ -20,6 +20,8 @@ import { FolderBuilder } from './components/FolderBuilder'
 import { OrphanedArchivesDialog } from './components/OrphanedArchivesDialog'
 import { SecretsAccessDashboard } from './components/SecretsAccessDashboard'
 import { ServiceAccountsDashboard } from './components/ServiceAccountsDashboard'
+import { OktaAdminsReport } from './components/OktaAdminsReport'
+import { CrossChecks } from './components/CrossChecks'
 import { REPORTS_SUB_TABS, SideNav } from './components/SideNav'
 import { UserMenu } from './components/UserMenu'
 import { UpgradeNoticeBanner } from './components/UpgradeNoticeBanner'
@@ -278,6 +280,8 @@ export default function App() {
                 {activeTab === 'reports' && reportsSubTab === 'browse' && 'Compliance Reports'}
                 {activeTab === 'reports' && reportsSubTab === 'secrets_access' && 'Secrets Access Dashboard'}
                 {activeTab === 'reports' && reportsSubTab === 'service_accounts' && 'Service Accounts Dashboard'}
+                {activeTab === 'reports' && reportsSubTab === 'okta_admins' && 'Okta Admins'}
+                {activeTab === 'reports' && reportsSubTab === 'cross_checks' && 'Cross-checks'}
                 {activeTab === 'access' && 'Access Explorer'}
                 {activeTab === 'builder' && 'Folder Builder'}
                 {activeTab === 'audit_log' && 'Audit Log'}
@@ -291,6 +295,10 @@ export default function App() {
                   'See who created, updated, retrieved, or deleted each secret and folder in a resource group/project.'}
                 {activeTab === 'reports' && reportsSubTab === 'service_accounts' &&
                   'Every SaaS app and Okta service account across the tenant — including ones since deleted — with who created, assigned, revealed, checked out or rotated it, and when.'}
+                {activeTab === 'reports' && reportsSubTab === 'okta_admins' &&
+                  'Who holds an administrator role in Okta, as of any date there is a snapshot for, and which of them also hold an OPA admin role.'}
+                {activeTab === 'reports' && reportsSubTab === 'cross_checks' &&
+                  'Questions only a tool that sees both Okta and OPA can answer. Candidates for review, not findings.'}
                 {activeTab === 'access' &&
                   'Explore who has access to what, across resource groups, projects, policies, users, and groups.'}
                 {activeTab === 'builder' &&
@@ -319,6 +327,8 @@ export default function App() {
           )}
           {activeTab === 'reports' && reportsSubTab === 'secrets_access' && <SecretsAccessDashboard />}
           {activeTab === 'reports' && reportsSubTab === 'service_accounts' && <ServiceAccountsDashboard />}
+          {activeTab === 'reports' && reportsSubTab === 'okta_admins' && <OktaAdminsReport />}
+          {activeTab === 'reports' && reportsSubTab === 'cross_checks' && <CrossChecks />}
           {activeTab === 'access' && <AccessExplorer subTab={accessSubTab} />}
           {activeTab === 'builder' && <FolderBuilder />}
           {activeTab === 'audit_log' && canAdmin && <AuditLogPage />}

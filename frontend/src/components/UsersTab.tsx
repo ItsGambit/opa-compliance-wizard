@@ -6,6 +6,7 @@ import { coverageNote } from '../utils/accessEvidence'
 import { aggregateResources, trackedRequests, type AccessLookup } from '../utils/accessResources'
 import type { ExportSection } from '../utils/export'
 import { visibleAccessSections } from '../utils/exportSections'
+import { formatDateTime } from '../utils/format'
 import { policiesUsingGroup, rulesGrantedToGroupIds } from '../utils/policy'
 import { ExplorerLayout } from './explorer/ExplorerLayout'
 import { GrantsMain } from './explorer/GrantsMain'
@@ -17,8 +18,15 @@ import { useGrantsExplorer } from './explorer/useGrantsExplorer'
 import { ExportButtons } from './ExportButtons'
 import { Select } from './Select'
 
+/** Okta lifecycle flags per OPA user id (cross-check C1), from the newest lookup; absent when none has been run. */
+export interface OktaUserFlags {
+  capturedAt: string | null
+  users: Record<string, { okta_state: string | null; flag: 'inactive' | 'absent' | 'unknown' | null }>
+}
+
 interface Props {
   model: AccessModel
+  okta?: OktaUserFlags
   /** Lets this tab remove a group from a user's own `groups` in the
    * already-loaded model, without forcing the ~30s+ full re-bootstrap
    * Access Explorer otherwise only does on an explicit Refresh click --
@@ -26,7 +34,13 @@ interface Props {
   onUserGroupRemoved: (userId: string, groupId: string) => void
 }
 
-export function UsersTab({ model, onUserGroupRemoved }: Props) {
+function flagSuffix(flag: 'inactive' | 'absent' | 'unknown' | null | undefined): string {
+  if (flag === 'inactive') return ' (Okta: inactive)'
+  if (flag === 'absent') return ' (Okta: not found)'
+  return ''
+}
+
+export function UsersTab({ model, okta, onUserGroupRemoved }: Props) {
   const [userId, setUserId] = useState<string | undefined>(undefined)
   // One stable "now" per screen so relative times do not shift while reading.
   const [now] = useState(() => Date.now())
@@ -43,14 +57,15 @@ export function UsersTab({ model, onUserGroupRemoved }: Props) {
   const userOptions = useMemo(
     () => model.users.map(u => ({
       value: u.id,
-      label: u.details?.full_name || u.name,
+      label: (u.details?.full_name || u.name) + flagSuffix(okta?.users[u.id]?.flag),
       // Not shown, but typed often: e-mail, login name, first/last name.
       keywords: [u.details?.email, u.name, u.details?.first_name, u.details?.last_name].filter((v): v is string => !!v),
       labelClassName: u.user_type === 'service' ? 'text-warn' : undefined,
     })),
-    [model.users]
+    [model.users, okta]
   )
 
+  const oktaFlag = user ? okta?.users[user.id]?.flag ?? null : null
   const groupIds = useMemo(() => new Set(user?.groups.map(g => g.id) ?? []), [user])
   const grants = useMemo(() => (user ? rulesGrantedToGroupIds(model.policies, groupIds) : []), [model.policies, groupIds, user])
   const resources = useMemo(
@@ -159,6 +174,14 @@ export function UsersTab({ model, onUserGroupRemoved }: Props) {
             </span>
             {isServiceAccount && (
               <span className="xp-rail-sub">No Okta identity — API-key-only, so "last used" (System Log) doesn't apply to it.</span>
+            )}
+            {oktaFlag && (
+              <span className={`xp-rail-sub ${oktaFlag === 'unknown' ? '' : 'text-warn'}`} role="status">
+                {oktaFlag === 'inactive' && <>Okta: this person's Okta user is deprovisioned or suspended, yet they are still an OPA principal. A candidate for review.</>}
+                {oktaFlag === 'absent' && <>Okta: no Okta user was found for this person, yet they are still an OPA principal. A candidate for review.</>}
+                {oktaFlag === 'unknown' && <>Okta: the status could not be read in the last lookup.</>}
+                {okta?.capturedAt && <> Looked up {formatDateTime(okta.capturedAt)}.</>}
+              </span>
             )}
             {user.groups_error && (
               <span className="xp-rail-sub text-warn">Groups could not be read for this user, so their access is unknown (not "none").</span>
