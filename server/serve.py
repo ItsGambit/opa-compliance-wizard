@@ -821,20 +821,32 @@ def _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, trigger
                 }, client_ip=client_ip, user_agent=user_agent)
         except Exception as snap_exc:
             engine.log("WARN", f"okta admin snapshot after the sync of '{env_name}' failed: {type(snap_exc).__name__}")
+            engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.failed", {"name": env_name, "kind": "okta_admins", "trigger": trigger, "error": _job_error_message(snap_exc)},
+                                   client_ip=client_ip, user_agent=user_agent)
         # Daily inventory counts (OPA and Okta, counts only) and the incremental sign-in / MFA aggregates.
+        inventory_started = time.monotonic()
         try:
             import inventory_counts
-            import signin_mfa
             creds = engine.get_environment_credentials_by_id(env_id, owner=owner)
             opa_client = engine.OpaClient(creds["base_domain"], creds["team_name"], creds["key_id"], creds["key_secret"])
             inv = inventory_counts.capture_if_due(env_id, okta_client=okta_client, opa_client=opa_client, model=_access_model_for(env_id))
             if inv:
+                seconds = round(time.monotonic() - inventory_started, 1)
+                engine.log("INFO", f"inventory counts for '{env_name}': {inv['item_count']} series in {seconds}s")
                 engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.captured", {
                     "name": env_name, "kind": inv["kind"], "snapshot_id": inv["snapshot_id"], "status": inv["status"],
-                    "item_count": inv["item_count"], "trigger": trigger}, client_ip=client_ip, user_agent=user_agent)
-            signin_mfa.refresh(env_id)
+                    "item_count": inv["item_count"], "trigger": trigger, "inventory_seconds": seconds}, client_ip=client_ip, user_agent=user_agent)
         except Exception as inv_exc:
-            engine.log("WARN", f"inventory counts / MFA aggregates after the sync of '{env_name}' failed: {type(inv_exc).__name__}")
+            engine.log("WARN", f"inventory counts after the sync of '{env_name}' failed after {round(time.monotonic() - inventory_started, 1)}s: {type(inv_exc).__name__}")
+            engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.failed", {"name": env_name, "kind": "inventory_counts", "trigger": trigger, "error": _job_error_message(inv_exc)},
+                                   client_ip=client_ip, user_agent=user_agent)
+        try:
+            import signin_mfa
+            signin_mfa.refresh(env_id)
+        except Exception as mfa_exc:
+            engine.log("WARN", f"sign-in / MFA aggregates after the sync of '{env_name}' failed: {type(mfa_exc).__name__}")
+            engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.failed", {"name": env_name, "kind": "mfa_aggregates", "trigger": trigger, "error": _job_error_message(mfa_exc)},
+                                   client_ip=client_ip, user_agent=user_agent)
     except Exception as exc:
         with _sync_jobs_lock:
             _sync_jobs[storage_name]["status"] = "error"

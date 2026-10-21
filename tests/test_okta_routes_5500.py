@@ -312,3 +312,41 @@ def test_snapshot_diff_and_export_need_live_read_for_every_kind_but_inventory(ma
     engine.set_shared_permissions({"live_read": "allow"}, environment_id=env_id)
     assert b(f"/export?snapshot_id={roster['snapshot_id']}").status_code == 200
     assert _call(base_url, "GET", base + f"/export?snapshot_id={roster['snapshot_id']}", headers=_who(OWNER_A)).status_code == 200  # the owner always
+
+
+def test_automatic_capture_failures_are_audited_with_the_trigger_and_the_inventory_duration_is_recorded(tmp_audit_store, tmp_environments_file, fake_keyring, tmp_audit_log, monkeypatch):
+    import server.serve as serve
+
+    audit_store.run_migrations()
+    _, env = engine.upsert_environment("dev", {"base_domain": "a.example.com", "team_name": "t", "key_id": "k", "key_secret": "s"})
+
+    class NoNetwork:
+        def __init__(self, *a, **k):
+            pass
+
+        def __getattr__(self, name):
+            def call(*a, **k):
+                raise engine.OpaApiError(599, name, "no network in tests")
+            return call
+    monkeypatch.setattr(engine, "OpaClient", NoNetwork)
+
+    class Sync(_CountingOkta):
+        def get_system_log(self, **k):
+            return [], True
+
+        def get_system_log_page(self, path):
+            return [], None
+    monkeypatch.setattr(oa, "capture_if_due", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    serve._run_sync_job(env, "dev", Sync(), "all", engine.LOCAL_OWNER_KEY, trigger="scheduled")
+    rows = [json.loads(line) for line in open(tmp_audit_log, encoding="utf-8") if line.strip()]
+    failed = [r for r in rows if r["action"] == "okta_snapshot.failed"]
+    assert any(r["details"]["kind"] == "okta_admins" and r["details"]["trigger"] == "scheduled" for r in failed)
+    assert serve._sync_jobs[env]["status"] == "done"  # still never fails the sync
+    # a successful inventory capture records how long it took
+    import inventory_counts
+    monkeypatch.setattr(inventory_counts, "capture_if_due", lambda *a, **k: audit_store.record_config_snapshot(env, "inventory_counts", [("okta.users", {"count": 1})]))
+    monkeypatch.setattr(oa, "capture_if_due", lambda *a, **k: None)
+    serve._run_sync_job(env, "dev", Sync(), "all", engine.LOCAL_OWNER_KEY, trigger="manual")
+    rows = [json.loads(line) for line in open(tmp_audit_log, encoding="utf-8") if line.strip()]
+    captured = [r for r in rows if r["action"] == "okta_snapshot.captured" and r["details"]["kind"] == "inventory_counts"]
+    assert captured and isinstance(captured[-1]["details"]["inventory_seconds"], float)
