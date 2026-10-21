@@ -350,6 +350,34 @@ describe('09 success and 10 failure', () => {
     bundle: { name: 'ocw-support-5.46.0-to-5.48.0-20261021T023158Z-k4q9.tar.gz', size: 1_800_000, sha256: 'c7a0e2' + '0'.repeat(52) + '91fd' },
   })
 
+  it('prints the updater\'s own words (what happened, whether anything changed, what to do) with the raw code second; an older run falls back to the sentence by code', async () => {
+    const words = { reason_text: 'A health check failed after the restart: the web page did not load.', changed: 'The previous release was put back and is running.',
+      next_step: 'The previous release is running. Download the support bundle (Audit Log, the upgrade.failed entry) and attach it to an issue on the project\'s GitHub page.' }
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ run: { ...ROLLED, ...words, failure: null, health: [] }, failures: { '5.48.0': { count: 1, last_code: 'health_healthz' } } }))
+    const { unmount } = renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    const what = await screen.findByText(/the web page did not load/)
+    expect(what.textContent).toMatch(/The previous release was put back and is running\..*Next: The previous release is running\. Download the support bundle.*\(Reason code health_healthz\.\)/)
+    unmount()
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ run: { ...ROLLED, failure: null, health: [], reason_code: 'release_files_mismatch', result: 'failed', step: 'staged' }, failures: {} }))
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    expect(await screen.findByText(/the prepared files do not match the signed release/)).toBeTruthy()  // no reason_text recorded: the fallback sentence
+  })
+
+  it('upgrade history shows the words and keeps the raw code secondary', async () => {
+    const history = [{ correlation_id: 'upg-aaaa0001', action: 'apply', version_from: '5.46.0', version_to: '5.48.0', result: 'failed', reason_code: 'environment_unexpected',
+      reason_text: 'The release\'s Python environment has something the updater does not expect.', changed: 'Nothing was changed on the server.',
+      next_step: 'From the unpacked release folder, run `sudo server/install.sh --refresh-updater`, then try again.', started_at: '2026-10-20T02:30:02Z', updated_at: '2026-10-20T02:31:00Z', seconds: 40, backup: null, bundle: null },
+    { correlation_id: 'upg-aaaa0002', action: 'apply', version_from: '5.45.0', version_to: '5.46.0', result: 'failed', reason_code: 'tree_mismatch', started_at: '2026-10-01T02:30:02Z', updated_at: '2026-10-01T02:31:00Z', seconds: 3, backup: null, bundle: null }]
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ history: history as never }))
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    const table = (await screen.findByRole('region', { name: 'Upgrade history' }))
+    expect(within(table).getByText(/Python environment has something the updater does not expect/)).toBeTruthy()
+    expect(within(table).getByText(/Nothing was changed on the server\./)).toBeTruthy()
+    expect(within(table).getByText('environment_unexpected', { selector: 'code' })).toBeTruthy()
+    // a row recorded by an earlier release has no words: the sentence for its code, not a bare code
+    expect(within(table).getByText(/did not pass the updater's checks \(older release\)/)).toBeTruthy()
+  })
+
   it('rolled back: what happened, where you are, the bundle download, clear-failure and restore on the command line', async () => {
     vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ run: ROLLED, failures: { '5.48.0': { count: 1, last_code: 'health_healthz' } } }))
     renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)

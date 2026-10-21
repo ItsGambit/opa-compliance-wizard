@@ -101,6 +101,8 @@ def cmd_status(a):
         if run:
             print(f"Last upgrade run  : {run['correlation_id']} {run['version_from']} -> {run['version_to']}: "
                   f"{run['result'] or 'IN PROGRESS at ' + str(run['step'])}" + (f" ({run['reason_code']})" if run["reason_code"] else ""))
+            if run.get("reason_text"):
+                print(f"                    {run['reason_text']} {run.get('changed') or ''} Next: {run.get('next_step') or ''}")
             print("                    Full picture and actions: sudo ocw-updater status")
     return EXIT_OK
 

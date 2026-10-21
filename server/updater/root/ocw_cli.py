@@ -174,6 +174,8 @@ def cmd_status(a, cfg, host):
         res = st.get("result") or (f"IN PROGRESS at step {st.get('step')}" if st.get("step") else "no upgrade in progress")
         print(f"last run       {st.get('correlation_id')} {st.get('version_from')}→{st.get('version_to')} {res}"
               + (f" in {st['seconds']:.0f} s" if st.get("seconds") else "") + (f"  [{st['reason_code']}]" if st.get("reason_code") else ""))
+        if st.get("reason_text"):
+            print(f"               {st['reason_text']} {st.get('changed')} Next: {st.get('next_step')}")
         if st.get("result") == "failed_needs_operator":
             print(f"               AN OPERATOR IS NEEDED: {st.get('operator_reason')}")
         if st.get("bundle"):
@@ -437,11 +439,20 @@ def finish_report(a, cfg, st):
         print(f"audit: upgrade.started … upgrade.completed  correlation={st['correlation_id']}")
     elif res == "rolled_back":
         print()
-        print(f"rolled back to {st.get('rolled_back_to')}  (reason {st.get('reason_code')}; audit: upgrade.rolled_back)")
+        if st.get("reason_text"):
+            print(f"Rolled back to {st.get('rolled_back_to')}: {st['reason_text']} {st.get('changed')} Next: {st.get('next_step')} "
+                  f"(reason code {st.get('reason_code')}; audit: upgrade.rolled_back)")
+        else:  # a run recorded by an earlier release
+            print(f"rolled back to {st.get('rolled_back_to')}  (reason {st.get('reason_code')}; audit: upgrade.rolled_back)")
         b = st.get("bundle")
         print(f"support bundle: {b['name'] if b else 'not created'}  (in {cfg.bundles}; download it from the Audit Log entry too)")
     elif res == "failed":
-        print(f"failed before anything was switched: {st.get('reason_code')} — {st.get('error')}")
+        if st.get("reason_text"):
+            print(f"Refused before anything was switched: {st['reason_text']} Next: {st.get('next_step')} (reason code {st.get('reason_code')})")
+            if st.get("error"):
+                print(f"Detail: {st['error']}")
+        else:  # a run recorded by an earlier release
+            print(f"failed before anything was switched: {st.get('reason_code')} — {st.get('error')}")
     else:
         print(f"FAILED and could not be rolled back automatically: {st.get('operator_reason')}")
         print("An operator must act: see `ocw-updater status`. The previous code is still on disk.")

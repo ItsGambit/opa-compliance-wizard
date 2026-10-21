@@ -90,7 +90,7 @@ def _parse_iso(text):
 BUNDLE_NAME_RE = __import__("re").compile(r"^ocw-support-[A-Za-z0-9._-]{1,160}\.tar\.gz$")
 MAX_BUNDLE_BYTES = 6 * 1024 * 1024
 _RUN_FIELDS = ("correlation_id", "action", "version_from", "version_to", "step", "result", "reason_code", "started_at",
-               "updated_at", "seconds", "failed_step", "operator_reason", "bundle", "schema_before", "schema_after")
+               "updated_at", "seconds", "failed_step", "operator_reason", "reason_text", "changed", "next_step", "bundle", "schema_before", "schema_after")
 
 
 def upgrade_dir():

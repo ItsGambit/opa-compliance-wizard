@@ -199,7 +199,9 @@ def test_overview_is_admin_only_counts_only_and_audited(matrix_server, tmp_audit
     engine.set_environment_shared("dev", OWNER_A, True)
     _put_model(serve, env_id, _model())
     oa.capture_and_store(env_id, FakeOkta())
-    assert _call(base_url, "GET", "/api/overview?environment=dev", headers=_who(OWNER_A)).status_code == 403  # the owner is not an admin
+    owner = _call(base_url, "GET", "/api/overview?environment=dev", headers=_who(OWNER_A))
+    assert owner.status_code == 200 and "alex@example.com" not in owner.text  # 5.51.0: the owner may read the counts (an archive viewer), never names
+    assert _call(base_url, "GET", "/api/overview/people?environment=dev&list=c1", headers=_who(OWNER_A)).status_code == 403  # the lists stay administrators-only
     r = _call(base_url, "GET", "/api/overview?environment=dev", headers=_who(ADMIN, admin=True))
     assert r.status_code == 200
     o = r.json()

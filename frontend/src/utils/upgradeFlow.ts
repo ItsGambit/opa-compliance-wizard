@@ -49,36 +49,63 @@ export function stepNumber(run: UpgradeRun): number {
   return Math.min(Math.max(done, 1), UPGRADE_STEPS.length)
 }
 
-/** Plain-language reason for a stable reason code (server/updater/root/ocw_activate.py REASONS). */
+/** Every reason code the updater can record (server/updater/root/ocw_activate.py REASONS) plus the codes the web application adds itself. A test
+ * iterates this list, so a code added to the updater without a sentence here cannot fall through to "reason code ..." unnoticed. */
+export const UPDATER_REASON_CODES = [
+  'request_invalid', 'request_replayed', 'request_stale', 'signature_invalid', 'key_unknown', 'version_not_newer', 'hash_mismatch', 'name_mismatch',
+  'version_mismatch', 'too_old', 'disk_space', 'sync_in_progress', 'pip_failed', 'stage_failed', 'not_staged', 'tree_mismatch', 'release_files_mismatch',
+  'environment_unexpected', 'backup_failed', 'migration_failed', 'nginx_invalid', 'restart_failed', 'health_unit', 'health_version', 'health_healthz',
+  'health_gate', 'health_quick_check', 'health_schema', 'health_chain', 'health_smoke', 'rollback_failed', 'interrupted', 'failed_before',
+  'too_many_failures', 'version_failed_before', 'in_flight', 'bad_release', 'bad_artifact', 'revoked_key', 'retired_key', 'wrong_role', 'no_key_pinned',
+  'keys_changed', 'unknown_alg', 'no_trust', 'bad_trust', 'internal_error', 'needs_install_sh', 'confirm_required', 'rollback_unavailable', 'no_backup',
+  'action_unsupported', 'prune_refused', 'target_changed', 'needs_operator',
+] as const
+
+/** Plain-language reason for a stable reason code, as a clause ("the release signature did not verify"). Since 5.51.0 the updater writes its own
+ * sentences (reason_text, changed, next_step) into the run and the screens print those; this is the fallback for runs and history rows
+ * recorded by an earlier release, and for the codes the web application adds itself. */
 export function describeReason(code: string | null | undefined): string {
   switch (code) {
+    case 'request_invalid': return 'the updater did not accept the request (a field was missing or malformed)'
+    case 'request_replayed': return 'this approval was already used'
+    case 'request_stale': return 'the request was older than 24 hours'
     case 'signature_invalid': return 'the release signature did not verify'
     case 'key_unknown': return 'the release was signed by a key this server does not trust'
     case 'revoked_key': case 'retired_key': return 'the release was signed by a key that is no longer accepted'
+    case 'wrong_role': return 'the release was signed by a key that may not sign releases (a standby key)'
+    case 'no_key_pinned': case 'no_trust': case 'bad_trust': return 'this server has no usable trust file for release keys'
+    case 'keys_changed': return 'the trusted keys changed while the request was being checked'
+    case 'unknown_alg': return 'the signature uses an algorithm this updater does not know'
     case 'version_not_newer': return 'the release is not newer than the installed version'
+    case 'version_mismatch': case 'name_mismatch': return 'the file\'s contents do not match the version or name it was requested as'
     case 'hash_mismatch': return 'the downloaded file does not match the signed hash'
     case 'too_old': return 'this release cannot be installed over the installed version (upgrade to an intermediate release first)'
+    case 'bad_release': case 'bad_artifact': return 'the release archive is not in the expected shape'
     case 'disk_space': return 'there was not enough free disk space'
-    case 'sync_in_progress': return 'a sync was still running after 10 minutes'
+    case 'sync_in_progress': return 'a refresh was still running after 10 minutes'
     case 'pip_failed': return 'the Python packages could not be installed'
+    case 'stage_failed': case 'not_staged': return 'the release could not be prepared for installation'
+    case 'tree_mismatch': return 'the prepared files or environment did not pass the updater\'s checks (older release)'
+    case 'release_files_mismatch': return 'the prepared files do not match the signed release'
+    case 'environment_unexpected': return 'the release\'s Python environment has something the updater does not expect'
+    case 'backup_failed': case 'no_backup': case 'backup_required': return 'there is no usable pre-upgrade copy of the archive'
     case 'migration_failed': return 'a schema migration failed'
     case 'nginx_invalid': return 'the nginx configuration of the release did not validate'
-    case 'request_replayed': return 'this approval was already used'
-    case 'request_stale': return 'the request was too old'
-    case 'in_flight': return 'another upgrade was in progress'
-    case 'target_changed': case 'backup_changed': return 'the release or the backup changed after the page was loaded; reload and look again'
-    case 'needs_operator': return 'the last upgrade could not be rolled back automatically; an operator must act on the server first'
-    case 'request_invalid': return 'the updater did not accept the request (it failed the updater\'s own checks)'
-    case 'rollback_unavailable': return 'there is no previous release to go back to, or the 24-hour rollback window has passed'
-    case 'activator_too_old': return 'the server\'s updater is older than this release (sudo server/install.sh --refresh-updater)'
-    case 'cli_only': return 'this action is only available from the server\'s command line'
-    case 'no_backup': case 'backup_failed': case 'backup_required': return 'there is no usable pre-upgrade copy of the archive'
-    case 'version_failed_before': return 'this version failed before; an operator must clear the failure on the server first'
-    case 'too_many_failures': return 'two upgrades have failed; contact the maintainers with the support bundle'
-    case 'rollback_failed': return 'the automatic rollback failed; an operator must act on the server'
-    case 'interrupted': return 'the updater was interrupted (power loss or kill) before finishing'
+    case 'restart_failed': return 'the services did not restart'
     case 'health_unit': case 'health_version': case 'health_healthz': case 'health_gate': case 'health_quick_check':
     case 'health_schema': case 'health_chain': case 'health_smoke': return 'a health check failed after the restart'
+    case 'rollback_failed': return 'the automatic rollback failed; an operator must act on the server'
+    case 'needs_operator': return 'the last upgrade could not be rolled back automatically; an operator must act on the server first'
+    case 'interrupted': return 'the updater was interrupted (power loss or kill) before finishing'
+    case 'failed_before': case 'version_failed_before': return 'this version failed before; an operator must clear the failure on the server first'
+    case 'too_many_failures': return 'upgrades are paused after two failed attempts'
+    case 'in_flight': return 'another upgrade was in progress'
+    case 'target_changed': case 'backup_changed': return 'the release or the backup changed after the page was loaded; reload and look again'
+    case 'confirm_required': case 'action_unsupported': case 'prune_refused': case 'cli_only': return 'this action needs a confirmation or is only available from the server\'s command line'
+    case 'needs_install_sh': return 'this change needs the installer'
+    case 'rollback_unavailable': return 'there is no previous release to go back to, or the 24-hour rollback window has passed'
+    case 'activator_too_old': return 'the server\'s updater is older than this release (from the unpacked release folder, run sudo server/install.sh --refresh-updater)'
+    case 'internal_error': return 'the updater hit an unexpected error'
     default: return code ? `reason code ${code}` : 'unknown reason'
   }
 }

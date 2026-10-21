@@ -3,7 +3,7 @@ import * as Dialog from '@radix-ui/react-dialog'
 import { useQueryClient } from '@tanstack/react-query'
 import { Copy, FileText, RefreshCw, Users } from 'lucide-react'
 import { startOktaCapture } from '../api/client'
-import { useEnvironments, useOverview, usePeopleList, useReportDefs } from '../api/hooks'
+import { useEnvironments, useOverview, usePeopleList, useReportDefs, useWhoami } from '../api/hooks'
 import { useIntegrityCheck } from '../hooks/useIntegrityCheck'
 import { useRefreshActions, useRefreshStatus } from '../hooks/useRefresh'
 import { toast } from '../hooks/useToast'
@@ -17,6 +17,7 @@ import {
   FACTOR_ROWS, approx, dayLabel, inventoryCsv, leadershipPdfHtml, overviewExportSections, pct, seriesValues, signed, weekReadout, windowFigures,
 } from '../utils/overview'
 import { oktaStateText } from '../utils/oktaAdmins'
+import { canAdminFrom } from '../utils/whoami'
 import { DialogCloseButton } from './DialogCloseButton'
 import { ExportButtons } from './ExportButtons'
 import { RefreshControl } from './RefreshControl'
@@ -285,7 +286,7 @@ function Trends({ o }: { o: OverviewData }) {
   )
 }
 
-function CrossChecks({ o, onOpen }: { o: OverviewData; onOpen: (l: 'c1' | 'c5') => void }) {
+function CrossChecks({ o, onOpen }: { o: OverviewData; onOpen?: (l: 'c1' | 'c5') => void }) {
   return (
     <section aria-labelledby="ov-xc" className="card p-4">
       <SectionHead id="ov-xc" title="Cross-checks" badge={<span className="text-xs font-normal text-muted">{o.cross_checks.length} rules, version 1</span>} />
@@ -309,7 +310,7 @@ function CrossChecks({ o, onOpen }: { o: OverviewData; onOpen: (l: 'c1' | 'c5') 
               <div className="flex flex-col items-end gap-1 min-w-28">
                 {ok ? (
                   <>
-                    {n > 0 ? <button type="button" onClick={() => onOpen(c.id === 'C1' ? 'c1' : 'c5')} aria-label={`Open the list: ${c.title}, ${n}`} className="text-[1.375rem] font-semibold text-accent-text underline underline-offset-2">{n}</button> : <span className="text-[1.375rem] font-semibold text-text">0</span>}
+                    {n > 0 && onOpen ? <button type="button" onClick={() => onOpen(c.id === 'C1' ? 'c1' : 'c5')} aria-label={`Open the list: ${c.title}, ${n}`} className="text-[1.375rem] font-semibold text-accent-text underline underline-offset-2">{n}</button> : <span className="text-[1.375rem] font-semibold text-text">0</span>}
                     <StatusBadge label={n === 0 ? 'Clear' : 'Review'} variant={n === 0 ? 'active' : 'error'} />
                     <span className="text-xs text-muted">{n === 0 ? 'none' : c.id === 'C1' ? `${c.result.people ?? 0} people, ${c.result.accounts ?? 0} service account(s)` : `${n} ${n === 1 ? 'person' : 'people'}`}</span>
                   </>
@@ -323,7 +324,7 @@ function CrossChecks({ o, onOpen }: { o: OverviewData; onOpen: (l: 'c1' | 'c5') 
   )
 }
 
-function SignIns({ o, environment, onOpen }: { o: OverviewData; environment: string; onOpen: (l: DrawerList) => void }) {
+function SignIns({ o, environment, onOpen }: { o: OverviewData; environment: string; onOpen?: (l: DrawerList) => void }) {
   const [period, setPeriod] = useState('13')
   const s = o.signins_mfa
   const qc = useQueryClient()
@@ -362,9 +363,9 @@ function SignIns({ o, environment, onOpen }: { o: OverviewData; environment: str
         <Tile label={`Successful sign-ins, ${n} weeks`} value={ev.signins.toLocaleString()} sub={`${pv ? `${pv.signins.toLocaleString()} by privileged people · ` : ''}${thisWeek ? `${thisWeek.password_only_derived.toLocaleString()} derived password-only this week` : ''}`} />
         <Tile label="Phishing-resistant share, this week" value={approx(thisWeek?.phishing_resistant_share)} sub={`everyone${privThis ? `; privileged people ${approx(privThis.phishing_resistant_share)}` : ''}${first && first !== thisWeek ? ` · ${pct(first.phishing_resistant_share)} at the start` : ''}`} />
         <Tile label="Privileged people who used a non-phishing-resistant factor" value={s.people.privileged_non_pr ?? 'n/a'} flag={(s.people.privileged_non_pr ?? 0) > 0}
-          onOpen={(s.people.privileged_non_pr ?? 0) > 0 ? () => onOpen('mfa_nonpr') : undefined} sub={s.people.privileged_total != null ? `of ${s.people.privileged_total} privileged people, in the period · push, code, SMS or email` : 'no privileged people known yet'} />
+          onOpen={onOpen && (s.people.privileged_non_pr ?? 0) > 0 ? () => onOpen('mfa_nonpr') : undefined} sub={s.people.privileged_total != null ? `of ${s.people.privileged_total} privileged people, in the period · push, code, SMS or email` : 'no privileged people known yet'} />
         <Tile label="People using SMS or voice, last 30 days" value={s.people.everyone_sms_voice_30d} flag={(s.people.privileged_sms_voice_30d ?? 0) > 0}
-          onOpen={(s.people.privileged_sms_voice_30d ?? 0) > 0 ? () => onOpen('mfa_smsvoice') : undefined} sub={s.people.privileged_sms_voice_30d != null ? `${s.people.privileged_sms_voice_30d} of them privileged (the list shows those)` : 'privileged people not known yet'} />
+          onOpen={onOpen && (s.people.privileged_sms_voice_30d ?? 0) > 0 ? () => onOpen('mfa_smsvoice') : undefined} sub={s.people.privileged_sms_voice_30d != null ? `${s.people.privileged_sms_voice_30d} of them privileged (the list shows those)` : 'privileged people not known yet'} />
         <Tile label="MFA failure rate, this week" value={approx(thisWeek?.mfa_failure_rate)} sub={`${privThis ? `privileged people ${approx(privThis.mfa_failure_rate)} · ` : ''}rate only, no reasons`} />
       </ul>
       <div className="grid gap-3 md:grid-cols-2">
@@ -526,6 +527,8 @@ function EvidenceReadiness({ o, environment, onOpenReports }: { o: OverviewData;
 // ── Page ────────────────────────────────────────────────────────────────────────────────────────────────────────
 export function OverviewPage({ onOpenReports }: { onOpenReports: () => void }) {
   const { data: environments } = useEnvironments()
+  const { data: whoami } = useWhoami()
+  const canAdmin = canAdminFrom(whoami)  // 5.51.0: an archive viewer sees the counts; the lists of names are administrators-only
   const environment = environments?.active ?? undefined
   const [asOf, setAsOf] = useState<string>(LATEST)
   const [drawer, setDrawer] = useState<DrawerList | null>(null)
@@ -569,7 +572,7 @@ export function OverviewPage({ onOpenReports }: { onOpenReports: () => void }) {
   if (isLoading) return <span className="text-sm text-text-faint">Loading…</span>
   if (isError || !o) {
     const status = (error as { status?: number } | null)?.status
-    return <div className="card p-3 text-sm text-loss">{status === 403 ? 'The Overview is for administrators.' : `Could not load the Overview: ${(error as Error | null)?.message ?? 'unknown error'}`}</div>
+    return <div className="card p-3 text-sm text-loss">{status === 403 ? 'The Overview needs administrator access, or the View archive and Live read permissions on this environment. Ask its owner or an administrator.' : `Could not load the Overview: ${(error as Error | null)?.message ?? 'unknown error'}`}</div>
   }
   const t = o.tiles
   const left = t.left_okta
@@ -610,17 +613,17 @@ export function OverviewPage({ onOpenReports }: { onOpenReports: () => void }) {
         <Tile label="People with Okta admin roles" value={o.okta_admins.state === 'ok' ? t.okta_people : o.okta_admins.state === 'refused' ? 'Not readable' : 'n/a'}
           sub={o.okta_admins.state === 'ok' ? `${roleText(t.okta_by_role)} (a person can hold several) · as of ${dayLabel(o.sources.okta_snapshot.captured_at ?? '')}` : o.okta_admins.message ?? 'No snapshot yet'} />
         <Tile label="People with privileged OPA roles" value={t.opa_privileged ?? 'n/a'} sub={t.opa_privileged == null ? 'No OPA scan stored yet. Select Refresh to scan now.' : `${roleText(t.opa_by_role)} · via group roles`} />
-        <Tile label="Hold both (separation of duties)" value={t.both ?? 'n/a'} flag={(t.both ?? 0) > 0} onOpen={(t.both ?? 0) > 0 ? () => setDrawer('c5') : undefined}
-          sub={t.both == null ? 'needs the Okta admin list and an OPA scan' : (t.both ?? 0) > 0 ? 'to review · Okta admin who is also an OPA admin' : 'none · Okta admin who is also an OPA admin'} />
-        <Tile label="Left Okta, still in OPA" value={left.state === 'ok' && left.effective_known ? leftN : left.state === 'refused' ? 'Not readable' : 'n/a'} flag={leftN > 0} onOpen={leftN > 0 ? () => setDrawer('c1') : undefined}
-          sub={left.state === 'ok' ? `${left.people ?? 0} people + ${left.accounts ?? 0} service account(s) · cross-check C1` : left.state === 'never_run' ? 'run the lookup on the Cross-checks page' : 'cross-check C1'} />
+        <Tile label="Hold both (separation of duties)" value={t.both ?? 'n/a'} flag={(t.both ?? 0) > 0} onOpen={canAdmin && (t.both ?? 0) > 0 ? () => setDrawer('c5') : undefined}
+          sub={t.both == null ? 'needs the Okta admin list and an OPA scan' : (t.both ?? 0) > 0 ? `to review · Okta admin who is also an OPA admin${canAdmin ? '' : ' · list: administrators only'}` : 'none · Okta admin who is also an OPA admin'} />
+        <Tile label="Left Okta, still in OPA" value={left.state === 'ok' && left.effective_known ? leftN : left.state === 'refused' ? 'Not readable' : 'n/a'} flag={leftN > 0} onOpen={canAdmin && leftN > 0 ? () => setDrawer('c1') : undefined}
+          sub={left.state === 'ok' ? `${left.people ?? 0} people + ${left.accounts ?? 0} service account(s) · cross-check C1${canAdmin || leftN === 0 ? '' : ' · list: administrators only'}` : left.state === 'never_run' ? 'run the lookup on the Cross-checks page' : 'cross-check C1'} />
         <Tile label="OPA service accounts and service users" value={t.service.total ?? 'n/a'} sub={t.service.total == null ? 'No OPA scan stored yet. Select Refresh to scan now.' : `+ ${t.service.service_users} service users · ${t.service.saas} SaaS · ${t.service.okta_ud} Okta Universal Directory`} />
         <Tile label="Evidence archive" value={t.archive_days != null ? `${t.archive_days}` : 'n/a'} sub={`days held · Okta keeps 90 · ${o.sources.archive.last_sync_status === 'error' ? 'last sync failed' : `last sync ${relative(o.sources.archive.last_sync_completed_at)}`}`} />
       </ul>
 
       <Trends o={o} />
-      <CrossChecks o={o} onOpen={setDrawer} />
-      <SignIns o={o} environment={environment} onOpen={setDrawer} />
+      <CrossChecks o={o} onOpen={canAdmin ? setDrawer : undefined} />
+      <SignIns o={o} environment={environment} onOpen={canAdmin ? setDrawer : undefined} />
       <Inventory o={o} />
       <EvidenceReadiness o={o} environment={environment} onOpenReports={onOpenReports} />
       <PeopleDrawer environment={environment} list={drawer} asOf={effectiveAsOf} onClose={() => setDrawer(null)} />

@@ -97,7 +97,7 @@ def test_apply_exit_codes_for_rollback_and_operator_needed(m, capsys):
     cli(m, "stage", str(tar))
     assert cli(m, "apply", "5.47.0", "--confirm-text", "5.47.0") == 3
     out = capsys.readouterr().out
-    assert "rolled back to 5.46.0" in out and "support bundle: ocw-support-5.46.0-to-5.47.0-" in out
+    assert "Rolled back to 5.46.0" in out and "The previous release was put back and is running." in out and "Next:" in out and "support bundle: ocw-support-5.46.0-to-5.47.0-" in out
     m2 = uf.Machine(m.root / "two")
     m2.host.unhealthy_versions.add("5.47.0")
     m2.env["OCW_UPDATER_FAULT"] = "rollback_fail"

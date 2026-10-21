@@ -141,7 +141,7 @@ def test_a_request_for_a_staged_release_whose_tree_vanished_changes_nothing(m):
     import shutil
     shutil.rmtree(m.opt / "staging" / "5.47.0" / "server")
     assert m.updater().apply(m.request("5.47.0", correlation_id="upg-aabb0003")) == "failed"
-    assert m.read_state()["reason_code"] == "tree_mismatch" and os.readlink(m.opt / "current") == "releases/5.46.0"
+    assert m.read_state()["reason_code"] == "release_files_mismatch" and os.readlink(m.opt / "current") == "releases/5.46.0"
 
 
 def test_main_converts_a_simulated_kill_into_a_hard_exit(m, monkeypatch):

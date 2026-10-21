@@ -6,7 +6,7 @@ import { useUpgradeStatus, useVersion, useWhoami } from '../api/hooks'
 import { toast } from '../hooks/useToast'
 import type { UpgradeStatus } from '../types'
 import { clearRequested, readRequested, type RequestedUpgrade } from '../utils/upgradeRequested'
-import { UPGRADE_STEPS, browserZone, isFailureResult, isRunning, serverZoneOf } from '../utils/upgradeFlow'
+import { UPGRADE_STEPS, browserZone, describeReason, isFailureResult, isRunning, serverZoneOf } from '../utils/upgradeFlow'
 import { formatDateTime } from '../utils/format'
 import { describeCheckFailure, frequencyLabel, updateState } from '../utils/upgrade'
 import { UpdateCheckForm } from './UpdateCheckForm'
@@ -251,7 +251,15 @@ function HistoryCard({ status }: { status: UpgradeStatus }) {
               <td className="py-1.5 pr-3 text-text-dim">{formatDateTime(r.started_at)}</td>
               <td className="py-1.5 pr-3 text-text-dim">
                 {r.result === 'completed' ? <Badge tone="ok">Completed</Badge> : r.result === 'rolled_back' ? <Badge tone="warn">Rolled back</Badge> : <Badge tone="err">{r.result ?? 'Unknown'}</Badge>}
-                {r.seconds != null && <> in {Math.round(r.seconds)} s</>}{r.reason_code && <> · <code className="font-mono">{r.reason_code}</code></>}
+                {r.seconds != null && <> in {Math.round(r.seconds)} s</>}
+                {r.reason_code && (
+                  <div className="mt-0.5 text-text-dim">
+                    {r.reason_text ?? `${describeReason(r.reason_code)}.`}
+                    {r.changed && <> {r.changed}</>}
+                    {r.next_step && <> Next: {r.next_step}</>}
+                    {' '}<span className="text-muted">(<code className="font-mono">{r.reason_code}</code>)</span>
+                  </div>
+                )}
               </td>
               <td className="py-1.5 text-text-dim"><code className="font-mono">{r.correlation_id}</code></td>
             </tr>

@@ -7,7 +7,10 @@ import pytest
 
 import audit_store
 import okta_admins as oa
-from test_okta_admins_5500 import FakeOkta
+from test_http_authz_matrix import ADMIN, OWNER_A, OWNER_B, _call, _seed_owner_a_with_session, _who, matrix_server  # noqa: F401,E402
+import create_secret_folders as engine
+from test_okta_admins_5500 import FakeOkta, _model
+from test_okta_routes_5500 import _audit_actions, _put_model
 
 ENV = "99999999-9999-9999-9999-999999999999"
 NOW = datetime(2026, 10, 21, 12, 0, tzinfo=timezone.utc)
@@ -72,3 +75,45 @@ def test_a_scheduled_refresh_that_did_not_read_opa_is_in_the_banner(db):
     audit_store._upsert_sync_state(audit_store._get_connection(), ENV, last_refresh_json=json.dumps({"scheduled": {
         "finished_at": "2026-10-21T02:20:00.000Z", "parts": {"opa": {"state": "ok"}}}}))
     assert "scheduled_opa" not in {a["kind"] for a in oa.build_overview(ENV, now=NOW)["attention"]}
+
+
+# -- Overview counts for archive viewers (never names) ------------------------------------------------------------------
+def _viewer_rows(path):
+    import json as _json
+    return [_json.loads(line) for line in open(path, encoding="utf-8") if line.strip() and '"overview.read"' in line]
+
+
+def test_an_archive_viewer_gets_the_counts_and_never_a_name_or_a_list(matrix_server, tmp_audit_log):
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+    engine.set_environment_shared("dev", OWNER_A, True)
+    _put_model(serve, env_id, _model())
+    oa.capture_and_store(env_id, FakeOkta())
+    engine.set_shared_permissions({"view_archive": "allow", "live_read": "allow"}, environment_id=env_id)
+    r = _call(base_url, "GET", "/api/overview?environment=dev", headers=_who(OWNER_B))
+    assert r.status_code == 200 and "alex@example.com" not in r.text and "sam@example.com" not in r.text
+    body = r.json()
+    assert "people" not in body and "privileged" not in body and body["okta_admins"]["count"] == 2
+    for lists in ("/api/overview/people?environment=dev&list=c1", "/api/overview/privileged?environment=dev"):
+        assert _call(base_url, "GET", lists, headers=_who(OWNER_B)).status_code == 403
+    assert _call(base_url, "GET", f"/api/overview?id={env_id}", headers=_who(OWNER_B)).status_code == 403  # ?id= addressing stays admin-only
+    viewers = [row["details"]["viewer"] for row in _viewer_rows(tmp_audit_log)]
+    assert viewers == ["archive_viewer"]
+    assert _call(base_url, "GET", "/api/overview?environment=dev", headers=_who(ADMIN, admin=True)).status_code == 200
+    assert [row["details"]["viewer"] for row in _viewer_rows(tmp_audit_log)] == ["archive_viewer", "admin"]
+
+
+@pytest.mark.parametrize("deny", ["view_archive", "live_read"])
+def test_without_either_capability_the_counts_are_refused(matrix_server, deny):
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+    engine.set_environment_shared("dev", OWNER_A, True)
+    engine.set_shared_permissions({"view_archive": "allow", "live_read": "allow", deny: "deny"}, environment_id=env_id)
+    r = _call(base_url, "GET", "/api/overview?environment=dev", headers=_who(OWNER_B))
+    assert r.status_code == 403 and r.json()["capability"] == deny
+
+
+def test_an_environment_the_caller_cannot_see_is_not_found_not_forbidden(matrix_server):
+    base_url, serve = matrix_server
+    _seed_owner_a_with_session(serve)  # private to A
+    assert _call(base_url, "GET", "/api/overview?environment=dev", headers=_who(OWNER_B)).status_code == 404

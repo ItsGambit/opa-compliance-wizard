@@ -76,7 +76,7 @@ def test_tampered_staged_tree_is_refused_by_root(m):
     assert m.host.run(["systemctl", "start", "ocw-stage@5.47.0.service"])[0] == 0
     (m.opt / "staging" / "5.47.0" / "requirements.lock").write_text("# evil\n")
     result = m.updater().apply(m.request("5.47.0", correlation_id="upg-aaaa0003"))
-    assert result == "failed" and m.read_state()["reason_code"] == "tree_mismatch"
+    assert result == "failed" and m.read_state()["reason_code"] == "release_files_mismatch"
     assert os.readlink(m.opt / "current") == "releases/5.46.0"
 
 
@@ -86,7 +86,8 @@ def test_extra_file_in_staged_tree_is_refused(m):
     m.host.run(["systemctl", "start", "ocw-stage@5.47.0.service"])
     (m.opt / "staging" / "5.47.0" / "server" / "planted.py").write_text("import os\n")
     assert m.updater().apply(m.request("5.47.0", correlation_id="upg-aaaa0004")) == "failed"
-    assert m.read_state()["reason_code"] == "tree_mismatch"
+    assert m.read_state()["reason_code"] == "release_files_mismatch"
+    assert "not part of the signed release" in m.read_state()["error"]  # the extra file has its own message
 
 
 def test_version_not_newer_and_wrong_hash_are_rejected(m):

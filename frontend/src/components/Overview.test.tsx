@@ -1,6 +1,6 @@
 import { fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { cancelRefresh, fetchEnvironments, fetchOverview, fetchPeopleList, fetchRefreshStatus, startOktaCapture, startRefresh, startSync } from '../api/client'
+import { cancelRefresh, fetchEnvironments, fetchOverview, fetchPeopleList, fetchRefreshStatus, fetchWhoami, startOktaCapture, startRefresh, startSync } from '../api/client'
 import type { RefreshStatus } from '../types'
 import { overview } from '../test/oktaFixtures'
 import { renderWithClient } from '../test/renderWithClient'
@@ -8,7 +8,7 @@ import { OverviewPage } from './Overview'
 
 vi.mock('../api/client', () => ({
   fetchEnvironments: vi.fn(), fetchOverview: vi.fn(), fetchPeopleList: vi.fn(), startOktaCapture: vi.fn(), startSync: vi.fn(), fetchReportDefs: vi.fn(), fetchIntegrity: vi.fn(),
-  fetchRefreshStatus: vi.fn(), startRefresh: vi.fn(), cancelRefresh: vi.fn(),
+  fetchRefreshStatus: vi.fn(), startRefresh: vi.fn(), cancelRefresh: vi.fn(), fetchWhoami: vi.fn(),
 }))
 vi.mock('./Select', async () => ({ Select: (await import('../test/MockSelect')).MockSelect }))
 vi.mock('./ExportButtons', () => ({ ExportButtons: ({ filenameBase }: { filenameBase: string }) => <div>export {filenameBase}</div> }))
@@ -23,6 +23,7 @@ beforeEach(() => {
   vi.mocked(fetchEnvironments).mockResolvedValue({ environments: [], active: 'prod-example' } as never)
   vi.mocked(fetchOverview).mockResolvedValue(overview())
   vi.mocked(fetchRefreshStatus).mockResolvedValue(IDLE)
+  vi.mocked(fetchWhoami).mockResolvedValue({ email: 'admin@example.com', is_local: false, is_admin: true, can_admin: true })
   vi.mocked(startRefresh).mockResolvedValue({ started: true, already_running: false, job_id: 'j1' })
 })
 
@@ -200,5 +201,22 @@ describe('OverviewPage', () => {
     const inv = screen.getByRole('region', { name: 'Inventory over time' })
     fireEvent.click(within(inv).getByRole('button', { name: 'Users' }))
     expect(within(inv).getByText(/Users \(Okta\), per daily snapshot/)).toBeTruthy()
+  })
+
+  it('an archive viewer (not an administrator) sees the counts as plain numbers with "list: administrators only", and no list can be opened', async () => {
+    vi.mocked(fetchWhoami).mockResolvedValue({ email: 'viewer@example.com', is_local: false, is_admin: false, can_admin: false })
+    vi.mocked(fetchOverview).mockResolvedValue(overview({ tiles: { ...overview().tiles, both: 2, left_okta: { people: 3, accounts: 1, state: 'ok', effective_known: true } } }))
+    renderWithClient(<OverviewPage onOpenReports={vi.fn()} />)
+    await screen.findByText(/14 people hold/)
+    expect(screen.queryByRole('button', { name: /Open the list/ })).toBeNull()
+    expect(screen.getAllByText(/list: administrators only/).length).toBe(2)
+    expect(screen.getAllByText('4').length).toBeGreaterThan(0)  // the count itself is still shown (people + service accounts)
+    expect(fetchPeopleList).not.toHaveBeenCalled()
+  })
+
+  it('a 403 says what is needed instead of "administrators only"', async () => {
+    vi.mocked(fetchOverview).mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }))
+    renderWithClient(<OverviewPage onOpenReports={vi.fn()} />)
+    expect(await screen.findByText(/administrator access, or the View archive and Live read permissions on this environment/)).toBeTruthy()
   })
 })

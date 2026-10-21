@@ -62,8 +62,9 @@ export function StartingCard({ requested, status, ageMs, received, onFollow }: P
     return (
       <section className="card p-4 border-loss/50" aria-labelledby="t-start" role="alert">
         <h2 className={CARD_TITLE} id="t-start"><AlertTriangle size={14} className="text-loss" aria-hidden="true" />{title2} <Badge tone="err">Refused</Badge></h2>
-        <p className="text-xs text-text-dim m-0">{describeReason(rejection.code)}. <span className="text-muted">({rejection.message})</span></p>
-        <p className="text-xs text-muted mt-2 mb-0">Nothing was changed. Correlation <code className="font-mono">{requested.correlationId}</code>; details are in the Audit Log.</p>
+        <p className="text-xs text-text-dim m-0">{rejection.reason_text ?? `${describeReason(rejection.code)}.`} <span className="text-muted">({rejection.message})</span></p>
+        {rejection.next_step && <p className="text-xs text-text m-0 mt-1">Next: {rejection.next_step}</p>}
+        <p className="text-xs text-muted mt-2 mb-0">{rejection.changed ?? 'Nothing was changed on the server.'} Correlation <code className="font-mono">{requested.correlationId}</code>; details are in the Audit Log.</p>
       </section>
     )
   }

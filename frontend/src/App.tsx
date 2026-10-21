@@ -29,7 +29,7 @@ import { UpgradeNoticeBanner } from './components/UpgradeNoticeBanner'
 import { markBundleRequested, rememberRequested } from './utils/upgradeRequested'
 import { UpdatesPage, type UpdatesHeader } from './components/UpdatesPage'
 import { UpdateKeysPage } from './components/UpdateKeysPage'
-import { environmentScopeKey } from './utils/environmentRows'
+import { activeRow, can, environmentScopeKey } from './utils/environmentRows'
 import { canAdminFrom } from './utils/whoami'
 import { SharedPermissionsDialog } from './components/SharedPermissionsDialog'
 import { SharedEnvironmentNotice } from './components/SharedEnvironmentNotice'
@@ -66,13 +66,16 @@ export default function App() {
   // UI-06: the Audit Log and banner settings follow what the server will
   // actually serve this caller (verified admin, or a local-mode operator).
   const canAdmin = canAdminFrom(whoami)
+  // 5.51.0: archive viewers (view_archive + live_read on the active environment) may open the Overview's counts; the lists of names stay admin-only.
+  const activeEnvRow = activeRow(environments)
+  const canViewOverview = canAdmin || (!!activeEnvRow && can(activeEnvRow, 'view_archive') && can(activeEnvRow, 'live_read'))
   const isConfigured = !!environments?.active
   const { data: upgradeStatus } = useUpgradeStatus(canAdmin)
   const queryClient = useQueryClient()
   // 5.50.0: the Overview is the home page for administrators; everyone else lands on Compliance Reports.
   useEffect(() => {
-    if (whoami && !canAdmin && activeTab === 'overview') navigate({ tab: 'reports', reportsSubTab: 'browse' })
-  }, [whoami, canAdmin, activeTab, navigate])
+    if (whoami && environments && !canViewOverview && activeTab === 'overview') navigate({ tab: 'reports', reportsSubTab: 'browse' })
+  }, [whoami, environments, canViewOverview, activeTab, navigate])
 
   // UI-05: the content below is scoped to the active tenant (see
   // EnvironmentScope) -- its id plus the connection fields, so a
@@ -267,6 +270,7 @@ export default function App() {
           onOpenEnvironments={() => setEnvironmentsOpen(true)}
           isAdmin={whoami?.is_admin}
           canAdmin={canAdmin}
+          canViewOverview={canViewOverview}
           onOpenBanner={() => setBannerOpen(true)}
           onOpenAccessControl={() => setAccessControlOpen(true)}
           onOpenAbout={() => setAboutOpen(true)}
@@ -296,7 +300,7 @@ export default function App() {
               </h1>
               <p className="text-xs text-muted mt-1 max-w-[72ch]">
                 {activeTab === 'overview' &&
-                  'Okta and OPA privileged access in one place: who can change the gate, who can open the vault, who holds both, and whether the evidence behind it is complete. Counts of people open the list behind them. Home page for administrators.'}
+                  'Okta and OPA privileged access in one place: who can change the gate, who can open the vault, who holds both, and whether the evidence behind it is complete. Counts of people open the list behind them (administrators). Home page for administrators; archive viewers see the counts.'}
                 {activeTab === 'reports' && reportsSubTab === 'browse' &&
                   'Audit evidence for SOC 2 / SOX / ISO 27001 and similar frameworks, generated from OPA + core Okta audit history.'}
                 {activeTab === 'reports' && reportsSubTab === 'secrets_access' &&
@@ -330,7 +334,7 @@ export default function App() {
 
           <SharedEnvironmentNotice />
 
-          {activeTab === 'overview' && canAdmin && <OverviewPage onOpenReports={() => navigate({ tab: 'reports', reportsSubTab: 'browse' })} />}
+          {activeTab === 'overview' && canViewOverview && <OverviewPage onOpenReports={() => navigate({ tab: 'reports', reportsSubTab: 'browse' })} />}
           {activeTab === 'reports' && reportsSubTab === 'browse' && (
             <ComplianceReports selectedReport={route.reportKey} onSelectReport={key => navigate({ tab: 'reports', reportsSubTab: 'browse', reportKey: key })} />
           )}

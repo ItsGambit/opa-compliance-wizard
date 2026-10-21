@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { describeReason, formatInZone, stepNumber, untilText, wallFields, wallToUtc, zoneOffsetMinutes } from './upgradeFlow'
+import { UPDATER_REASON_CODES, describeReason, formatInZone, stepNumber, untilText, wallFields, wallToUtc, zoneOffsetMinutes } from './upgradeFlow'
 import { makeRun } from '../test/upgradeFixtures'
 
 describe('time zones', () => {
@@ -55,5 +55,24 @@ describe('reason sentences and the bundle cool-down', () => {
     markBundleRequested(1_000_000)
     expect(bundleCoolingDown(1_000_000 + 4 * 60_000)).toBe(true)
     expect(bundleCoolingDown(1_000_000 + 5 * 60_000 + 1)).toBe(false)
+  })
+})
+
+describe('describeReason (5.51.0)', () => {
+  it('has a plain sentence for every code the updater can record; none falls through to "reason code"', () => {
+    for (const code of UPDATER_REASON_CODES) {
+      const text = describeReason(code)
+      expect(text, code).not.toMatch(/^reason code/)
+      expect(text, code).not.toContain('_')  // a sentence, not the raw code
+      expect(text.length, code).toBeGreaterThan(10)
+    }
+    expect(describeReason('tree_mismatch')).toBe('the prepared files or environment did not pass the updater\'s checks (older release)')
+    expect(describeReason('release_files_mismatch')).toMatch(/do not match the signed release/)
+    expect(describeReason('environment_unexpected')).toMatch(/Python environment/)
+    expect(describeReason('some_future_code')).toBe('reason code some_future_code')
+  })
+
+  it('lists each code once', () => {
+    expect(new Set(UPDATER_REASON_CODES).size).toBe(UPDATER_REASON_CODES.length)
   })
 })

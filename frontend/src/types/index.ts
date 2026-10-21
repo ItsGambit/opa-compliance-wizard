@@ -439,6 +439,10 @@ export interface UpgradeRun {
   step: string | null
   result: 'completed' | 'rolled_back' | 'failed' | 'failed_needs_operator' | null
   reason_code: string | null
+  /** 5.51.0: the updater's own words (what happened, whether anything changed, what to do). Runs recorded by an earlier release have none. */
+  reason_text?: string | null
+  changed?: string | null
+  next_step?: string | null
   started_at: string | null
   updated_at: string | null
   seconds: number | null
@@ -523,6 +527,9 @@ export interface UpgradeHistoryRow {
   version_to: string | null
   result: string | null
   reason_code: string | null
+  reason_text?: string | null
+  changed?: string | null
+  next_step?: string | null
   started_at: string | null
   updated_at: string | null
   seconds: number | null
@@ -549,7 +556,7 @@ export interface UpgradeView {
     mine: boolean
   } | null
   settings: { second_approval: boolean }
-  rejection: { correlation_id: string; code: string; message: string; at: string | null } | null
+  rejection: { correlation_id: string; code: string; message: string; at: string | null; reason_text?: string | null; changed?: string | null; next_step?: string | null } | null
   rollback: { available: boolean; until: string; to: string | null } | null
   /** The updater's published list of pre-upgrade copies (names, sizes, dates, integrity; no paths). */
   backups?: { backups: UpgradeBackup[]; updated_at: string; total_bytes: number | null } | null

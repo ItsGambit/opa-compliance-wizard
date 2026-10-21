@@ -105,6 +105,8 @@ interface Props {
   // can_admin). Access Control stays on isAdmin: saving it needs the hosted
   // step-up MFA flow, which a local run doesn't have.
   canAdmin?: boolean
+  /** 5.51.0: the Overview's counts are also for archive viewers (view_archive + live_read on the active environment), not only administrators. */
+  canViewOverview?: boolean
   onOpenBanner: () => void
   onOpenAccessControl: () => void
   onOpenAbout: () => void
@@ -246,6 +248,7 @@ export function SideNav({
   onOpenEnvironments,
   isAdmin,
   canAdmin,
+  canViewOverview,
   onOpenBanner,
   onOpenAccessControl,
   onOpenAbout,
@@ -323,8 +326,8 @@ export function SideNav({
         {collapsed && <div className="md:hidden px-2 mb-3"><Brand /></div>}
 
         <div className="flex flex-col gap-0.5">
-          {/* 5.50.0: the Overview is the home page for administrators (the counts endpoint behind it is admin-only). */}
-          {canAdmin && (
+          {/* 5.50.0: the Overview is the home page for administrators. 5.51.0: archive viewers see its counts too (never names). */}
+          {(canAdmin || canViewOverview) && (
             <NavItem
               active={activeTab === 'overview'}
               label="Overview"

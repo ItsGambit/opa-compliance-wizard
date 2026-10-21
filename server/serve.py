@@ -2391,12 +2391,15 @@ class Handler(SimpleHTTPRequestHandler):
         # Okta-derived block carries its own state, so a refused read says "refused", never zero.
         privileged = path.endswith("/privileged")
         people_route = path.endswith("/people")
-        if not _can_admin(owner_key, self.headers):
+        # 5.51.0: the counts (/api/overview) are also served to a caller who holds view_archive and live_read on the named environment
+        # (an archive viewer): the same counts, never a name. The lists of people and the ?id= addressing stay administrators-only.
+        is_admin = _can_admin(owner_key, self.headers)
+        admin_id = (qs.get("id") or [None])[0]
+        if not is_admin and (privileged or people_route or admin_id):
             return self._send_json(403, {"error": "Admin access required for the overview."})
         import audit_store
         import okta_admins
         name = (qs.get("environment") or qs.get("env") or [local_env_name])[0]
-        admin_id = (qs.get("id") or [None])[0]
         if admin_id:
             meta = engine.list_all_environments().get(admin_id)
             name = (meta or {}).get("name")
@@ -2408,6 +2411,10 @@ class Handler(SimpleHTTPRequestHandler):
             meta = engine.list_environments_for(engine_owner).get(name)
         if meta is None:
             return self._send_json(404, {"error": f"No environment named '{name}' visible to this user."})
+        if not is_admin:
+            # Visibility first (the 404 above), then what an archive viewer needs: read the archive and live data of this environment.
+            if self._capability_refused(engine_owner, meta["environment_id"], ("view_archive", "live_read")):
+                return
         as_of = (qs.get("as_of") or [None])[0] or None
         try:
             weeks = int((qs.get("weeks") or [26])[0])
@@ -2439,7 +2446,7 @@ class Handler(SimpleHTTPRequestHandler):
         except ValueError as exc:
             return self._send_json(400, {"error": str(exc)})
         overview["capture"] = _capture_state(env_id)
-        self._log_audit_event(actor_email, actor_sub, "overview.read", {"name": name, "as_of": as_of})
+        self._log_audit_event(actor_email, actor_sub, "overview.read", {"name": name, "as_of": as_of, "viewer": "admin" if is_admin else "archive_viewer"})
         return self._send_json(200, overview)
 
     def _caller(self):

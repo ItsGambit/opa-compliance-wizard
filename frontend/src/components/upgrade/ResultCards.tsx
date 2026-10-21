@@ -167,8 +167,11 @@ export function FailureCards({ run, status }: { run: UpgradeRun; status: Upgrade
               {failure?.step === 'health_check' || failedCheck ? <>After the restart on {run.version_to}, the health check <strong className="text-text">{failedCheckLabel ?? failure?.step}</strong> failed
                 {failedAt ? <> at {clockIn(failedAt, zone)}</> : null}{afterSwitch != null ? <>, {afterSwitch} s after the switch</> : null}.{' '}
                 {failedCheck?.detail && <>{failedCheck.detail} </>}</>
-                : <>{failure?.step || run.failed_step ? <>At step <strong className="text-text">{failure?.step ?? run.failed_step}</strong>: </> : null}{describeReason(run.reason_code)}. {failure?.detail ?? ''} </>}
-              (Reason code <code className="font-mono">{run.reason_code}</code>.)
+                : <>{failure?.step || run.failed_step ? <>At step <strong className="text-text">{failure?.step ?? run.failed_step}</strong>: </> : null}
+                  {run.reason_text ? run.reason_text : <>{describeReason(run.reason_code)}.</>} {failure?.detail ?? ''} </>}
+              {run.changed && <> <strong className="text-text">{run.changed}</strong></>}
+              {run.next_step && <> <span className="text-text">Next: {run.next_step}</span></>}
+              {' '}(Reason code <code className="font-mono">{run.reason_code}</code>.)
               {rolled && <> The updater put {run.rolled_back_to ?? run.version_from} back.{rollbackOk && finished ? <> Rollback health checks passed at {clockIn(finished, zone)}.</> : null}</>}
               {operator && run.operator_reason && <> {run.operator_reason}</>}
             </p>

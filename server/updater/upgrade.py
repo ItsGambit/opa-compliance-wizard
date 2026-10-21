@@ -563,8 +563,12 @@ def rejection(correlation_id):
             r = json.load(fh)
     except (OSError, ValueError):
         return None
-    return {"correlation_id": correlation_id, "code": str(r.get("code"))[:40], "message": str(r.get("message"))[:300], "at": r.get("at")} \
-        if isinstance(r, dict) else None
+    if not isinstance(r, dict):
+        return None
+    out = {"correlation_id": correlation_id, "code": str(r.get("code"))[:40], "message": str(r.get("message"))[:300], "at": r.get("at")}
+    for k in ("reason_text", "changed", "next_step"):  # 5.51.0: the updater's own plain words (older refusals have none)
+        out[k] = str(r[k])[:600] if isinstance(r.get(k), str) else None
+    return out
 
 
 # --- schedule tick -----------------------------------------------------------------------------------------------------
@@ -674,6 +678,8 @@ def run_view():
     if st is None:
         return None
     out = {k: st.get(k) for k in service._RUN_FIELDS}
+    for k in ("reason_text", "changed", "next_step"):  # plain text written by the root-owned updater: bounded, shown as text only
+        out[k] = str(out[k])[:600] if isinstance(out.get(k), str) else None
     heads = st.get("chain_heads_before")
     out["chain_heads_recorded"] = len(heads) if isinstance(heads, dict) else None
     for k in RUN_EXTRA:
@@ -709,6 +715,9 @@ def history_view(limit=10):
             b = h.get("backup")
             out.append({"correlation_id": h.get("correlation_id"), "action": h.get("action"), "version_from": h.get("version_from"),
                         "version_to": h.get("version_to"), "result": h.get("result"), "reason_code": h.get("reason_code"),
+                        "reason_text": str(h["reason_text"])[:600] if isinstance(h.get("reason_text"), str) else None,
+                        "changed": str(h["changed"])[:200] if isinstance(h.get("changed"), str) else None,
+                        "next_step": str(h["next_step"])[:600] if isinstance(h.get("next_step"), str) else None,
                         "started_at": h.get("started_at"), "updated_at": h.get("updated_at"), "seconds": h.get("seconds"),
                         "backup": os.path.basename(b) if isinstance(b, str) else None, "bundle": h.get("bundle")})
     return out[-limit:][::-1]

@@ -63,7 +63,7 @@ import ocw_bundle  # noqa: E402
 import ocw_host  # noqa: E402
 import ocw_trust  # noqa: E402
 
-ACTIVATOR_VERSION = "5.50.1"
+ACTIVATOR_VERSION = "5.51.0"
 STEP_ORDER = ["validated", "downloaded", "staged", "preflight", "backup", "switching", "restarting", "health_check", "completed"]
 STEP_LABEL = {"validated": "Received and validated", "downloaded": "Downloaded", "staged": "Verified and staged",
               "preflight": "Preflight", "backup": "Backup", "switching": "Switching", "restarting": "Restarting",
@@ -71,13 +71,122 @@ STEP_LABEL = {"validated": "Received and validated", "downloaded": "Downloaded",
 HEALTH_CHECKS = ["unit_active", "version", "healthz", "gate_401", "quick_check", "schema_version", "chain_heads", "smoke_read"]
 REASONS = {"request_invalid", "request_replayed", "request_stale", "signature_invalid", "key_unknown", "version_not_newer",
            "hash_mismatch", "name_mismatch", "version_mismatch", "too_old", "disk_space", "sync_in_progress", "pip_failed",
-           "stage_failed", "not_staged", "tree_mismatch", "backup_failed", "migration_failed", "nginx_invalid", "restart_failed",
+           "stage_failed", "not_staged", "tree_mismatch", "release_files_mismatch", "environment_unexpected", "backup_failed", "migration_failed", "nginx_invalid", "restart_failed",
            "health_unit", "health_version", "health_healthz", "health_gate", "health_quick_check", "health_schema",
            "health_chain", "health_smoke", "rollback_failed", "interrupted", "failed_before", "too_many_failures",
            "version_failed_before", "in_flight", "bad_release", "bad_artifact", "revoked_key", "retired_key", "wrong_role",
            "no_key_pinned", "keys_changed", "unknown_alg", "no_trust", "bad_trust", "internal_error", "needs_install_sh",
            "confirm_required", "rollback_unavailable", "no_backup", "action_unsupported", "prune_refused", "target_changed",
            "needs_operator"}
+# --- what every reason says (5.51.0) ------------------------------------------------------------------------------------
+# One source for the CLI and the web page: the activator writes reason_text (what happened), changed (whether anything on the
+# server changed) and next_step (what to do) into the run's state, so the two cannot drift. Every message says all three, in plain
+# words, without alarm for conditions that are not a security finding. `tree_mismatch` stays so state and history written by an
+# earlier release still validate; new runs use release_files_mismatch or environment_unexpected.
+CHANGED_NONE = "Nothing was changed on the server."
+CHANGED_BACK = "The previous release was put back and is running."
+CHANGED_UNKNOWN = "Unknown: an operator must check the server."
+ISSUE_STEP = "open an issue on the project's GitHub page"
+BUNDLE_STEP = "Download the support bundle (Audit Log, the upgrade.failed entry) and attach it to an issue on the project's GitHub page."
+INSTALL_STEP = "From the unpacked release folder, run `sudo server/install.sh --refresh-updater`, then try again."
+STATUS_STEP = "`sudo ocw-updater status`"
+# The commands next_step may name (the test checks each against the real command line parser).
+NEXT_STEP_COMMANDS = ("sudo ocw-updater status", "sudo ocw-updater clear-failure", "sudo ocw-updater trust list",
+                      "sudo server/install.sh --refresh-updater", "sudo server/install.sh")
+_HEALTH_WHAT = {"health_unit": "the application service was not running", "health_version": "the service reported a different version than expected",
+                "health_healthz": "the web page did not load", "health_gate": "the sign-in gate did not answer as expected",
+                "health_quick_check": "the database did not open or failed its integrity check",
+                "health_schema": "the database schema version was not the expected one",
+                "health_chain": "the evidence chain heads were not as expected", "health_smoke": "a read of the archive failed"}
+REASON_TEXT = {
+    "request_invalid": ("The updater did not accept the request (a field was missing or malformed).",
+                        "Reload the Updates page and request again. If it repeats, run " + STATUS_STEP + " on the server."),
+    "request_replayed": ("This approval was already used.", "Request the upgrade again from the Updates page."),
+    "request_stale": ("The request was older than 24 hours.", "Request the upgrade again from the Updates page."),
+    "signature_invalid": ("The release file's signature did not verify.",
+                          "The updater refused it. Download the release again; if it fails again, do not install that file and " + ISSUE_STEP + "."),
+    "key_unknown": ("The release was signed by a key this server does not trust.",
+                    "Check the release notes for a key change. `sudo ocw-updater trust list` shows the keys this server trusts."),
+    "revoked_key": ("The release was signed by a key that is no longer accepted.", "Use a release signed by the current key."),
+    "retired_key": ("The release was signed by a key that is no longer accepted.", "Use a release signed by the current key."),
+    "wrong_role": ("The release was signed by a key that may not sign releases (a standby key).", "Use a release signed by the primary key."),
+    "no_key_pinned": ("This server has no usable trust file for release keys.", INSTALL_STEP),
+    "no_trust": ("This server has no usable trust file for release keys.", INSTALL_STEP),
+    "bad_trust": ("This server has no usable trust file for release keys.", INSTALL_STEP),
+    "keys_changed": ("The trusted keys changed while the request was being checked.", "Request the upgrade again."),
+    "unknown_alg": ("The signature uses an algorithm this updater does not know.", "Refresh the updater, then try again. " + INSTALL_STEP),
+    "version_not_newer": ("This server already runs the same or a newer version.", "Nothing to do."),
+    "version_mismatch": ("The file's contents do not match the version it was requested as.", "Download the release again."),
+    "name_mismatch": ("The file's contents do not match the name it was requested as.", "Download the release again."),
+    "hash_mismatch": ("The downloaded file does not match its signed hash.",
+                      "Try again. If it happens again, something between this server and GitHub is changing the file (often a proxy or a broken mirror). "
+                      "Do not install it; " + ISSUE_STEP + "."),
+    "too_old": ("This release cannot be installed over the installed version.",
+                "Upgrade to an intermediate release first; the release notes say which."),
+    "bad_release": ("The release archive is not in the expected shape.", "Download the release again."),
+    "bad_artifact": ("The release archive is not in the expected shape.", "Download the release again."),
+    "disk_space": ("There was not enough free disk space.", "Free some space (" + STATUS_STEP + " lists the backups directory), then request again."),
+    "sync_in_progress": ("A refresh was still running after 10 minutes.", "Try again when it finishes (the Overview shows its progress)."),
+    "pip_failed": ("The Python packages could not be installed.", "It is usually a network or Python version problem. " + BUNDLE_STEP),
+    "stage_failed": ("The release could not be prepared for installation.", "Try again. If it repeats: " + BUNDLE_STEP),
+    "not_staged": ("The release could not be prepared for installation.", "Try again. If it repeats: " + BUNDLE_STEP),
+    "release_files_mismatch": ("The prepared files do not match the signed release (a file differs, is missing, or is extra).",
+                               "Download the release again. If it repeats, the staging area may have been altered: run " + STATUS_STEP + " and " + ISSUE_STEP + "."),
+    "environment_unexpected": ("The release's Python environment has something the updater does not expect (for example a link to a file "
+                               "outside the release, or a file with group or world write permission).",
+                               "This is usually a Python layout the updater has not seen. " + INSTALL_STEP + " If it repeats: " + BUNDLE_STEP),
+    "tree_mismatch": ("The prepared files or environment did not pass the updater's checks (older release).",
+                      "Download the release again. If it repeats: " + BUNDLE_STEP),
+    "backup_failed": ("The pre-upgrade copy of the archive could not be made or is not usable.",
+                      "Check that there is free disk space and that the archive can be read (the Overview's Verify the chain checks the evidence chain), then request again."),
+    "no_backup": ("The pre-upgrade copy of the archive could not be made or is not usable.",
+                  "Check that there is free disk space and that the archive can be read (the Overview's Verify the chain checks the evidence chain), then request again."),
+    "migration_failed": ("A database schema migration failed.", "The archive is as it was before the upgrade. " + BUNDLE_STEP),
+    "nginx_invalid": ("The release's nginx configuration did not validate.", BUNDLE_STEP),
+    "restart_failed": ("The services did not restart.",
+                       "Run " + STATUS_STEP + ". If the previous release is not running, an operator must act on the server."),
+    "rollback_failed": ("The automatic rollback failed.",
+                        "On the server, run " + STATUS_STEP + " and follow its instructions. The previous code is still on disk."),
+    "needs_operator": ("The automatic rollback failed.",
+                       "On the server, run " + STATUS_STEP + " and follow its instructions. The previous code is still on disk."),
+    "interrupted": ("The updater was interrupted (power loss or a kill) before finishing.", "Run " + STATUS_STEP + " on the server."),
+    "failed_before": ("This version failed before and is blocked.", "On the server, run `sudo ocw-updater clear-failure`, then request again."),
+    "version_failed_before": ("This version failed before and is blocked.", "On the server, run `sudo ocw-updater clear-failure`, then request again."),
+    "too_many_failures": ("Upgrades are paused after two failed attempts.", "Open an issue on the project's GitHub page with the support bundle."),
+    "in_flight": ("Another upgrade was in progress.", "Wait for it to finish."),
+    "target_changed": ("The release or the backup changed after the page was loaded.", "Reload the page and check the release again."),
+    "confirm_required": ("The action needs a confirmation, or is only available on the server.", "Run it from the server's command line as the message says."),
+    "action_unsupported": ("The action needs a confirmation, or is only available on the server.", "Run it from the server's command line as the message says."),
+    "prune_refused": ("The action needs a confirmation, or is only available on the server.", "Run it from the server's command line as the message says."),
+    "needs_install_sh": ("This change needs the installer.", "From the unpacked release folder, run `sudo server/install.sh` as the release notes say."),
+    "rollback_unavailable": ("There is no previous release to go back to, or the 24-hour rollback window has passed.",
+                             "Nothing to do. Request the release you want instead."),
+    "internal_error": ("The updater hit an unexpected error.", BUNDLE_STEP + " It names the correlation id."),
+}
+for _code, _what in _HEALTH_WHAT.items():
+    REASON_TEXT[_code] = (f"A health check failed after the restart: {_what}.",
+                          "The previous release is running. " + BUNDLE_STEP + " It includes the failed check's detail.")
+
+
+def describe_reason(code, result=None, detail=None, installed=None):
+    """(reason_text, changed, next_step) for a reason code. `changed` follows what the run actually did (result), not the code:
+    a refusal before the switch changed nothing, an automatic rollback put the previous release back, and only a rollback that
+    failed (or a restore that was interrupted) leaves the server in a state an operator has to check."""
+    if code == "operator":  # a rollback an operator asked for (not a failure)
+        return "The previous release was put back at an operator's request.", CHANGED_BACK, "Nothing to do. The previous release is running."
+    text, step = REASON_TEXT.get(code) or REASON_TEXT["internal_error"]
+    if code == "disk_space" and isinstance(detail, str) and detail.startswith("not enough free disk space ("):
+        text = "There was not enough free disk space " + detail[len("not enough free disk space "):] + "."
+    elif code == "version_not_newer" and installed:
+        text = f"This server already runs {installed} (the same or a newer version)."
+    if code in ("rollback_failed", "needs_operator") or result == "failed_needs_operator":
+        changed = CHANGED_UNKNOWN
+    elif result == "rolled_back":
+        changed = CHANGED_BACK
+    else:
+        changed = CHANGED_NONE
+    return text, changed, step
+
 # What the web application may ask for through the request inbox (5.48.0). Each is advisory: the application has checked the
 # administrator's step-up approval, root re-validates everything here. Scheduling stays in the application (it never sends a time).
 APP_ACTIONS = ("apply", "rollback", "restore", "clear_failure", "bundle")
@@ -754,19 +863,19 @@ class Updater:
                 dirs[:] = [d for d in dirs if d != ".venv"]
                 files = [f for f in files if f not in (".staged", ".staging")]
             if os.lstat(base).st_mode & 0o6022:
-                raise StepFailed("tree_mismatch", f"{os.path.relpath(base, root)} is writable by others or has a setuid/setgid bit", "staged")
+                raise StepFailed("environment_unexpected", f"{os.path.relpath(base, root)} is writable by others or has a setuid/setgid bit", "staged")
             for d in list(dirs):
                 p = os.path.join(base, d)
                 if os.path.islink(p):
-                    raise StepFailed("tree_mismatch", f"{os.path.relpath(p, root)} is a link", "staged")
+                    raise StepFailed("environment_unexpected", f"{os.path.relpath(p, root)} is a link", "staged")
             for name in files:
                 p = os.path.join(base, name)
                 rel = os.path.relpath(p, root).replace(os.sep, "/")
                 st = os.lstat(p)
                 if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
-                    raise StepFailed("tree_mismatch", f"{rel} is not a plain single-link file", "staged")
+                    raise StepFailed("environment_unexpected", f"{rel} is not a plain single-link file", "staged")
                 if st.st_mode & 0o6022:
-                    raise StepFailed("tree_mismatch", f"{rel} is writable by others or has a setuid/setgid bit", "staged")
+                    raise StepFailed("environment_unexpected", f"{rel} is writable by others or has a setuid/setgid bit", "staged")
                 if "__pycache__" in rel.split("/"):
                     os.unlink(p)
                     continue
@@ -776,12 +885,14 @@ class Updater:
                         h.update(chunk)
                 if rel == "manifest.json":
                     continue
-                if expected.get(rel) != h.hexdigest():
-                    raise StepFailed("tree_mismatch", f"{rel} does not match the signed manifest", "staged")
+                if rel not in expected:
+                    raise StepFailed("release_files_mismatch", f"{rel} is not part of the signed release", "staged")
+                if expected[rel] != h.hexdigest():
+                    raise StepFailed("release_files_mismatch", f"{rel} does not match the signed manifest", "staged")
                 seen.add(rel)
         missing = sorted(set(expected) - seen)
         if missing:
-            raise StepFailed("tree_mismatch", f"{len(missing)} file(s) the manifest lists are missing (first: {missing[0]})", "staged")
+            raise StepFailed("release_files_mismatch", f"{len(missing)} file(s) the manifest lists are missing (first: {missing[0]})", "staged")
         self.check_venv(root)
 
     _INTERPRETER_NAME = re.compile(r"python[0-9]*(\.[0-9]+)?t?")   # t: free-threaded builds (python3.14t)
@@ -837,7 +948,7 @@ class Updater:
         world-writable entry, nothing but plain files, directories and links."""
         venv = os.path.join(root, ".venv")
         if os.path.islink(venv):
-            raise StepFailed("tree_mismatch", ".venv is a link", "staged")
+            raise StepFailed("environment_unexpected", ".venv is a link", "staged")
         real_root = os.path.realpath(root)
         for base, dirs, files in os.walk(venv, followlinks=False):
             for name in dirs + files:
@@ -849,15 +960,15 @@ class Updater:
                     inside = target == real_root or target.startswith(real_root + os.sep)
                     interpreter = self._is_base_interpreter_link(root, rel, target)
                     if not (inside or interpreter):
-                        raise StepFailed("tree_mismatch", f"{rel} is a link that leaves the release directory", "staged")
+                        raise StepFailed("environment_unexpected", f"{rel} is a link that leaves the release directory", "staged")
                     continue
                 if st.st_mode & 0o6022:
-                    raise StepFailed("tree_mismatch", f"{rel} is writable by others or has a setuid/setgid bit", "staged")
+                    raise StepFailed("environment_unexpected", f"{rel} is writable by others or has a setuid/setgid bit", "staged")
                 if stat.S_ISREG(st.st_mode):
                     if st.st_nlink != 1:
-                        raise StepFailed("tree_mismatch", f"{rel} has more than one hard link", "staged")
+                        raise StepFailed("environment_unexpected", f"{rel} has more than one hard link", "staged")
                 elif not stat.S_ISDIR(st.st_mode):
-                    raise StepFailed("tree_mismatch", f"{rel} is not a plain file, directory or link", "staged")
+                    raise StepFailed("environment_unexpected", f"{rel} is not a plain file, directory or link", "staged")
 
     # --- prepare phase (everything before the switch) ----------------------------------------------
     def prepare(self, req):
@@ -910,7 +1021,7 @@ class Updater:
         try:
             self.host.chown_tree(root)
         except ocw_host.HostError as exc:
-            raise StepFailed("tree_mismatch", str(exc), "staged")
+            raise StepFailed("environment_unexpected", str(exc), "staged")
         self.check_tree(root, manifest)
         self.finish("staged", signed_by=info["key_id"], files_verified=len(manifest["files"]), adoption=info["adoption"])
         self.begin("preflight")
@@ -1066,8 +1177,8 @@ class Updater:
         if self.fault("disk_full"):
             free_opt = free_data = 0
         if free_opt < need_opt or free_data < need_data:
-            raise StepFailed("disk_space", f"not enough free disk space (code volume {free_opt // 2**20} MB free, needs {need_opt // 2**20}; "
-                                           f"data volume {free_data // 2**20} MB free, needs {need_data // 2**20})", "preflight",
+            raise StepFailed("disk_space", f"not enough free disk space (code volume {free_opt // 2**20} MB free, needs {need_opt // 2**20} MB; "
+                                           f"data volume {free_data // 2**20} MB free, needs {need_data // 2**20} MB)", "preflight",
                              {"free_opt": free_opt, "free_data": free_data, "need_opt": need_opt, "need_data": need_data})
         waited = 0
         limit = 0 if c.fast else 600
@@ -1513,7 +1624,7 @@ class Updater:
 
     def _history(self):
         line = {k: self.st.get(k) for k in ("correlation_id", "action", "version_from", "version_to", "result", "reason_code",
-                                            "started_at", "updated_at", "action_id", "seconds")}
+                                            "started_at", "updated_at", "action_id", "seconds", "reason_text", "changed", "next_step")}
         line["backup"] = (self.st.get("backup") or {}).get("path")
         line["bundle"] = (self.st.get("bundle") or {}).get("name")
         b = self.st.get("backup") or {}
@@ -1525,10 +1636,16 @@ class Updater:
             os.fsync(fh.fileno())
 
     # --- failure paths -----------------------------------------------------------------------------------
+    def say(self, code, detail=None):
+        """Records what the run's outcome means in plain words (reason_text, changed, next_step) once result is set."""
+        text, changed, step = describe_reason(code, self.st.get("result"), detail, self.st.get("version_from"))
+        self.st.update(reason_text=text, changed=changed, next_step=step)
+
     def fail_before_switch(self, f):
         """Nothing was switched: leave the install exactly as it was."""
         self.st.update(result="failed", reason_code=f.code if f.code in REASONS else "internal_error", failed_step=f.step or self.st.get("step"),
                        error=str(f)[:500])
+        self.say(self.st["reason_code"], str(f))
         self.st["failed_detail"] = f.detail
         self.page_off()
         self.persist()
@@ -1580,6 +1697,7 @@ class Updater:
         secs = round(self.host.now() - t_start, 1)
         self.st.update(result="rolled_back", step="rolled_back", rolled_back_to=target, rollback_seconds=secs,
                        reason_code=(self.st.get("failure") or {}).get("reason_code") if failure else "operator")
+        self.say(self.st["reason_code"], (self.st.get("failure") or {}).get("detail"))
         self.persist()
         if failure is not None and self.st["version_to"] and not getattr(failure, "no_blame", False):
             self.record_failure(self.st["version_to"], self.st["reason_code"])
@@ -1599,6 +1717,7 @@ class Updater:
     def needs_operator(self, why):
         self.st.update(result="failed_needs_operator", step="failed_needs_operator", operator_reason=why[:500],
                        reason_code="rollback_failed")
+        self.say("rollback_failed")
         self.page("needs_operator", "restarting")
         self.persist()
         log("CRIT", "UPGRADE FAILED AND COULD NOT BE ROLLED BACK AUTOMATICALLY. An operator must run `ocw-updater status`. " + why[:300])
@@ -1662,7 +1781,7 @@ class Updater:
         rc, ver = self.host.run(["systemctl", "--version"], 10)
         ver_to = str(self.st.get("version_to"))
         staged = (read_json(os.path.join(c.releases, ver_to, ".staged")) or read_json(os.path.join(c.staging, ver_to, ".staged")) or {})
-        s = {k: self.st.get(k) for k in ("correlation_id", "action", "version_from", "version_to", "result", "reason_code", "failure",
+        s = {k: self.st.get(k) for k in ("correlation_id", "action", "version_from", "version_to", "result", "reason_code", "reason_text", "changed", "next_step", "failure",
                                          "failed_step", "error", "started_at", "updated_at", "seconds", "rollback_seconds",
                                          "steps_done", "health", "rollback_health", "schema_before", "schema_after", "manifest",
                                          "baseline", "signed_by", "sha256", "operator_reason", "preflight")}
@@ -1961,6 +2080,8 @@ class Updater:
             log("WARN", "restore interrupted: the previous database was put back")
         self.page_off()
         self.st.update(result="failed", reason_code="interrupted")
+        text, _changed, step = describe_reason("interrupted")
+        self.st.update(reason_text=text, changed=CHANGED_UNKNOWN, next_step=step)  # a restore that stopped half way: an operator must look
         self.persist()
         self._history()
         self.audit("upgrade.failed", {"reason_code": "interrupted", "detail": "the restore was interrupted; check `ocw-updater status`"})
@@ -2167,7 +2288,9 @@ def reject(up, cid, code, message, name=""):
         cid = "upg-00000000"
     os.makedirs(cfg.rejections, exist_ok=True)
     write_json_atomic(os.path.join(cfg.rejections, f"{cid}.json"), {"correlation_id": cid, "code": code if code in REASONS else "request_invalid",
-                                                                    "message": message[:300], "at": iso(up.host.now())})
+                                                                    "message": message[:300], "at": iso(up.host.now()),
+                                                                    **dict(zip(("reason_text", "changed", "next_step"),
+                                                                               describe_reason(code if code in REASONS else "request_invalid")))})
     up.st = {"correlation_id": cid}
     up.audit("upgrade.request_rejected", {"reason_code": code, "detail": message[:200], "file": name[:80]})
     up.st = None

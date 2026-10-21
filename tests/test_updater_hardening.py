@@ -73,7 +73,7 @@ def test_a_failure_after_the_move_leaves_nothing_the_staging_account_can_reuse(m
     staged(m)
     (m.opt / "staging" / "5.47.0" / "requirements.lock").write_text("# evil\n")
     assert m.updater().apply(m.request("5.47.0", correlation_id="upg-00000104")) == "failed"
-    assert m.read_state()["reason_code"] == "tree_mismatch"
+    assert m.read_state()["reason_code"] == "release_files_mismatch"
     assert not (m.opt / "staging" / "5.47.0").exists()  # moved: the account cannot touch it any more
 
 
@@ -365,7 +365,7 @@ def test_check_tree_walks_the_virtualenv_and_refuses_escaping_links_and_setuid_b
     os.symlink("/etc", root / ".venv" / "lib-evil")
     with pytest.raises(act.StepFailed) as e:
         up.check_tree(str(root), manifest)
-    assert e.value.code == "tree_mismatch" and "leaves the release" in str(e.value)
+    assert e.value.code == "environment_unexpected" and "leaves the release" in str(e.value)
     os.unlink(root / ".venv" / "lib-evil")
     os.symlink("/usr/bin/env", root / ".venv" / "bin" / "helper")                    # only bin/python* may leave
     with pytest.raises(act.StepFailed):

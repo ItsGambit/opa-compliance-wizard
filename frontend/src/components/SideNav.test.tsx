@@ -15,7 +15,7 @@ beforeAll(() => {
   })) as unknown as typeof window.matchMedia
 })
 
-function renderNav(flags: { isAdmin?: boolean; canAdmin?: boolean }) {
+function renderNav(flags: { isAdmin?: boolean; canAdmin?: boolean; canViewOverview?: boolean }) {
   const noop = () => {}
   return render(
     <SideNav
@@ -48,5 +48,19 @@ describe('SideNav admin entries', () => {
     expect(screen.queryAllByText('Audit Log')).toHaveLength(0)
     expect(screen.queryAllByText('Announcement banner')).toHaveLength(0)
     expect(screen.queryAllByText('Access control')).toHaveLength(0)
+  })
+})
+
+describe('SideNav Overview entry (5.51.0)', () => {
+  it('shows the Overview to an administrator and to an archive viewer, not to anyone else', () => {
+    const { unmount } = renderNav({ canAdmin: true })
+    expect(screen.queryAllByText('Overview').length).toBeGreaterThan(0)
+    unmount()
+    const viewer = renderNav({ canAdmin: false, canViewOverview: true })
+    expect(screen.queryAllByText('Overview').length).toBeGreaterThan(0)
+    expect(screen.queryAllByText('Audit Log')).toHaveLength(0)  // a viewer gets the counts, not the admin entries
+    viewer.unmount()
+    renderNav({ canAdmin: false, canViewOverview: false })
+    expect(screen.queryAllByText('Overview')).toHaveLength(0)
   })
 })
