@@ -394,6 +394,10 @@ def test_a_real_virtualenv_built_by_this_python_passes_the_root_check(m, tmp_pat
     root = tmp_path / "release"
     root.mkdir()
     subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(root / ".venv")], check=True)
+    from ocw_host import SystemHost
+    # The production order: root normalises the tree (owner, and no group/other write, whatever the builder's umask)
+    # before it checks it. A runner with umask 002 makes group-writable files, which only this step clears.
+    SystemHost().chown_tree(str(root), os.getuid(), os.getgid())
     m.updater().check_venv(str(root))
 
 
