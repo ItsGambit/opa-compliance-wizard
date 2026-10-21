@@ -1,11 +1,12 @@
 /** 5.48.0: the upgrade flow's screens (artboards 03-11) and the local-mode / channel additions. */
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, fetchUpgradeNotice, fetchUpgradeStatus, fetchVersion, fetchWhoami, requestUpgrade, reviewUpgrade, saveUpgradeSettings } from '../api/client'
+import { ApiError, fetchAuditLog, fetchUpgradeNotice, fetchUpgradeStatus, fetchVersion, fetchWhoami, requestUpgrade, reviewUpgrade, saveUpgradeSettings } from '../api/client'
 import { renderWithClient } from '../test/renderWithClient'
 import { makePreview, makeRun, makeStatus, makeUpgrade, NEWER, TARGET_SHA } from '../test/upgradeFixtures'
+import { toast } from '../hooks/useToast'
 import { beginStepUp } from '../utils/stepUp'
-import { rememberRequested } from '../utils/upgradeRequested'
+import { markBundleRequested, rememberRequested } from '../utils/upgradeRequested'
 import { UpdatesPage } from './UpdatesPage'
 import { UpgradeNoticeBanner } from './UpgradeNoticeBanner'
 
@@ -27,6 +28,7 @@ beforeAll(() => {
 
 beforeEach(() => {
   sessionStorage.clear()
+  localStorage.clear()
   vi.clearAllMocks()
   vi.mocked(fetchWhoami).mockResolvedValue({ email: 'admin@example.com', is_local: false, is_admin: true, can_admin: true })
   vi.mocked(fetchVersion).mockResolvedValue({ version: '5.46.0' })
@@ -52,7 +54,7 @@ describe('03 available, reviewed', () => {
     expect(screen.getByText(/min_upgrade_from/)).toBeTruthy()
     expect(screen.getByText(/Migration 11 is not rollback-safe/)).toBeTruthy()
     expect(screen.getByText('All passed')).toBeTruthy()
-    expect(screen.getByText(/About 50 s\./)).toBeTruthy()
+    expect(screen.getByText(/About 50 seconds\./)).toBeTruthy()
     expect((screen.getByRole('button', { name: /Upgrade now/ }) as HTMLButtonElement).disabled).toBe(false)
     expect((screen.getByRole('button', { name: /Schedule/ }) as HTMLButtonElement).disabled).toBe(false)
   })
@@ -70,10 +72,8 @@ describe('03 available, reviewed', () => {
 
   it.each([
     ['preflight failed', { preview: makePreview({ preflight_ok: false, preflight: [{ id: 'disk_data', ok: false, text: 'Disk, data volume: 1 GB free; 3 GB needed.' }] }) }, /A preflight check failed: Disk, data volume/],
-    ['an operator is needed', { run: makeRun({ result: 'failed_needs_operator', step: 'failed_needs_operator' }) }, /An operator must act on the server/],
     ['the version failed before', { failures: { '5.48.0': { count: 1, last_code: 'health_healthz' } } }, /failed here before.*clear-failure/],
     ['two failures', { failures: { '5.40.0': { count: 1, last_code: 'x' }, '5.41.0': { count: 1, last_code: 'y' } } }, /Two upgrades have failed/],
-    ['already scheduled', { schedule: { correlation_id: 'upg-0000abcd', version: '5.48.0', sha256: TARGET_SHA, when_utc: '2099-01-01T00:00:00Z', entered: null, entered_tz: null, status: 'scheduled', actor_email: null, approved_at: '2026-10-19T16:12:00Z', key_id: null } }, /already scheduled|Upgrade to 5.48.0 scheduled/],
     ['a second approval is pending', { pending_approval: { kind: 'apply', version: '5.48.0', sha256: TARGET_SHA, when_utc: null, entered: null, first_email: 'first@example.com', created_at: '2026-10-19T14:32:00Z', expires_at: '2099-10-20T14:32:00Z', correlation_id: 'upg-0000abce', mine: true } }, /waiting for a second admin|a different admin must approve/],
   ])('the buttons are off with the reason: %s', async (_name, over, text) => {
     vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE(over))
@@ -269,10 +269,10 @@ describe('08a progress', () => {
     for (const err of [new ApiError('Bad Gateway', 502), new ApiError('Service Unavailable', 503), new TypeError('Failed to fetch')]) {
       vi.mocked(fetchUpgradeStatus).mockRejectedValueOnce(err)
       await act(async () => { await client.refetchQueries({ queryKey: ['upgrade_status'] }) })
-      expect(await screen.findByText(/Restarting — this normally takes under a minute/)).toBeTruthy()
+      expect((await screen.findAllByText(/Restarting — this normally takes under a minute/)).length).toBeGreaterThan(0)
       expect(screen.getByText('Upgrading to 5.48.0')).toBeTruthy()
       await act(async () => { await client.refetchQueries({ queryKey: ['upgrade_status'] }) })
-      await waitFor(() => expect(screen.queryByText(/Restarting — this normally/)).toBeNull())
+      await waitFor(() => expect(screen.getAllByText(/Restarting — this normally/)).toHaveLength(1))      // only the explainer card is left
     }
   })
 
@@ -324,7 +324,7 @@ describe('09 success and 10 failure', () => {
     vi.mocked(fetchVersion).mockResolvedValue({ version: '5.48.0' })
     vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({ installed_version: '5.48.0', upgrade: makeUpgrade({ run: makeRun({ health }), rollback: { available: true, until: '2099-01-01T00:00:00Z', to: '5.46.0' } }) }))
     renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
-    expect(await screen.findByText('Upgraded to 5.48.0 in 52 s')).toBeTruthy()
+    expect(await screen.findByText('Upgraded to 5.48.0 in 52 seconds')).toBeTruthy()
     expect(screen.getByText('8 of 8 passed')).toBeTruthy()
     expect(screen.getByText(/Migrations 10 and 11 applied \(schema 9 → 11\)/)).toBeTruthy()
     expect(screen.getByText('sudo ocw-updater rollback')).toBeTruthy()             // the command stays visible as secondary text
@@ -378,15 +378,17 @@ describe('09 success and 10 failure', () => {
     expect(restoreBtn.disabled).toBe(false)
     expect(screen.getByText('sudo ocw-updater restore --confirm RESTORE')).toBeTruthy()
     fireEvent.click(restoreBtn)
-    await waitFor(() => expect(requestUpgrade).toHaveBeenCalledWith({ kind: 'restore', confirm: 'RESTORE' }))
+    await waitFor(() => expect(requestUpgrade).toHaveBeenCalledWith({ kind: 'restore', confirm: 'RESTORE', backup: 'audit_store-pre-5.48.0-20261021T023005Z.db' }))
   })
 
-  it('needs an operator: says so, offers no upgrade, no restore', async () => {
+  it('needs an operator: says so, offers no upgrade, no restore and no clear-failure button (the command is shown instead)', async () => {
     vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ run: makeRun({ result: 'failed_needs_operator', step: 'failed_needs_operator', reason_code: 'rollback_failed', operator_reason: 'health checks failed after the rollback', bundle: null }) }))
     renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
     expect(await screen.findByText('The upgrade to 5.48.0 failed and could not be rolled back automatically')).toBeTruthy()
     expect(screen.getByText(/An operator must act on the server\./, { selector: 'strong' })).toBeTruthy()
-    expect((screen.getByRole('button', { name: /Upgrade now/ }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByText('sudo ocw-updater clear-failure', { selector: 'code' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /Upgrade now/ })).toBeNull()      // the page is the result, nothing else
+    expect(screen.queryByRole('button', { name: /Clear failure/ })).toBeNull()
     expect(screen.queryByText('Restore the pre-upgrade archive copy')).toBeNull()
   })
 
@@ -454,19 +456,19 @@ describe('the notice banner (every signed-in user)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss announcement' }))
     expect(screen.queryByText(/Scheduled maintenance/)).toBeNull()
   })
-  it('running and failed stay, and only admins get the link', async () => {
+  it('running stays (no dismiss) and has no link', async () => {
     await show({ kind: 'running', version: '5.48.0', started_at: '2026-10-21T02:30:00Z' }, true)
     expect(await screen.findByText(/Upgrade to 5.48.0 in progress/)).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Open the Updates page' })).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Dismiss announcement' })).toBeNull()
   })
   it('failed and rolled back is an alert', async () => {
     await show({ kind: 'failed', result: 'rolled_back', version: '5.48.0', rolled_back_to: '5.46.0', at: '2026-10-21T02:31:00Z' })
     expect((await screen.findByRole('alert')).textContent).toMatch(/rolled back automatically.*5\.46\.0/)
   })
-  it('nothing for none, and "available" is the admin banner, not this one', async () => {
+  it('available is for admins and says where to go; dismissible', async () => {
     await show({ kind: 'available', version: '5.48.0' }, true)
-    await waitFor(() => expect(fetchUpgradeNotice).toHaveBeenCalled())
+    expect(await screen.findByText('Version 5.48.0 of OPA Compliance Wizard is available. Admins can review and upgrade from the Updates page.')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss announcement' }))
     expect(screen.queryByRole('status')).toBeNull()
   })
 })
@@ -480,33 +482,22 @@ describe('backups table (artboard 01) and operations in flight', () => {
   ]
   const withBackups = (backups = ROWS) => makeStatus({ upgrade: makeUpgrade({ backups: { backups, updated_at: '2026-10-19T00:00:00Z', total_bytes: 3e9 } }) })
 
-  it('lists the copies newest first with size and integrity, and never offers a delete for a single copy', async () => {
-    vi.mocked(fetchUpgradeStatus).mockResolvedValue(withBackups([ROWS[0]]))
-    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
-    expect(await screen.findByText('Pre-upgrade backups')).toBeTruthy()
-    expect(screen.getAllByText(/5.46.0 ·/).length).toBeGreaterThan(0)
-    expect((screen.getByRole('button', { name: /Delete older backups/ }) as HTMLButtonElement).disabled).toBe(true)
-  })
-
-  it('deleting is typed, shows what goes, keeps the newest, and then asks for MFA', async () => {
+  it('lists the copies newest first with size and integrity; deleting is a command only, with the reason', async () => {
     vi.mocked(fetchUpgradeStatus).mockResolvedValue(withBackups())
-    vi.mocked(requestUpgrade).mockResolvedValue(STEP_UP)
     renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
     const rows = (await screen.findAllByText(/·/)).filter(el => el.tagName === 'TD')
     expect(rows[0].textContent).toMatch(/^5\.46\.0/)                   // newest first
     expect(screen.getByText('not recorded')).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: /Delete older backups/ }))
-    const dlg = await screen.findByRole('dialog')
-    expect(within(dlg).getByText(/This deletes 2 backups/)).toBeTruthy()
-    const del = within(dlg).getByRole('button', { name: 'Delete' }) as HTMLButtonElement
-    expect(del.disabled).toBe(true)
-    fireEvent.change(within(dlg).getByLabelText(/Type PRUNE/), { target: { value: 'PRUNE' } })
-    fireEvent.change(within(dlg).getByLabelText('Number of newest backups to keep'), { target: { value: '2' } })
-    expect(within(dlg).getByText(/This deletes 1 backup /)).toBeTruthy()
-    fireEvent.click(del)
-    await waitFor(() => expect(requestUpgrade).toHaveBeenCalledWith({ kind: 'prune_backups', confirm: 'PRUNE', keep_last: 2 }))
-    await waitFor(() => expect(beginStepUp).toHaveBeenCalled())
-    expect(within(dlg).getByLabelText('Number of newest backups to keep')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /Delete older backups/ })).toBeNull()
+    expect(screen.getByText(/Deleting the only copies of the archive the web application cannot touch needs shell access/)).toBeTruthy()
+    expect(screen.getByLabelText('Delete older backups command').textContent).toBe('sudo ocw-updater prune-backups --keep N --confirm PRUNE')
+    expect(requestUpgrade).not.toHaveBeenCalled()
+  })
+
+  it('says so when the server has not published a backups list yet', async () => {
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({ upgrade: makeUpgrade({ backups: null }) }))
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    expect(await screen.findByText('Backups will be listed after the first upgrade with this version.')).toBeTruthy()
   })
 
   it('a rollback the browser just asked for shows as "Rolling back", and a refusal of it as a refusal', async () => {
@@ -518,5 +509,177 @@ describe('backups table (artboard 01) and operations in flight', () => {
     vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ rejection: { correlation_id: 'upg-aaaa0001', code: 'rollback_unavailable', message: 'the 24-hour window', at: null } }))
     renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
     expect(await screen.findByText('The updater refused: the rollback')).toBeTruthy()
+  })
+})
+
+describe('mockup fidelity (round 3)', () => {
+  it('03: Upgrade now / Schedule sit below the rows, the key id is bold, migrations say what they do, sizes read like the mockup', async () => {
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE())
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    const title = await screen.findByText('5.48.0 is available')
+    const lastCheck = screen.getByText('Last check')
+    const upgrade = screen.getByRole('button', { name: /Upgrade now/ })
+    expect(lastCheck.compareDocumentPosition(upgrade) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(screen.getByText('Both continue to a confirmation screen that shows exactly what changes, then a step-up MFA approval. Nothing is installed before that.')).toBeTruthy()
+    expect(title.parentElement?.querySelector('code.font-bold')?.textContent).toBe('E7620F1842B4E81F')
+    expect(screen.getByRole('columnheader', { name: 'What it does' })).toBeTruthy()
+    expect(screen.queryByText('Crosses')).toBeNull()                                   // no release list known: no row
+  })
+
+  it('03: a Crosses row appears when the server lists the skipped releases', async () => {
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ preview: makePreview({ crosses: ['5.47.0'] }) }))
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    expect(await screen.findByText('Crosses')).toBeTruthy()
+    expect(screen.getByText(/5\.47\.0 \(skipped release\)/)).toBeTruthy()
+  })
+
+  it('05a: the version line says what it crosses, the backup paragraph names the directory and free space, the README link is real', async () => {
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ preview: makePreview({ crosses: ['5.47.0'], backup_dir: '/var/lib/example/upgrade/backups', free_bytes: { opt: 41_200_000_000, data: 118_000_000_000 } }) }))
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    fireEvent.click(await screen.findByRole('button', { name: /Upgrade now/ }))
+    await screen.findByText('Confirm the upgrade to 5.48.0')
+    expect(screen.getByText(/\(crosses 5\.47\.0\)/)).toBeTruthy()
+    expect(screen.getByText('/var/lib/example/upgrade/backups/')).toBeTruthy()
+    expect(screen.getByText(/118\.0 GB on the data volume, 41\.2 GB on the code volume/)).toBeTruthy()
+    const link = screen.getByRole('link', { name: 'Rollback and restore, in the README' }) as HTMLAnchorElement
+    expect(link.href).toContain('README.md#rollback-is-code-only-restoring-data-is-a-separate-typed-decision')
+    expect(screen.getByText(/adds the upgrade_schedule table|Adds the upgrade_schedule table/i, { exact: false })).toBeTruthy()
+  })
+
+  it('header: the page tells the app what to say while it runs and when it is a full page', async () => {
+    const onHeader = vi.fn()
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ run: makeRun({ result: null, step: 'switching', seconds: null }) }))
+    const { unmount } = renderWithClient(<UpdatesPage onOpenKeys={() => {}} onHeader={onHeader} />)
+    await screen.findByText('Upgrading to 5.48.0')
+    await waitFor(() => expect(onHeader).toHaveBeenLastCalledWith({ subtitle: 'Upgrading 5.46.0 → 5.48.0. The updater runs on the server; closing this tab does not stop it. This page polls every 2 seconds.', fullPage: false }))
+    unmount()
+    onHeader.mockClear()
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE())
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} onHeader={onHeader} />)
+    fireEvent.click(await screen.findByRole('button', { name: /Upgrade now/ }))
+    await waitFor(() => expect(onHeader).toHaveBeenLastCalledWith({ subtitle: null, fullPage: true }))
+  })
+
+  it('06: after the approval only the explainer and the Starting card show; Received stays with Follow progress until followed', async () => {
+    rememberRequested({ correlationId: 'upg-7f3a9c2e', version: '5.48.0', approvedAt: new Date().toISOString(), email: 'admin@example.com', stepUp: true })
+    const early = makeRun({ result: null, step: 'validated', seconds: null, steps_done: [] })
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ run: early }))
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    expect(await screen.findByText("How the approval travels (OCW's existing step-up pattern, unchanged)")).toBeTruthy()
+    expect(screen.getByText('Received by the updater')).toBeTruthy()
+    expect(screen.queryByText('5.48.0 is available')).toBeNull()                       // the available card and the rest are hidden
+    expect(screen.queryByText('Release signing keys')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Follow progress' }))
+    expect(await screen.findByText('Upgrading to 5.48.0')).toBeTruthy()
+    expect(screen.getByText('While the server restarts')).toBeTruthy()
+    expect(screen.queryByText('Release signing keys')).toBeNull()                       // nothing unrelated during a run
+  })
+
+  it('07: a schedule replaces the available card with the installed version (Check now off) and the events of this upgrade', async () => {
+    const SCHED = { correlation_id: 'upg-7f3a9c2e', version: '5.48.0', sha256: TARGET_SHA, when_utc: '2099-10-21T02:30:00Z', entered: 'Europe/London 03:30', entered_tz: 'Europe/London', status: 'scheduled' as const, actor_email: 'admin@example.com', approved_at: '2026-10-19T16:12:00Z', key_id: 'E7620F1842B4E81F' }
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ schedule: SCHED }))
+    vi.mocked(fetchAuditLog).mockResolvedValue({ entries: [
+      { timestamp: '2026-10-19T16:13:00Z', actor_email: null, actor_sub: null, action: 'upgrade.staged', details: { correlation_id: 'upg-7f3a9c2e', trigger: 'ocw-updater' } },
+      { timestamp: '2026-10-19T16:12:00Z', actor_email: 'admin@example.com', actor_sub: 'x', action: 'upgrade.scheduled', details: { correlation_id: 'upg-7f3a9c2e', step_up_verified: true } },
+      { timestamp: '2026-10-19T15:40:00Z', actor_email: 'admin@example.com', actor_sub: 'x', action: 'upgrade.check', details: { correlation_id: 'other' } },
+    ] })
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    expect(await screen.findByText('Upgrade to 5.48.0 scheduled')).toBeTruthy()
+    expect(screen.getByText('Installed version')).toBeTruthy()
+    expect(screen.queryByText('5.48.0 is available')).toBeNull()
+    expect((screen.getByRole('button', { name: /Check now/ }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByText('Ready')).toBeTruthy()
+    expect(await screen.findByText('Events for this upgrade')).toBeTruthy()
+    expect(await screen.findByText('upgrade.staged')).toBeTruthy()
+    expect(screen.getAllByText('upgrade.scheduled').length).toBeGreaterThan(0)
+    expect(screen.queryByText('upgrade.check')).toBeNull()                              // only entries with this correlation id
+    expect(screen.getByText('Signed hash approved')).toBeTruthy()                       // never "Staged and verified": the run does not say so
+  })
+
+  it('09: the success page names who approved it, how it ran, the outage and the updater, and opens the audit log filtered', async () => {
+    vi.mocked(fetchVersion).mockResolvedValue({ version: '5.48.0' })
+    const health = ['unit_active', 'version', 'healthz', 'gate_401', 'quick_check', 'schema_version', 'chain_heads', 'smoke_read'].map(id => ({ id, ok: true, detail: '' }))
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({ installed_version: '5.48.0', upgrade: makeUpgrade({ run: makeRun({ health, seconds: 52,
+      steps_done: [{ step: 'switching', at: '2026-10-21T02:30:22Z', seconds: 10 }, { step: 'restarting', at: '2026-10-21T02:30:32Z', seconds: 21 }, { step: 'health_check', at: '2026-10-21T02:30:53Z', seconds: 10 }] }),
+      rollback: { available: true, until: '2099-01-01T00:00:00Z', to: '5.46.0' } }) }))
+    vi.mocked(fetchAuditLog).mockResolvedValue({ entries: [
+      { timestamp: '2026-10-21T02:30:54Z', actor_email: null, actor_sub: null, action: 'upgrade.completed', details: { correlation_id: 'upg-7f3a9c2e', notes: { updater: 'updated' } } },
+      { timestamp: '2026-10-21T02:30:02Z', actor_email: null, actor_sub: null, action: 'upgrade.started', details: { correlation_id: 'upg-7f3a9c2e', trigger_kind: 'schedule 2026-10-21T02:30:00Z' } },
+      { timestamp: '2026-10-19T16:12:00Z', actor_email: 'admin@example.com', actor_sub: 'x', action: 'upgrade.scheduled', details: { correlation_id: 'upg-7f3a9c2e', step_up_verified: true } },
+    ] })
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    expect(await screen.findByText('Upgraded to 5.48.0 in 52 seconds')).toBeTruthy()
+    expect(await screen.findByText(/admin@example.com · .* · step-up MFA verified/)).toBeTruthy()
+    expect(screen.getByText(/scheduled for .*· started /)).toBeTruthy()
+    expect(screen.getByText(/The service was unavailable for 41 s\./)).toBeTruthy()
+    expect(screen.getByText('Activator updated itself to 5.48.0 after re-verifying the release')).toBeTruthy()
+    expect(screen.getByText('upgrade/backups/audit_store-pre-5.48.0-20261021T023005Z.db')).toBeTruthy()
+    expect(screen.queryByText('Installed version')).toBeNull()                          // the mockup's page is the result only
+    fireEvent.click(await screen.findByRole('button', { name: /View the 3 audit entries for this upgrade/ }))
+    expect(sessionStorage.getItem('opa.auditSearch')).toBe('upg-7f3a9c2e')
+    expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Upgraded to 5.48.0', description: expect.stringContaining('The page reloaded on the new version') }))
+  })
+
+  it('10: the failure page tells the story with times, links the audit entries, and builds on the bundle name', async () => {
+    vi.mocked(fetchAuditLog).mockResolvedValue({ entries: [
+      { timestamp: '2026-10-19T16:12:00Z', actor_email: 'admin@example.com', actor_sub: 'x', action: 'upgrade.requested', details: { correlation_id: 'upg-7f3a9c2e', step_up_verified: true } },
+      { timestamp: '2026-10-21T02:31:58Z', actor_email: null, actor_sub: null, action: 'upgrade.failed', details: { correlation_id: 'upg-7f3a9c2e' } },
+    ] })
+    const run = makeRun({ result: 'rolled_back', step: 'rolled_back', reason_code: 'health_healthz', rolled_back_to: '5.46.0', updated_at: '2026-10-21T02:31:58Z', seconds: 116,
+      steps_done: [{ step: 'switching', at: '2026-10-21T02:30:54Z', seconds: 1 }],
+      failure: { step: 'health_check', reason_code: 'health_healthz', detail: 'x', at: '2026-10-21T02:31:14Z' },
+      health: [{ id: 'unit_active', ok: true, detail: '' }, { id: 'healthz', ok: false, detail: '/healthz reported degraded: archive index rebuild incomplete' }],
+      rollback_health: Array.from({ length: 8 }, (_, i) => ({ id: `c${i}`, ok: true, detail: '' })),
+      bundle: { name: 'ocw-support-5.46.0-to-5.48.0-20261021T023158Z-k4q9.tar.gz', size: 1_800_000, sha256: 'c7a0e2' + '0'.repeat(52) + '91fd' } })
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ run, failures: { '5.48.0': { count: 1, last_code: 'health_healthz' } } }))
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    expect(await screen.findByText('The upgrade to 5.48.0 failed and was rolled back automatically')).toBeTruthy()
+    expect(screen.getByText(/\d+ s after the switch/)).toBeTruthy()
+    expect(screen.getByText(/Rollback health checks passed at/)).toBeTruthy()
+    expect(await screen.findByRole('button', { name: '2 audit entries' })).toBeTruthy()
+    expect(screen.getByText(/admin@example.com · .* · step-up MFA verified/)).toBeTruthy()
+    expect(screen.getByText(/the updater on the server at /)).toBeTruthy()
+    expect(screen.getByText(/e-mail addresses → /)).toBeTruthy()
+    expect(screen.getByRole('link', { name: 'SECURITY.md' })).toBeTruthy()
+    expect(screen.queryByText(/Email this file/)).toBeNull()
+    expect(screen.getByText(/the copy taken at /)).toBeTruthy()
+    // the mockup ends after the restore card: no available card, what's new, settings or keys below
+    for (const t of ['5.48.0 is available', "What's new", 'Update check', 'Release signing keys']) expect(screen.queryByText(t)).toBeNull()
+  })
+
+  it('operations are off with the command to run when the installed updater predates them', async () => {
+    const run = makeRun({ result: 'rolled_back', step: 'rolled_back', reason_code: 'health_healthz', rolled_back_to: '5.46.0', failure: { step: 'health_check', reason_code: 'health_healthz', detail: '', at: null },
+      bundle: { name: 'ocw-support-5.46.0-to-5.48.0-20261021T023158Z-k4q9.tar.gz', size: 1_800_000, sha256: 'ab'.repeat(32) } })
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({ upgrade: makeUpgrade({ run, failures: { '5.48.0': { count: 1, last_code: 'x' } }, updater: { ready: true, reason: null, activator: '5.47.0', message: '' } }) }))
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    await screen.findByText('The upgrade to 5.48.0 failed and was rolled back automatically')
+    expect(screen.getAllByText(/Update the server's updater first: sudo server\/install\.sh --refresh-updater/).length).toBeGreaterThan(0)
+    expect((screen.getByRole('button', { name: /Clear failure/ }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: /Restore pre-upgrade copy/ }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('a 409 activator_too_old from the server switches the operations off in the same way', async () => {
+    const run = makeRun({ result: 'completed' })
+    vi.mocked(fetchVersion).mockResolvedValue({ version: '5.48.0' })
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({ installed_version: '5.48.0', upgrade: makeUpgrade({ run, rollback: { available: true, until: '2099-01-01T00:00:00Z', to: '5.46.0' } }) }))
+    vi.mocked(requestUpgrade).mockRejectedValue(new ApiError('too old', 409, { error: 'x', reason: 'activator_too_old' }))
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    fireEvent.click(await screen.findByRole('button', { name: /Create a support bundle/ }))
+    await waitFor(() => expect(requestUpgrade).toHaveBeenCalled())
+    await waitFor(() => expect((screen.getByRole('button', { name: /Create a support bundle/ }) as HTMLButtonElement).disabled).toBe(true))
+    expect(screen.getAllByText(/Update the server's updater first/).length).toBeGreaterThan(0)
+  })
+})
+
+describe('bundle rebuild cool-down', () => {
+  it('the rebuild and the on-demand bundle buttons stay off for five minutes after a request', async () => {
+    markBundleRequested()
+    const run = makeRun({ result: 'rolled_back', step: 'rolled_back', reason_code: 'health_healthz', rolled_back_to: '5.46.0', failure: { step: 'health_check', reason_code: 'health_healthz', detail: '', at: null },
+      bundle: { name: 'ocw-support-5.46.0-to-5.48.0-20261021T023158Z-k4q9.tar.gz', size: 1_800_000, sha256: 'ab'.repeat(32) } })
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ run, failures: { '5.48.0': { count: 1, last_code: 'x' } } }))
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    await screen.findByText('The upgrade to 5.48.0 failed and was rolled back automatically')
+    fireEvent.click(screen.getByRole('checkbox', { name: /Include host names and environment names unredacted/ }))
+    expect((screen.getByRole('button', { name: /Rebuild with host names/ }) as HTMLButtonElement).disabled).toBe(true)
   })
 })

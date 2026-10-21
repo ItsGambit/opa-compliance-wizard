@@ -1,42 +1,51 @@
 {
   "schema": 1,
-  "comment": "One entry per migration in audit_store.MIGRATIONS (tests/test_migration_rollback_safety.py keeps them in step). rollback_safe: the PREVIOUS release's code still works on a database at this schema, so a code-only rollback is safe. A migration that drops or renames something older code reads is false: then restoring the pre-upgrade archive copy is the only way back, and the confirmation screen says so.",
+  "comment": "One entry per migration in audit_store.MIGRATIONS (tests/test_migration_rollback_safety.py keeps them in step). rollback_safe: the PREVIOUS release's code still works on a database at this schema, so a code-only rollback is safe. A migration that drops or renames something older code reads is false: then restoring the pre-upgrade archive copy is the only way back, and the confirmation screen says so. description: one plain-language line shown on the Updates page's confirmation (what the migration does).",
   "migrations": {
     "1": {
       "since": "5.29.0",
-      "rollback_safe": true
+      "rollback_safe": true,
+      "description": "Creates the unified archive schema (environments, schedules, banner, events, sync state)"
     },
     "2": {
       "since": "5.29.0",
-      "rollback_safe": true
+      "rollback_safe": true,
+      "description": "Adds the hash-chained ingestion manifests"
     },
     "3": {
       "since": "5.31.0",
-      "rollback_safe": true
+      "rollback_safe": true,
+      "description": "Adds the pending admin actions that bind a step-up approval to the exact change"
     },
     "4": {
       "since": "5.34.0",
-      "rollback_safe": false
+      "rollback_safe": false,
+      "description": "Drops the retired preserve-logs-locally column"
     },
     "5": {
       "since": "5.40.0",
-      "rollback_safe": true
+      "rollback_safe": true,
+      "description": "Adds indexes for the service-accounts report"
     },
     "6": {
       "since": "5.40.2",
-      "rollback_safe": true
+      "rollback_safe": true,
+      "description": "Adds evidence chain v2 fields and sync-attempt tracking"
     },
     "7": {
       "since": "5.40.4",
-      "rollback_safe": true
+      "rollback_safe": true,
+      "description": "Adds manifest entries and chain heads (evidence chain v2 goes live)"
     },
     "8": {
       "since": "5.42.0",
-      "rollback_safe": true
+      "rollback_safe": true,
+      "description": "Adds shared-environment permissions"
     },
     "9": {
       "since": "5.43.0",
-      "rollback_safe": true
+      "rollback_safe": true,
+      "description": "Adds per-user shared-permission exceptions and known identities"
     }
   }
 }

@@ -22,10 +22,9 @@ import { SecretsAccessDashboard } from './components/SecretsAccessDashboard'
 import { ServiceAccountsDashboard } from './components/ServiceAccountsDashboard'
 import { REPORTS_SUB_TABS, SideNav } from './components/SideNav'
 import { UserMenu } from './components/UserMenu'
-import { UpdateBanner } from './components/UpdateBanner'
 import { UpgradeNoticeBanner } from './components/UpgradeNoticeBanner'
-import { rememberRequested } from './utils/upgradeRequested'
-import { UpdatesPage } from './components/UpdatesPage'
+import { markBundleRequested, rememberRequested } from './utils/upgradeRequested'
+import { UpdatesPage, type UpdatesHeader } from './components/UpdatesPage'
 import { UpdateKeysPage } from './components/UpdateKeysPage'
 import { environmentScopeKey } from './utils/environmentRows'
 import { canAdminFrom } from './utils/whoami'
@@ -54,6 +53,8 @@ export default function App() {
   const [aboutOpen, setAboutOpen] = useState(false)
   const [orphansOpen, setOrphansOpen] = useState(false)
   const [sharedPermissionsOpen, setSharedPermissionsOpen] = useState(false)
+  // 5.48.0: the Updates page tells the header what to say in each state (progress, starting) and when it is a full page (confirmation).
+  const [updatesHeader, setUpdatesHeader] = useState<UpdatesHeader>({ subtitle: null, fullPage: false })
   // 5.42.0: an Environments change whose step-up approval didn't complete --
   // its screen reopens with the user's input (see utils/stepUp.ts).
   const [restore, setRestore] = useState<Extract<PendingStepUp, { kind: 'environment_change' }> | null>(null)
@@ -125,14 +126,15 @@ export default function App() {
         // 5.48.0: an upgrade request the gate just approved (now / schedule / reschedule / cancel / second approval).
         const kind = String(resp.kind ?? '')
         const version = typeof resp.version === 'string' ? resp.version : null
-        const OPS: Record<string, string> = { rollback: 'Rollback', restore: 'Restore', clear_failure: 'Clear failure', bundle: 'Support bundle', prune_backups: 'Delete backups' }
+        const OPS: Record<string, string> = { rollback: 'Rollback', restore: 'Restore', clear_failure: 'Clear failure', bundle: 'Support bundle' }
         const label = OPS[kind] ? 'requested' : kind === 'cancel' ? 'cancelled' : resp.awaiting_second_approval ? 'waiting for a second admin'
           : kind === 'schedule' ? 'scheduled' : kind === 'reschedule' ? 'rescheduled' : 'requested'
         if ((kind === 'apply' || kind === 'approve_second') && typeof resp.correlation_id === 'string' && !resp.awaiting_second_approval) {
           rememberRequested({ correlationId: resp.correlation_id, version: version ?? '', approvedAt: new Date().toISOString(), email: whoami?.email ?? null, stepUp: true })
-        } else if (['rollback', 'restore', 'clear_failure', 'bundle', 'prune_backups'].includes(kind) && typeof resp.correlation_id === 'string') {
+        } else if (['rollback', 'restore', 'clear_failure', 'bundle'].includes(kind) && typeof resp.correlation_id === 'string') {
           rememberRequested({ correlationId: resp.correlation_id, version: '', approvedAt: new Date().toISOString(), email: whoami?.email ?? null, stepUp: true,
-            kind: kind as 'rollback' | 'restore' | 'clear_failure' | 'bundle' | 'prune_backups' })
+            kind: kind as 'rollback' | 'restore' | 'clear_failure' | 'bundle' })
+          if (kind === 'bundle') markBundleRequested()
         }
         toast({
           title: OPS[kind] ? `${OPS[kind]}: requested` : kind === 'cancel' ? 'Upgrade request cancelled' : `Upgrade${version ? ` to ${version}` : ''}: ${label}`,
@@ -245,7 +247,6 @@ export default function App() {
   return (
     <div className="flex flex-col h-dvh">
       <AnnouncementBanner />
-      <UpdateBanner canAdmin={canAdmin} onOpenUpdates={() => setActiveTab('updates')} />
       <UpgradeNoticeBanner canAdmin={canAdmin} onOpenUpdates={() => setActiveTab('updates')} />
       <div className="flex flex-1 min-h-0">
         <SideNav
@@ -270,6 +271,7 @@ export default function App() {
         <EnvironmentScope scopeKey={scopeKey}>
         <AccessModelProvider>
         <main className="flex-1 overflow-y-auto px-8 py-6 flex flex-col gap-5">
+          {!(activeTab === 'updates' && updatesHeader.fullPage) && (
           <header className="flex items-start justify-between">
             <div>
               <h1 className="text-lg font-semibold text-text">
@@ -296,7 +298,7 @@ export default function App() {
                 {activeTab === 'audit_log' &&
                   'Every write action across every environment and user — admin-only, for compliance visibility.'}
                 {activeTab === 'updates' &&
-                  'Check for signed releases and see every update step in the audit log. Admin-only.'}
+                  (updatesHeader.subtitle ?? 'Check for signed releases, upgrade now or on a schedule, and see every upgrade step in the audit log. Admin-only.')}
                 {activeTab === 'update_keys' &&
                   'The keys this install trusts for release signatures. A primary signs releases; the offline standby can only sign a revocation that replaces a primary. A primary can never change the standby or undo a revocation.'}
               </p>
@@ -308,6 +310,7 @@ export default function App() {
               <UserMenu />
             </div>
           </header>
+          )}
 
           <SharedEnvironmentNotice />
 
@@ -319,7 +322,7 @@ export default function App() {
           {activeTab === 'access' && <AccessExplorer subTab={accessSubTab} />}
           {activeTab === 'builder' && <FolderBuilder />}
           {activeTab === 'audit_log' && canAdmin && <AuditLogPage />}
-          {activeTab === 'updates' && canAdmin && <UpdatesPage onOpenKeys={() => setActiveTab('update_keys')} />}
+          {activeTab === 'updates' && canAdmin && <UpdatesPage onOpenKeys={() => setActiveTab('update_keys')} onHeader={setUpdatesHeader} />}
           {activeTab === 'update_keys' && canAdmin && <UpdateKeysPage onBack={() => setActiveTab('updates')} />}
 
           <Footer />

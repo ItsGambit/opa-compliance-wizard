@@ -6,7 +6,7 @@ import { useUpgradeStatus, useVersion, useWhoami } from '../api/hooks'
 import { toast } from '../hooks/useToast'
 import type { UpgradeStatus } from '../types'
 import { clearRequested, readRequested, type RequestedUpgrade } from '../utils/upgradeRequested'
-import { isFailureResult, isRunning } from '../utils/upgradeFlow'
+import { UPGRADE_STEPS, browserZone, isFailureResult, isRunning, serverZoneOf } from '../utils/upgradeFlow'
 import { formatDateTime } from '../utils/format'
 import { describeCheckFailure, frequencyLabel, updateState } from '../utils/upgrade'
 import { UpdateCheckForm } from './UpdateCheckForm'
@@ -14,11 +14,11 @@ import { AvailableSection } from './upgrade/AvailableSection'
 import { BackupsCard } from './upgrade/BackupsCard'
 import { ConfirmUpgrade, type ConfirmMode } from './upgrade/ConfirmUpgrade'
 import { Badge, CARD_TITLE, CommandBlock, KeyId, KV, Row } from './upgrade/parts'
-import { ProgressCard } from './upgrade/ProgressCard'
+import { ProgressCard, WhileRestarting } from './upgrade/ProgressCard'
 import { FailureCards, SuccessCards } from './upgrade/ResultCards'
-import { ScheduledCard } from './upgrade/ScheduledCard'
+import { EventsCard, ScheduledCard } from './upgrade/ScheduledCard'
 import { ScheduleDialog, type ScheduleChoice } from './upgrade/ScheduleDialog'
-import { StartingCard } from './upgrade/StartingCard'
+import { ApprovalTravels, StartingCard } from './upgrade/StartingCard'
 
 export { Badge, KeyId } from './upgrade/parts'
 
@@ -27,7 +27,7 @@ function clockSkewSeconds(status: UpgradeStatus): number {
   return Math.round(Math.abs(new Date(status.server.time).getTime() - Date.now()) / 1000)
 }
 
-function StatusCard({ status, onCheckNow, checking, disabled }: { status: UpgradeStatus; onCheckNow: () => void; checking: boolean; disabled?: boolean }) {
+function StatusCard({ status, onCheckNow, checking, disabled, compact }: { status: UpgradeStatus; onCheckNow: () => void; checking: boolean; disabled?: boolean; compact?: boolean }) {
   const state = updateState(status)
   const { latest, last_check: last, check } = status
   const skew = clockSkewSeconds(status)
@@ -38,12 +38,12 @@ function StatusCard({ status, onCheckNow, checking, disabled }: { status: Upgrad
         <div className="min-w-0 flex-1">
           <h2 className={CARD_TITLE} id="t-status">
             Installed version
-            {state === 'up_to_date' && <Badge tone="ok"><CheckCircle2 size={12} aria-hidden="true" />Up to date</Badge>}
-            {state === 'update_available' && <Badge tone="acc"><Download size={12} aria-hidden="true" />Update available</Badge>}
-            {state === 'failed' && <Badge tone="warn"><AlertTriangle size={12} aria-hidden="true" />Last check failed</Badge>}
-            {(state === 'not_enabled') && <Badge tone="neu">Update check not enabled</Badge>}
-            {state === 'off' && <Badge tone="neu">Update check off</Badge>}
-            {state === 'waiting' && <Badge tone="neu">Waiting for the first check</Badge>}
+            {!compact && state === 'up_to_date' && <Badge tone="ok"><CheckCircle2 size={12} aria-hidden="true" />Up to date</Badge>}
+            {!compact && state === 'update_available' && <Badge tone="acc"><Download size={12} aria-hidden="true" />Update available</Badge>}
+            {!compact && state === 'failed' && <Badge tone="warn"><AlertTriangle size={12} aria-hidden="true" />Last check failed</Badge>}
+            {!compact && (state === 'not_enabled') && <Badge tone="neu">Update check not enabled</Badge>}
+            {!compact && state === 'off' && <Badge tone="neu">Update check off</Badge>}
+            {!compact && state === 'waiting' && <Badge tone="neu">Waiting for the first check</Badge>}
           </h2>
           <div className={KV}>
             <Row label="Installed">
@@ -57,28 +57,43 @@ function StatusCard({ status, onCheckNow, checking, disabled }: { status: Upgrad
             </Row>
             {last.at && (
               <Row label="Last check">
-                {formatDateTime(last.at)} · result: {last.status === 'ok' ? (status.update_available ? 'newer release found' : 'up to date') : describeCheckFailure(last.code)}
-                {last.by && <> · by {last.by.replace(/^admin:/, '')} (Check now)</>}
-                {last.next_at && check.frequency === 'daily' && <> · next automatic check {formatDateTime(last.next_at)}</>}
+                {formatDateTime(last.at)} · {compact ? (last.status === 'ok' ? (status.update_available ? 'a newer release was found' : 'up to date') : describeCheckFailure(last.code)) : <>result: {last.status === 'ok' ? (status.update_available ? 'newer release found' : 'up to date') : describeCheckFailure(last.code)}</>}
+                {!compact && last.by && <> · by {last.by.replace(/^admin:/, '')} (Check now)</>}
+                {!compact && last.next_at && check.frequency === 'daily' && <> · next automatic check {formatDateTime(last.next_at)}</>}
               </Row>
             )}
-            {!check.prompt_needed && <Row label="Server clock">
+            {status.upgrade && !check.prompt_needed && (
+              <Row label="Updater">
+                {status.upgrade.updater.ready
+                  ? <><Badge tone="ok">Ready</Badge> ocw-updater {status.upgrade.updater.activator ?? ''}</>
+                  : <><Badge tone="warn">Not ready</Badge> {status.upgrade.updater.message}</>}
+              </Row>
+            )}
+            {!check.prompt_needed && !compact && <Row label="Server clock">
               {formatDateTime(status.server.time)}{status.server.zone && <> ({status.server.zone})</>} ·{' '}
               {skew <= 5 ? `your browser agrees within ${Math.max(skew, 1)} s` : <span className="text-warn">your browser differs by {skew} s</span>}
             </Row>}
           </div>
         </div>
-        {check.prompt_needed ? null : <div className="flex gap-2 flex-wrap items-center shrink-0">
+        {check.prompt_needed || compact ? null : <div className="flex gap-2 flex-wrap items-center shrink-0">
           <button type="button" className="btn-secondary !text-text-dim" onClick={onCheckNow} disabled={!canCheck || checking || !!disabled}
             title={canCheck ? (disabled ? 'Disabled while an upgrade is scheduled or running' : undefined) : 'Turn the update check on first'}>
             <RefreshCw size={14} aria-hidden="true" className={checking ? 'animate-spin' : ''} />Check now
           </button>
         </div>}
       </div>
-      {!check.prompt_needed && (
+      {compact && !check.prompt_needed && (
+        <div className="flex gap-2 flex-wrap items-center mt-3">
+          <button type="button" className="btn-secondary !text-text-dim" onClick={onCheckNow} disabled={!canCheck || checking || !!disabled}>
+            <RefreshCw size={14} aria-hidden="true" className={checking ? 'animate-spin' : ''} />Check now
+          </button>
+          {disabled && <span className="text-xs text-muted">Disabled while an upgrade is scheduled or running.</span>}
+        </div>
+      )}
+      {!compact && !check.prompt_needed && (
         <p className="text-xs text-muted mt-3 mb-0">Check now asks the release server for the latest stable release. It is limited to once a minute and never installs anything.</p>
       )}
-      {disabled && <p className="text-xs text-muted mt-2 mb-0">Check now is off while an upgrade is scheduled or running.</p>}
+      {disabled && !compact && <p className="text-xs text-muted mt-2 mb-0">Check now is off while an upgrade is scheduled or running.</p>}
       {last.consecutive_failures > 0 && (
         <p className="text-xs text-warn mt-2 mb-0" role="alert">
           The last {last.consecutive_failures} check{last.consecutive_failures === 1 ? '' : 's'} failed
@@ -282,9 +297,14 @@ function isTransient(error: unknown): boolean {
   return error instanceof TypeError          // fetch() rejects with a TypeError when nothing answered (the app is restarting)
 }
 
+/** What the page header says under "Updates" in each state (artboards 06 and 08a), or null for the default text. */
+export interface UpdatesHeader { subtitle: string | null; fullPage: boolean }
+
+const STEP_AT_OR_BEFORE_DOWNLOAD = ['validated', 'downloaded']
+
 /** The admin-only Updates page: check for signed releases, review what changes, upgrade now or on a schedule with a step-up MFA
  * approval, follow the live progress through the restart, and see the result. The daily check is OFF until an admin chooses. */
-export function UpdatesPage({ onOpenKeys }: { onOpenKeys: () => void }) {
+export function UpdatesPage({ onOpenKeys, onHeader }: { onOpenKeys: () => void; onHeader?: (h: UpdatesHeader) => void }) {
   const { data: whoami } = useWhoami()
   const isLocal = !!whoami?.is_local
   const { data: loadedVersion } = useVersion()
@@ -293,6 +313,7 @@ export function UpdatesPage({ onOpenKeys }: { onOpenKeys: () => void }) {
   const queryClient = useQueryClient()
   const [notNow, setNotNow] = useState(false)
   const [requested, setRequested] = useState<RequestedUpgrade | null>(() => readRequested())
+  const [following, setFollowing] = useState(false)
   const [view, setView] = useState<'overview' | 'confirm'>('overview')
   const [mode, setMode] = useState<ConfirmMode>('apply')
   const [choice, setChoice] = useState<ScheduleChoice | null>(null)
@@ -303,26 +324,31 @@ export function UpdatesPage({ onOpenKeys }: { onOpenKeys: () => void }) {
 
   const run = status?.upgrade?.run ?? null
   const running = isRunning(run)
+  const stepIdx = run?.step ? UPGRADE_STEPS.findIndex(s => s.id === run.step) : -1
   const received = (r: RequestedUpgrade) => {
     if (!run) return false
     if (r.kind === 'rollback' || r.kind === 'restore') return run.action === r.kind && Date.parse(run.started_at ?? '') >= Date.parse(r.approvedAt) - 60_000
-    if (r.kind) return Date.now() - Date.parse(r.approvedAt) > 20_000      // bundle / clear / delete: done in seconds; the cards above show the result
+    if (r.kind) return Date.now() - Date.parse(r.approvedAt) > 20_000      // bundle / clear / delete: done in seconds; the cards show the result
     return run.correlation_id === r.correlationId
   }
-  const startedWaiting = !!requested && !received(requested) && !(status?.upgrade?.rejection?.correlation_id === requested.correlationId)
+  const refused = !!requested && status?.upgrade?.rejection?.correlation_id === requested.correlationId
+  const isReceived = !!requested && received(requested)
+  // The "Starting" card stays (with Follow progress) while the run is in its first steps; the progress card takes over when the user follows or the run is past the download.
+  const pastDownload = !!run && (run.result !== null || stepIdx > STEP_AT_OR_BEFORE_DOWNLOAD.length - 1)
+  const showStarting = !!requested && (refused || !isReceived || (!requested.kind ? !following && !pastDownload : false))
   const restarting = isError && isTransient(error) && !!status
 
   // Poll every 2 s while an upgrade is starting or running (the server restarts underneath; failed polls just wait for the next tick).
-  useEffect(() => { setPolling(running || startedWaiting) }, [running, startedWaiting])
+  useEffect(() => { setPolling(running || (!!requested && !refused)) }, [running, requested, refused])
 
-  // While the request is waiting for the updater, ask for the refusal belonging to it.
+  // While the request waits for the updater, ask for the refusal belonging to it.
   useEffect(() => {
-    if (!requested || !startedWaiting) return
+    if (!requested || isReceived || refused) return
     const id = setInterval(() => {
       fetchUpgradeStatus(requested.correlationId).then(s => queryClient.setQueryData(['upgrade_status'], s)).catch(() => { /* the poll above retries */ })
     }, 4000)
     return () => clearInterval(id)
-  }, [requested, startedWaiting, queryClient])
+  }, [requested, isReceived, refused, queryClient])
 
   // When the new version answers, reload once so the browser runs the new interface.
   useEffect(() => {
@@ -334,11 +360,21 @@ export function UpdatesPage({ onOpenKeys }: { onOpenKeys: () => void }) {
     window.location.reload()
   }, [status, loadedVersion, run])
 
-  // Once the updater has the request, the "starting" card has done its job.
+  // The "Starting" card has done its job once the run is past the download (or the user followed it), or the run is over.
   useEffect(() => {
-    if (requested && run && received(requested)) { clearRequested(); setRequested(null) }
+    if (!requested || !run || !isReceived) return
+    if (requested.kind ? true : (following || pastDownload)) { clearRequested(); setRequested(null) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [requested, run])
+  }, [requested, run, following, pastDownload])
+
+  // The toast of a finished upgrade, once, the first time this page shows it (the page has just reloaded on the new version).
+  useEffect(() => {
+    if (!run || run.result !== 'completed' || run.action !== 'apply' || !status || status.installed_version !== run.version_to) return
+    const key = `opa.upgradeToasted:${run.correlation_id}`
+    try { if (localStorage.getItem(key)) return; localStorage.setItem(key, '1') } catch { return }
+    const ok = (run.health ?? []).filter(h => h.ok).length
+    toast({ title: `Upgraded to ${run.version_to}`, description: `${ok > 0 ? `All ${ok} health checks passed. ` : ''}The page reloaded on the new version.`, variant: 'success' })
+  }, [run, status])
 
   const review = useMutation({
     mutationFn: reviewUpgrade,
@@ -363,20 +399,38 @@ export function UpdatesPage({ onOpenKeys }: { onOpenKeys: () => void }) {
     onError: (err: Error) => toast({ title: 'Could not check now', description: err.message, variant: 'error' }),
   })
 
+  const u = status?.upgrade
+  const sched = u?.schedule && (u.schedule.status === 'scheduled' || u.schedule.status === 'missed') ? u.schedule : null
+  const failureShown = !!run && isFailureResult(run) && (
+    run.result === 'failed_needs_operator' || (!!run.version_to && (u?.failures[run.version_to]?.count ?? 0) > 0)
+    || (run.result === 'failed' && Date.now() - Date.parse(run.updated_at ?? '') < 24 * 3600_000))
+  const successShown = !!run && run.result === 'completed' && run.action === 'apply' && !!u?.rollback?.available   // for the 24 h rollback window
+  const confirming = view === 'confirm' && !!preview
+  const startingNow = showStarting && !!status
+  const zone = (status && serverZoneOf(status)) ?? browserZone()
+
+  // What the page header (in App) says in each state.
+  const headerKey = !status ? 'none' : confirming ? 'confirm' : running && run ? `run:${run.version_from}:${run.version_to}` : startingNow ? 'starting' : 'default'
+  useEffect(() => {
+    if (!onHeader) return
+    if (headerKey === 'confirm') onHeader({ subtitle: null, fullPage: true })
+    else if (headerKey.startsWith('run:')) {
+      const [, from, to] = headerKey.split(':')
+      onHeader({ subtitle: `Upgrading ${from} → ${to}. The updater runs on the server; closing this tab does not stop it. This page polls every 2 seconds.`, fullPage: false })
+    } else if (headerKey === 'starting') onHeader({ subtitle: 'Back from the step-up: the approval was consumed on return, the request file was written, and the updater has picked it up.', fullPage: false })
+    else onHeader({ subtitle: null, fullPage: false })
+  }, [headerKey, onHeader])
+  useEffect(() => () => onHeader?.({ subtitle: null, fullPage: false }), [onHeader])
+
   if (isLoading) return <p className="text-xs text-muted">Loading…</p>
   if (!status) return <p role="alert" className="text-xs text-loss">Could not load the update status: {(error as Error | null)?.message}</p>
 
   const state = updateState(status)
-  const u = status.upgrade
-  const sched = u?.schedule && (u.schedule.status === 'scheduled' || u.schedule.status === 'missed') ? u.schedule : null
-  const busy = running || sched?.status === 'scheduled' || startedWaiting
-  const failureShown = !!run && isFailureResult(run)
-  const successShown = !!run && run.result === 'completed' && run.action === 'apply' && !!u?.rollback?.available   // for the 24 h rollback window
-  const editing = view === 'confirm' && !!preview
+  const busy = running || sched?.status === 'scheduled' || (!!requested && !refused)
   const openSchedule = (m: 'schedule' | 'reschedule') => { setScheduleMode(m); setScheduleOpen(true) }
   const pending = u?.pending_approval ?? null
 
-  if (editing && preview) {
+  if (confirming && preview) {
     return (
       <ConfirmUpgrade status={status} preview={preview} mode={mode} choice={choice} isLocal={isLocal} adminEmail={whoami?.email ?? null}
         onBack={() => { setView('overview'); setChoice(null) }} onDone={() => { setView('overview'); setChoice(null) }}
@@ -384,37 +438,66 @@ export function UpdatesPage({ onOpenKeys }: { onOpenKeys: () => void }) {
     )
   }
 
+  // Artboard 06: right after the approval, only the explainer and the Starting card.
+  if (startingNow && requested) {
+    return (
+      <div className="flex flex-col gap-5">
+        {!requested.kind && !refused && <ApprovalTravels version={requested.version} />}
+        <StartingCard requested={requested} status={status} ageMs={Date.now() - Date.parse(requested.approvedAt)} received={isReceived}
+          onFollow={() => { setFollowing(true) }} />
+        {refused && <div><button type="button" className="btn-secondary !text-text-dim" onClick={() => { clearRequested(); setRequested(null) }}>Dismiss</button></div>}
+      </div>
+    )
+  }
+  // Artboard 08a: while it runs, only the progress and what happens at the restart.
+  if (running && run) {
+    return (
+      <div className="flex flex-col gap-5">
+        <ProgressCard run={run} restarting={restarting} zone={zone} />
+        <WhileRestarting from={run.version_from} to={run.version_to} />
+      </div>
+    )
+  }
+  // Artboard 10: after a failure the page is the result (and what to do about it), nothing else.
+  if (failureShown && run) {
+    return <div className="flex flex-col gap-5"><FailureCards run={run} status={status} /></div>
+  }
+
   return (
     <div className="flex flex-col gap-5">
-      {restarting && !running && (
+      {restarting && (
         <p role="status" className="text-xs text-muted m-0">The server did not answer just now (it may be restarting). This page keeps trying.</p>
       )}
-      {running && run && <ProgressCard run={run} restarting={restarting} />}
-      {!running && requested && (startedWaiting || status.upgrade?.rejection?.correlation_id === requested.correlationId) && (
-        <StartingCard requested={requested} status={status} ageMs={Date.now() - Date.parse(requested.approvedAt)} />
+      {requested && refused && (
+        <>
+          <StartingCard requested={requested} status={status} ageMs={0} received={false} onFollow={() => {}} />
+          <div><button type="button" className="btn-secondary !text-text-dim" onClick={() => { clearRequested(); setRequested(null) }}>Dismiss</button></div>
+        </>
       )}
-      {!running && requested && status.upgrade?.rejection?.correlation_id === requested.correlationId && (
-        <div><button type="button" className="btn-secondary !text-text-dim" onClick={() => { clearRequested(); setRequested(null) }}>Dismiss</button></div>
-      )}
-      {!running && failureShown && run && <FailureCards run={run} status={status} />}
-      {!running && successShown && run && <SuccessCards run={run} status={status} />}
-      {!running && !isLocal && sched && (
+      {successShown && run && <SuccessCards run={run} status={status} />}
+      {!isLocal && sched && (
         <ScheduledCard status={status} onReschedule={() => openSchedule('reschedule')}
           onRunNow={() => { setMode('apply'); setChoice(null); setView('confirm') }} />
       )}
+      {!isLocal && sched?.status === 'scheduled' && (
+        <div className="grid gap-5 md:grid-cols-2">
+          <StatusCard status={status} onCheckNow={() => checkNow.mutate()} checking={checkNow.isPending} disabled compact />
+          <EventsCard correlationId={sched.correlation_id} />
+        </div>
+      )}
 
       {/* Mockup 03: when an update is available, its card leads the page and replaces the installed-version card (owner, 2026-10-20). */}
-      {!running && state === 'update_available' && status.latest
+      {sched?.status !== 'scheduled' && !successShown && state === 'update_available' && status.latest
         ? (isLocal
-          ? <><LocalModeCard status={status} /></>
+          ? <LocalModeCard status={status} />
           : <AvailableSection status={status} isLocal={isLocal} reviewing={review.isPending} reviewError={reviewError}
               onReview={() => review.mutate()}
               onUpgradeNow={() => { setMode('apply'); setChoice(null); setView('confirm') }}
               onSchedule={() => openSchedule('schedule')}
               onSecondApproval={() => { setMode('second'); setView('confirm') }} />)
-        : !running && <StatusCard status={status} onCheckNow={() => checkNow.mutate()} checking={checkNow.isPending} disabled={busy} />}
-      {!running && isLocal && state !== 'update_available' && <LocalModeCard status={status} />}
-      {!running && pending && !pending.mine && state !== 'update_available' && (
+        : sched?.status !== 'scheduled' && !successShown && <StatusCard status={status} onCheckNow={() => checkNow.mutate()} checking={checkNow.isPending} disabled={busy} />}
+      {isLocal && state !== 'update_available' && <LocalModeCard status={status} />}
+      {pending && !pending.mine && state !== 'update_available' && (
         <section className="card p-4 border-accent/50">
           <p className="text-xs text-text-dim m-0">A request to upgrade to {pending.version} is waiting for a second admin's approval.{' '}
             <button type="button" className="btn-primary ml-2" onClick={() => { setMode('second'); setView('confirm') }}>Review and approve…</button></p>
@@ -428,9 +511,9 @@ export function UpdatesPage({ onOpenKeys }: { onOpenKeys: () => void }) {
           <button type="button" className="btn-secondary !text-text-dim" onClick={() => setNotNow(false)}>Enable the update check…</button>
         </section>
       )}
-      {!status.check.prompt_needed && !running && <CheckSettingsCard status={status} isLocal={isLocal} />}
-      {!status.check.prompt_needed && !running && !isLocal && <BackupsCard status={status} />}
-      {!status.check.prompt_needed && !running && !isLocal && <HistoryCard status={status} />}
+      {!status.check.prompt_needed && <CheckSettingsCard status={status} isLocal={isLocal} />}
+      {!status.check.prompt_needed && !isLocal && <BackupsCard status={status} />}
+      {!status.check.prompt_needed && !isLocal && <HistoryCard status={status} />}
       {!status.check.prompt_needed && <KeysSummaryCard status={status} onOpenKeys={onOpenKeys} />}
 
       {preview && (

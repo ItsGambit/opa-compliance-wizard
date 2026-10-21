@@ -39,3 +39,21 @@ describe('run helpers', () => {
     expect(describeReason(null)).toBe('unknown reason')
   })
 })
+
+describe('reason sentences and the bundle cool-down', () => {
+  it('every refusal the status can show has a plain sentence', () => {
+    for (const code of ['target_changed', 'backup_changed', 'needs_operator', 'in_flight', 'request_invalid', 'rollback_unavailable', 'activator_too_old', 'cli_only', 'no_backup', 'backup_required']) {
+      expect(describeReason(code)).not.toMatch(/^reason code /)
+    }
+    expect(describeReason('activator_too_old')).toContain('--refresh-updater')
+  })
+
+  it('a bundle request keeps the bundle buttons off for five minutes', async () => {
+    const { markBundleRequested, bundleCoolingDown } = await import('./upgradeRequested')
+    localStorage.clear()
+    expect(bundleCoolingDown()).toBe(false)
+    markBundleRequested(1_000_000)
+    expect(bundleCoolingDown(1_000_000 + 4 * 60_000)).toBe(true)
+    expect(bundleCoolingDown(1_000_000 + 5 * 60_000 + 1)).toBe(false)
+  })
+})

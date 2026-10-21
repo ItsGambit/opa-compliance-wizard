@@ -16,6 +16,7 @@ export function describeCheckFailure(code: string | null): string {
 export function formatBytes(n: number | null | undefined): string {
   if (!n || n < 0) return ''
   if (n < 1024 * 1024) return `${Math.max(1, Math.round(n / 1024))} KB`
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`     // GB = 10^9 bytes, as the server's preflight text writes it
   return `${(n / (1024 * 1024)).toFixed(1)} MB`
 }
 

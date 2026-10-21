@@ -536,8 +536,10 @@ def cmd_bundle(a, cfg, host):
         up = _updater(cfg, host)
         st = act.read_json(cfg.state_path) or {}
         cid = a.correlation or st.get("correlation_id")
-        up.st = dict(st) if st.get("correlation_id") == cid else {"correlation_id": cid}
-        info = up.make_bundle(include_hosts=a.include_hosts, correlation_id=cid)
+        same = bool(cid) and st.get("correlation_id") == cid
+        # a bundle for an older run is built from a throw-away state and never written over the real one
+        up.st = dict(st) if same else {"correlation_id": cid}
+        info = up.make_bundle(include_hosts=a.include_hosts, correlation_id=cid, record=same, touch=False)
         if not info:
             print("could not build the bundle; see the journal", file=sys.stderr)
             return EXIT_OPERATOR
@@ -582,7 +584,7 @@ def cmd_prune_backups(a, cfg, host):
         up = _updater(cfg, host)
         up.st = {"correlation_id": None}
         try:
-            up.validate_other({"action": "prune_backups", **req}, "prune_backups")
+            up.validate_prune(req)
             up.prune_backups(req, _actor())
         except act.StepFailed as exc:
             print(f"refused: {exc}", file=sys.stderr)

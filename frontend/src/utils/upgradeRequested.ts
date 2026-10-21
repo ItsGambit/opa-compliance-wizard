@@ -4,7 +4,7 @@
 export interface RequestedUpgrade {
   correlationId: string; version: string; approvedAt: string; email: string | null; stepUp: boolean
   /** Absent = an upgrade ("apply"); else the operation the updater was asked for. */
-  kind?: 'rollback' | 'restore' | 'clear_failure' | 'bundle' | 'prune_backups'
+  kind?: 'rollback' | 'restore' | 'clear_failure' | 'bundle'
 }
 
 const KEY = 'opa.upgradeRequested'
@@ -27,4 +27,35 @@ export function readRequested(now = Date.now()): RequestedUpgrade | null {
 
 export function clearRequested(): void {
   try { sessionStorage.removeItem(KEY) } catch { /* nothing to clear */ }
+}
+
+const AUDIT_SEARCH_KEY = 'opa.auditSearch'
+
+/** "View the N audit entries": leave the search text for the Audit Log page to pick up (once) and go there. */
+export function openAuditLogFor(text: string, go: () => void = () => { window.location.hash = '#/audit_log' }): void {
+  try { sessionStorage.setItem(AUDIT_SEARCH_KEY, text) } catch { /* the page just opens unfiltered */ }
+  go()
+}
+
+export function takeAuditSearch(): string {
+  try {
+    const v = sessionStorage.getItem(AUDIT_SEARCH_KEY)
+    if (v) sessionStorage.removeItem(AUDIT_SEARCH_KEY)
+    return v ?? ''
+  } catch { return '' }
+}
+
+const BUNDLE_KEY = 'opa.bundleRequestedAt'
+/** The updater refuses a second bundle request within five minutes: the page keeps its "build a bundle" buttons off for that long. */
+export const BUNDLE_COOLDOWN_MS = 5 * 60_000
+
+export function markBundleRequested(now = Date.now()): void {
+  try { localStorage.setItem(BUNDLE_KEY, String(now)) } catch { /* the updater still refuses a repeat */ }
+}
+
+export function bundleCoolingDown(now = Date.now()): boolean {
+  try {
+    const t = Number(localStorage.getItem(BUNDLE_KEY))
+    return Number.isFinite(t) && t > 0 && now - t < BUNDLE_COOLDOWN_MS
+  } catch { return false }
 }

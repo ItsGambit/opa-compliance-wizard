@@ -38,7 +38,7 @@ export function makePreview(over: Partial<UpgradePreview> = {}): UpgradePreview 
     key_id: RELEASE_KEY.key_id, key_status: 'active', key_since: '5.46.0', key_role: 'release', signed_at: '2026-10-17T08:00:00Z',
     manifest: {
       min_upgrade_from: '5.45.0', downtime_estimate_seconds: 45,
-      migrations: [{ version: 10, since: '5.48.0', rollback_safe: true }, { version: 11, since: '5.48.0', rollback_safe: false }],
+      migrations: [{ version: 10, since: '5.48.0', rollback_safe: true, description: 'Adds the upgrade_schedule table' }, { version: 11, since: '5.48.0', rollback_safe: false, description: 'Rebuilds the event index for faster range queries' }],
       expected_schema_version: 11, changelog_excerpt: '5.48.0 — In-app upgrade flow\nUpgrade from the Updates page.', nginx_template_changed: true,
       activator_version: '5.48.0', built_at: '2026-10-17T07:00:00Z',
     },
@@ -51,7 +51,7 @@ export function makePreview(over: Partial<UpgradePreview> = {}): UpgradePreview 
       { id: 'sqlite', ok: true, text: 'SQLite 3.46.1 (needs 3.35.0 or newer).' },
       { id: 'sync', ok: true, text: 'No sync is running.' },
       { id: 'in_flight', ok: true, text: 'No other upgrade is in flight.' },
-      { id: 'updater', ok: true, text: 'Updater present (activator 5.47.0).' },
+      { id: 'updater', ok: true, text: 'Updater present: ocw-updater 5.48.0, activator 5.48.0. No other upgrade in flight.' },
     ],
     preflight_ok: true,
     ...over,
@@ -73,7 +73,7 @@ export function makeRun(over: Partial<UpgradeRun> = {}): UpgradeRun {
 /** The 5.48.0 `upgrade` block of /api/upgrade/status with a working updater and nothing happening. */
 export function makeUpgrade(over: Partial<UpgradeView> = {}): UpgradeView {
   return {
-    run: null, updater: { ready: true, reason: null, activator: '5.47.0', message: '' }, preview: null, schedule: null, last: null, pending_approval: null,
+    run: null, updater: { ready: true, reason: null, activator: '5.48.0', message: '' }, preview: null, schedule: null, last: null, pending_approval: null,
     settings: { second_approval: false }, rejection: null, rollback: null, failures: {}, history: [], zone: { iana: 'Europe/London' },
     sync_hint: { last_sync_completed_at: '2026-10-19T02:14:00Z', daily_run_times_utc: ['03:00'] }, step_up_required: true, now: new Date().toISOString(),
     ...over,

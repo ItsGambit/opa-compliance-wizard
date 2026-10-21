@@ -290,7 +290,7 @@ def _manifest_view(raw, version):
         if isinstance(item, dict) and isinstance(item.get("version"), int) and not isinstance(item["version"], bool):
             migrations.append({"version": item["version"], "since": _cap_text(item.get("since"), 20),
                                "rollback_safe": item.get("rollback_safe") is True,
-                               "summary": _cap_text(item.get("summary"), 200)})
+                               "description": _cap_text(item.get("description") or item.get("summary"), 200)})
     num = lambda v: v if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 10 ** 6 else None  # noqa: E731
     excerpt = _cap_text(m.get("changelog_excerpt"), 2000)
     return {"min_upgrade_from": _cap_text(m.get("min_upgrade_from"), 20), "downtime_estimate_seconds": num(m.get("downtime_estimate_seconds")),
@@ -307,38 +307,91 @@ def _vtuple(text, default):
         return default
 
 
+def _size(n):
+    """Sizes as the Updates page shows them: GB with one decimal from 1 GB, else whole MB (or KB)."""
+    n = int(n or 0)
+    if n >= 10 ** 9:
+        return f"{n / 10 ** 9:.1f} GB"
+    if n >= 10 ** 6:
+        return f"{round(n / 10 ** 6)} MB"
+    return f"{max(1, round(n / 10 ** 3))} KB"
+
+
+def _utc_hm(text):
+    try:
+        return datetime.strptime(str(text)[:19], "%Y-%m-%dT%H:%M:%S").strftime("%H:%M")
+    except ValueError:
+        return None
+
+
 def preflight(manifest, size, ctx, now):
-    """[{id, ok, text}]: what the Updates page shows as 'Preflight'. `ctx`: sync_running (bool), db_bytes (int), run (state.json
-    fields or None)."""
+    """[{id, ok, text}]: what the Updates page shows as 'Preflight'. `ctx` (all optional): sync_running (bool), db_bytes, audit_log_bytes,
+    backups_total (bytes of the updater's published pre-upgrade copies), sync_hint ({last_sync_completed_at, daily_run_times_utc}),
+    run (state.json fields or None)."""
     items = []
     opt = opt_dir() or Path(keylib.REPO_ROOT)
     data = data_dir()
+    db = ctx.get("db_bytes") or 0
     need_opt = 3 * (size or 20 * 2**20) + 100 * 2**20
-    need_data = 3 * (ctx.get("db_bytes") or 0) + 100 * 2**20
-    for ident, label, path, need in (("disk_opt", "Disk, code volume", opt, need_opt), ("disk_data", "Disk, data volume", data, need_data)):
-        try:
-            free = shutil.disk_usage(str(path)).free
-            items.append({"id": ident, "ok": free >= need, "text": f"{label}: {free / 2**30:.1f} GB free; {need / 2**30:.1f} GB needed."})
-        except OSError:
-            items.append({"id": ident, "ok": False, "text": f"{label}: could not read free space."})
+    need_data = 3 * db + 100 * 2**20
+    try:
+        free = shutil.disk_usage(str(opt)).free
+        items.append({"id": "disk_opt", "ok": free >= need_opt, "text": f"Disk, code volume: {_size(free)} free; {_size(need_opt)} needed (3× the archive file + its environment). "
+                      + ("Passed." if free >= need_opt else "Not enough.")})
+    except OSError:
+        items.append({"id": "disk_opt", "ok": False, "text": "Disk, code volume: could not read the free space."})
+    try:
+        free = shutil.disk_usage(str(data)).free
+        items.append({"id": "disk_data", "ok": free >= need_data, "text": f"Disk, data volume: {_size(free)} free; {_size(need_data)} needed"
+                      + (f" for a {_size(db)} archive backup with headroom" if db else "") + ". " + ("Passed." if free >= need_data else "Not enough.")})
+    except OSError:
+        items.append({"id": "disk_data", "ok": False, "text": "Disk, data volume: could not read the free space."})
+    if db:
+        parts = [f"{_size(db)} audit_store.db"]
+        if ctx.get("audit_log_bytes"):
+            parts.append(f"{_size(ctx['audit_log_bytes'])} audit_log.jsonl")
+        parts.append("access_control.json")
+        extra = f" Existing pre-upgrade backups: {_size(ctx['backups_total'])} (kept; never deleted automatically)." if ctx.get("backups_total") else ""
+        items.append({"id": "backup", "ok": True, "text": "Backup size: " + " + ".join(parts) + "." + extra})
     want_py = _vtuple((manifest or {}).get("min_python"), _PY_MIN)
     have_py = sys.version_info[:3]
-    items.append({"id": "python", "ok": have_py >= want_py,
-                  "text": f"Python {'.'.join(map(str, have_py))} (needs {'.'.join(map(str, want_py))} or newer)."})
+    items.append({"id": "python", "ok": have_py >= want_py, "text": f"Python {'.'.join(map(str, have_py))} ≥ {'.'.join(map(str, want_py[:2]))}."
+                  + ("" if have_py >= want_py else " Too old.")})
     want_sql = _vtuple((manifest or {}).get("min_sqlite"), _SQLITE_MIN)
     have_sql = tuple(int(p) for p in sqlite3.sqlite_version.split("."))
-    items.append({"id": "sqlite", "ok": have_sql >= want_sql,
-                  "text": f"SQLite {sqlite3.sqlite_version} (needs {'.'.join(map(str, want_sql))} or newer)."})
+    items.append({"id": "sqlite", "ok": have_sql >= want_sql, "text": f"SQLite {sqlite3.sqlite_version} ≥ {'.'.join(map(str, want_sql))}."
+                  + ("" if have_sql >= want_sql else " Too old.")})
+    hint = ctx.get("sync_hint") or {}
+    last = _utc_hm(hint.get("last_sync_completed_at"))
+    runs = hint.get("daily_run_times_utc") or []
+    when = (f" Last sync finished {last} UTC." if last else "") + (f" Next scheduled {', '.join(runs)} UTC." if runs else "")
     items.append({"id": "sync", "ok": not ctx.get("sync_running"),
-                  "text": "No sync is running." if not ctx.get("sync_running")
-                  else "A sync is running: the upgrade waits up to 10 minutes for it to finish, then refuses to start."})
+                  "text": ("No sync running." + when) if not ctx.get("sync_running")
+                  else "A sync is running: the upgrade waits up to 10 minutes for it to finish, then refuses to start." + when})
     run = ctx.get("run") or {}
     busy = bool(run) and run.get("result") is None and bool(run.get("step"))
-    items.append({"id": "in_flight", "ok": not busy, "text": "No other upgrade is in flight." if not busy else "Another upgrade is in progress."})
+    if busy:
+        items.append({"id": "in_flight", "ok": False, "text": "Another upgrade is in progress."})
     st = updater_state()
-    items.append({"id": "updater", "ok": st["ready"],
-                  "text": (f"Updater present{' (activator ' + st['activator'] + ')' if st['activator'] else ''}." if st["ready"] else st["message"])})
+    if st["ready"]:
+        act = st["activator"]
+        newer = bool(act and (manifest or {}).get("activator_version") and (manifest or {}).get("activator_version") != act)
+        items.append({"id": "updater", "ok": True,
+                      "text": "Updater present" + (f": ocw-updater {act}, activator {act}" if act else "") + (" (will update itself after this release verifies)" if newer else "")
+                      + ("." if busy else ". No other upgrade in flight.")})
+    else:
+        items.append({"id": "updater", "ok": False, "text": st["message"]})
     return items
+
+
+def _free_bytes():
+    out = {}
+    for key, path in (("opt", opt_dir() or Path(keylib.REPO_ROOT)), ("data", data_dir())):
+        try:
+            out[key] = shutil.disk_usage(str(path)).free
+        except OSError:
+            out[key] = None
+    return out
 
 
 def build_preview(installed_version, size, ctx, now=None):
@@ -374,7 +427,8 @@ def build_preview(installed_version, size, ctx, now=None):
                "key_since": key_entry.get("since"), "key_role": key_entry.get("role"), "signed_at": fields.get("timestamp"),
                "manifest": manifest, "manifest_source": "the release's manifest.json asset (not itself signed; the updater re-verifies the "
                                                         "signed copy inside the archive before installing)",
-               "checked_at": _iso(now), "db_bytes": ctx.get("db_bytes"),
+               "checked_at": _iso(now), "db_bytes": ctx.get("db_bytes"), "backup_dir": str(service.upgrade_dir() / "backups"),
+               "free_bytes": _free_bytes(),
                "preflight": preflight(manifest, size, ctx, now)}
     preview["preflight_ok"] = all(i["ok"] for i in preview["preflight"])
     save_preview(preview)
@@ -388,6 +442,7 @@ def refresh_preflight(ctx, now=None):
         return None
     p["preflight"] = preflight(p.get("manifest"), p.get("size"), ctx, now)
     p["preflight_ok"] = all(i["ok"] for i in p["preflight"])
+    p["free_bytes"] = _free_bytes()
     p["checked_at"] = _iso(now)
     save_preview(p)
     return p
@@ -403,8 +458,16 @@ def new_correlation_id():
     return "upg-" + uuid.uuid4().hex[:8]
 
 
-ACTION_KINDS = {"rollback": ("confirm",), "restore": ("confirm",), "clear_failure": (), "bundle": ("include_hosts", "for_correlation_id"),
-                "prune_backups": ("confirm", "keep_last", "names")}
+# Deleting the pre-upgrade copies is a command-line operation only (`ocw-updater prune-backups`): the root-held copies are the
+# ones a compromised web process cannot reach, so the inbox does not take a request to delete them.
+ACTION_KINDS = {"rollback": ("confirm",), "restore": ("confirm", "backup"), "clear_failure": (), "bundle": ("include_hosts", "for_correlation_id")}
+OPERATIONS_MIN_ACTIVATOR = (5, 48, 0)
+
+
+def activator_too_old(activator):
+    """True when the installed activator is known to be older than the one that takes the in-app operations (None = unknown: not refused)."""
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)$", str(activator or ""))
+    return bool(m) and tuple(int(x) for x in m.groups()) < OPERATIONS_MIN_ACTIVATOR
 BACKUP_NAME_RE = re.compile(r"^audit_store-pre-[0-9A-Za-z._-]{1,80}\.db$")
 
 
@@ -450,7 +513,7 @@ def write_request(*, correlation_id, version, sha256, action_id, actor, trigger_
 
 
 def write_action(action, *, correlation_id, action_id, actor, trigger_kind="app", now=None, **fields):
-    """Write a rollback / restore / clear_failure / bundle / prune_backups request (closed set of fields, checked here and again
+    """Write a rollback / restore / clear_failure / bundle request (closed set of fields, checked here and again
     by the updater). The typed confirmations are part of the request: the updater refuses it without them."""
     now = now or datetime.now(timezone.utc)
     if action not in ACTION_KINDS or set(fields) - set(ACTION_KINDS[action]):
@@ -458,23 +521,17 @@ def write_action(action, *, correlation_id, action_id, actor, trigger_kind="app"
     req = _base_request(action, correlation_id, action_id, actor, trigger_kind, now)
     if action == "rollback" and fields.get("confirm") != "ROLLBACK":
         raise ValueError("rollback needs the typed confirmation")
-    if action == "restore" and fields.get("confirm") != "RESTORE":
-        raise ValueError("restore needs the typed confirmation")
+    if action == "restore":
+        if fields.get("confirm") != "RESTORE":
+            raise ValueError("restore needs the typed confirmation")
+        if not isinstance(fields.get("backup"), str) or not BACKUP_NAME_RE.match(fields["backup"]):
+            raise ValueError("restore must name the backup copy")
     if action == "bundle":
         if not isinstance(fields.get("include_hosts", False), bool):
             raise ValueError("include_hosts must be true or false")
         fc = fields.get("for_correlation_id")
         if fc is not None and not CID_RE.match(str(fc)):
             raise ValueError("invalid correlation id")
-    if action == "prune_backups":
-        keep, names = fields.get("keep_last"), fields.get("names")
-        if fields.get("confirm") != "PRUNE" or (keep is None) == (names is None):
-            raise ValueError("prune needs PRUNE and exactly one of keep_last / names")
-        if keep is not None and (not isinstance(keep, int) or isinstance(keep, bool) or not 1 <= keep <= 50):
-            raise ValueError("keep_last must be 1 to 50")
-        if names is not None and (not isinstance(names, list) or not 1 <= len(names) <= 50
-                                  or not all(isinstance(n, str) and BACKUP_NAME_RE.match(n) for n in names)):
-            raise ValueError("names must be 1 to 50 backup file names")
     req.update({k: v for k, v in fields.items() if v is not None})
     path = _write_inbox(req)
     with _lock:
@@ -581,6 +638,24 @@ def tick(installed_version, ctx_fn, now=None):
 
 
 # --- what the Updates page reads -----------------------------------------------------------------------------------------
+_DETAIL_KEYS = ("request", "source", "signed_by", "files_verified", "free_opt_mb", "free_data_mb", "sync_waited_s", "nginx_template_changed",
+                "name", "size", "integrity", "current", "previous", "units", "passed", "total")
+
+
+def _step_detail(d):
+    """The few plain facts each step recorded (file names, counts, sizes) for the progress list; nothing else from the state file."""
+    out = {}
+    for k in _DETAIL_KEYS:
+        v = (d or {}).get(k) if isinstance(d, dict) else None
+        if isinstance(v, (int, float, bool)) or v is None:
+            out[k] = v
+        elif isinstance(v, str):
+            out[k] = v[:120]
+        elif k == "units" and isinstance(v, list):
+            out[k] = [str(u)[:60] for u in v[:8]]
+    return {k: v for k, v in out.items() if v is not None}
+
+
 RUN_EXTRA = ("steps_done", "health", "rollback_health", "rolled_back_to", "rollback_seconds", "failure", "signed_by", "sha256",
              "requested_by", "schema_before", "schema_after", "backup", "manifest", "downtime_estimate_seconds", "step_started_at")
 
@@ -599,6 +674,8 @@ def run_view():
     if st is None:
         return None
     out = {k: st.get(k) for k in service._RUN_FIELDS}
+    heads = st.get("chain_heads_before")
+    out["chain_heads_recorded"] = len(heads) if isinstance(heads, dict) else None
     for k in RUN_EXTRA:
         v = st.get(k)
         if k == "backup" and isinstance(v, dict):
@@ -606,7 +683,8 @@ def run_view():
         if k == "manifest" and isinstance(v, dict):
             v = {kk: v.get(kk) for kk in ("migrations", "expected_schema_version")}
         if k == "steps_done" and isinstance(v, list):
-            v = [{"step": s.get("step"), "at": s.get("at"), "seconds": s.get("seconds")} for s in v if isinstance(s, dict)][:20]
+            v = [{"step": s.get("step"), "at": s.get("at"), "seconds": s.get("seconds"), "detail": _step_detail(s.get("detail"))}
+                 for s in v if isinstance(s, dict)][:20]
         if k in ("health", "rollback_health") and isinstance(v, list):
             v = [{"id": h.get("id"), "ok": h.get("ok"), "detail": str(h.get("detail"))[:200]} for h in v if isinstance(h, dict)][:20]
         if k == "failure" and isinstance(v, dict):
