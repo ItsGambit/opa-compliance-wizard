@@ -245,7 +245,9 @@ class Machine:
         os.symlink(f"releases/{version}", self.opt / "current")
         (self.opt / "updater" / "config.json").write_text(json.dumps({
             "app_user": "nobody", "app_group": "nogroup", "backend_service": "opa-compliance-wizard", "gate_service": "opa-auth-gate",
-            "nginx_site": str(self.root / "nginx" / "site"), "backend_port": 8766}))
+            "nginx_site": str(self.root / "nginx" / "site"), "backend_port": 8766,
+            "second_gate_sites_dir": str(self.root / "nginx-sites")}))
+        (self.root / "nginx-sites").mkdir()
         trust = {"schema": 1, "serial": 0, "keys": ocw_trust.parse_key_list(json.dumps(self.key_list).encode()), "revoked": []}
         (self.opt / "updater" / "trust.json").write_text(json.dumps(trust))
         (self.etc / "app.env").write_text("".join(f"{k}={v}\n" for k, v in FAKE_SECRETS.items()) + f"OPA_AUDIT_DB_PATH={self.db}\n")

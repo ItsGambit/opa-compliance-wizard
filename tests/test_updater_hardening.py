@@ -532,13 +532,52 @@ def test_apply_writes_its_request_through_no_link_and_with_a_random_temporary_na
     assert list((other / "requests").iterdir()) == []
 
 
-def test_a_release_that_needs_install_sh_is_refused_with_a_clear_reason(m):
-    m.build_release("5.47.0", manifest_over={"requires_install_sh": True})
+def _set_install_sh_version(m, value):
+    path = m.opt / "updater" / "config.json"
+    cfg = json.loads(path.read_text())
+    if value is None:
+        cfg.pop("install_sh_version", None)
+    else:
+        cfg["install_sh_version"] = value
+    path.write_text(json.dumps(cfg))
+
+
+def _apply_5_47_0(m, over, cid):
+    m.build_release("5.47.0", manifest_over=over)
     m.put_artifacts("5.47.0")
-    assert m.updater().apply(m.request("5.47.0", correlation_id="upg-00000401")) == "failed"
+    return m.updater().apply(m.request("5.47.0", correlation_id=cid))
+
+
+@pytest.mark.parametrize("recorded", [None, "5.46.0", "not-a-version"])
+def test_a_release_whose_install_sh_minimum_is_newer_than_the_recorded_version_is_refused_with_the_command(m, recorded):
+    _set_install_sh_version(m, recorded)
+    assert _apply_5_47_0(m, {"install_sh_min_version": "5.47.0"}, "upg-00000401") == "failed"
     st = m.read_state()
-    assert st["reason_code"] == "needs_install_sh" and "install.sh" in st["error"]
+    assert st["reason_code"] == "needs_install_sh"
+    assert "sudo server/install.sh --refresh-updater" in st["error"] and "5.47.0" in st["error"]
     assert os.readlink(m.opt / "current") == "releases/5.46.0"
+
+
+@pytest.mark.parametrize("recorded", ["5.47.0", "5.48.0"])
+def test_a_release_is_accepted_once_install_sh_has_recorded_a_version_that_is_new_enough(m, recorded):
+    _set_install_sh_version(m, recorded)
+    assert _apply_5_47_0(m, {"install_sh_min_version": "5.47.0", "requires_install_sh": False}, "upg-00000402") == "completed"
+
+
+def test_the_old_boolean_alone_can_now_be_satisfied_and_a_manifest_without_either_is_not_gated(m):
+    # a manifest from a release that only has the boolean: the release's own version is the minimum
+    assert _apply_5_47_0(m, {"requires_install_sh": True}, "upg-00000403") == "failed"
+    assert m.read_state()["reason_code"] == "needs_install_sh"
+
+
+def test_the_boolean_alone_is_satisfied_by_a_recorded_version(m):
+    _set_install_sh_version(m, "5.47.0")
+    assert _apply_5_47_0(m, {"requires_install_sh": True}, "upg-00000404") == "completed"
+
+
+def test_a_manifest_without_the_gating_fields_is_not_refused(m):
+    _set_install_sh_version(m, None)
+    assert _apply_5_47_0(m, {}, "upg-00000405") == "completed"
 
 
 def test_requires_install_sh_is_a_real_comparison_with_the_previous_tag(tmp_path):
@@ -558,3 +597,95 @@ def test_requires_install_sh_is_a_real_comparison_with_the_previous_tag(tmp_path
     assert tool._requires_install_sh(repo, same, "1.1.0") is False
     changed = dict(same, **{"server/ocw-upgrade.service": (0o644, b"different\n")})
     assert tool._requires_install_sh(repo, changed, "1.1.0") is True
+
+
+def _git_repo(tmp_path, tags):
+    """A real git repo with one commit per entry of `tags` ({version: {file: text}}), each tagged vX."""
+    tool = _release_tool()
+    repo = tmp_path / "repo"
+    (repo / "server").mkdir(parents=True)
+    run = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True)  # noqa: E731
+    run("init", "-q")
+    run("config", "user.email", "t@example.com")
+    run("config", "user.name", "t")
+    state = {n: "base\n" for n in tool.INSTALL_SH_FILES}
+    for version, changes in tags.items():
+        state.update(changes)
+        for n, text in state.items():
+            (repo / n).write_text(text)
+        run("add", "-A")
+        run("commit", "-q", "--allow-empty", "-m", version)
+        run("tag", f"v{version}")
+    return tool, repo, state
+
+
+def _files(state):
+    return {n: (0o644, t.encode()) for n, t in state.items()}
+
+
+def test_install_sh_min_version_walks_the_tags_back_to_the_newest_change(tmp_path):
+    tool, repo, state = _git_repo(tmp_path, {
+        "1.0.0": {},
+        "1.1.0": {"server/ocw-updater.sh": "wrapper v2\n"},
+        "1.2.0": {},
+        "1.3.0": {"server/ocw-upgrade.service": "unit v2\n"},
+        "1.4.0": {},
+        "1.5.0": {},
+    })
+    # nothing changed in 1.6.0 against 1.5.0: the answer walks back through 1.5.0 and 1.4.0 to 1.3.0 (the unit)
+    assert tool._install_sh_min_version(repo, _files(state), "1.6.0") == "1.3.0"
+    # a change in this release is its own minimum
+    changed = dict(state, **{"server/install.sh": "installer v2\n"})
+    assert tool._install_sh_min_version(repo, _files(changed), "1.6.0") == "1.6.0"
+    # a wrapper-only change: the minimum moves but the 5.47.0-compatible boolean (units only) stays false
+    wrapper = dict(state, **{"server/ocw-updater.sh": "wrapper v3\n"})
+    assert tool._install_sh_min_version(repo, _files(wrapper), "1.6.0") == "1.6.0"
+    assert tool._requires_install_sh(repo, _files(wrapper), "1.6.0") is False
+    # a unit change sets both
+    unit = dict(state, **{"server/ocw-upgrade.path": "path v2\n"})
+    assert tool._requires_install_sh(repo, _files(unit), "1.6.0") is True
+    assert tool._install_sh_min_version(repo, _files(unit), "1.6.0") == "1.6.0"
+    # in between releases: 1.2.0 inherits 1.1.0's wrapper change
+    assert tool._install_sh_min_version(repo, _files(dict(state, **{"server/ocw-upgrade.service": "base\n"})), "1.2.0") == "1.1.0"
+
+
+def test_install_sh_min_version_of_a_first_release_is_its_own_version(tmp_path):
+    tool, repo, state = _git_repo(tmp_path, {"1.0.0": {}})
+    assert tool._install_sh_min_version(repo, _files(state), "0.9.0") == "0.9.0"
+    # the oldest tag counts as having introduced the files
+    assert tool._install_sh_min_version(repo, _files(state), "1.0.1") == "1.0.0"
+
+
+def _second_site(m, name, with_deny, header=True):
+    from server.nginx_second_site import build
+    text = build(uf.SITE_TEMPLATE.format(name="opa.example.com", cert="/c/full.pem", key="/c/key.pem", secret=uf.PROXY_SECRET),
+                 8768, "127.0.0.1:8080", "opa2.example.com", name)
+    if not with_deny:
+        text = text.replace("    location /api/upgrade {\n        return 403;\n    }\n", "")
+    if not header:
+        text = "\n".join(l for l in text.splitlines() if not l.startswith("# OPA auth gate")) + "\n"
+    path = m.root / "nginx-sites" / f"opa-{name}"
+    path.write_text(text)
+    return path
+
+
+def test_preflight_warns_and_audits_when_a_second_gate_site_lacks_the_upgrade_deny_but_does_not_block(m):
+    bare = _second_site(m, "bare", with_deny=False)
+    _second_site(m, "good", with_deny=True)
+    _second_site(m, "hand-made", with_deny=False, header=False)   # not generated by setup-second-gate.sh: ignored
+    before = bare.read_text()
+    m.build_release("5.47.0")
+    m.put_artifacts("5.47.0")
+    assert m.updater().apply(m.request("5.47.0", correlation_id="upg-00000410")) == "completed"
+    entries = [e for e in m.audit_actions() if e["action"] == "upgrade.step" and e["details"].get("step") == "second_gate_site_unprotected"]
+    assert len(entries) == 1 and entries[0]["details"]["sites"] == ["opa-bare"]
+    assert "--regenerate-second-sites" in entries[0]["details"]["detail"]
+    assert bare.read_text() == before   # read-only
+
+
+def test_preflight_is_silent_when_every_second_gate_site_denies_the_upgrade_routes(m):
+    _second_site(m, "good", with_deny=True)
+    m.build_release("5.47.0")
+    m.put_artifacts("5.47.0")
+    assert m.updater().apply(m.request("5.47.0", correlation_id="upg-00000411")) == "completed"
+    assert not [e for e in m.audit_actions() if e["details"].get("step") == "second_gate_site_unprotected"]
