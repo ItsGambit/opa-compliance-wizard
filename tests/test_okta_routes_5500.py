@@ -359,3 +359,36 @@ def test_export_log_bounds_as_of_before_it_reaches_the_audit_log(matrix_server, 
     assert _call(base_url, "POST", url, {"format": "csv", "as_of": "2026-10-01" + "x" * 5000}, _who(OWNER_A)).status_code == 400
     assert _call(base_url, "POST", url, {"format": "csv", "as_of": "2026-10-01T00:00:00.000Z"}, _who(OWNER_A)).status_code == 200
     assert max(len(json.dumps(json.loads(line))) for line in open(tmp_audit_log, encoding="utf-8") if line.strip()) < 2000
+
+
+def test_failed_capture_audit_entries_carry_the_error_class_and_status_not_the_request_url(tmp_audit_store, tmp_environments_file, fake_keyring, tmp_audit_log, monkeypatch):
+    import server.serve as serve
+
+    audit_store.run_migrations()
+    _, env = engine.upsert_environment("dev", {"base_domain": "secret-team.example.com", "team_name": "secret-team", "key_id": "k", "key_secret": "s"})
+
+    class Leaky:
+        def __init__(self, *a, **k):
+            pass
+
+        def __getattr__(self, name):
+            def call(*a, **k):
+                raise engine.OpaApiError(503, "https://secret-team.example.com/v1/teams/secret-team/oauth2/token", "body with secret-team")
+            return call
+    monkeypatch.setattr(engine, "OpaClient", Leaky)
+
+    class Sync(_CountingOkta):
+        def get_system_log(self, **k):
+            return [], True
+
+        def get_system_log_page(self, path):
+            return [], None
+        def count_okta_objects(self, *a, **k):
+            raise engine.OktaApiError(500, "https://example.okta.com/api/v1/users", "x")
+    monkeypatch.setattr(oa, "capture_if_due", lambda *a, **k: (_ for _ in ()).throw(engine.OktaApiError(500, "https://example.okta.com/api/v1/iam", "x")))
+    serve._run_sync_job(env, "dev", Sync(), "all", engine.LOCAL_OWNER_KEY, trigger="scheduled")
+    raw = open(tmp_audit_log, encoding="utf-8").read()
+    failed = [json.loads(line) for line in raw.splitlines() if '"okta_snapshot.failed"' in line]
+    assert {f["details"]["kind"] for f in failed} >= {"okta_admins", "inventory_counts"}
+    assert {f["details"]["kind"]: f["details"]["error"] for f in failed} == {"okta_admins": "OktaApiError: 500", "inventory_counts": "ValueError"}  # class and status only
+    assert "secret-team" not in "".join(json.dumps(f) for f in failed)

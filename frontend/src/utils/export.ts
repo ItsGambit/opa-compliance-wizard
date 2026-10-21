@@ -33,6 +33,13 @@ export function markdownCell(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/\|/g, '\\|').replace(/\r\n|\r|\n/g, '<br>')
 }
 
+/** A Markdown heading's text: line breaks become spaces and the characters Markdown reads as markup (backslash, backtick,
+ * asterisk, underscore, brackets, angle brackets, pipe, tilde, hash) are escaped, so an environment name such as
+ * `[x](http://example.com)` or `<b>x</b>` stays plain text in the exported file. */
+export function markdownHeading(value: string): string {
+  return value.replace(/\r\n|\r|\n/g, ' ').replace(/([\\`*_[\]<>|~#])/g, '\\$1')
+}
+
 /** Multiple sections in one CSV file, separated by a blank line, each
  * preceded by its own title line — opens fine as one sheet in Excel/
  * Sheets (distinct visual blocks) without needing a multi-file export. */
@@ -56,7 +63,7 @@ export function toMarkdown(sections: ExportSection[]): string {
     .map(section => {
       const columns = Object.keys(section.rows[0])
       const lines = [
-        `## ${section.title.replace(/\r\n|\r|\n/g, ' ')}`,
+        `## ${markdownHeading(section.title)}`,
         '',
         `| ${columns.map(markdownCell).join(' | ')} |`,
         `| ${columns.map(() => '---').join(' | ')} |`,

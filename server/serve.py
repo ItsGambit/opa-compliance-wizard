@@ -562,6 +562,13 @@ def _access_job_progress(storage_name):
     return _progress
 
 
+def _failure_summary(exc):
+    """What an audit entry says about a failed background call: the error class and, for an OPA or Okta call, its HTTP status or
+    kind. Never the message, which carries the request URL (the OPA team name, the Okta org host) and part of the response body."""
+    status = getattr(exc, "status", None)
+    return f"{type(exc).__name__}: {status}" if status is not None else type(exc).__name__
+
+
 def _job_error_message(exc):
     """SRV-03 for background jobs (their error is returned by the status
     routes): an upstream OPA/Okta error or a deliberate ValueError (e.g. the
@@ -824,7 +831,7 @@ def _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, trigger
                 }, client_ip=client_ip, user_agent=user_agent)
         except Exception as snap_exc:
             engine.log("WARN", f"okta admin snapshot after the sync of '{env_name}' failed: {type(snap_exc).__name__}")
-            engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.failed", {"name": env_name, "kind": "okta_admins", "trigger": trigger, "error": _job_error_message(snap_exc)},
+            engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.failed", {"name": env_name, "kind": "okta_admins", "trigger": trigger, "error": _failure_summary(snap_exc)},
                                    client_ip=client_ip, user_agent=user_agent)
         # Daily inventory counts (OPA and Okta, counts only) and the incremental sign-in / MFA aggregates.
         inventory_started = time.monotonic()
@@ -841,14 +848,14 @@ def _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, trigger
                     "item_count": inv["item_count"], "trigger": trigger, "inventory_seconds": seconds}, client_ip=client_ip, user_agent=user_agent)
         except Exception as inv_exc:
             engine.log("WARN", f"inventory counts after the sync of '{env_name}' failed after {round(time.monotonic() - inventory_started, 1)}s: {type(inv_exc).__name__}")
-            engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.failed", {"name": env_name, "kind": "inventory_counts", "trigger": trigger, "error": _job_error_message(inv_exc)},
+            engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.failed", {"name": env_name, "kind": "inventory_counts", "trigger": trigger, "error": _failure_summary(inv_exc)},
                                    client_ip=client_ip, user_agent=user_agent)
         try:
             import signin_mfa
             signin_mfa.refresh(env_id)
         except Exception as mfa_exc:
             engine.log("WARN", f"sign-in / MFA aggregates after the sync of '{env_name}' failed: {type(mfa_exc).__name__}")
-            engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.failed", {"name": env_name, "kind": "mfa_aggregates", "trigger": trigger, "error": _job_error_message(mfa_exc)},
+            engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.failed", {"name": env_name, "kind": "mfa_aggregates", "trigger": trigger, "error": _failure_summary(mfa_exc)},
                                    client_ip=client_ip, user_agent=user_agent)
     except Exception as exc:
         with _sync_jobs_lock:
@@ -1061,7 +1068,7 @@ def _run_capture_job(env_id, env_name, owner, kind, model, correlation_id, actor
         message = _job_error_message(exc)
         with _capture_jobs_lock:
             _capture_jobs[env_id] = {"status": "error", "kind": kind, "error": message, "finished_at": _utc_now_iso()}
-        engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.failed", {"name": env_name, "kind": kind, "error": message},
+        engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.failed", {"name": env_name, "kind": kind, "error": _failure_summary(exc)},
                                client_ip=client_ip, user_agent=user_agent)
 
 

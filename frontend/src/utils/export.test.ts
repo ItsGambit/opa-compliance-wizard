@@ -78,3 +78,15 @@ describe('downloadTextFile', () => {
     expect(revoke).toHaveBeenCalledWith('blob:x')
   })
 })
+
+
+describe('markdownHeading', () => {
+  it('escapes markup in a section title (an environment name) and keeps ordinary titles as they are', async () => {
+    const { markdownHeading, toMarkdown } = await import('./export')
+    expect(markdownHeading('Okta Admins')).toBe('Okta Admins')
+    expect(markdownHeading('prod [x](http://example.com) <b>x</b> a_b *c*')).toBe('prod \\[x\\](http://example.com) \\<b\\>x\\</b\\> a\\_b \\*c\\*')
+    expect(markdownHeading('line one\nline two')).toBe('line one line two')
+    const md = toMarkdown([{ title: 'Overview: [x](http://example.com)', rows: [{ A: '1' }] }])
+    expect(md.split('\n')[0]).toBe('## Overview: \\[x\\](http://example.com)')
+  })
+})
