@@ -455,6 +455,56 @@ that environment's own report. First start after upgrading to v5.40.0
 builds two new archive indexes (a one-off few seconds on a large
 archive) that keep the per-account rotation reads fast.
 
+### Okta Admins report and cross-checks
+
+Added in 5.50.0. Both are read from **stored snapshots** of Okta (see "Configuration snapshots" below),
+never from a live call, so "as of the audit date" and "now" are the same screen.
+
+**Okta Admins** (Compliance Reports > Okta Admins) lists who holds an administrator role in Okta, from
+`GET /api/v1/iam/assignees/users` and each user's `GET /api/v1/users/{id}/roles`, with:
+
+- the role and, for the scoped standard roles, its group or app targets
+  (`/roles/{id}/targets/groups` and `/targets/catalog/apps`); custom roles with their permission names and the
+  resource set they are bound to; the custom roles and resource sets defined in the org;
+- standing versus **time-bound** access, from Okta's governance grants where the org uses them (an org without
+  the feature answers E0000015 and the report says every assignment is standing);
+- the `user.account.privilege.grant` and `.revoke` events the archive holds for the person, or "before the
+  archive began", or "no privilege event in the archive". Revoke events are archived only with the "all events"
+  ingestion scope;
+- a status between snapshots: **active** (in this snapshot), **removed** (in the previous one, not in this
+  one, with the dates between which it happened) or **unknown** (a privilege event names someone who is in no
+  snapshot);
+- **separation of duties**: Okta admins who also hold an OPA admin role (`pam_admin`, `resource_admin`,
+  `delegated_resource_admin`, any role ending in `admin`, or membership of a resource group's delegated admin
+  group), matched by login or e-mail. This needs the OPA roster, so open the Access Explorer once per session;
+  until then the report says separation of duties is unknown.
+
+It lists users with a **direct** role assignment. Roles held only through a group, and OAuth service apps with
+roles, are not listed yet. The **As of** picker lists the dates there is a snapshot for; **Capture now** reads Okta
+and stores a new one (a capture is also taken after each sync, at most every six hours); the history panel lists
+every capture (a refused one is recorded too), compares any two, and exports one as JSON with its hashes. CSV and
+Markdown exports carry the snapshot id and sha256 they were built from, and each export is recorded in the audit
+log. If the token cannot read role assignments the report shows the refusal message instead of an empty list.
+
+**Cross-checks** (Compliance Reports > Cross-checks), check **C1**: every OPA user, and every Okta service account
+by its Okta user id, is looked up in Okta (`GET /api/v1/users/{id|login}`, read-only, bounded to 5,000 principals).
+Those whose Okta user is **deprovisioned or suspended**, or **not found**, are listed with their OPA roles as
+candidates for review, never as findings. OPA-native service users have no Okta identity and are not looked up.
+The Access Explorer Users view marks the same people. Run the lookup from the card (it needs the OPA roster).
+
+**Configuration snapshots.** Each capture is stored as one row per object and sealed into the archive's
+hash chain (one manifest per snapshot; its sealed entries are the objects' hashes). The deep integrity check
+re-reads and re-hashes them, so an edited, added or removed object, or a removed snapshot, is detected; deleting
+an environment's archive removes its snapshots; retention never prunes them. The same threat model as the archived
+log applies (see the integrity check's description).
+
+**Overview data (counts only).** The admin-only `GET /api/overview` returns, per block, either its numbers or its
+state (`never_captured`, `refused`, `not_loaded`...): Okta admin role holders, OPA privileged users, separation-of-duties
+overlaps, C1 counts, OPA service accounts, archive coverage and chain status, weekly privilege grant and revoke counts,
+snapshot dates, the **inventory** (daily counts per series with first-seen date and 7- and 30-day change) and the
+weekly **sign-in and MFA** figures. `GET /api/overview/privileged` returns the people behind the privileged figures; it
+is admin-only and every read is audited. Neither is reachable through an additional login gate.
+
 ### Policy assignment (Folder Builder)
 
 Every folder row in the tree editor carries a small access badge

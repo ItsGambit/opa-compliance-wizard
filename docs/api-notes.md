@@ -228,6 +228,37 @@ these APIs day-to-day.
       root-caused — which is why the dashboard shows `sync_status` as
       informational context and never as a compliance finding.
 
+## System Log sync and Okta role APIs (5.50.0)
+
+From Okta's System Log query guide and the role-assignment API pages; the 5.50.0 behaviour is built on these.
+
+1. **Polling, not bounded paging, for the delta sync.** A System Log request with `since` and no `until`, sorted
+   ASCENDING, is a *polling request*: it returns every event as Okta persists it, ordered by persistence time, and always
+   carries a `next` link (an empty page still has one). A bounded request (`since` + `until`) can miss events that Okta
+   persists after their `published` time ("Some events may be delayed"), and the guide says not to transfer data by manually
+   paginating with `since` and `until`: "always follow the `next` links". `sync_okta_events` follows `next`, saves the last
+   link as a cursor (`sync_state.poll_cursor`) after every page, and stops at an empty page. Because ordering is by
+   persistence time, `published` can arrive out of order, so the published watermark (`last_synced_at`) advances only after
+   a complete pass. A saved cursor Okta rejects (400) falls back, once, to the watermark minus one hour; events are
+   de-duplicated by uuid. The 90-day first backfill stays a day-by-day bounded walk (the page cap is the constraint there),
+   followed by one polling pass.
+2. **`since` may not be more than 180 days back** (HTTP 400 "The since parameter is over 180 days prior to the current day");
+   the app moves an older value to 179 days back. Okta keeps 90 days of events either way.
+3. **A System Log query that runs over 30 seconds** answers HTTP 500 `E0000009`: retried with a smaller page (polling) or a
+   smaller window (bounded walk), never read as "no events". A refused filter (400, `E0000031` / `E0000053`) is an error.
+4. **Correlation fields.** `transaction.id`, `authenticationContext.rootSessionId` and `transaction.detail.requestApiTokenId`
+   are stored as indexed columns (`events.transaction_id`, `root_session_id`, `api_token_id`) and found with
+   `audit_store.events_by_correlation`. Not live-verified here: that `pam.*` events carry `rootSessionId` / `transaction.id`.
+5. **Role assignments.** `GET /api/v1/iam/assignees/users` (`{value:[{id, orn, _links}]}`, paged by `_links.next`),
+   `GET /api/v1/users/{id}/roles` (a list: `id`, `label`, `type`, `status`, `assignmentType`, plus `role` and `resource-set` for
+   `CUSTOM`), `/roles/{assignmentId}/targets/groups` and `/targets/catalog/apps` (limit 1-20), `GET /api/v1/iam/roles` (`{roles}`),
+   `/iam/roles/{id}/permissions`, `GET /api/v1/iam/resource-sets` (`{"resource-sets"}`), and the governance
+   `/roles/{id}/governance` (grants with `expirationDate`). Live-confirmed with a Super Administrator token. A Read-only
+   Administrator and an Organization Administrator token were both refused with `E0000006` on the iam and role-assignment
+   endpoints (while `api-tokens`, logs, policies and users were readable). `GET /api/v1/users` omits DEPROVISIONED users
+   unless filtered; the lifecycle check therefore looks users up one by one (`GET /api/v1/users/{id|login}`, which does
+   return a deprovisioned user). The user object includes a `credentials` object: it is never stored.
+
 ## Idempotency
 
 Existing folders are detected by recursively walking the full folder

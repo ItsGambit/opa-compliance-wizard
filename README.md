@@ -76,6 +76,9 @@ worth reporting privately.
    [Service Accounts Dashboard](docs/features.md#service-accounts-dashboard)
    (every SaaS app and Okta service account across the tenant, including
    ones since deleted, with reveals, checkouts and rotation history).
+   Since 5.50.0, two views that join Okta and OPA: the
+   [Okta Admins report](docs/features.md#okta-admins-report-and-cross-checks)
+   and the lifecycle cross-check.
 2. **Creates a tree of OPA vault secret folders** (any depth) — and, if
    needed, the resource group / project / access group they live under —
    from a CSV file or the dashboard's visual tree editor. See
@@ -143,9 +146,36 @@ the dashboard does.
 Want to run it as a CLI instead, or host it for a team? See
 [docs/hosting.md](docs/hosting.md).
 
+## Data the Okta Admins report holds (5.50.0)
+
+The Okta Admins report, the cross-check and the Overview read your Okta org with the environment's
+existing Okta API token and store the result locally, in this app's archive. Read-only: nothing is written
+to Okta (the optional group creation of the Folder Builder is the only write the app has ever made).
+
+| What is stored | Why | How it is removed |
+|---|---|---|
+| Okta admins: user id, status, login, e-mail, first and last name, role assignments (role, status, dates, group or app targets, time-bound grants), custom roles and their permission names, resource sets | the Okta Admins report, as of any snapshot date | with the environment's archive (delete the environment with "also delete its archive", or purge an orphaned archive) |
+| The Okta status of each OPA user and Okta service account | the lifecycle cross-check | same |
+| Daily counts (OPA objects, Okta users, groups, apps, policies by type, admin role holders) | the Overview's inventory over time | same; counts only, no names |
+| Per person and week: counts of sign-ins and of multi-factor events by factor class | the Overview's sign-in and MFA figures | same |
+
+Never stored: Okta `credentials` objects, any profile attribute beyond login, e-mail and name, tokens.
+Snapshots are sealed into the same tamper-evident chain as the archived log and are never pruned by
+retention; a deep integrity check verifies them.
+
+**Which Okta role the token needs.** The Okta Admins report calls Okta's role-assignment APIs, which Okta
+only answers for a token whose admin can view roles and admin assignments: **Super Administrator**, or a
+custom admin role with the permission `okta.iam.read` (view roles, resources and admin assignments) plus
+permission to read users. Organization Administrator and Read-only Administrator tokens are refused (Okta
+error E0000006). When Okta refuses, the report says: "Your Okta token cannot read admin role assignments;
+this report needs a token whose admin can view roles and admin assignments (for example a custom admin role
+with that permission, or Super Administrator)." and every other screen keeps working. The cross-check needs a
+token whose admin can read users; the System Log archive needs log read access, as before. The app does not
+test the token's permissions up front: each screen says what it could not read.
+
 ## Upgrading
 
-**Nothing changes for you unless you choose it.** Upgrading to 5.49.0 changes no
+**Nothing changes for you unless you choose it.** Upgrading to 5.50.0 changes no
 behaviour of an existing install: the update check is **off**, `server/deploy.sh` and `--ref`
 keep working in place (with a note that the install can move to the upgrade layout), and no
 key has to be pinned. 5.46.0 added **signed releases** and the update check; 5.47.0 adds the
