@@ -356,6 +356,7 @@ check "the site ends at 200" bash -c "tail -1 $WORK/poll2.txt | grep -q '^200'"
 check "the maintenance page file is gone" test ! -e "$OPT/maintenance/active.html"
 check "a pre-upgrade backup exists, root-only" bash -c "test \"\$(stat -c %a $DATA/upgrade/backups/audit_store-pre-98.0.2-*.db)\" = 600"
 check "state.json says completed" bash -c "grep -q '\"result\": \"completed\"' $DATA/upgrade/state.json"
+for _ in $(seq 1 20); do grep -q 'upgrade.completed' "$DATA/audit_log.jsonl" && break; sleep 0.5; done   # the entry follows the state file by a moment
 check "audit log has upgrade.completed with a correlation id" bash -c "grep -q 'upgrade.completed' $DATA/audit_log.jsonl && grep -q 'upg-' $DATA/audit_log.jsonl"
 check "previous points at 98.0.1" test "$(readlink "$OPT/previous")" = "releases/98.0.1"
 
