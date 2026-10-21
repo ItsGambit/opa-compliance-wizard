@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from server.nginx_second_site import _location_blocks, build, server_blocks
+from server.nginx_second_site import _location_blocks, build, missing_denies, server_blocks, site_params
 
 TEMPLATE = (Path(__file__).resolve().parent.parent / "server" / "nginx-opa-secrets-wizard.conf").read_text()
 MAIN = TEMPLATE.replace("REPLACE_WITH_NGINX_PROXY_SECRET_VALUE", "s3cr3t-live-value")
@@ -335,3 +335,23 @@ def test_the_issuer_header_is_forwarded_like_the_other_identity_headers(site):
     assert https_block.count("X-Auth-Issuer $auth_issuer") == 3 and site.count("X-Auth-Issuer $auth_issuer") == 2
     # ... each with the marker that tells serve.py the issuer was overwritten here.
     assert site.count("proxy_set_header X-Nginx-Issuer-Forwarded $nginx_proxy_secret;") == 2
+
+
+# --- reading an existing generated site (server/install.sh --regenerate-second-sites, the updater's preflight) ------
+
+def test_a_generated_site_has_no_missing_denies_and_its_parameters_can_be_read_back(site):
+    assert missing_denies(site) == []
+    assert site_params(site) == ("8768", "127.0.0.1:8080", "opa.example.com")
+
+
+def test_missing_denies_finds_a_site_generated_before_the_upgrade_deny_existed(site):
+    old = site.replace("    location /api/upgrade {\n        return 403;\n    }\n", "")
+    assert missing_denies(old) == ["/api/upgrade"]
+    # a deny that is only commented out, or quoted, does not count
+    assert missing_denies(old.replace("    location /api/archives {", "    # location /api/upgrade { return 403; }\n    location /api/archives {")) == ["/api/upgrade"]
+    assert missing_denies(old.replace("location /api/upgrade", "location /api/upgrade-x")) != []
+
+
+def test_regenerating_from_the_read_back_parameters_reproduces_the_site(site):
+    port, listen, host = site_params(site)
+    assert build(MAIN, port, listen, host, "second") == site

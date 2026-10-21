@@ -37,7 +37,12 @@
 #   --remove-legacy-sudoers    also remove the old deploy sudoers file (opa-compliance-wizard-deploy) after checking it only
 #                              grants what deploy.sh used to need; moved aside, never deleted. Never done without this flag.
 #   --apply-nginx              also bake and apply this release's nginx template (adds the maintenance page)
-#   --refresh-updater          (re-run) replace the root-owned updater code with this checkout's
+#   --refresh-updater          (re-run) replace the root-owned updater code, the units and the ocw-updater command with this
+#                              checkout's, and record this checkout's version in the updater's config.json (install_sh_version):
+#                              the updater refuses a release whose newest change to those files is newer than that version.
+#                              Touches no data. This is the command a refused upgrade asks for ("needs_install_sh").
+#   --regenerate-second-sites  regenerate the nginx site of every additional login gate (opa-auth-gate-*) from the live main site
+#                              with this release's rules (the /api/upgrade deny), with `nginx -t` first and a restore on failure
 #   --yes                      do not ask for confirmation
 #
 # Everything below that is a path can be redirected for testing (OCW_OPT_DIR, OCW_DATA_DIR, OCW_UNIT_DIR, OCW_BIN_DIR,
@@ -49,6 +54,7 @@ DATA_DIR="${OCW_DATA_DIR:-/var/lib/opa-compliance-wizard}"
 UNIT_DIR="${OCW_UNIT_DIR:-/etc/systemd/system}"
 BIN_DIR="${OCW_BIN_DIR:-/usr/local/bin}"
 ENV_FILE="${OCW_ENV_FILE:-/etc/opa-compliance-wizard.env}"
+NGINX_SITES_DIR="${OCW_NGINX_SITES_DIR:-/etc/nginx/sites-available}"
 SUDOERS_DIR="${OCW_SUDOERS_DIR:-/etc/sudoers.d}"
 ARTIFACTS_DIR="${OCW_ARTIFACTS_DIR:-/var/lib/ocw-updater/artifacts}"
 UPDATER_ENV="${OCW_UPDATER_ENV:-/etc/ocw-updater.env}"
@@ -64,8 +70,9 @@ WHEELHOUSE=""
 REMOVE_SUDOERS=""
 APPLY_NGINX=""
 REFRESH_UPDATER=""
+REGEN_SECOND=""
 
-usage() { sed -n '2,44p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,50p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 note() { echo "$*"; }
 plan() { echo "  - $*"; }
@@ -81,12 +88,13 @@ while [ $# -gt 0 ]; do
     --remove-legacy-sudoers) REMOVE_SUDOERS=1; shift ;;
     --apply-nginx) APPLY_NGINX=1; shift ;;
     --refresh-updater) REFRESH_UPDATER=1; shift ;;
+    --regenerate-second-sites) REGEN_SECOND=1; shift ;;
     -h | --help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
 done
 
-for _p in "$OPT_DIR" "$DATA_DIR" "$UNIT_DIR" "$BIN_DIR" "$ENV_FILE" "$SUDOERS_DIR" "$ARTIFACTS_DIR"; do
+for _p in "$OPT_DIR" "$DATA_DIR" "$UNIT_DIR" "$BIN_DIR" "$ENV_FILE" "$SUDOERS_DIR" "$ARTIFACTS_DIR" "$NGINX_SITES_DIR"; do
   case "$_p" in
     /*) ;;
     *) die "paths must be absolute (got '$_p')" ;;
@@ -129,6 +137,46 @@ for _s in opa-secrets-wizard opa-compliance-wizard; do
   if systemctl cat "$_s" >/dev/null 2>&1; then SERVICE_NAME="$_s"; break; fi
 done
 unit_prop() { systemctl show -p "$2" --value "$1" 2>/dev/null || true; }
+
+# rewrite_unit <unit> <input> <output>: the migrated copy of a unit file. Every edit tolerates leading whitespace (systemd
+# does, and units written by hand are often indented) and keeps the line's own indentation. A key this has to find or add
+# next to is REQUIRED: if it is missing the function fails with the reason instead of quietly skipping the edit, so a unit is
+# never half migrated (it runs before anything is changed, in the dry run too).
+rewrite_unit() {
+  local _u="$1" _in="$2" _out="$3" _esc
+  _esc="$(printf '%s' "$LEGACY_DIR" | sed -e 's/[][\.*^$|&]/\\&/g')"
+  if ! grep -Eq '^[[:space:]]*WorkingDirectory=' "$_in"; then
+    echo "ERROR: $_u: no WorkingDirectory= line in $_in, so the migrated unit could not be given OPA_DATA_DIR; nothing was changed. Add the line by hand (see docs/hosting.md) and re-run." >&2
+    return 1
+  fi
+  if [ "$_u" = "$SERVICE_NAME" ] && ! grep -Eq '^[[:space:]]*ProtectSystem=' "$_in" && ! grep -Eq '^[[:space:]]*ProtectHome=' "$_in"; then
+    echo "ERROR: $_u: neither ProtectSystem= nor ProtectHome= in $_in, so ProtectSystem=strict could not be placed; nothing was changed. Add ProtectSystem=strict by hand and re-run." >&2
+    return 1
+  fi
+  sed -e "s|^\([[:space:]]*\)ReadWritePaths=${_esc}[[:space:]]*\$|\1ReadWritePaths=$DATA_DIR|" \
+      -e "s|$_esc|$OPT_DIR/current|g" "$_in" > "$_out" || return 1
+  if ! grep -Eq '^[[:space:]]*Environment=OPA_DATA_DIR=' "$_out"; then
+    awk -v d="$DATA_DIR" '!done && /^[[:space:]]*WorkingDirectory=/ { print; match($0, /^[[:space:]]*/); ind = substr($0, 1, RLENGTH); print ind "Environment=OPA_DATA_DIR=" d; print ind "Environment=PYTHONDONTWRITEBYTECODE=1"; done=1; next } { print }' \
+      "$_out" > "$_out.2" && mv "$_out.2" "$_out"
+  fi
+  if [ "$_u" = "$SERVICE_NAME" ] && ! grep -Eq '^[[:space:]]*ProtectSystem=' "$_out"; then
+    awk '!done && /^[[:space:]]*ProtectHome=/ { match($0, /^[[:space:]]*/); print substr($0, 1, RLENGTH) "ProtectSystem=strict"; done=1 } { print }' "$_out" > "$_out.2" && mv "$_out.2" "$_out"
+  fi
+  # what was asked for must now be there
+  if ! grep -Eq "^[[:space:]]*Environment=OPA_DATA_DIR=$DATA_DIR\$" "$_out" || { [ "$_u" = "$SERVICE_NAME" ] && ! grep -Eq '^[[:space:]]*ProtectSystem=' "$_out"; }; then
+    echo "ERROR: $_u: the migrated copy of $_in does not have Environment=OPA_DATA_DIR=$DATA_DIR (and ProtectSystem= for the main service); nothing was changed." >&2
+    return 1
+  fi
+}
+
+# the additional login gates (setup-second-gate.sh): units opa-auth-gate-<name>, nginx site <sites dir>/opa-<name>
+SECOND_GATES="$(systemctl list-unit-files 'opa-auth-gate-*.service' --no-legend 2>/dev/null | awk '{print $1}' | sed -e 's/\.service$//' -e 's/^opa-auth-gate-//' | tr '\n' ' ' || true)"
+second_site_status() { # second_site_status <name>: prints ok | missing-deny | no-site | unreadable
+  local _site="$NGINX_SITES_DIR/opa-$1" _rc=0
+  [ -f "$_site" ] || { echo "no-site"; return 0; }
+  "$PY3" -I "$SOURCE_DIR/server/nginx_second_site.py" --check "$_site" >/dev/null 2>&1 || _rc=$?
+  case "$_rc" in 0) echo "ok" ;; 1) echo "missing-deny" ;; *) echo "unreadable" ;; esac
+}
 
 LAYOUT_PRESENT=""
 [ -L "$OPT_DIR/current" ] && LAYOUT_PRESENT=1
@@ -210,7 +258,7 @@ if [ -z "$REFRESH_UPDATER" ] && [ -n "$LAYOUT_PRESENT" ]; then
 else
   plan "install the root-owned updater files ($(find "$SOURCE_DIR/server/updater/root" -maxdepth 1 -name '*.py' | wc -l | tr -d ' ') + nginx_bake.py) into $OPT_DIR/updater"
 fi
-plan "write $OPT_DIR/updater/config.json and (once) the root trust list from $SOURCE_DIR/server/release_keys.json"
+plan "write $OPT_DIR/updater/config.json (recording install_sh_version=$VERSION once the units and the command are in place) and (once) the root trust list from $SOURCE_DIR/server/release_keys.json"
 if [ "$MODE" != "reinstall" ]; then
   plan "copy this checkout to $OPT_DIR/releases/$VERSION and build its virtualenv with 'pip install --require-hashes' as $UPDATER_USER${WHEELHOUSE:+ from $WHEELHOUSE only}; then make the tree root-owned"
   plan "point $OPT_DIR/current at releases/$VERSION"
@@ -237,6 +285,39 @@ else
   plan "leave any old deploy sudoers lines alone (add --remove-legacy-sudoers to remove them)"
 fi
 plan "enable ocw-upgrade.path and ocw-upgrade.service (boot-time resume)"
+# every unit that would be rewritten must have the lines the rewrite works from: checked now, on a scratch copy, so a
+# surprising unit stops the run (the dry run too) before anything has been changed
+if [ "$MODE" = "migrate" ]; then
+  _scratch="$(mktemp -d)"
+  trap 'rm -rf "$_scratch"' EXIT
+  _bad_units=""
+  for _u in $ALL_UNITS; do
+    _frag="$(unit_prop "$_u" FragmentPath)"
+    case "$_frag" in "$UNIT_DIR"/*) ;; *) continue ;; esac
+    [ -f "$_frag" ] || { echo "ERROR: $_u: $_frag does not exist" >&2; _bad_units=1; continue; }
+    rewrite_unit "$_u" "$_frag" "$_scratch/$_u.service" || _bad_units=1
+  done
+  [ -z "$_bad_units" ] || die "a unit does not have the lines the migration edits (above); nothing was changed"
+fi
+if [ -n "$SECOND_GATES" ]; then
+  note ""
+  note "!! ADDITIONAL LOGIN GATES FOUND: $SECOND_GATES"
+  for _g in $SECOND_GATES; do
+    case "$(second_site_status "$_g")" in
+      ok) note "   opa-$_g ($NGINX_SITES_DIR/opa-$_g): already denies /api/upgrade" ;;
+      no-site) note "   opa-$_g: no nginx site at $NGINX_SITES_DIR/opa-$_g (OCW_NGINX_SITES_DIR=<dir> if it lives elsewhere); check it by hand" ;;
+      unreadable) note "   opa-$_g: $NGINX_SITES_DIR/opa-$_g could not be read or parsed; check it by hand" ;;
+      *) note "   opa-$_g: $NGINX_SITES_DIR/opa-$_g does NOT deny /api/upgrade: through that hostname an admin of that org could reach this server's upgrade routes" ;;
+    esac
+  done
+  if [ -n "$REGEN_SECOND" ]; then
+    plan "regenerate those nginx sites from the live main site ($CONF_NGINX_SITE) with nginx -t first and a restore on failure"
+  else
+    note "   Neither this installer nor the updater changes those sites. After this run, regenerate them with"
+    note "       sudo bash $SOURCE_DIR/server/install.sh --regenerate-second-sites"
+    note "   (add --apply-nginx in the same command to also apply the main site's maintenance page first)."
+  fi
+fi
 note ""
 if [ -n "$DRY_RUN" ]; then
   note "Dry run: nothing was changed."
@@ -330,11 +411,23 @@ if [ -z "$LAYOUT_PRESENT" ] || [ -n "$REFRESH_UPDATER" ]; then
   own root:root 0755 "$OPT_DIR/updater/lib"
 fi
 _cfg_tmp="$OPT_DIR/updater/config.json.tmp"
+# keep the version install.sh recorded earlier until this run has finished replacing the units and the command
+_prev_isv=""
+if [ -f "$OPT_DIR/updater/config.json" ]; then
+  _prev_isv="$("$PY3" -I -c 'import json, re, sys
+try:
+    v = json.load(open(sys.argv[1])).get("install_sh_version", "")
+except Exception:
+    v = ""
+print(v if isinstance(v, str) and re.fullmatch(r"[0-9]+[.][0-9]+[.][0-9]+", v) else "")' "$OPT_DIR/updater/config.json")"
+fi
+_isv_json=""
+[ -z "$_prev_isv" ] || _isv_json=", \"install_sh_version\": \"$_prev_isv\""
 cat > "$_cfg_tmp" <<EOF
 {"app_user": "$APP_USER", "app_group": "$APP_GROUP", "stage_user": "$UPDATER_USER",
  "backend_service": "${SERVICE_NAME:-opa-compliance-wizard}", "gate_service": "opa-auth-gate",
- "nginx_site": "$CONF_NGINX_SITE", "backend_port": $CONF_PORT,
- "artifacts_dir": "$ARTIFACTS_DIR", "env_file": "$ENV_FILE"}
+ "nginx_site": "$CONF_NGINX_SITE", "backend_port": $CONF_PORT, "second_gate_sites_dir": "$NGINX_SITES_DIR",
+ "artifacts_dir": "$ARTIFACTS_DIR", "env_file": "$ENV_FILE"$_isv_json}
 EOF
 own root:root 0644 "$_cfg_tmp"
 mv "$_cfg_tmp" "$OPT_DIR/updater/config.json"
@@ -442,8 +535,9 @@ PY
   # the environment file: add OPA_DATA_DIR; an archive path that pointed into the old directory follows the move
   if [ -f "$ENV_FILE" ]; then
     cp -p "$ENV_FILE" "$BACKUP_DIR/$(basename -- "$ENV_FILE")"
-    grep -q '^OPA_DATA_DIR=' "$ENV_FILE" || printf '\nOPA_DATA_DIR=%s\n' "$DATA_DIR" >> "$ENV_FILE"
-    sed -i.ocwbak -e "s|^OPA_AUDIT_DB_PATH=$LEGACY_DIR/|OPA_AUDIT_DB_PATH=$DATA_DIR/|" "$ENV_FILE" && rm -f "$ENV_FILE.ocwbak"
+    grep -Eq '^[[:space:]]*OPA_DATA_DIR=' "$ENV_FILE" || printf '\nOPA_DATA_DIR=%s\n' "$DATA_DIR" >> "$ENV_FILE"
+    _envesc="$(printf '%s' "$LEGACY_DIR" | sed -e 's/[][\\.*^$|&]/\\&/g')"
+    sed -i.ocwbak -e "s|^\([[:space:]]*\)OPA_AUDIT_DB_PATH=${_envesc}/|\1OPA_AUDIT_DB_PATH=$DATA_DIR/|" "$ENV_FILE" && rm -f "$ENV_FILE.ocwbak"
   else
     note "NOTE: $ENV_FILE does not exist; create it as docs/hosting.md describes (OPA_DATA_DIR=$DATA_DIR is the new line)"
   fi
@@ -454,16 +548,7 @@ PY
     case "$_frag" in "$UNIT_DIR"/*) ;; *) note "NOTE: $_u is defined in '$_frag', outside $UNIT_DIR: not rewritten (edit it as docs/hosting.md describes)"; continue ;; esac
     cp -p "$_frag" "$BACKUP_DIR/$(basename -- "$_frag")"
     UNIT_BACKUPS+=("$_frag")
-    _esc="$(printf '%s' "$LEGACY_DIR" | sed -e 's/[][\.*^$|&]/\\&/g')"
-    sed -e "s|^[[:space:]]*ReadWritePaths=${_esc}[[:space:]]*\$|ReadWritePaths=$DATA_DIR|" \
-        -e "s|$_esc|$OPT_DIR/current|g" "$BACKUP_DIR/$(basename -- "$_frag")" > "$_frag.new"
-    if ! grep -q '^Environment=OPA_DATA_DIR=' "$_frag.new"; then
-      awk -v d="$DATA_DIR" '!done && /^WorkingDirectory=/ { print; print "Environment=OPA_DATA_DIR=" d; print "Environment=PYTHONDONTWRITEBYTECODE=1"; done=1; next } { print }' \
-        "$_frag.new" > "$_frag.new2" && mv "$_frag.new2" "$_frag.new"
-    fi
-    if [ "$_u" = "$SERVICE_NAME" ] && ! grep -q '^ProtectSystem=' "$_frag.new"; then
-      awk '!done && /^ProtectHome=/ { print "ProtectSystem=strict"; done=1 } { print }' "$_frag.new" > "$_frag.new2" && mv "$_frag.new2" "$_frag.new"
-    fi
+    rewrite_unit "$_u" "$BACKUP_DIR/$(basename -- "$_frag")" "$_frag.new" || restore_migration
     echo "--- $_frag (changes)"; diff -u "$BACKUP_DIR/$(basename -- "$_frag")" "$_frag.new" || true
     mv "$_frag.new" "$_frag"
   done
@@ -504,6 +589,58 @@ if [ -n "$APPLY_NGINX" ]; then
   "$PY3" -I "$OPT_DIR/updater/ocw_activate.py" cli nginx-sync || note "WARNING: the nginx template was not applied (see above); the maintenance page will not show until it is"
 fi
 
+regenerate_second_sites() {
+  command -v nginx >/dev/null 2>&1 || { note "WARNING: nginx is not installed here; the second-gate sites were not regenerated"; return 1; }
+  [ -f "$CONF_NGINX_SITE" ] && [ ! -L "$CONF_NGINX_SITE" ] || { note "WARNING: the main nginx site $CONF_NGINX_SITE is not a regular file; the second-gate sites were not regenerated (they are generated from it)"; return 1; }
+  mkdir -p "$BACKUP_DIR"
+  chmod 0700 "$BACKUP_DIR"
+  local _g _site _new _params _port _listen _host _extra _failed="" _changed=() _s
+  for _g in $SECOND_GATES; do
+    _site="$NGINX_SITES_DIR/opa-$_g"
+    if [ ! -f "$_site" ] || [ -L "$_site" ]; then note "    opa-$_g: no regular file at $_site: not regenerated (check it by hand)"; _failed=1; continue; fi
+    if ! _params="$("$PY3" -I "$SOURCE_DIR/server/nginx_second_site.py" --params "$_site")"; then
+      note "    opa-$_g: could not read the gate port, listen address and host from $_site: not regenerated"; _failed=1; continue
+    fi
+    read -r _port _listen _host <<<"$_params"
+    _extra=()
+    case "$_listen" in 127.*) ;; *) _extra=(--allow-public-listen) ;; esac   # keep the choice the operator made when the site was created
+    _new="$BACKUP_DIR/opa-$_g.site.new"
+    cp -p "$_site" "$BACKUP_DIR/opa-$_g.site.before"
+    if ! "$PY3" -I "$SOURCE_DIR/server/nginx_second_site.py" "$CONF_NGINX_SITE" "$_new" "$_port" "$_listen" "$_host" "$_g" ${_extra[@]+"${_extra[@]}"}; then
+      note "    opa-$_g: the generator refused the main site (above): not regenerated"; _failed=1; continue
+    fi
+    cat "$_new" > "$_site"   # same inode, owner and mode as before
+    if nginx -t >/dev/null 2>&1; then
+      note "    opa-$_g: regenerated ($_listen, $_host, gate port $_port); the old copy is $BACKUP_DIR/opa-$_g.site.before"
+      _changed+=("$_g")
+    else
+      cat "$BACKUP_DIR/opa-$_g.site.before" > "$_site"
+      note "    opa-$_g: nginx -t rejected the regenerated site; the old one was put back"
+      nginx -t >/dev/null 2>&1 || note "WARNING: nginx -t still fails with the old site restored: fix nginx's configuration (nothing was reloaded)"
+      _failed=1
+    fi
+  done
+  if [ "${#_changed[@]}" -gt 0 ]; then
+    if systemctl reload nginx; then
+      note "    nginx reloaded"
+    else
+      for _s in "${_changed[@]}"; do cat "$BACKUP_DIR/opa-$_s.site.before" > "$NGINX_SITES_DIR/opa-$_s"; done
+      note "WARNING: nginx would not reload; the previous second-gate sites were put back"
+      _failed=1
+    fi
+  fi
+  [ -z "$_failed" ]
+}
+
+if [ -n "$REGEN_SECOND" ]; then
+  note "==> Second-gate nginx sites"
+  if [ -z "$SECOND_GATES" ]; then
+    note "    no additional login gates (opa-auth-gate-*) on this server: nothing to regenerate"
+  else
+    regenerate_second_sites || SECOND_FAILED=1
+  fi
+fi
+
 if [ -n "$REMOVE_SUDOERS" ]; then
   note "==> Old deploy sudoers"
   _sf="$SUDOERS_DIR/opa-compliance-wizard-deploy"
@@ -522,6 +659,22 @@ if [ -n "$REMOVE_SUDOERS" ]; then
   fi
 fi
 
+# the units and the command above are now this release's: record that, so the updater stops asking for this run
+"$PY3" -I - "$OPT_DIR/updater/config.json" "$VERSION" <<'PY' || die "could not record install_sh_version in $OPT_DIR/updater/config.json"
+import json, os, sys
+path, version = sys.argv[1], sys.argv[2]
+with open(path, encoding="utf-8") as fh:
+    cfg = json.load(fh)
+cfg["install_sh_version"] = version
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(cfg, fh)
+    fh.flush()
+    os.fsync(fh.fileno())
+os.chmod(tmp, 0o644)
+os.replace(tmp, path)
+PY
+note "    recorded install_sh_version=$VERSION in $OPT_DIR/updater/config.json"
 systemctl daemon-reload
 systemctl enable ocw-upgrade.path ocw-upgrade.service >/dev/null 2>&1 || note "WARNING: could not enable ocw-upgrade.path / ocw-upgrade.service"
 systemctl start ocw-upgrade.path || note "WARNING: could not start ocw-upgrade.path"
@@ -530,3 +683,15 @@ note "Done. Next:"
 note "  ocw-updater status                      what is installed and ready"
 note "  sudo ocw-updater apply <version>        upgrade (staging, backup, switch, health checks, automatic rollback)"
 note "  sudo server/install.sh --apply-nginx    (if you did not pass it) once, so other users see a maintenance page while it switches"
+if [ -n "$SECOND_GATES" ]; then
+  _unfixed=""
+  for _g in $SECOND_GATES; do [ "$(second_site_status "$_g")" = "ok" ] || _unfixed="$_unfixed $_g"; done
+  if [ -n "$_unfixed" ]; then
+    note ""
+    note "!! ACTION NEEDED: the nginx site of these additional login gates does not deny /api/upgrade:$_unfixed"
+    note "!! Through that hostname an administrator of that org could reach this server's upgrade routes. Run"
+    note "!!     sudo bash $SOURCE_DIR/server/install.sh --regenerate-second-sites"
+    note "!! (it rebuilds each site from the live main site, runs nginx -t, and puts the old site back if it fails)."
+  fi
+fi
+[ -z "${SECOND_FAILED:-}" ] || die "the second-gate nginx sites were not all regenerated (see above); the rest of the install is done"

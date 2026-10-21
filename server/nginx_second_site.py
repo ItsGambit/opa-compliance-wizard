@@ -14,6 +14,10 @@ The backend (127.0.0.1:8766), auth_request rules and the proxy secret stay exact
 
 Usage: python3 server/nginx_second_site.py <main site> <output> <gate port> <listen> <host> <name>
        [--allow-public-listen]
+       python3 server/nginx_second_site.py --check <site>    exit 0: every deny is present; 1: some are missing (listed);
+                                                             2: unreadable
+       python3 server/nginx_second_site.py --params <site>   print "<gate port> <listen> <host>" of an existing generated
+                                                             site (what server/install.sh --regenerate-second-sites reuses)
 
 <listen> must be a loopback address (127.x.x.x) unless --allow-public-listen is given (GATE-15): this site
 carries the proxy secret path and speaks plain HTTP, so publishing it on a LAN or public address is a choice
@@ -194,6 +198,25 @@ _ACCESS_CONTROL_BLOCK = (
 )
 
 
+def missing_denies(text):
+    """The SECOND_SITE_DENIED_PREFIXES that `text` (an existing generated site) does not answer 403 on. Comments and quoted
+    strings are ignored. Read-only."""
+    structure = _structure(text)
+    return [p for p in SECOND_SITE_DENIED_PREFIXES
+            if not re.search(rf"(?<![A-Za-z0-9_$])location\s+{re.escape(p)}\s*\{{\s*return\s+403\s*;\s*\}}", structure)]
+
+
+def site_params(text):
+    """(gate port, listen address, host) of an existing generated site, so it can be generated again the same way."""
+    structure = _structure(text)
+    listens = set(re.findall(r"(?<![A-Za-z0-9_$])listen\s+([0-9.]+:[0-9]{2,5})\s*;", structure))
+    hosts = set(re.findall(r"(?<![A-Za-z0-9_$])server_name\s+([A-Za-z0-9.-]+)\s*;", structure))
+    ports = set(re.findall(r"proxy_pass\s+http://127\.0\.0\.1:([0-9]{4,5})", structure)) - {"8766"}
+    if len(listens) != 1 or len(hosts) != 1 or len(ports) != 1:
+        raise ValueError(f"cannot tell the gate port / listen address / host apart (found {sorted(ports)}, {sorted(listens)}, {sorted(hosts)})")
+    return ports.pop(), listens.pop(), hosts.pop()
+
+
 def _replace_directive(block, pattern, replacement):
     """Replace every real (not commented-out, not quoted) occurrence of
     `pattern` in `block`, wherever it sits on the line."""
@@ -263,6 +286,19 @@ def build(main_site, gate_port, listen, host, name, allow_public_listen=False):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] in ("--check", "--params"):
+        try:
+            with open(sys.argv[2], encoding="utf-8") as fh:
+                site_text = fh.read()
+            if sys.argv[1] == "--check":
+                missing = missing_denies(site_text)
+                print("\n".join(missing))
+                raise SystemExit(1 if missing else 0)
+            print(" ".join(site_params(site_text)))
+            raise SystemExit(0)
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            print(f"{exc}", file=sys.stderr)
+            raise SystemExit(2)
     src, dst, port, listen, host, name = sys.argv[1:7]
     extra = sys.argv[7:]
     if extra not in ([], ["--allow-public-listen"]):
