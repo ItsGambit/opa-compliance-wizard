@@ -1,14 +1,17 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { useQueryClient } from '@tanstack/react-query'
-import { Camera, Copy, FileText, RefreshCw, ShieldCheck, Users } from 'lucide-react'
-import { startOktaCapture, startSync } from '../api/client'
+import { Copy, FileText, RefreshCw, Users } from 'lucide-react'
+import { startOktaCapture } from '../api/client'
 import { useEnvironments, useOverview, usePeopleList, useReportDefs } from '../api/hooks'
 import { useIntegrityCheck } from '../hooks/useIntegrityCheck'
+import { useRefreshActions, useRefreshStatus } from '../hooks/useRefresh'
 import { toast } from '../hooks/useToast'
 import type { CrossCheckRow, InventorySeries, MfaWeek, Overview as OverviewData, SodOverlap } from '../types'
 import { downloadTextFile, toCsv } from '../utils/export'
-import { formatDateTime } from '../utils/format'
+import { formatDateTime, formatDateTimeZone } from '../utils/format'
+import { activeRow, can, refreshReason } from '../utils/environmentRows'
+import { ageText, completedText, isActive, requestedParts, scanFreshness, staleBadgeText } from '../utils/refresh'
 import { exportAllReports } from '../utils/reportExports'
 import {
   FACTOR_ROWS, approx, dayLabel, inventoryCsv, leadershipPdfHtml, overviewExportSections, pct, seriesValues, signed, weekReadout, windowFigures,
@@ -16,6 +19,8 @@ import {
 import { oktaStateText } from '../utils/oktaAdmins'
 import { DialogCloseButton } from './DialogCloseButton'
 import { ExportButtons } from './ExportButtons'
+import { RefreshControl } from './RefreshControl'
+import { RefreshProgressCard } from './RefreshProgressCard'
 import { Select } from './Select'
 import { StatusBadge } from './StatusBadge'
 import { Legend, Sparkline, TimeChart } from './TimeChart'
@@ -146,35 +151,74 @@ function PeopleDrawer({ environment, list, asOf, onClose }: { environment: strin
 }
 
 // ── Sections ────────────────────────────────────────────────────────────────────────────────────────────────────
-function SourcesStrip({ o, environment, asOf, onCaptured }: { o: OverviewData; environment: string; asOf: string | undefined; onCaptured: () => void }) {
+function ScanRow({ o }: { o: OverviewData }) {
+  const m = o.sources.opa_model
+  const now = Date.now()
+  if (!m.built_at) {
+    const sched = o.sources.refresh?.schedule
+    return (
+      <span>
+        No OPA scan stored yet. Select <strong>Refresh</strong> to scan now{sched?.enabled ? `, or wait for the daily refresh at ${sched.run_time} UTC` : ''}.
+      </span>
+    )
+  }
+  const freshness = scanFreshness(m.built_at, now)
+  const stale = staleBadgeText(m.built_at, now)
+  return (
+    <span>
+      OPA scan {formatDateTimeZone(m.built_at)} ({ageText(m.built_at, now)}){' '}
+      {stale ? <StatusBadge label={stale} variant={freshness === 'very_stale' ? 'error' : 'warn'} /> : <StatusBadge label="Current" variant="active" />}
+      {m.modified_at && <>{' '}<StatusBadge label="Edited since the scan" variant="neutral" /></>}
+      {m.principals_effective != null ? ` · ${m.principals_effective} principals with effective access, resolved through policies` : ''}
+      {(m.warnings_count ?? 0) > 0 ? ` · ${m.warnings_count} section${m.warnings_count === 1 ? '' : 's'} the key cannot read` : ''} · stored in the local archive
+    </span>
+  )
+}
+
+function ScheduleRow({ o }: { o: OverviewData }) {
+  const r = o.sources.refresh
+  if (!r) return <span>—</span>
+  const last = r.last_scheduled
+  const parts = last ? (['opa', 'log', 'okta'] as const).filter(p => last.parts[p]) : []
+  const ok = parts.filter(p => last!.parts[p]!.state === 'ok').length
+  const lastText = last?.finished_at ? ` · last run ${formatDateTimeZone(last.finished_at)} · ${completedText(ok, parts.length)}` : ' · no scheduled run yet'
+  return <span>{r.schedule.enabled ? `Daily at ${r.schedule.run_time} UTC${lastText}` : `The daily refresh is off${last?.finished_at ? lastText.replace(' · last run', ' · last scheduled run') : ''}. Turn it on in the environment's sync settings.`}</span>
+}
+
+function SourcesStrip({ o, environment, canRun, disabledReason, onRefresh }: {
+  o: OverviewData; environment: string; canRun: boolean; disabledReason: string; onRefresh: (parts?: ('opa' | 'okta' | 'log')[]) => void
+}) {
   const s = o.sources
   const qc = useQueryClient()
   const integrity = useIntegrityCheck(environment)
-  const [busy, setBusy] = useState<string | null>(null)
-  const act = async (key: string, fn: () => Promise<unknown>, done: string) => {
-    setBusy(key)
-    try { await fn(); toast({ title: done, variant: 'success' }); onCaptured(); void qc.invalidateQueries({ queryKey: ['overview', environment] }) }
-    catch (e) { toast({ title: 'Could not start that', description: (e as Error).message, variant: 'error' }) }
-    finally { setBusy(null) }
+  const { data: refresh } = useRefreshStatus(environment)
+  const running = refresh?.status === 'running'
+  const buildSignins = async () => {
+    try { await startOktaCapture(environment, 'mfa_aggregates'); await qc.invalidateQueries({ queryKey: ['overview', environment] }) }
+    catch (e) { toast({ title: 'Could not build the sign-in figures', description: (e as Error).message, variant: 'error' }) }
   }
   const chain = integrity.state.phase === 'done' ? integrity.state.result : null
   return (
     <section aria-label="Where the figures come from" className="card p-4 flex flex-col gap-3">
       <div className="grid gap-x-5 gap-y-3 text-xs text-text-dim sm:grid-cols-2 lg:grid-cols-3">
         <div className="flex flex-col gap-0.5">
+          <span className="section-label">OPA access model (who can reach what)</span>
+          <ScanRow o={o} />
+        </div>
+        <div className="flex flex-col gap-0.5">
           <span className="section-label">Okta configuration (who holds which role)</span>
           {s.okta_snapshot.captured_at ? (
-            <span>Okta configuration snapshot {formatDateTime(s.okta_snapshot.captured_at)}{s.okta_snapshot.index ? ` (${s.okta_snapshot.index}${s.okta_snapshot.index === 1 ? 'st' : s.okta_snapshot.index === 2 ? 'nd' : s.okta_snapshot.index === 3 ? 'rd' : 'th'} snapshot` : ''}{s.okta_snapshot.first_at ? `, since ${dayLabel(s.okta_snapshot.first_at)})` : s.okta_snapshot.index ? ')' : ''} · sealed into the evidence chain <StatusBadge label="Chained" variant="active" /></span>
+            <span>Okta configuration snapshot {formatDateTimeZone(s.okta_snapshot.captured_at)}{s.okta_snapshot.index ? ` (${s.okta_snapshot.index}${s.okta_snapshot.index === 1 ? 'st' : s.okta_snapshot.index === 2 ? 'nd' : s.okta_snapshot.index === 3 ? 'rd' : 'th'} snapshot` : ''}{s.okta_snapshot.first_at ? `, since ${dayLabel(s.okta_snapshot.first_at)})` : s.okta_snapshot.index ? ')' : ''} · sealed into the evidence chain <StatusBadge label="Chained" variant="active" /></span>
           ) : <span>No readable snapshot yet{s.okta_snapshot.newest_attempt_status === 'refused' ? ': Okta refused the last capture' : ''}.</span>}
         </div>
         <div className="flex flex-col gap-0.5">
           <span className="section-label">System Log archive (what happened)</span>
           {s.archive.has_archive ? (
             <span>
-              {s.archive.days_held} days held{s.archive.oldest ? `, ${dayLabel(s.archive.oldest)} to ${dayLabel(s.archive.newest ?? '')}` : ''} (Okta keeps 90) · {s.archive.events?.toLocaleString()} events · last sync {formatDateTime(s.archive.last_sync_completed_at)} ({relative(s.archive.last_sync_completed_at)}){' '}
+              {s.archive.days_held} days held{s.archive.oldest ? `, ${dayLabel(s.archive.oldest)} to ${dayLabel(s.archive.newest ?? '')}` : ''} (Okta keeps 90) · {s.archive.events?.toLocaleString()} events · last sync {formatDateTimeZone(s.archive.last_sync_completed_at)} ({relative(s.archive.last_sync_completed_at)}){' '}
               {s.archive.last_sync_status === 'error' ? <StatusBadge label="Sync failed" variant="error" /> : <StatusBadge label="Current" variant="active" />}
             </span>
-          ) : <span>No archive yet: run Sync now.</span>}
+          ) : <span>No archive yet: select <strong>Refresh</strong> to read the System Log.</span>}
         </div>
         <div className="flex flex-col gap-0.5">
           <span className="section-label">Evidence chain</span>
@@ -184,19 +228,25 @@ function SourcesStrip({ o, environment, asOf, onCaptured }: { o: OverviewData; e
           </span>
         </div>
         <div className="flex flex-col gap-0.5">
-          <span className="section-label">OPA access model (who can reach what)</span>
-          <span>{s.opa_model.loaded ? <>{s.opa_model.refreshed_at ? `Refreshed ${formatDateTime(s.opa_model.refreshed_at)}` : 'Loaded'}{s.opa_model.principals_effective != null ? ` · ${s.opa_model.principals_effective} principals with effective access` : ''}</> : 'Not loaded in this session: open the Access Explorer once.'}</span>
-        </div>
-        <div className="flex flex-col gap-0.5">
           <span className="section-label">Okta org</span>
           <span>{s.okta_org.users != null ? `${s.okta_org.users.toLocaleString()} users (informational)` : 'No count yet'}</span>
         </div>
+        <div className="flex flex-col gap-0.5">
+          <span className="section-label">Scheduled refresh</span>
+          <ScheduleRow o={o} />
+        </div>
       </div>
-      <div className="flex items-center gap-2 flex-wrap">
-        <button type="button" className="btn-secondary" disabled={busy === 'sync'} onClick={() => act('sync', () => startSync(environment), 'Sync started')}><RefreshCw size={13} aria-hidden="true" className={busy === 'sync' ? 'animate-spin' : ''} /> Sync now</button>
-        <button type="button" className="btn-secondary" disabled={busy === 'snap'} onClick={() => act('snap', async () => { await startOktaCapture(environment, 'okta_admins'); await startOktaCapture(environment, 'inventory_counts') }, 'Snapshot started')}><Camera size={13} aria-hidden="true" /> Take a snapshot now</button>
-        <button type="button" className="btn-secondary" disabled={integrity.state.phase === 'checking'} onClick={() => integrity.run(true)}><ShieldCheck size={13} aria-hidden="true" /> {integrity.state.phase === 'checking' ? 'Verifying…' : 'Verify the chain'}</button>
-        <span className="text-xs text-muted">Each action is logged in the Audit Log. Live reads are read-only.{asOf ? '' : ''}</span>
+      <div className="flex items-start gap-3 flex-wrap">
+        <RefreshControl
+          running={running}
+          disabledReason={canRun ? '' : disabledReason}
+          onRefresh={onRefresh}
+          extras={[
+            { key: 'verify', label: integrity.state.phase === 'checking' ? 'Verifying…' : 'Verify the chain', hint: 'no reads', disabled: integrity.state.phase === 'checking', onSelect: () => integrity.run(true) },
+            ...(o.signins_mfa.state === 'not_built' ? [{ key: 'signins', label: 'Build sign-in figures from the archive', onSelect: () => void buildSignins() }] : []),
+          ]}
+        />
+        <span className="text-xs text-muted self-center">Refresh reads OPA and Okta again and syncs the System Log. Each part is logged in the Audit Log. Reads only; nothing is written to OPA or Okta.</span>
       </div>
     </section>
   )
@@ -252,7 +302,7 @@ function CrossChecks({ o, onOpen }: { o: OverviewData; onOpen: (l: 'c1' | 'c5') 
                 <div className="text-xs text-muted mt-0.5">{c.statement}</div>
                 <div className="text-[0.6875rem] text-muted mt-1.5 flex gap-x-4 flex-wrap">
                   {c.inputs.okta_snapshot && <span>Okta snapshot {formatDateTime(c.inputs.okta_snapshot.captured_at)}</span>}
-                  <span>OPA access model {c.inputs.opa_roster_loaded ? 'loaded' : 'not loaded'}</span>
+                  <span>OPA scan {c.inputs.opa_roster_loaded ? 'stored' : 'not stored yet'}</span>
                 </div>
                 {!ok && c.message && <div className="text-xs text-loss mt-1" role="status">{c.message}</div>}
               </div>
@@ -380,7 +430,7 @@ function Inventory({ o }: { o: OverviewData }) {
     return (
       <section aria-labelledby="ov-inv" className="card p-4">
         <SectionHead id="ov-inv" title="Inventory over time" />
-        <p className="text-sm text-text-dim">No inventory snapshot yet. The first is taken after the next sync, or press Take a snapshot now.</p>
+        <p className="text-sm text-text-dim">No inventory snapshot yet. Select <strong>Refresh</strong> to take one.</p>
       </section>
     )
   }
@@ -483,6 +533,18 @@ export function OverviewPage({ onOpenReports }: { onOpenReports: () => void }) {
   const [copied, setCopied] = useState(false)
   const effectiveAsOf = asOf === LATEST ? undefined : asOf
   const { data: o, isLoading, isError, error, refetch } = useOverview(environment, effectiveAsOf)
+  // 5.51.0: one Refresh (the OPA scan, the Okta scan and the System Log sync). The page reloads itself as each part ends.
+  const { data: refresh } = useRefreshStatus(environment)
+  const { start, stop } = useRefreshActions(environment)
+  const row = activeRow(environments)
+  const canRun = !row || (can(row, 'sync_now') && can(row, 'live_read'))
+  const endedSignature = refresh && refresh.status !== 'idle' ? `${refresh.job_id}:${requestedParts(refresh).filter(p => !isActive(refresh.parts[p].state)).length}` : ''
+  const lastSignature = useRef(endedSignature)
+  useEffect(() => {
+    if (endedSignature === lastSignature.current) return
+    lastSignature.current = endedSignature
+    if (endedSignature) void refetch()
+  }, [endedSignature, refetch])
   const exportBits = useMemo(() => (o && environment ? overviewExportSections(o, environment) : []), [o, environment])
   const asOfOptions = useMemo(
     () => [{ value: LATEST, label: o?.sources.okta_snapshot.captured_at ? `Latest · ${formatDateTime(o.sources.okta_snapshot.captured_at)}` : 'Latest' },
@@ -530,11 +592,11 @@ export function OverviewPage({ onOpenReports }: { onOpenReports: () => void }) {
           <ExportButtons sections={exportBits} filenameBase="opa-overview-counts" />
           <div className="flex flex-col gap-1"><span className="section-label">Paper</span><Select ariaLabel="Paper size" value={paper} onValueChange={v => setPaper(v as 'A4' | 'Letter')} placeholder="Paper" options={[{ value: 'A4', label: 'A4' }, { value: 'Letter', label: 'Letter' }]} /></div>
           <button type="button" className="btn-primary" onClick={printPdf}><FileText size={13} aria-hidden="true" /> PDF for leadership</button>
-          <button type="button" className="btn-secondary" onClick={() => void refetch()} aria-label="Reload the Overview"><RefreshCw size={13} aria-hidden="true" /> Refresh</button>
         </div>
       </div>
 
-      <SourcesStrip o={o} environment={environment} asOf={effectiveAsOf} onCaptured={() => void refetch()} />
+      <SourcesStrip o={o} environment={environment} canRun={canRun} disabledReason={row ? refreshReason(row) : ''} onRefresh={parts => void start(parts)} />
+      {refresh && refresh.status !== 'idle' && <RefreshProgressCard status={refresh} canRun={canRun} onRetry={part => void start([part])} onStop={() => void stop()} />}
 
       <section aria-labelledby="ov-state" className="card p-4">
         <div className="flex items-start justify-between gap-3 flex-wrap">
@@ -547,12 +609,12 @@ export function OverviewPage({ onOpenReports }: { onOpenReports: () => void }) {
       <ul className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 list-none p-0 m-0" aria-label="Key figures">
         <Tile label="People with Okta admin roles" value={o.okta_admins.state === 'ok' ? t.okta_people : o.okta_admins.state === 'refused' ? 'Not readable' : 'n/a'}
           sub={o.okta_admins.state === 'ok' ? `${roleText(t.okta_by_role)} (a person can hold several) · as of ${dayLabel(o.sources.okta_snapshot.captured_at ?? '')}` : o.okta_admins.message ?? 'No snapshot yet'} />
-        <Tile label="People with privileged OPA roles" value={t.opa_privileged ?? 'n/a'} sub={t.opa_privileged == null ? 'The OPA roster is not loaded' : `${roleText(t.opa_by_role)} · via group roles`} />
+        <Tile label="People with privileged OPA roles" value={t.opa_privileged ?? 'n/a'} sub={t.opa_privileged == null ? 'No OPA scan stored yet. Select Refresh to scan now.' : `${roleText(t.opa_by_role)} · via group roles`} />
         <Tile label="Hold both (separation of duties)" value={t.both ?? 'n/a'} flag={(t.both ?? 0) > 0} onOpen={(t.both ?? 0) > 0 ? () => setDrawer('c5') : undefined}
-          sub={t.both == null ? 'needs the Okta admin list and the OPA roster' : (t.both ?? 0) > 0 ? 'to review · Okta admin who is also an OPA admin' : 'none · Okta admin who is also an OPA admin'} />
+          sub={t.both == null ? 'needs the Okta admin list and an OPA scan' : (t.both ?? 0) > 0 ? 'to review · Okta admin who is also an OPA admin' : 'none · Okta admin who is also an OPA admin'} />
         <Tile label="Left Okta, still in OPA" value={left.state === 'ok' && left.effective_known ? leftN : left.state === 'refused' ? 'Not readable' : 'n/a'} flag={leftN > 0} onOpen={leftN > 0 ? () => setDrawer('c1') : undefined}
           sub={left.state === 'ok' ? `${left.people ?? 0} people + ${left.accounts ?? 0} service account(s) · cross-check C1` : left.state === 'never_run' ? 'run the lookup on the Cross-checks page' : 'cross-check C1'} />
-        <Tile label="OPA service accounts and service users" value={t.service.total ?? 'n/a'} sub={t.service.total == null ? 'The OPA roster is not loaded' : `+ ${t.service.service_users} service users · ${t.service.saas} SaaS · ${t.service.okta_ud} Okta Universal Directory`} />
+        <Tile label="OPA service accounts and service users" value={t.service.total ?? 'n/a'} sub={t.service.total == null ? 'No OPA scan stored yet. Select Refresh to scan now.' : `+ ${t.service.service_users} service users · ${t.service.saas} SaaS · ${t.service.okta_ud} Okta Universal Directory`} />
         <Tile label="Evidence archive" value={t.archive_days != null ? `${t.archive_days}` : 'n/a'} sub={`days held · Okta keeps 90 · ${o.sources.archive.last_sync_status === 'error' ? 'last sync failed' : `last sync ${relative(o.sources.archive.last_sync_completed_at)}`}`} />
       </ul>
 

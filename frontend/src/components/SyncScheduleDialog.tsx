@@ -150,7 +150,7 @@ function SyncScheduleContent({ env, restoreDraft }: Props) {
         return false
       }
       queryClient.invalidateQueries({ queryKey: ['environments'] })
-      toast({ title: config.enabled ? 'Daily sync enabled' : 'Daily sync disabled', variant: 'success' })
+      toast({ title: config.enabled ? 'Daily refresh enabled' : 'Daily refresh disabled', variant: 'success' })
       return true
     } catch (err) {
       toast({ title: 'Could not save sync settings', description: err instanceof Error ? err.message : String(err), variant: 'error' })
@@ -182,7 +182,7 @@ function SyncScheduleContent({ env, restoreDraft }: Props) {
     if (!(await doSave(config))) return // keep the prompt open; nothing else may start on a failed save
     setFirstRunPrompt(false)
     if (firstRunChoice === 'backfill' && canSyncNow) {
-      job.start(env.is_own ? config.ingestion_scope : undefined)
+      job.start()
     } else if (firstRunChoice === 'csv' && csvFile) {
       setSaving(true)
       try {
@@ -236,8 +236,9 @@ function SyncScheduleContent({ env, restoreDraft }: Props) {
                 <fieldset disabled={!canEditSettings} className="flex flex-col gap-3 disabled:opacity-70">
                 <label className="flex items-center gap-2 text-sm text-text cursor-pointer">
                   <input type="checkbox" checked={enabled} onChange={e => setEnabled(e.target.checked)} className="accent-accent" />
-                  Enable daily sync
+                  Enable daily refresh
                 </label>
+                <p className="text-[0.6875rem] text-text-dim -mt-2">The daily refresh reads the OPA scan, the Okta scan and the System Log in one job. The settings below govern the System Log part.</p>
 
                 <fieldset className="field">
                   <legend className="section-label block mb-1">What to ingest</legend>
@@ -388,10 +389,10 @@ function SyncScheduleContent({ env, restoreDraft }: Props) {
                   className="btn-secondary self-start"
                   disabled={isRunning || !env.name || !canSyncNow}
                   title={permissionReason(env, 'sync_now') || undefined}
-                  // A shared user's Sync now always uses the owner's saved scope.
-                  onClick={() => job.start(env.is_own ? ingestionScope : undefined)}
+                  // Runs the System Log part of the refresh with the saved scope (save first to change it).
+                  onClick={() => job.start()}
                 >
-                  <Play size={12} aria-hidden="true" /> {isRunning ? 'Syncing…' : 'Sync now'}
+                  <Play size={12} aria-hidden="true" /> {isRunning ? 'Syncing…' : 'Sync System Log now'}
                 </button>
                 {!canSyncNow && <p className="text-[0.6875rem] text-text-dim">{permissionReason(env, 'sync_now')}</p>}
 

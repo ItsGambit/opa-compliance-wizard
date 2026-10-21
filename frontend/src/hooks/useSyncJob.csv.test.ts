@@ -7,8 +7,8 @@ import { renderHookWithClient } from '../test/renderWithClient'
 import type { SyncStatusResponse } from '../types'
 import { useSyncJob } from './useSyncJob'
 
-vi.mock('../api/client', async importOriginal => ({ ...(await importOriginal<typeof import('../api/client')>()), fetchSyncStatus: vi.fn(), startSync: vi.fn() }))
-import { startSync } from '../api/client'
+vi.mock('../api/client', async importOriginal => ({ ...(await importOriginal<typeof import('../api/client')>()), fetchSyncStatus: vi.fn(), startRefresh: vi.fn(), fetchRefreshStatus: vi.fn() }))
+import { fetchRefreshStatus, startRefresh } from '../api/client'
 
 const st = (s: SyncStatusResponse['status'], kind?: string): SyncStatusResponse => ({ status: s, kind, steps: [], error: null, sync_state: null, is_first_sync: false })
 
@@ -36,8 +36,9 @@ describe('useSyncJob attach rules', () => {
   })
 
   it('after a fresh sign-in, a watched run that finished meanwhile shows as done and refreshes reports', async () => {
-    vi.mocked(startSync).mockResolvedValue({ started: true, already_running: false })
-    vi.mocked(fetchSyncStatus).mockResolvedValueOnce(st('idle')).mockRejectedValueOnce(new Error('x')).mockRejectedValueOnce(new Error('x')).mockRejectedValueOnce(new Error('x')).mockResolvedValue(st('done'))
+    vi.mocked(startRefresh).mockResolvedValue({ started: true, already_running: false, job_id: 'j1' })
+    vi.mocked(fetchRefreshStatus).mockRejectedValue(new Error('x'))  // the refresh poll dies with the session
+    vi.mocked(fetchSyncStatus).mockResolvedValueOnce(st('idle')).mockResolvedValue(st('done'))
     const { result, client } = renderHookWithClient(() => useSyncJob('dev'))
     await advance()
     await act(async () => { result.current.start() })
@@ -61,7 +62,7 @@ describe('useSyncJob attach rules', () => {
 
   it('a start that never reached the server is not reconciled to the previous run\'s "done"', async () => {
     vi.mocked(fetchSyncStatus).mockResolvedValue(st('done'))
-    vi.mocked(startSync).mockRejectedValue(new Error('Your session has expired'))
+    vi.mocked(startRefresh).mockRejectedValue(new Error('Your session has expired'))
     const { result } = renderHookWithClient(() => useSyncJob('dev'))
     await advance()
     await act(async () => { result.current.start() })

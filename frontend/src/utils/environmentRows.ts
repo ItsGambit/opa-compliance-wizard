@@ -50,6 +50,14 @@ const CAPABILITY_VERBS: Record<SharedCapabilityKey, string> = {
   sync_settings: 'change its sync settings',
 }
 
+/** 5.51.0: why Refresh / Sync now is off for this viewer ('' when it is on). A refresh reads OPA (live reads) and runs the sync, so it needs both. */
+export function refreshReason(env: Environment): string {
+  const missing = (['sync_now', 'live_read'] as const).find(c => !can(env, c))
+  if (!missing) return ''
+  const label = missing === 'sync_now' ? 'Sync now' : 'Live read'
+  return `Refreshing needs the ${label} permission on this environment. ${permissionReason(env, missing)} Reports show what its owner's refreshes have archived.`
+}
+
 /** The compliance-sync dialog is offered when the caller may use any part
  * of it: owners always; shared users when an admin allowed Sync now or the
  * sync settings (before 5.42.0 it was owner-only, and that stays the

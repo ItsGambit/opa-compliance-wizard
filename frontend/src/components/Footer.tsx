@@ -1,12 +1,10 @@
 import { REPO_CHANGELOG_URL, REPO_README_URL } from '../utils/links'
-import { useEffect, useRef } from 'react'
 import { RefreshCw } from 'lucide-react'
 import { useEnvironments, useSyncStatus, useUpgradeStatus, useVersion, useWhoami } from '../api/hooks'
-import { useSyncJob } from '../hooks/useSyncJob'
-import { toast } from '../hooks/useToast'
+import { useRefreshActions, useRefreshStatus, useRefreshWatcher } from '../hooks/useRefresh'
 import { formatDateTime } from '../utils/format'
-import { getSyncProgressPercent } from '../utils/syncProgress'
-import { activeRow, can, permissionReason } from '../utils/environmentRows'
+import { activeRow, can, refreshReason } from '../utils/environmentRows'
+import { completedText, isActive, latestRefresh, requestedParts } from '../utils/refresh'
 import { canAdminFrom } from '../utils/whoami'
 import { AFFILIATION } from '../utils/brand'
 
@@ -30,33 +28,22 @@ export function Footer() {
   // 5.42.0: "Sync now" on an environment shared with this user follows what
   // an admin allows shared users (off unless allowed); the server enforces it.
   const active = activeRow(environments)
-  const canSync = !active || can(active, 'sync_now')
+  const canRefresh = !active || (can(active, 'sync_now') && can(active, 'live_read'))
 
-  // ONE global sync trigger, not a Refresh button on every report/
-  // resource-history view -- every one of those reads the SAME shared
-  // audit_store.db archive, so pulling fresh Okta data is inherently one
-  // action, not something that needs re-triggering per screen (a real
-  // per-view version of this was built and verified working, then
-  // deliberately consolidated here instead -- see the plan file). No
-  // explicit ingestionScope passed to start() -- the server falls back to
-  // this environment's saved schedule scope, so this can never silently
-  // change a user's chosen curated/all setting.
-  const syncJob = useSyncJob(activeEnv)
-  const isSyncing = syncJob.phase === 'starting' || syncJob.phase === 'running'
-  // Same real (not animated) percent SyncScheduleDialog's own manual-sync
-  // trigger already shows -- see getSyncProgressPercent's docstring. Falls
-  // back to the same small fixed value that dialog uses (8%) before the
-  // first "fetch" step has landed, rather than showing a stuck 0%.
-  const syncProgressPercent = getSyncProgressPercent(syncJob.status?.steps ?? [])
-  // Archive-backed views refresh inside useSyncJob when a sync finishes
-  // (shared with the sync settings dialog); only the failure toast is here.
-  const prevSyncPhase = useRef(syncJob.phase)
-  useEffect(() => {
-    if (syncJob.phase === 'error' && prevSyncPhase.current !== 'error') {
-      toast({ title: 'Sync failed', description: syncJob.error ?? undefined, variant: 'error' })
-    }
-    prevSyncPhase.current = syncJob.phase
-  }, [syncJob.phase, syncJob.error])
+  // ONE global trigger, not a Refresh button on every report/resource-history view -- every one of those reads the SAME shared
+  // audit_store.db archive, so pulling fresh data is inherently one action. 5.51.0: Sync now runs the whole refresh (the OPA scan,
+  // the Okta scan and the System Log sync: the same job as the Overview's Refresh); a refresh already running is attached to,
+  // never started twice. The server uses this environment's saved ingestion scope, so this can never silently change a user's
+  // chosen curated/all setting.
+  const { data: refreshStatus } = useRefreshStatus(activeEnv)
+  const { start } = useRefreshActions(activeEnv)
+  useRefreshWatcher(activeEnv)  // the finish toast and the data reload, once, on every page
+  const isSyncing = refreshStatus?.status === 'running'
+  const parts = refreshStatus && isSyncing ? requestedParts(refreshStatus) : []
+  const endedParts = refreshStatus ? parts.filter(p => !isActive(refreshStatus.parts[p].state)).length : 0
+  const syncProgressPercent = parts.length ? Math.max(8, Math.round((endedParts / parts.length) * 100)) : null  // parts finished, not an animated bar
+  const latest = latestRefresh(refreshStatus, syncStatus?.sync_state?.last_refresh)
+  const reason = !canRefresh && active ? refreshReason(active) : ''
 
   return (
     <footer className="max-w-4xl mx-auto w-full mt-4 pt-3 border-t border-border text-xs text-text-faint flex flex-wrap items-center justify-center gap-3">
@@ -76,26 +63,29 @@ export function Footer() {
           {/* last_sync_completed_at, not the watermark: as of 5.40.2 it is written
               only by a sync that finished successfully (DATA-05), which is what
               "last sync" should mean here. */}
-          <span>Last sync: {syncStatus?.sync_state?.last_sync_completed_at ? formatDateTime(syncStatus.sync_state.last_sync_completed_at) : 'never'}</span>
+          {latest ? (
+            <span>Last refresh: {formatDateTime(latest.finishedAt)} · {latest.failing.length === 0 ? completedText(latest.done, latest.total) : `${completedText(latest.done, latest.total)}; ${latest.failing.join(', ')} did not complete`}</span>
+          ) : (
+            <span>Last sync: {syncStatus?.sync_state?.last_sync_completed_at ? formatDateTime(syncStatus.sync_state.last_sync_completed_at) : 'never'}</span>
+          )}
+          {/* aria-disabled, not disabled (WCAG 2.1.1, 1.3.1): the button stays focusable so its reason is read out. */}
           <button
             type="button"
-            onClick={() => syncJob.start()}
-            disabled={isSyncing || !canSync}
-            title={canSync
-              ? 'Pull the latest events from live Okta for every report and resource history'
-              : `${active ? permissionReason(active, 'sync_now') : ''} Reports show what its owner's syncs have archived.`}
-            aria-describedby={!canSync ? 'footer-sync-reason' : undefined}
-            className="inline-flex items-center gap-1 hover:text-text-dim disabled:opacity-60"
+            onClick={() => { if (!isSyncing && canRefresh) void start() }}
+            aria-disabled={isSyncing || !canRefresh}
+            aria-describedby={reason ? 'footer-sync-reason' : undefined}
+            title={reason || (isSyncing ? 'A refresh is running' : 'Refresh: read OPA and Okta again and sync the System Log')}
+            className="inline-flex items-center gap-1 hover:text-text-dim aria-disabled:opacity-60 aria-disabled:cursor-not-allowed"
           >
             <RefreshCw size={11} aria-hidden="true" className={isSyncing ? 'animate-spin' : ''} />
             {isSyncing ? 'Syncing…' : 'Sync now'}
           </button>
-          {!canSync && active && <span id="footer-sync-reason" className="sr-only">{permissionReason(active, 'sync_now')}</span>}
+          {reason && <span id="footer-sync-reason" className="sr-only">{reason}</span>}
           {isSyncing && (
             <span
               className="h-1 w-16 rounded-full bg-bg-hover overflow-hidden"
               role="progressbar"
-              aria-label="Sync progress"
+              aria-label="Refresh progress"
               aria-valuemin={0}
               aria-valuemax={100}
               aria-valuenow={syncProgressPercent ?? undefined}

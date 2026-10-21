@@ -1,38 +1,18 @@
 import { Check, CircleDashed, Loader2, X } from 'lucide-react'
 import type { BootstrapStepEvent } from '../api/client'
-import type { JobPhase } from '../hooks/useAccessBootstrapJob'
+import type { JobPhase } from '../hooks/useAccessScanJob'
+import { formatDateTimeZone } from '../utils/format'
+import { deriveSteps, type StepDisplay } from '../utils/bootstrapSteps'
 
-interface StepDisplay {
-  key: string
-  label: string
-  status: 'pending' | 'active' | 'done' | 'error'
-  detail?: string
-}
-
-/** Steps run strictly in order, so at most one step is ever "started but
- * not done" at a time — when the job errors, that's the one that failed;
- * everything after it never started. */
-function deriveSteps(stepDefs: [string, string][], events: BootstrapStepEvent[], phase: JobPhase): StepDisplay[] {
-  return stepDefs.map(([key, label]) => {
-    const keyEvents = events.filter(e => e.key === key)
-    const doneEvent = keyEvents.find(e => e.status === 'done')
-    if (doneEvent) return { key, label, status: 'done', detail: doneEvent.detail ?? undefined }
-
-    const started = keyEvents.some(e => e.status === 'start')
-    if (started) {
-      const latest = [...keyEvents].reverse()[0]
-      if (phase === 'error') return { key, label, status: 'error', detail: latest.detail ?? undefined }
-      return { key, label, status: 'active', detail: latest.detail ?? undefined }
-    }
-    return { key, label, status: 'pending' }
-  })
-}
+const STEP_STATE_TEXT: Record<StepDisplay['status'], string> = { pending: 'not started', active: 'running', done: 'done', error: 'failed' }
 
 function StepIcon({ status }: { status: StepDisplay['status'] }) {
-  if (status === 'done') return <Check size={14} className="text-win shrink-0" />
-  if (status === 'active') return <Loader2 size={14} className="text-accent animate-spin shrink-0" />
-  if (status === 'error') return <X size={14} className="text-loss shrink-0" />
-  return <CircleDashed size={14} className="text-text-faint shrink-0" />
+  // The icon's colour and motion are not the only signal (WCAG 1.4.1): the state is also text for a screen reader.
+  const icon = status === 'done' ? <Check size={14} aria-hidden="true" className="text-win shrink-0" />
+    : status === 'active' ? <Loader2 size={14} aria-hidden="true" className="text-accent animate-spin shrink-0" />
+    : status === 'error' ? <X size={14} aria-hidden="true" className="text-loss shrink-0" />
+    : <CircleDashed size={14} aria-hidden="true" className="text-text-faint shrink-0" />
+  return <>{icon}<span className="sr-only">{STEP_STATE_TEXT[status]}: </span></>
 }
 
 interface Props {
@@ -43,13 +23,15 @@ interface Props {
   onRetry: () => void
   /** Bottom variant only: hides a failed-refresh panel (data stays). */
   onDismiss?: () => void
+  /** The stored scan that stays on screen while a refresh runs or after one fails (bottom variant): named in the failure message. */
+  previousBuiltAt?: string | null
   /** "fullpage" replaces the whole tab content (first load). "bottom" is a
    * compact panel meant to sit at the bottom of the screen while the
    * previous result stays visible underneath (refresh). */
   variant: 'fullpage' | 'bottom'
 }
 
-export function BootstrapProgressPanel({ phase, stepDefs, events, error, onRetry, onDismiss, variant }: Props) {
+export function BootstrapProgressPanel({ phase, stepDefs, events, error, onRetry, onDismiss, variant, previousBuiltAt }: Props) {
   const steps = deriveSteps(stepDefs, events, phase)
 
   const body = (
@@ -65,9 +47,16 @@ export function BootstrapProgressPanel({ phase, stepDefs, events, error, onRetry
       ))}
       {phase === 'error' && (
         <div className="flex items-center gap-3 mt-1">
-          <p className="text-sm text-loss">{error ?? 'Something went wrong.'}</p>
+          <p className="text-sm text-loss">
+            {variant === 'bottom' ? 'Refresh failed: ' : ''}{error ?? 'Something went wrong.'}{' '}
+            <span className="text-text-dim">
+              {variant === 'bottom'
+                ? (previousBuiltAt ? `The scan from ${formatDateTimeZone(previousBuiltAt)} is still shown.` : 'No scan is stored yet.')
+                : 'No scan is stored yet.'}
+            </span>
+          </p>
           <button type="button" className="btn-secondary shrink-0" onClick={onRetry}>
-            Retry
+            {variant === 'bottom' && previousBuiltAt ? 'Retry' : 'Try again'}
           </button>
           {onDismiss && variant === 'bottom' && (
             <button type="button" className="btn-secondary shrink-0" onClick={onDismiss}>
@@ -83,7 +72,7 @@ export function BootstrapProgressPanel({ phase, stepDefs, events, error, onRetry
     return (
       <div className="fixed bottom-4 right-4 left-4 sm:left-auto sm:w-96 card p-3 shadow-xl z-40 flex flex-col gap-2 max-h-64 overflow-y-auto">
         <span className="section-label">
-          {phase === 'error' ? 'Refresh failed' : 'Refreshing access data…'}
+          {phase === 'error' ? 'Refresh failed' : 'Refreshing the OPA scan…'}
         </span>
         {body}
       </div>
@@ -93,7 +82,7 @@ export function BootstrapProgressPanel({ phase, stepDefs, events, error, onRetry
   return (
     <div className="card p-6 flex flex-col gap-3">
       <p className="text-sm text-text-dim text-center">
-        Scanning every resource group, project, policy, group, and user across your tenant…
+        No stored OPA scan for this environment yet. Scanning every resource group, project, policy, group, and user across your tenant…
       </p>
       {body}
     </div>

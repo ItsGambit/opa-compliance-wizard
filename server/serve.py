@@ -1335,7 +1335,10 @@ def _refresh_status(environment_id):
     if "log" in running:
         with _sync_jobs_lock:
             steps["log"] = list((_sync_jobs.get(environment_id) or {}).get("steps") or [])
-    return job.status_view(steps)
+    view = job.status_view(steps)
+    if "opa" in job.parts:
+        view["parts"]["opa"]["step_defs"] = engine.ACCESS_MODEL_STEPS  # the ordered [key, label] list the step display needs
+    return view
 
 
 def _start_refresh_job(env_id, env_name, parts=None, trigger="manual", owner=engine.LOCAL_OWNER_KEY, ingestion_scope=None,

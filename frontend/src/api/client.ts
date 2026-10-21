@@ -1,7 +1,6 @@
 import type {
   AccessControlConfig,
   AccessControlSaveResponse,
-  AccessModel,
   AdConnectionDiscoveryConfig,
   ApiErrorBody,
   AuditLogEntry,
@@ -48,6 +47,10 @@ import type {
   SyncSchedule,
   SyncStatusResponse,
   WorkloadRole,
+  AccessModelResponse,
+  RefreshPartName,
+  RefreshStartResponse,
+  RefreshStatus,
 } from '../types'
 
 /** Thrown for any non-2xx answer from the API. `status` lets callers (and
@@ -411,36 +414,32 @@ export function execute(resourceGroupId: string, projectId: string, rows: CsvRow
   })
 }
 
-/** The Access Explorer bootstrap runs as a background job (it's not
- * cheap — see build_access_model's docstring) rather than one blocking
- * request, so the UI can show real step-by-step progress instead of a
- * bare spinner. See useAccessBootstrapJob for the polling loop. */
+/** One step event of the OPA scan (the Access Explorer's scan is a background job: it is not cheap -- see build_access_model's
+ * docstring -- so the UI shows real step-by-step progress instead of a bare spinner). See useAccessScanJob for the polling loop. */
 export interface BootstrapStepEvent {
   key: string
   status: 'start' | 'progress' | 'done'
   detail: string | null
 }
-export interface BootstrapStartResponse {
-  started: boolean
-  already_running?: boolean
-  steps?: [string, string][]
-}
-export interface BootstrapStatusResponse {
-  status: 'idle' | 'running' | 'done' | 'error'
-  steps: BootstrapStepEvent[]
-  error: string | null
+
+/** 5.51.0: the stored OPA scan (memory, else the local archive). Rejects with a 404 whose body.reason is "no_scan" when none was ever stored. */
+export function fetchAccessModel(): Promise<AccessModelResponse> {
+  return apiFetch('/api/access/model')
 }
 
-export function startAccessBootstrap(): Promise<BootstrapStartResponse> {
-  return apiFetch('/api/access/bootstrap/start', { method: 'POST' })
+// ── The combined Refresh (5.51.0) ────────────────────────────────────────
+
+/** Starts one refresh (default: the OPA scan, the Okta scan and the System Log sync), or attaches to the one already running. */
+export function startRefresh(environment: string, parts?: RefreshPartName[]): Promise<RefreshStartResponse> {
+  return apiFetch(`/api/environments/${encodeURIComponent(environment)}/refresh`, { method: 'POST', body: JSON.stringify(parts ? { parts } : {}) })
 }
 
-export function fetchAccessBootstrapStatus(): Promise<BootstrapStatusResponse> {
-  return apiFetch('/api/access/bootstrap/status')
+export function fetchRefreshStatus(environment: string): Promise<RefreshStatus> {
+  return apiFetch(`/api/environments/${encodeURIComponent(environment)}/refresh/status`)
 }
 
-export function fetchAccessBootstrapResult(): Promise<AccessModel> {
-  return apiFetch('/api/access/bootstrap/result')
+export function cancelRefresh(environment: string): Promise<{ cancelling: boolean; job_id: string | null }> {
+  return apiFetch(`/api/environments/${encodeURIComponent(environment)}/refresh/cancel`, { method: 'POST', body: JSON.stringify({}) })
 }
 
 // ── Folder Builder: policy assignment ────────────────────────────────────

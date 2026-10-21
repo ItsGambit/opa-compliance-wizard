@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { fetchSyncStatus, onSessionRestored, startSync } from '../api/client'
+import { fetchRefreshStatus, fetchSyncStatus, onSessionRestored, startRefresh } from '../api/client'
 import { invalidateArchiveQueries } from '../api/queryClient'
-import type { IngestionScope, SyncStatusResponse } from '../types'
+import type { RefreshStatus, SyncStatusResponse } from '../types'
 import { JOB_LOST_MESSAGE, startPollLoop } from './pollLoop'
 
 export type SyncJobPhase = 'idle' | 'starting' | 'running' | 'done' | 'error'
@@ -25,7 +25,7 @@ const INITIAL_STATE: SyncJobState = { phase: 'idle', status: null, error: null, 
 const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err))
 
 /** Drives one environment's compliance-sync background job: POST
- * /sync/start, then poll /sync/status until done/error (see startPollLoop
+ * /refresh (the System Log part), then poll /refresh/status until done/error (see startPollLoop
  * for the loop itself). Also exposes `refreshStatus()` for callers that
  * just want the current state.
  *
@@ -125,24 +125,64 @@ export function useSyncJob(environmentName: string | undefined) {
       })
   }, [environmentName, beginPolling, queryClient])
 
-  const start = useCallback((ingestionScope?: IngestionScope) => {
+  // 5.51.0: a sync started from here is the refresh job's System Log part (`parts: ["log"]`), run with the environment's saved
+  // ingestion scope: the legacy sync/start route is no longer called by any screen. Its progress and outcome are read from the
+  // refresh job (the sync's own status slot may still hold the PREVIOUS run's result for a moment after the start).
+  const beginRefreshPolling = useCallback((name: string, gen: number) => {
+    stopPolling()
+    lostPoll.current = false
+    cancelPoll.current = startPollLoop<RefreshStatus>({
+      fetchStatus: () => fetchRefreshStatus(name),
+      onStatus: status => {
+        if (gen !== generation.current) return 'stop'
+        const log = status.parts.log
+        const asSync = (s: SyncStatusResponse['status'], error: string | null): SyncStatusResponse => ({
+          status: s, error, steps: (log.steps ?? []) as SyncStatusResponse['steps'], sync_state: null, is_first_sync: false,
+          ...(log.state === 'ok' ? { result: { inserted: log.events_new ?? 0, scanned: 0, since: '', chunks: 0, pruned: 0, cutoff: null } } : {}),
+        })
+        if (status.status === 'running') {
+          setState(s => ({ ...s, status: { ...asSync('running', null), sync_state: s.status?.sync_state ?? null, is_first_sync: s.status?.is_first_sync ?? false }, phase: 'running' }))
+          return 'continue'
+        }
+        cancelPoll.current = null
+        if (status.status === 'idle') {
+          setState(s => ({ ...s, phase: 'error', error: JOB_LOST_MESSAGE }))
+        } else if (log.state === 'ok' || log.state === 'not_requested') {
+          setState(s => ({ ...s, status: { ...asSync('done', null), sync_state: s.status?.sync_state ?? null, is_first_sync: s.status?.is_first_sync ?? false }, phase: 'done', error: null }))
+          invalidateArchiveQueries(queryClient)
+        } else {
+          setState(s => ({ ...s, status: asSync('error', log.message ?? null), phase: 'error', error: log.message ?? 'The System Log sync did not complete.' }))
+        }
+        void fetchSyncStatus(name).then(fresh => { if (gen === generation.current) setState(s => ({ ...s, status: s.status ? { ...s.status, sync_state: fresh.sync_state, is_first_sync: fresh.is_first_sync } : fresh, statusLoaded: true })) }).catch(() => {})
+        return 'stop'
+      },
+      onFatal: message => {
+        if (gen !== generation.current) return
+        cancelPoll.current = null
+        lostPoll.current = true
+        setState(s => ({ ...s, phase: 'error', error: message }))
+      },
+    })
+  }, [queryClient, stopPolling])
+
+  const start = useCallback(() => {
     if (!environmentName) return
     stopPolling()
     const gen = generation.current
     lostPoll.current = false
     setState(s => ({ ...s, phase: 'starting', error: null }))
-    startSync(environmentName, ingestionScope)
+    startRefresh(environmentName, ['log'])
       .then(() => {
         if (gen !== generation.current) return
         // started or already_running: either way there is a job to follow.
         setState(s => ({ ...s, phase: 'running' }))
-        beginPolling(environmentName, gen)
+        beginRefreshPolling(environmentName, gen)
       })
       .catch(err => {
         if (gen !== generation.current) return
         setState(s => ({ ...s, phase: 'error', error: errorText(err) }))
       })
-  }, [environmentName, beginPolling, stopPolling])
+  }, [environmentName, beginRefreshPolling, stopPolling])
 
   // After a fresh sign-in, pick a running job back up (its polling stopped
   // when the session expired).

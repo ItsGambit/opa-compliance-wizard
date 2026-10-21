@@ -22,13 +22,13 @@ export function ToastProvider() {
 }
 
 function ToastItem({ message: m, onDismiss }: { message: ToastMessage; onDismiss: () => void }) {
-  const borderColor = m.variant === 'error' ? 'border-loss/40' : m.variant === 'success' ? 'border-win/40' : 'border-border'
-  const titleColor  = m.variant === 'error' ? 'text-loss' : m.variant === 'success' ? 'text-win' : 'text-text'
+  const borderColor = m.variant === 'error' ? 'border-loss/40' : m.variant === 'success' ? 'border-win/40' : m.variant === 'warning' ? 'border-warn/40' : 'border-border'
+  const titleColor  = m.variant === 'error' ? 'text-loss' : m.variant === 'success' ? 'text-win' : m.variant === 'warning' ? 'text-warn' : 'text-text'
 
   return (
     <Toast.Root
       open
-      duration={m.duration ?? (m.variant === 'error' ? ERROR_TOAST_DURATION_MS : undefined)}
+      duration={m.duration ?? (m.variant === 'error' || m.variant === 'warning' ? ERROR_TOAST_DURATION_MS : undefined)}
       onOpenChange={open => { if (!open) onDismiss() }}
       className={`bg-bg-elevated border ${borderColor} rounded-lg shadow-xl px-4 py-3 flex items-start gap-3
         data-[state=open]:animate-[slide-in-from-right_0.2s_ease-out]
@@ -38,6 +38,9 @@ function ToastItem({ message: m, onDismiss }: { message: ToastMessage; onDismiss
         <Toast.Title className={`text-sm font-medium ${titleColor}`}>{m.title}</Toast.Title>
         {m.description && (
           <Toast.Description className="text-xs text-text-faint mt-0.5">{m.description}</Toast.Description>
+        )}
+        {m.action && (
+          <a href={m.action.href} className="text-xs text-accent-text underline underline-offset-2 mt-1 inline-block">{m.action.label}</a>
         )}
       </div>
       <Toast.Close asChild>

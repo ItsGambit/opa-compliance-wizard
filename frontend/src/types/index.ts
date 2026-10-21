@@ -182,6 +182,59 @@ export interface SyncState {
   /** When a CSV import last ran (5.40.2, DATA-03 -- imports no longer move
    * the live-sync watermark). Older servers omit it. */
   last_import_at?: string | null
+  /** 5.51.0: what the last scheduled and the last other refresh did to each part (state and a short message). */
+  last_refresh?: { scheduled?: RefreshRecord | null; manual?: RefreshRecord | null } | null
+}
+
+// ── The combined Refresh (5.51.0) ──────────────────────────────────────────────────────────────────────────────
+export type RefreshPartName = 'opa' | 'okta' | 'log'
+export type RefreshPartState = 'not_requested' | 'pending' | 'running' | 'ok' | 'refused' | 'error' | 'skipped' | 'cancelled' | 'timed_out' | 'partial'
+export interface RefreshStepEvent { key: string; status: 'start' | 'progress' | 'done' | 'error'; detail: string | null }
+export interface RefreshPart {
+  state: RefreshPartState
+  message?: string
+  steps?: RefreshStepEvent[]
+  /** The OPA scan's ordered step list as [key, label] (the server owns the wording). */
+  step_defs?: [string, string][]
+  started_at?: string
+  finished_at?: string
+  built_at?: string
+  counts?: Record<string, number>
+  warnings?: number
+  events_new?: number
+  adopted?: boolean
+  /** The Okta scan's four sub-parts. */
+  sub?: Record<string, { state: string; message?: string }>
+}
+export interface RefreshStatus {
+  status: 'idle' | 'running' | 'done'
+  job_id: string | null
+  trigger: 'manual' | 'scheduled' | 'explorer' | null
+  started_at: string | null
+  finished_at: string | null
+  parts_requested: RefreshPartName[]
+  parts: Record<RefreshPartName, RefreshPart>
+  cancel_requested: boolean
+  summary: string | null
+}
+export interface RefreshRecord {
+  finished_at: string | null
+  trigger?: string | null
+  parts: Partial<Record<RefreshPartName, { state: RefreshPartState; message?: string | null }>>
+}
+export interface RefreshStartResponse { started: boolean; already_running: boolean; job_id: string | null; upgrade_starting?: boolean }
+
+/** GET /api/access/model: the stored OPA scan with when it was read. */
+export interface AccessModelResponse {
+  model: AccessModel
+  built_at: string
+  age_seconds: number | null
+  source: 'memory' | 'cache'
+  stale: boolean
+  very_stale: boolean
+  counts: Record<string, number>
+  warnings: number
+  modified_at: string | null
 }
 
 export interface SyncStatusResponse {
@@ -1601,12 +1654,18 @@ export interface Overview {
   capture?: CaptureJobState
   paragraph: string
   viewing_as_of: string | null
-  attention: { kind: 'sync' | 'snapshot' | 'chain'; text: string }[]
+  attention: { kind: 'sync' | 'snapshot' | 'chain' | 'scheduled_opa'; text: string }[]
   sources: {
     okta_snapshot: { captured_at: string | null; index: number | null; snapshots_total: number; first_at: string | null; state: string; newest_attempt_status: string | null; newest_attempt_at: string | null; days_old: number | null }
     archive: { has_archive: boolean; oldest: string | null; newest: string | null; days_held: number | null; events: number | null; last_sync_completed_at: string | null; last_sync_status: string | null; last_sync_error: string | null; sync_mode: string | null; scope: string | null; days_since_sync: number | null }
     chain: { valid: boolean | null; manifest_count: number | null; reason: string | null; head_hash: string | null } | null
-    opa_model: { loaded: boolean; refreshed_at: string | null; principals_effective: number | null }
+    opa_model: {
+      loaded: boolean; refreshed_at: string | null; principals_effective: number | null
+      /** 5.51.0 */
+      built_at?: string | null; age_seconds?: number | null; source?: 'memory' | 'cache' | 'none'; stale?: boolean; very_stale?: boolean
+      counts?: Record<string, number>; warnings_count?: number; modified_at?: string | null; last_scan_outcome?: RefreshPartState | null
+    }
+    refresh?: { schedule: { enabled: boolean; run_time: string }; last_scheduled: RefreshRecord | null; last_manual: RefreshRecord | null }
     okta_org: { users: number | null }
   }
   tiles: {

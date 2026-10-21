@@ -4,9 +4,11 @@ export interface ToastMessage {
   id: string
   title: string
   description?: string
-  variant?: 'default' | 'success' | 'error'
+  variant?: 'default' | 'success' | 'error' | 'warning'
   /** Override how long it stays (ms) -- e.g. a warning that asks for a manual step. */
   duration?: number
+  /** A link in the toast (5.51.0): e.g. "View progress" to the Overview's progress card. */
+  action?: { label: string; href: string }
 }
 
 type Listener = (msg: ToastMessage) => void
