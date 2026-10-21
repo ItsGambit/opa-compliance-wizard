@@ -161,6 +161,10 @@ class Cfg:
         self.gate_service = c.get("gate_service", "opa-auth-gate")
         self.nginx_site = c.get("nginx_site", "/etc/nginx/sites-available/opa-secrets-wizard")
         self.backend_port = int(c.get("backend_port", 8766))
+        v = c.get("install_sh_version")
+        self.install_sh_version = v if isinstance(v, str) else ""   # written by server/install.sh: the release it was last run from
+        sites = c.get("second_gate_sites_dir")
+        self.second_gate_sites_dir = sites if isinstance(sites, str) and sites.startswith("/") else "/etc/nginx/sites-available"
         self.faults = set()
         if env.get("OCW_TEST_MODE") == "1":
             self.faults = {f for f in env.get("OCW_UPDATER_FAULT", "").split(",") if f}
@@ -846,12 +850,9 @@ class Updater:
         manifest = info["manifest"]
         self.st["manifest"] = {k: manifest.get(k) for k in ("version", "min_upgrade_from", "migrations",
                                                          "downtime_estimate_seconds", "nginx_template_changed", "expected_schema_version",
-                                                         "migration_time_estimate_seconds", "nginx_change_required", "requires_install_sh") if k in manifest}
+                                                         "migration_time_estimate_seconds", "nginx_change_required", "requires_install_sh", "install_sh_min_version") if k in manifest}
         self.st["downtime_estimate_seconds"] = manifest.get("downtime_estimate_seconds") or 60
-        if manifest.get("requires_install_sh"):
-            raise StepFailed("needs_install_sh", f"{ver} changes the systemd units, the ocw-updater command or server/install.sh, which the "
-                                                 "updater cannot replace by itself: unpack this release and run `sudo bash server/install.sh` "
-                                                 "from it, then apply it again", "staged")
+        self.check_install_sh(manifest, ver)
         self.st["signed_by"] = info["key_id"]
         self.st["sha256"] = info["sha256"]
         self._adoption = (info["adoption"], info["candidate_keys"])
@@ -940,6 +941,71 @@ class Updater:
             except OSError:
                 pass
 
+    def check_install_sh(self, manifest, ver):
+        """The units, the ocw-updater command and server/install.sh are replaced only by install.sh, never by the updater.
+        install.sh records in config.json the version of the release it was run from; a release that says its newest change
+        to those files is in `install_sh_min_version` is refused only while that record is missing or older. A manifest
+        without the field falls back to the boolean `requires_install_sh` (true: the release's own version is the minimum),
+        so a release that only a 5.47.0 updater would have refused unconditionally can now be satisfied."""
+        need = manifest.get("install_sh_min_version")
+        if need is None:
+            if not manifest.get("requires_install_sh"):
+                return
+            need = ver
+        try:
+            need_t = ocw_trust.version_tuple(need)
+        except ocw_trust.TrustError:
+            raise StepFailed("bad_release", f"the manifest's install_sh_min_version {str(need)[:40]!r} is not a version", "staged")
+        have = self.cfg.install_sh_version
+        try:
+            have_t = ocw_trust.version_tuple(have) if have else None
+        except ocw_trust.TrustError:
+            have_t = None
+        if have_t is not None and have_t >= need_t:
+            return
+        recorded = f"was last run from {have}" if have_t is not None else "has not recorded a version"
+        raise StepFailed("needs_install_sh", f"{ver} needs the systemd units, the ocw-updater command or server/install.sh from release {need} or newer, "
+                                             f"and install.sh {recorded} on this server. Unpack the release file for {ver} that you downloaded "
+                                             "(not the copy in the staging directory) and run `sudo server/install.sh --refresh-updater` from "
+                                             "that unpacked directory; it refreshes the units, the command and the updater, records the version "
+                                             "and touches no data. Then apply this release again.", "staged")
+
+    def check_second_gate_sites(self):
+        """Read-only. The nginx site of an additional login gate (setup-second-gate.sh) must answer 403 on /api/upgrade, or an
+        administrator of that org could reach this server's upgrade routes through its hostname. Neither this updater nor
+        install.sh rewrites those sites (`install.sh --regenerate-second-sites` does); this only looks, warns and writes an
+        audit entry. Returns the names of the sites found without the deny. Never raises, never changes anything."""
+        found = []
+        try:
+            directory = self.cfg.second_gate_sites_dir
+            main = os.path.basename(self.cfg.nginx_site)
+            for name in sorted(os.listdir(directory)):
+                if not name.startswith("opa-") or name == main:
+                    continue
+                try:
+                    fd = open_regular(os.path.join(directory, name))
+                    with os.fdopen(fd, "rb") as fh:
+                        raw = fh.read(1 << 20)
+                except OSError:
+                    continue
+                text = raw.decode("utf-8", "replace")
+                if "# OPA auth gate '" not in text[:600]:
+                    continue    # not a site setup-second-gate.sh generated
+                active = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+                if not re.search(r"location\s+/api/upgrade\s*\{\s*return\s+403\s*;\s*\}", active):
+                    found.append(name[:60])
+        except OSError:
+            return []
+        if found:
+            msg = ("the nginx site of an additional login gate does not deny /api/upgrade: " + ", ".join(found) +
+                   ". Run `sudo server/install.sh --regenerate-second-sites` from the installed release.")
+            log("WARN", msg)
+            try:
+                self.audit("upgrade.step", {"step": "second_gate_site_unprotected", "sites": found, "detail": msg[:300]})
+            except OSError as exc:
+                log("WARN", f"could not write the audit entry: {exc.strerror}")
+        return found
+
     def preflight(self, req, artifact):
         c = self.cfg
         db = c.db_path()
@@ -968,10 +1034,13 @@ class Updater:
             snap = self.host.db_tool(["snapshot", db])
         if self.st["manifest"].get("nginx_template_changed"):
             self.nginx_prepare()
+        unprotected = self.check_second_gate_sites()
         self.st["schema_before"] = snap.get("schema_version")
         self.st["chain_heads_before"] = snap.get("chain_heads") or {}
         self.st["preflight"] = {"free_opt_mb": free_opt // 2**20, "free_data_mb": free_data // 2**20, "sync_waited_s": waited,
                                 "nginx_template_changed": bool(self.st["manifest"].get("nginx_template_changed"))}
+        if unprotected:
+            self.st["preflight"]["second_gate_sites_without_upgrade_deny"] = unprotected
         # baseline for "not worse than before"
         status, body = self.host.http_get(c.backend_port, "/healthz")
         self.st["baseline"] = {"healthz": _healthz_status(body) if status == 200 else None}

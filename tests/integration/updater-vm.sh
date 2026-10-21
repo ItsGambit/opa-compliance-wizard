@@ -27,7 +27,10 @@
 # WHAT IT DOES (each line is an assertion; a summary and a non-zero exit status at the end if any failed)
 #   1  builds a "legacy" in-home install (version 98.0.1) the way docs/hosting.md describes, with seeded synthetic data
 #   2  install.sh --dry-run changes nothing; install.sh migrates (data moved, units rewritten with the keyring and /run/user
-#      carve-outs kept, the app comes back healthy, original data kept as *.migrated-*)
+#      carve-outs kept, the app comes back healthy, original data kept as *.migrated-*). The legacy main unit is INDENTED
+#      (like many real ones): its added lines must keep the indentation; the version install.sh ran from is recorded in the
+#      updater's config; an additional login gate (unit + nginx site without the /api/upgrade deny) is announced loudly, and
+#      `install.sh --regenerate-second-sites` fixes it under a real `nginx -t`
 #   3  stages and applies a good signed release (98.0.2) while polling the site: the maintenance page (503, no version number)
 #      is seen, the final answer is 200; backup taken; audit events and a state file exist; the activator updated itself
 #   4  stages and applies a release whose application crashes at start (98.0.3): automatic code-only rollback, exit 3, a
@@ -133,14 +136,14 @@ cleanup() {
     return $rc
   fi
   say "Cleaning up everything this script created"
-  systemctl stop ocw-upgrade.path ocw-upgrade-due.timer ocw-upgrade.service opa-compliance-wizard opa-auth-gate 2>/dev/null
-  systemctl disable ocw-upgrade.path ocw-upgrade.service ocw-upgrade-due.timer opa-compliance-wizard opa-auth-gate 2>/dev/null
-  rm -f /etc/systemd/system/{opa-compliance-wizard,opa-auth-gate,ocw-stage@,ocw-upgrade,ocw-upgrade-due}.service \
+  systemctl stop ocw-upgrade.path ocw-upgrade-due.timer ocw-upgrade.service opa-compliance-wizard opa-auth-gate opa-auth-gate-vmsecond 2>/dev/null
+  systemctl disable ocw-upgrade.path ocw-upgrade.service ocw-upgrade-due.timer opa-compliance-wizard opa-auth-gate opa-auth-gate-vmsecond 2>/dev/null
+  rm -f /etc/systemd/system/{opa-compliance-wizard,opa-auth-gate,opa-auth-gate-vmsecond,ocw-stage@,ocw-upgrade,ocw-upgrade-due}.service \
     /etc/systemd/system/ocw-upgrade.path /etc/systemd/system/ocw-upgrade-due.timer
   rm -rf /etc/systemd/system/ocw-upgrade.service.d
   rm -f /etc/ocw-updater-test-mode
   systemctl daemon-reload
-  rm -f /etc/nginx/sites-enabled/opa-secrets-wizard "$NGINX_SITE" /etc/nginx/ssl/opa-secrets-wizard.crt /etc/nginx/ssl/opa-secrets-wizard.key
+  rm -f /etc/nginx/sites-enabled/opa-secrets-wizard "$NGINX_SITE" /etc/nginx/sites-enabled/opa-vmsecond /etc/nginx/sites-available/opa-vmsecond /etc/nginx/ssl/opa-secrets-wizard.crt /etc/nginx/ssl/opa-secrets-wizard.key
   systemctl reload nginx 2>/dev/null
   rm -rf "$OPT" "$DATA" /var/lib/ocw-updater /var/cache/ocw-updater /opt/ocw-vm-test
   rm -f /usr/local/bin/ocw-updater "$ENV_FILE" /etc/ocw-updater.env "$ENV_FILE".bak*
@@ -173,7 +176,8 @@ if [ -f "$MARKER" ]; then
   mkdir -p "$WORK"
 fi
 for p in "$OPT" "$DATA" "$ENV_FILE" /etc/systemd/system/opa-compliance-wizard.service /etc/systemd/system/opa-secrets-wizard.service \
-  /etc/systemd/system/opa-auth-gate.service "$NGINX_SITE" /etc/nginx/sites-enabled/opa-secrets-wizard /var/lib/ocw-updater; do
+  /etc/systemd/system/opa-auth-gate.service /etc/systemd/system/opa-auth-gate-vmsecond.service "$NGINX_SITE" \
+  /etc/nginx/sites-enabled/opa-secrets-wizard /etc/nginx/sites-available/opa-vmsecond /var/lib/ocw-updater; do
   [ ! -e "$p" ] || die "$p exists and is not from an earlier run of this script: this does not look like a throwaway VM. Refusing."
 done
 id ocw-updater >/dev/null 2>&1 && die "the ocw-updater account exists: this does not look like a throwaway VM. Refusing."
@@ -242,6 +246,8 @@ umask 022
 sed -e "s|__APP_DIR__|$LEGACY|g" -e "s|__APP_USER_HOME__|$TEST_HOME|g" -e "s|__APP_USER__|$TEST_USER|g" -e "s|/run/user/1000|/run/user/$TEST_UID|g" \
   -e "s|__DATA_DIR__|$LEGACY|g" -e '/^Environment=OPA_DATA_DIR=/d' -e '/^Environment=PYTHONDONTWRITEBYTECODE=/d' -e '/^ProtectSystem=/d' \
   "$CHECKOUT/server/opa-compliance-wizard.service" > /etc/systemd/system/opa-compliance-wizard.service
+# indent every setting line by two spaces, as many hand-installed units are (systemd accepts it); install.sh must still edit them
+sed -i -E '/^(\[|#|$)/!s/^/  /' /etc/systemd/system/opa-compliance-wizard.service
 # the stand-in gate: answers 401 on /verify like the real gate does without a cookie
 mkdir -p /opt/ocw-vm-test
 cat > /opt/ocw-vm-test/fake_gate.py <<'EOF'
@@ -264,6 +270,18 @@ Restart=on-failure
 RestartSec=3
 ReadWritePaths=$LEGACY
 EOF
+# an additional login gate (setup-second-gate.sh): a second stand-in gate unit, indented too
+cat > /etc/systemd/system/opa-auth-gate-vmsecond.service <<EOF
+[Unit]
+Description=Stand-in additional login gate for the updater VM test
+[Service]
+  User=$TEST_USER
+  WorkingDirectory=$LEGACY
+  ExecStart=/usr/bin/python3 /opt/ocw-vm-test/fake_gate.py --port 8768
+  Restart=on-failure
+  RestartSec=3
+  ReadWritePaths=$LEGACY
+EOF
 # nginx: a site built from the repo template with synthetic values and a self-signed certificate
 mkdir -p /etc/nginx/ssl
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=$SITE_NAME" -keyout /etc/nginx/ssl/opa-secrets-wizard.key \
@@ -273,9 +291,19 @@ sed -e "s|REPLACE_WITH_SERVER_NAME|$SITE_NAME|g" -e "s|REPLACE_WITH_NGINX_PROXY_
   "$CHECKOUT/server/nginx-opa-secrets-wizard.conf" > "$NGINX_SITE"
 chmod 640 "$NGINX_SITE"
 ln -s "$NGINX_SITE" /etc/nginx/sites-enabled/opa-secrets-wizard
+# the additional gate's site as an OLDER release generated it: the generator's output without the /api/upgrade deny
+python3 "$CHECKOUT/server/nginx_second_site.py" "$NGINX_SITE" /etc/nginx/sites-available/opa-vmsecond 8768 127.0.0.1:8081 vm-second.example.com vmsecond
+python3 - <<'PY'
+p = "/etc/nginx/sites-available/opa-vmsecond"
+t = open(p).read()
+n = t.replace("    location /api/upgrade {\n        return 403;\n    }\n", "")
+assert n != t
+open(p, "w").write(n)
+PY
+ln -s /etc/nginx/sites-available/opa-vmsecond /etc/nginx/sites-enabled/opa-vmsecond
 nginx -t >/dev/null 2>&1 || die "the synthetic nginx site does not pass nginx -t"
 systemctl daemon-reload
-systemctl enable --now opa-auth-gate opa-compliance-wizard >/dev/null 2>&1
+systemctl enable --now opa-auth-gate opa-auth-gate-vmsecond opa-compliance-wizard >/dev/null 2>&1
 systemctl start nginx
 for _ in $(seq 1 40); do curl -sf http://127.0.0.1:8766/api/version >/dev/null 2>&1 && break; sleep 1; done
 check "legacy install answers as 98.0.1" bash -c "curl -sf http://127.0.0.1:8766/api/version | grep -q '\"98.0.1\"'"
@@ -301,6 +329,7 @@ UPDATER_CMD=/usr/local/bin/ocw-updater
 bash "$LEGACY/server/install.sh" --dry-run --app-user "$TEST_USER" > "$WORK/dryrun.txt"
 check "dry run printed a plan" grep -q "Dry run: nothing was changed" "$WORK/dryrun.txt"
 check "dry run created no layout" test ! -e "$OPT"
+check "dry run announces the additional login gate and names the command" bash -c "grep -q 'ADDITIONAL LOGIN GATES FOUND: vmsecond' $WORK/dryrun.txt && grep -q -- '--regenerate-second-sites' $WORK/dryrun.txt && grep -q 'does NOT deny /api/upgrade' $WORK/dryrun.txt"
 bash "$LEGACY/server/install.sh" --yes --app-user "$TEST_USER" --apply-nginx > "$WORK/install.txt" 2>&1 || { cat "$WORK/install.txt"; bad "install.sh exited non-zero"; }
 check "current points at the migrated release" test "$(readlink "$OPT/current")" = "releases/98.0.1"
 check "the root-owned code is not writable by the application account" bash -c "! runuser -u $TEST_USER -- touch $OPT/current/x 2>/dev/null"
@@ -309,6 +338,17 @@ check "the original data is kept, renamed" bash -c "ls $LEGACY/audit_store.db.mi
 check "unit keeps the keyring carve-out" grep -q "ReadWritePaths=$TEST_HOME/.local/share/keyrings" /etc/systemd/system/opa-compliance-wizard.service
 check "unit keeps the /run/user carve-out" grep -q "ReadWritePaths=/run/user/$TEST_UID" /etc/systemd/system/opa-compliance-wizard.service
 check "application is active after the migration" systemctl is-active --quiet opa-compliance-wizard
+check "the indented unit got its added lines, indented the same way" bash -c "grep -Eq '^  Environment=OPA_DATA_DIR=$DATA\$' /etc/systemd/system/opa-compliance-wizard.service && grep -Eq '^  Environment=PYTHONDONTWRITEBYTECODE=1\$' /etc/systemd/system/opa-compliance-wizard.service && grep -Eq '^  ProtectSystem=strict\$' /etc/systemd/system/opa-compliance-wizard.service"
+check "the effective unit has ProtectSystem=strict and OPA_DATA_DIR" bash -c "systemctl show -p ProtectSystem --value opa-compliance-wizard | grep -qx strict && systemctl show -p Environment --value opa-compliance-wizard | grep -q OPA_DATA_DIR=$DATA"
+check "the additional gate's unit was rewritten too" grep -Eq "^  WorkingDirectory=$OPT/current\$" /etc/systemd/system/opa-auth-gate-vmsecond.service
+check "install.sh recorded the release it ran from in the updater's config" bash -c "python3 -c 'import json,sys; sys.exit(0 if json.load(open(\"$OPT/updater/config.json\")).get(\"install_sh_version\") == \"98.0.1\" else 1)'"
+check "the migration run said the additional gate's site needs action" grep -q 'ACTION NEEDED' "$WORK/install.txt"
+check "the additional gate's site still lacks the deny (the migration does not touch it)" bash -c "! grep -q 'location /api/upgrade' /etc/nginx/sites-available/opa-vmsecond"
+bash "$OPT/current/server/install.sh" --regenerate-second-sites --yes --app-user "$TEST_USER" > "$WORK/regen.txt" 2>&1 || { cat "$WORK/regen.txt"; bad "install.sh --regenerate-second-sites exited non-zero"; }
+check "the regenerated additional site denies /api/upgrade" grep -q 'location /api/upgrade' /etc/nginx/sites-available/opa-vmsecond
+check "nginx -t passes with the regenerated site" nginx -t
+check "nginx answers 403 on /api/upgrade through the additional site" bash -c "test \"\$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: vm-second.example.com' http://127.0.0.1:8081/api/upgrade/status)\" = 403"
+check "a backup of the old additional site was kept" bash -c "ls $OPT/install-backup-*/opa-vmsecond.site.before >/dev/null"
 wait_version() { for _ in $(seq 1 60); do curl -sf http://127.0.0.1:8766/api/version 2>/dev/null | grep -q "\"$1\"" && return 0; sleep 1; done; return 1; }
 check "application answers as 98.0.1 from /opt" wait_version 98.0.1
 check "nginx serves /healthz" bash -c "curl -sk --resolve $SITE_NAME:443:127.0.0.1 https://$SITE_NAME/healthz | grep -q status"

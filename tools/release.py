@@ -202,25 +202,54 @@ def _nginx_template_changed(repo, files, version):
     return old != mine[1]
 
 
-INSTALL_SH_FILES = ("server/ocw-stage@.service", "server/ocw-upgrade.service", "server/ocw-upgrade.path", "server/ocw-upgrade-due.service",
-                    "server/ocw-upgrade-due.timer", "server/ocw-updater.sh", "server/install.sh")
+UNIT_FILES = ("server/ocw-stage@.service", "server/ocw-upgrade.service", "server/ocw-upgrade.path", "server/ocw-upgrade-due.service",
+              "server/ocw-upgrade-due.timer")
+INSTALL_SH_FILES = UNIT_FILES + ("server/ocw-updater.sh", "server/install.sh")
+
+
+def _file_at_tag(repo, tag, name):
+    try:
+        return subprocess.run(["git", "-C", str(repo), "show", f"{tag}:{name}"], capture_output=True, check=True).stdout
+    except (subprocess.CalledProcessError, OSError):
+        return None
+
+
+def _differs_from_tag(repo, files, tag, names):
+    """True when any of `names` in `files` (this release's {name: (mode, bytes)}) differs from the same file at `tag`."""
+    for name in names:
+        mine = files.get(name)
+        if (mine[1] if mine else None) != _file_at_tag(repo, tag, name):
+            return True
+    return False
 
 
 def _requires_install_sh(repo, files, version):
-    """True when a unit, the wrapper or install.sh differs from the previous tag's: the updater cannot replace those itself
-    (only the root-owned Python files self-update), so the operator must re-run server/install.sh from the new release."""
+    """True when a systemd UNIT file differs from the previous tag's. This is the field a 5.47.0 updater understands (it
+    refuses whenever it is true, and nothing it does can fix that), so it is true only when a stale unit could break the
+    service: a changed wrapper or install.sh alone is covered by `install_sh_min_version` for updaters that know it."""
     prev = _previous_tag(repo, version)
     if prev is None:
-        return any(n in files for n in INSTALL_SH_FILES)
-    for name in INSTALL_SH_FILES:
-        mine = files.get(name)
-        try:
-            old = subprocess.run(["git", "-C", str(repo), "show", f"{prev}:{name}"], capture_output=True, check=True).stdout
-        except (subprocess.CalledProcessError, OSError):
-            old = None
-        if (mine[1] if mine else None) != old:
-            return True
-    return False
+        return any(n in files for n in UNIT_FILES)
+    return _differs_from_tag(repo, files, prev, UNIT_FILES)
+
+
+def _install_sh_min_version(repo, files, version):
+    """The newest release version (this one or an earlier tag) in which the units, the ocw-updater wrapper or install.sh
+    changed, found by walking the tags back. The updater refuses a release only while the version install.sh last
+    recorded is older than this. The oldest tag counts as having introduced those files, and a release with no earlier
+    tag uses its own version."""
+    prev = _previous_tag(repo, version)
+    if prev is None or _differs_from_tag(repo, files, prev, INSTALL_SH_FILES):
+        return version
+    cur = prev
+    while True:
+        before = _previous_tag(repo, cur[1:])
+        if before is None:
+            return cur[1:]
+        mine = {n: (0, d) for n in INSTALL_SH_FILES if (d := _file_at_tag(repo, cur, n)) is not None}
+        if _differs_from_tag(repo, mine, before, INSTALL_SH_FILES):
+            return cur[1:]
+        cur = before
 
 
 def _activator_version(files):
@@ -271,8 +300,12 @@ def build_release(version, repo=REPO, out_dir=None, frontend_dist=None, min_upgr
         # the rare release that cannot work without the new site (then an unbakeable site refuses the upgrade).
         "nginx_template_changed": _nginx_template_changed(repo, files, version),
         "nginx_change_required": False,
-        # The units, the wrapper and install.sh are not self-updated: when they changed the updater refuses and says to
-        # run server/install.sh from the new release first.
+        # The units, the wrapper and install.sh are not self-updated. `install_sh_min_version` is the newest release in which
+        # any of them changed: the updater refuses with a clear message only while the version server/install.sh last
+        # recorded is older (the fix is `sudo server/install.sh --refresh-updater` from the new release). The older boolean
+        # is kept for 5.47.0 updaters, which refuse whenever it is true and cannot be satisfied: it is true only when a
+        # systemd unit file itself changed.
+        "install_sh_min_version": _install_sh_min_version(repo, files, version),
         "requires_install_sh": _requires_install_sh(repo, files, version),
         "requires_reboot": False,
         "activator_version": activator_version,

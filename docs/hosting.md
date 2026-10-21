@@ -201,7 +201,14 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
      `/var/lib/opa-compliance-wizard`; the backend unit also has `ProtectSystem=strict` (the gate unit does not: it creates its
      session key under `/etc` on first start);
    * the app's archive path (`OPA_AUDIT_DB_PATH`, below) and every other data file follow `OPA_DATA_DIR`;
-   * a second gate's site generated before 5.47.0 lacks the `/api/upgrade` deny block: run `server/setup-second-gate.sh` again for it;
+   * a second gate's site generated before 5.47.0 lacks the `/api/upgrade` deny block. `setup-second-gate.sh` never rewrites an existing
+     site, and neither `install.sh` nor the updater changes one by itself: `install.sh` lists every `opa-auth-gate-*` unit with the status of
+     its site, and `sudo server/install.sh --regenerate-second-sites` rebuilds them from the live main site (add `--apply-nginx` to apply the
+     main site's maintenance page first; `nginx -t` runs before the reload and the old site is put back if it fails). The sites are looked for in
+     `/etc/nginx/sites-available/opa-<name>` (`OCW_NGINX_SITES_DIR` if they live elsewhere);
+   * the unit files may be indented (systemd allows it): `install.sh` edits them either way and stops before changing anything if
+     `WorkingDirectory=` (or, for the backend unit, `ProtectSystem=` / `ProtectHome=`) is missing;
+   * after a release that changes the units or `install.sh`, the updater asks for `sudo server/install.sh --refresh-updater` (README, "Upgrading");
    * the units `ocw-stage@.service` (unprivileged staging; optional proxy settings in `/etc/ocw-updater.env`), `ocw-upgrade.path` and
      `ocw-upgrade.service` (root: activate, roll back, resume at boot) are documented in the README ("Upgrading").
 

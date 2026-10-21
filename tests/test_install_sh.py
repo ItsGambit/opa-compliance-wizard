@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
+MAIN_SITE = (REPO / "server" / "nginx-opa-secrets-wizard.conf").read_text().replace("REPLACE_WITH_NGINX_PROXY_SECRET_VALUE", "s3cr3t-live-value")
 pytestmark = pytest.mark.skipif(sys.platform == "win32" or not shutil.which("bash"), reason="install.sh is a Linux server script")
 
 STUB_SYSTEMCTL = r'''#!/bin/bash
@@ -52,6 +53,15 @@ esac
 '''
 
 
+# `nginx -t` fails while $STUB/nginx_bad exists or when any file in $OCW_NGINX_SITES_DIR contains the word BROKEN
+NGINX_STUB = r'''#!/bin/bash
+echo "nginx $*" >> "$STUB/calls"
+[ "$1" = "-t" ] || exit 0
+[ ! -e "$STUB/nginx_bad" ] || exit 1
+! grep -rq BROKEN "$OCW_NGINX_SITES_DIR" 2>/dev/null
+'''
+
+
 class Backend(http.server.BaseHTTPRequestHandler):
     version = "0.0.0"
 
@@ -76,7 +86,7 @@ def world(tmp_path):
     (stub / "bin").mkdir(parents=True)
     (stub / "units").mkdir()
     for name, body in (("systemctl", STUB_SYSTEMCTL), ("sleep", "#!/bin/bash\nexit 0\n"), ("runuser", '#!/bin/bash\nshift 3\nexec "$@"\n'),
-                       ("useradd", "#!/bin/bash\nexit 0\n"), ("chown", '#!/bin/bash\necho "$@" >> "$STUB/chowns"\nexit 0\n')):
+                       ("useradd", "#!/bin/bash\nexit 0\n"), ("nginx", NGINX_STUB), ("chown", '#!/bin/bash\necho "$@" >> "$STUB/chowns"\nexit 0\n')):
         p = stub / "bin" / name
         p.write_text(body)
         p.chmod(0o755)
@@ -85,7 +95,7 @@ def world(tmp_path):
     (src / "server" / "updater").mkdir(parents=True)
     shutil.copytree(REPO / "server" / "updater" / "root", src / "server" / "updater" / "root")
     for f in ("nginx_bake.py", "release_keys.json", "ocw-stage@.service", "ocw-upgrade.path", "ocw-upgrade.service", "ocw-upgrade-due.service",
-              "ocw-upgrade-due.timer", "ocw-updater.sh", "install.sh", "opa-compliance-wizard.service", "start-headless.sh"):
+              "ocw-upgrade-due.timer", "ocw-updater.sh", "install.sh", "nginx_second_site.py", "opa-compliance-wizard.service", "start-headless.sh"):
         shutil.copy(REPO / "server" / f, src / "server" / f)
     (src / "create_secret_folders.py").write_text('SCRIPT_VERSION = "5.47.0"\n')
     (src / "requirements.lock").write_text("# empty on purpose\n")
@@ -107,22 +117,26 @@ def world(tmp_path):
     (legacy / "audit_log.jsonl").write_text('{"action":"x"}\n')
     (legacy / "access_control.json").write_text('{"admin_group_id": null}')
     (legacy / "my-template.csv").write_text("path,description\nB,\n")
-    (legacy / ".deploy.conf").write_text(f"OPA_BACKEND_PORT={port}\nOPA_NGINX_SITE=/etc/nginx/conf.d/opa.conf\n")
+    main_site = w / "nginx" / "opa-secrets-wizard"
+    main_site.parent.mkdir()
+    main_site.write_text(MAIN_SITE)
+    (legacy / ".deploy.conf").write_text(f"OPA_BACKEND_PORT={port}\nOPA_NGINX_SITE={main_site}\n")
     unit_dir = w / "units"
     unit_dir.mkdir()
     user = os.environ.get("USER") or os.popen("id -un").read().strip()
     unit = unit_dir / "opa-compliance-wizard.service"
+    # indented, as the units on a real server often are (systemd accepts leading whitespace)
     unit.write_text(f"""[Unit]
 Description=OPA Compliance Wizard
 [Service]
-User={user}
-WorkingDirectory={legacy}
-EnvironmentFile=/etc/opa-compliance-wizard.env
-ExecStart={legacy}/server/start-headless.sh
-ProtectHome=read-only
-ReadWritePaths={legacy}
-ReadWritePaths=/home/app/.local/share/keyrings
-ReadWritePaths=/run/user/1000
+  User={user}
+  WorkingDirectory={legacy}
+  EnvironmentFile=/etc/opa-compliance-wizard.env
+  ExecStart={legacy}/server/start-headless.sh
+  ProtectHome=read-only
+  ReadWritePaths={legacy}
+  ReadWritePaths=/home/app/.local/share/keyrings
+  ReadWritePaths=/run/user/1000
 """)
     gate = unit_dir / "opa-auth-gate.service"
     gate.write_text(f"[Service]\nUser={user}\nWorkingDirectory={legacy}\nExecStart={legacy}/.venv/bin/python server/auth_gate.py --port 8767\n"
@@ -136,7 +150,8 @@ ReadWritePaths=/run/user/1000
     env = dict(os.environ, PATH=f"{stub / 'bin'}:{os.environ['PATH']}", STUB=str(stub), OCW_INSTALL_TEST="1", OCW_TEST_MODE="1", OCW_FAST="1",
                OCW_OPT_DIR=str(w / "opt"), OCW_DATA_DIR=str(w / "var-lib"), OCW_UNIT_DIR=str(unit_dir), OCW_BIN_DIR=str(w / "bin"),
                OCW_ENV_FILE=str(env_file), OCW_SUDOERS_DIR=str(w / "sudoers"), OCW_ARTIFACTS_DIR=str(w / "var-ocw" / "artifacts"),
-               OCW_UPDATER_ENV=str(w / "etc" / "ocw-updater.env"))
+               OCW_UPDATER_ENV=str(w / "etc" / "ocw-updater.env"), OCW_NGINX_SITES_DIR=str(w / "nginx-sites"))
+    (w / "nginx-sites").mkdir()
     (w / "bin").mkdir()
     (w / "sudoers").mkdir()
 
@@ -209,7 +224,7 @@ def test_migration_moves_data_rewrites_units_and_keeps_the_carve_outs(world):
         assert (opt / "updater" / "current" / f).exists(), f
     assert (opt / "updater" / "ocw_activate.py").read_text().startswith("#!/usr/bin/env python3") and "os.execv" in (opt / "updater" / "ocw_activate.py").read_text()
     cfg = json.loads((opt / "updater" / "config.json").read_text())
-    assert cfg["nginx_site"] == "/etc/nginx/conf.d/opa.conf" and cfg["backend_port"] == world.port
+    assert cfg["nginx_site"] == str(world.w / "nginx" / "opa-secrets-wizard") and cfg["backend_port"] == world.port
     assert json.loads((opt / "updater" / "trust.json").read_text())["keys"]
     for f in ("ocw-stage@.service", "ocw-upgrade.path", "ocw-upgrade.service"):
         text = (world.w / "units" / f).read_text()
@@ -310,3 +325,165 @@ def test_install_hands_out_owners_releases_root_staging_to_the_staging_account_a
         assert stat.S_IMODE((world.w / "var-lib" / f).stat().st_mode) == 0o600
     assert stat.S_IMODE((world.w / "opt" / "releases").stat().st_mode) == 0o755
     assert stat.S_IMODE((world.w / "opt" / "handoff").stat().st_mode) == 0o750
+
+
+# --- version-gated updater refusals: install.sh records the release it was run from ---------------------------------
+
+def _cfg(world):
+    return json.loads((world.w / "opt" / "updater" / "config.json").read_text())
+
+
+def test_install_records_the_version_it_was_run_from_and_a_rerun_from_a_newer_tree_advances_it(world):
+    Backend.version = "5.47.0"
+    d = world.run("--dry-run")
+    assert d.returncode == 0 and "install_sh_version=5.47.0" in d.stdout and not (world.w / "opt").exists()
+    assert world.run().returncode == 0
+    assert _cfg(world)["install_sh_version"] == "5.47.0"
+    # a plain re-run from the same tree keeps it; one from a newer unpacked release (--refresh-updater) advances it
+    (world.src / "create_secret_folders.py").write_text('SCRIPT_VERSION = "5.48.0"\n')
+    assert _cfg(world)["install_sh_version"] == "5.47.0"
+    p = world.run("--refresh-updater")
+    assert p.returncode == 0, p.stdout + p.stderr
+    cfg = _cfg(world)
+    assert cfg["install_sh_version"] == "5.48.0" and cfg["app_user"] == world.user and "recorded install_sh_version=5.48.0" in p.stdout
+    # the units and the command were refreshed by the same run, and no data was touched
+    assert (world.w / "bin" / "ocw-updater").read_text() == (REPO / "server" / "ocw-updater.sh").read_text().replace("__OPT_DIR__", str(world.w / "opt")).replace(
+        "__DATA_DIR__", str(world.w / "var-lib")).replace("__APP_USER__", world.user).replace("__PYTHON3__", shutil.which("python3")).replace(
+        "__ARTIFACTS_DIR__", str(world.w / "var-ocw" / "artifacts")).replace("__ENV_FILE__", str(world.env_file))
+
+
+def test_a_failed_run_keeps_the_previously_recorded_version(world):
+    Backend.version = "5.47.0"
+    assert world.run().returncode == 0
+    (world.src / "create_secret_folders.py").write_text('SCRIPT_VERSION = "5.48.0"\n')
+    (world.src / "server" / "ocw-upgrade.service").unlink()  # the run dies while installing the units, after config.json is rewritten
+    assert world.run("--refresh-updater").returncode != 0
+    assert _cfg(world)["install_sh_version"] == "5.47.0"
+
+
+# --- indented units (systemd accepts leading whitespace; the units on a real server often have it) ---------------------
+
+def test_indented_unit_lines_are_edited_and_their_indentation_is_kept(world):
+    Backend.version = "5.47.0"
+    p = world.run()
+    assert p.returncode == 0, p.stdout + p.stderr
+    data = world.w / "var-lib"
+    lines = world.unit.read_text().splitlines()
+    assert f"  WorkingDirectory={world.w / 'opt'}/current" in lines
+    assert f"  Environment=OPA_DATA_DIR={data}" in lines and "  Environment=PYTHONDONTWRITEBYTECODE=1" in lines
+    assert lines.index("  ProtectSystem=strict") == lines.index("  ProtectHome=read-only") - 1
+    assert f"  ReadWritePaths={data}" in lines and "  ReadWritePaths=/run/user/1000" in lines
+    # the unindented gate unit stays unindented
+    assert f"Environment=OPA_DATA_DIR={data}" in world.gate.read_text().splitlines()
+
+
+def test_a_unit_without_the_expected_lines_stops_the_run_before_anything_changes_even_in_a_dry_run(world):
+    before = world.unit.read_text()
+    world.unit.write_text(before.replace(f"  WorkingDirectory={world.legacy}\n", ""))
+    for args in (("--dry-run",), ()):
+        p = world.run(*args)
+        assert p.returncode != 0 and "WorkingDirectory" in p.stderr and "nothing was changed" in p.stderr, (args, p.stdout, p.stderr)
+        assert not (world.w / "opt").exists() and not (world.w / "var-lib").exists()
+        assert (world.legacy / "audit_store.db").exists()
+    world.unit.write_text(before.replace("  ProtectHome=read-only\n", ""))
+    p = world.run("--dry-run")
+    assert p.returncode != 0 and "ProtectSystem" in p.stderr and not (world.w / "opt").exists()
+    # an already hardened unit does not need ProtectHome
+    world.unit.write_text(before.replace("  ProtectHome=read-only\n", "  ProtectSystem=strict\n"))
+    assert world.run("--dry-run").returncode == 0
+
+
+def test_an_indented_env_file_is_recognised(world):
+    Backend.version = "5.47.0"
+    world.env_file.write_text(f"  OPA_DATA_DIR=/somewhere/else\n\tOPA_AUDIT_DB_PATH={world.legacy}/audit_store.db\n")
+    assert world.run().returncode == 0
+    env = world.env_file.read_text()
+    assert env.count("OPA_DATA_DIR=") == 1  # not added a second time
+    assert f"\tOPA_AUDIT_DB_PATH={world.w / 'var-lib'}/audit_store.db" in env
+
+
+# --- additional login gates ---------------------------------------------------------------------------------------------
+
+def _add_second_gate(world, name="second", with_deny=False, listen="127.0.0.1:8080", host="opa2.example.com"):
+    from server.nginx_second_site import build
+    user = world.user
+    unit = world.w / "units" / f"opa-auth-gate-{name}.service"
+    unit.write_text(f"[Service]\nUser={user}\nWorkingDirectory={world.legacy}\nExecStart={world.legacy}/.venv/bin/python server/auth_gate.py --port 8768\n"
+                    f"ReadWritePaths={world.legacy}\n")
+    (world.stub / "units" / f"opa-auth-gate-{name}.props").write_text(
+        f"FragmentPath={unit}\nUser={user}\nWorkingDirectory={world.legacy}\nActiveState=active\nNRestarts=0\n")
+    text = build(MAIN_SITE, 8768, listen, host, name, allow_public_listen=not listen.startswith("127."))
+    if not with_deny:
+        text = text.replace("    location /api/upgrade {\n        return 403;\n    }\n", "")
+        assert "/api/upgrade" not in text
+    site = world.w / "nginx-sites" / f"opa-{name}"
+    site.write_text(text)
+    return site, unit
+
+
+def test_second_gates_are_announced_loudly_in_the_dry_run_and_the_real_run(world):
+    Backend.version = "5.47.0"
+    site, _unit = _add_second_gate(world)
+    d = world.run("--dry-run")
+    assert d.returncode == 0, d.stdout + d.stderr
+    assert "ADDITIONAL LOGIN GATES FOUND: second" in d.stdout and "does NOT deny /api/upgrade" in d.stdout
+    assert f"server/install.sh --regenerate-second-sites" in d.stdout
+    p = world.run()
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "ACTION NEEDED" in p.stdout and "--regenerate-second-sites" in p.stdout and "second" in p.stdout.split("ACTION NEEDED")[1]
+    assert "/api/upgrade" not in site.read_text()  # not touched without the flag
+
+
+def test_regenerate_second_sites_adds_the_deny_keeps_the_rest_and_validates_nginx(world):
+    Backend.version = "5.47.0"
+    site, _unit = _add_second_gate(world)
+    before = site.read_text()
+    p = world.run("--regenerate-second-sites")
+    assert p.returncode == 0, p.stdout + p.stderr
+    after = site.read_text()
+    assert "location /api/upgrade {\n        return 403;\n    }" in after
+    assert "listen 127.0.0.1:8080;" in after and "server_name opa2.example.com;" in after and "127.0.0.1:8768" in after
+    assert "ACTION NEEDED" not in p.stdout
+    # only the deny block was added
+    import difflib
+    changed = [l for l in difflib.unified_diff(before.splitlines(), after.splitlines(), lineterm="", n=0) if l[:1] in "+-" and l[:3] not in ("+++", "---")]
+    assert all(l.startswith("+") for l in changed) and any("/api/upgrade" in l for l in changed)
+    c = calls(world)
+    assert "nginx -t" in c and "systemctl reload nginx" in c
+    assert list((world.w / "opt").glob("install-backup-*/opa-second.site.before"))
+    # idempotent
+    assert world.run("--regenerate-second-sites").returncode == 0
+    assert site.read_text() == after
+
+
+def test_regenerate_second_sites_keeps_an_operator_chosen_public_listen_address(world):
+    Backend.version = "5.47.0"
+    site, _unit = _add_second_gate(world, listen="10.0.0.5:8080")
+    assert world.run("--regenerate-second-sites").returncode == 0
+    assert "listen 10.0.0.5:8080;" in site.read_text() and "location /api/upgrade" in site.read_text()
+
+
+def test_regenerate_second_sites_puts_the_old_site_back_when_nginx_rejects_the_new_one(world):
+    Backend.version = "5.47.0"
+    site, _unit = _add_second_gate(world)
+    before = site.read_text()
+    (world.stub / "nginx_bad").write_text("")
+    p = world.run("--regenerate-second-sites")
+    assert p.returncode != 0 and "nginx -t rejected the regenerated site" in p.stdout
+    assert site.read_text() == before
+    assert "systemctl reload nginx" not in calls(world)
+
+
+def test_regenerate_second_sites_reports_a_missing_site_and_fails(world):
+    Backend.version = "5.47.0"
+    site, _unit = _add_second_gate(world)
+    site.unlink()
+    p = world.run("--regenerate-second-sites")
+    assert p.returncode != 0 and "no regular file" in p.stdout
+
+
+def test_a_second_site_that_already_denies_upgrade_is_reported_ok(world):
+    Backend.version = "5.47.0"
+    _add_second_gate(world, with_deny=True)
+    p = world.run("--dry-run")
+    assert "already denies /api/upgrade" in p.stdout and "does NOT" not in p.stdout
