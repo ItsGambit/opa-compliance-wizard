@@ -613,7 +613,7 @@ def opa_principals(model, limit=MAX_PRINCIPALS):
     for a in model.get("okta_accounts") or []:
         if isinstance(a, dict) and isinstance(a.get("okta_user_id"), str) and a["okta_user_id"]:
             principals.append({"key": f"okta_ud_account:{a.get('id')}", "source": "okta_ud_account", "opa_id": a.get("id"),
-                               "name": a.get("name") or a.get("username"), "email": None, "lookup": a["okta_user_id"],
+                               "name": a.get("name") or a.get("username"), "email": None, "lookup": a["okta_user_id"], "okta_lookup_id": a["okta_user_id"],
                                "project": a.get("project_name")})
     return principals[:limit], skipped
 
@@ -628,10 +628,13 @@ def capture_principal_status(okta_client, model, limit=MAX_PRINCIPALS):
     meta = {"principals": len(principals), "skipped_service_users": skipped, "unreadable": 0, "truncated": False}
     items = []
     for p in principals:
-        entry = {k: p.get(k) for k in ("source", "opa_id", "name", "email", "project")}
+        entry = {k: p.get(k) for k in ("source", "opa_id", "name", "email", "project", "okta_lookup_id")}
         try:
-            user = _clean_user(okta_client.get_user(p["lookup"]))
-            entry.update({"okta_state": user.get("status") or "UNREADABLE", "okta_id": user.get("id"), "okta_login": user.get("login")})
+            raw_user = okta_client.get_user(p["lookup"])
+            user = _clean_user(raw_user)
+            changed = raw_user.get("statusChanged") if isinstance(raw_user, dict) and isinstance(raw_user.get("statusChanged"), str) else None
+            entry.update({"okta_state": user.get("status") or "UNREADABLE", "okta_id": user.get("id"), "okta_login": user.get("login"),
+                          "okta_status_changed": changed})
         except OktaApiError as exc:
             kind = _classify(exc)
             if kind == "refused" and not items:
@@ -649,6 +652,41 @@ def capture_principal_status(okta_client, model, limit=MAX_PRINCIPALS):
 # Okta user statuses that mean "this person cannot sign in to Okta now".
 INACTIVE_OKTA_STATES = ("DEPROVISIONED", "SUSPENDED")
 SIGNIN_CAPABLE = ("ACTIVE", "PROVISIONED", "RECOVERY", "PASSWORD_EXPIRED", "LOCKED_OUT", "STAGED")
+
+
+def effective_access(model):
+    """What OPA access still resolves, for cross-check C1: ({opa_user_id: {"groups", "policies", "resources"}},
+    {okta_user_id: {"policies"}}) from the access model, or None when it is not loaded. A user has effective access
+    when an ACTIVE policy names one of their groups and has at least one rule that resolves to a specific resource;
+    an Okta service account when an active policy resolves to it."""
+    if not isinstance(model, dict) or not isinstance(model.get("policies"), list):
+        return None
+    pols = []
+    for p in model["policies"]:
+        if not isinstance(p, dict) or not p.get("active"):
+            continue
+        principals = p.get("principals") if isinstance(p.get("principals"), dict) else {}
+        gids = {g.get("id") for g in principals.get("user_groups") or [] if isinstance(g, dict) and g.get("id")}
+        resolved = [res for r in (p.get("rules") if isinstance(p.get("rules"), list) else []) if isinstance(r, dict)
+                    for res in (r.get("resolutions") if isinstance(r.get("resolutions"), list) else [])
+                    if isinstance(res, dict) and res.get("kind") == "resolved"]
+        if gids and resolved:
+            pols.append((gids, resolved))
+    users = {}
+    for u in model.get("users") or []:
+        if not isinstance(u, dict) or not u.get("id"):
+            continue
+        mine = {g.get("id") for g in u.get("groups") or [] if isinstance(g, dict)}
+        hit = [(g, res) for g, res in pols if g & mine]
+        if hit:
+            users[u["id"]] = {"groups": len(mine & set().union(*(g for g, _ in hit))), "policies": len(hit), "resources": sum(len(res) for _, res in hit)}
+    ud = {}
+    for a in model.get("okta_accounts") or []:
+        if isinstance(a, dict) and isinstance(a.get("okta_user_id"), str):
+            n = sum(1 for _g, res in pols if any(r.get("id") in (a["okta_user_id"], a.get("id")) for r in res))
+            if n:
+                ud[a["okta_user_id"]] = {"policies": n}
+    return users, ud
 
 
 def build_cross_checks(environment_id, access_model=None, now=None):
@@ -674,7 +712,8 @@ def build_cross_checks(environment_id, access_model=None, now=None):
         else:
             card["message"] = "Run the lookup to compare each OPA principal with its Okta user."
         return card
-    rows, counts = [], {"checked": 0, "inactive_in_okta": 0, "absent_in_okta": 0, "unreadable": 0, "active": 0}
+    effective = effective_access(access_model)
+    rows, counts = [], {"checked": 0, "inactive_in_okta": 0, "absent_in_okta": 0, "unreadable": 0, "active": 0, "effective": 0, "effective_people": 0, "effective_accounts": 0}
     for item in snap["items"]:
         e = item["object"] if isinstance(item["object"], dict) else {}
         counts["checked"] += 1
@@ -693,8 +732,18 @@ def build_cross_checks(environment_id, access_model=None, now=None):
             flag = None
         if flag:
             opa = opa_by_id.get(e.get("opa_id")) if e.get("source") == "opa_user" else None
+            footprint = None
+            if effective is not None:
+                if e.get("source") == "opa_user":
+                    footprint = effective[0].get(e.get("opa_id"))
+                else:
+                    footprint = effective[1].get(e.get("okta_lookup_id") or e.get("okta_id") or "")
+            if flag in ("inactive", "absent") and effective is not None and footprint:
+                counts["effective"] += 1
+                counts["effective_people" if e.get("source") == "opa_user" else "effective_accounts"] += 1
             rows.append({**e, "flag": flag, "opa_roles": (opa or {}).get("roles", []),
-                         "opa_powerful_roles": (opa or {}).get("powerful_roles", [])})
+                         "opa_powerful_roles": (opa or {}).get("powerful_roles", []),
+                         "access_effective": None if effective is None else bool(footprint), "footprint": footprint})
     rows.sort(key=lambda r: ({"inactive": 0, "absent": 1, "unknown": 2}[r["flag"]], (r.get("name") or "").lower()))
     stale = snap["captured_at"] < _iso(now - timedelta(days=7))
     card.update({"state": "ok", "counts": counts, "rows": rows,
@@ -725,6 +774,28 @@ def user_flags(environment_id):
 # ---------------------------------------------------------------------------
 # Overview: counts only
 # ---------------------------------------------------------------------------
+def _c1_result(card):
+    c = card["counts"]
+    if card["state"] != "ok":
+        return {"state": card["state"], "people": None, "accounts": None}
+    return {"state": "ok", "people": c.get("effective_people"), "accounts": c.get("effective_accounts"),
+            "unreadable": c.get("unreadable"), "checked": c.get("checked")}
+
+
+def _c5_card(admins, index):
+    sod = admins["separation_of_duties"]
+    state = admins["state"] if admins["state"] != "ok" else ("not_loaded" if sod["state"] == "not_loaded" else "ok")
+    return {
+        "id": "C5", "title": "Okta admin who is also an OPA admin (separation of duties)",
+        "statement": ("An Okta Super, Organization or Application Administrator who also holds pam_admin, resource_admin or delegated_resource_admin "
+                      "in OPA. Since-dates come from the privilege-grant events and the snapshot history."),
+        "state": state, "message": admins.get("message") if state == "refused" else None,
+        "inputs": {"okta_snapshot": admins.get("as_of_snapshot"), "opa_roster_loaded": index["state"] != "not_loaded"},
+        "counts": {"people": len(sod["overlaps"]) if state == "ok" else None},
+        "result": {"state": state, "people": len(sod["overlaps"]) if state == "ok" else None},
+    }
+
+
 def privileged_identity_sets(environment_id, access_model=None, as_of=None):
     """(okta_user_ids, logins, sources): the people counted as privileged for the sign-in / MFA cohort --
     Okta admin role holders in the as-of snapshot (by Okta user id) and OPA users with an OPA admin role
@@ -749,7 +820,7 @@ def privileged_identity_sets(environment_id, access_model=None, as_of=None):
     return ids, logins, sources
 
 
-def build_overview(environment_id, as_of=None, access_model=None, service_accounts_total=None, now=None, integrity=None, weeks=26):
+def build_overview(environment_id, as_of=None, access_model=None, service_accounts_total=None, now=None, integrity=None, weeks=26, model_time=None, okta_host=None):
     """Counts for the executive dashboard, one cheap aggregate. Every Okta-derived
     block carries its own state ("ok" | "refused" | "never_captured" | "error" |
     "not_loaded") so a block whose Okta read was refused says so instead of
@@ -803,9 +874,39 @@ def build_overview(environment_id, as_of=None, access_model=None, service_accoun
         }
         if privileged == [] and not (pids or plogins):
             signins_mfa["privileged_message"] = "No privileged people are known yet (capture the Okta admins and load the OPA roster)."
+    import overview_extras as ox
+    inv_summary = inventory_counts.series_summary(environment_id, as_of=as_of, now=now)
+    snap_for_tiles = audit_store.latest_config_snapshot(environment_id, KIND_ADMINS, as_of=as_of)
+    admin_users = [i["object"] for i in (snap_for_tiles["items"] if snap_for_tiles else []) if isinstance(i["object"], dict) and i["object"].get("kind") == "user" and i["object"].get("roles")]
+    eff = effective_access(access_model)
+    c5_card = _c5_card(admins, index)
+    src = ox.sources(environment_id, end, as_of, admins, model_time, (len(eff[0]) + len(eff[1])) if eff else None, inv_summary, integrity)
+    tl = ox.tiles(admin_users, index, cross, admins["separation_of_duties"], access_model, inv_summary, src["archive"]["days_held"])
+    weekly_priv = ox.weekly_event_counts(environment_id, list(GRANT_EVENT_TYPES), end)
+    req_types = ["access.request.create", "access.request.resolve", "access.request.expire"]
+    weekly_req = ox.weekly_event_counts(environment_id, req_types, end, success_only=False)
+    thirty = audit_store._iso_ms(end - timedelta(days=30))
+    req30 = {"created": 0, "resolved": 0, "expired": 0}
+    for r in audit_store.query_events(environment_id, event_types=req_types, since=thirty, until=audit_store._iso_ms(end), limit=5000):
+        k = {"access.request.create": "created", "access.request.resolve": "resolved", "access.request.expire": "expired"}[r["event_type"]]
+        req30[k] += 1
+    opa_pts = next((x["points"] for x in inv_summary["series"] if x["key"] == "opa.privileged_users"), [])
+    attention = ox.attention(src)
+    para = ox.paragraph({"tiles": tl, "okta_state": admins["state"], "okta_host": okta_host, "archive": src["archive"], "chain": integrity,
+                         "requests30": req30, "attention_sync": next((a["text"] for a in attention if a["kind"] == "sync"), None)})
     return {
         "environment_id": environment_id, "as_of": as_of, "generated_at": _iso(now),
-        "inventory": inventory_counts.series_summary(environment_id, as_of=as_of, now=now),
+        "sources": src, "attention": attention, "tiles": tl, "paragraph": para, "viewing_as_of": as_of if as_of and (admins.get("as_of_snapshot") or {}).get("snapshot_id") != (admins.get("last_attempt") or {}).get("snapshot_id") else None,
+        "trends": {
+            "admin_holders": {"okta": ox.admin_holder_points(environment_id, as_of), "opa": opa_pts},
+            "privilege_events": [{"week": w, "granted": weekly_priv[w].get("user.account.privilege.grant", 0), "revoked": weekly_priv[w].get("user.account.privilege.revoke", 0)} for w in weekly_priv],
+            "revokes_archived": coverage.get("ingestion_scope") == "all",
+            "access_requests": [{"week": w, "created": weekly_req[w].get("access.request.create", 0), "resolved": weekly_req[w].get("access.request.resolve", 0),
+                                 "expired": weekly_req[w].get("access.request.expire", 0)} for w in weekly_req],
+        },
+        "cross_checks": [{**{k: cross[k] for k in ("id", "title", "statement", "state", "message", "inputs", "counts")}, "result": _c1_result(cross)}, c5_card],
+        "evidence_readiness": ox.evidence_readiness(end, src["archive"], (admins.get("as_of_snapshot") or {}).get("captured_at")),
+        "inventory": inv_summary,
         "signins_mfa": signins_mfa,
         "okta_admins": admin_block,
         "opa_privileged_users": {"state": index["state"], "count": sum(1 for u in index["users"] if u["powerful_roles"]) if index["state"] != "not_loaded" else None,
@@ -864,3 +965,23 @@ def privileged_people_report(environment_id, access_model=None, as_of=None, week
     out.sort(key=lambda x: ((x["login"] or "").lower(), x["okta_user_id"] or ""))
     return {"weeks": weeks, "people": out, "generated_at": _iso(now),
             "note": "Each person's figures are their own sign-ins and multi-factor events in the archive over the window."}
+
+
+PEOPLE_LISTS = ("c1", "c5")
+
+
+def people_list(environment_id, which, access_model=None, as_of=None):
+    """The named list behind an Overview count (admin-only, audited endpoint): 'c1' the OPA principals whose Okta
+    user is gone and whose OPA access still resolves, 'c5' the Okta admins who also hold an OPA admin role."""
+    if which not in PEOPLE_LISTS:
+        raise ValueError("list must be one of " + ", ".join(PEOPLE_LISTS))
+    if which == "c5":
+        report = build_okta_admins_report(environment_id, as_of=as_of, access_model=access_model)
+        return {"list": "c5", "state": report["state"] if report["state"] != "ok" else report["separation_of_duties"]["state"],
+                "message": report.get("message"), "snapshot": report.get("as_of_snapshot"), "people": report["separation_of_duties"]["overlaps"]}
+    card = build_cross_checks(environment_id, access_model=access_model)
+    rows = [r for r in card["rows"] if r["flag"] in ("inactive", "absent") and r.get("access_effective")]
+    snap = card["inputs"].get("okta_snapshot")
+    return {"list": "c1", "state": card["state"], "message": card["message"], "snapshot": snap, "people": rows,
+            "note": ("'OPA access still effective' means at least one active OPA security policy resolves to this principal today. "
+                     "This tool does not change it.")}

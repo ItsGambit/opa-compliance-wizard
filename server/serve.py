@@ -589,6 +589,7 @@ def _run_access_job(storage_name, job_client, job_okta_client, correlation_id=No
         with _access_jobs_lock:
             _access_jobs[storage_name]["status"] = "done"
             _access_jobs[storage_name]["result"] = result
+            _access_jobs[storage_name]["result_at"] = _utc_now_iso()  # 5.50.0: when the Overview says the OPA roster was read
     except Exception as exc:
         with _access_jobs_lock:
             _access_jobs[storage_name]["status"] = "error"
@@ -979,6 +980,20 @@ def _capture_state(environment_id):
     out = {k: job[k] for k in ("kind", "error", "finished_at") if job.get(k) is not None}
     out["status"] = job["status"]
     return out
+
+
+def _okta_host(environment_id, meta):
+    """The host of the environment's Okta org (for the Overview's wording), never a credential."""
+    from urllib.parse import urlparse as _up
+    url = (meta or {}).get("okta_url") or ""
+    host = _up(url).hostname if url else None
+    return host
+
+
+def _access_model_time(environment_id):
+    with _access_jobs_lock:
+        job = _access_jobs.get(environment_id)
+        return job.get("result_at") if job else None
 
 
 def _access_model_for(environment_id):
@@ -1630,6 +1645,7 @@ class Handler(SimpleHTTPRequestHandler):
         # additional login gate (nginx answers 403 there for the whole /api/overview prefix). Each
         # Okta-derived block carries its own state, so a refused read says "refused", never zero.
         privileged = path.endswith("/privileged")
+        people_route = path.endswith("/people")
         if not _can_admin(owner_key, self.headers):
             return self._send_json(403, {"error": "Admin access required for the overview."})
         import audit_store
@@ -1659,6 +1675,11 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             audit_store.normalize_window(None, as_of)
             model = _access_model_for(env_id)
+            if people_route:
+                which = (qs.get("list") or [""])[0]
+                named = okta_admins.people_list(env_id, which, access_model=model, as_of=as_of)
+                self._log_audit_event(actor_email, actor_sub, "overview.people_read", {"name": name, "list": which, "as_of": as_of, "people": len(named["people"])})
+                return self._send_json(200, named)
             if privileged:
                 people = okta_admins.privileged_people_report(env_id, access_model=model, as_of=as_of, weeks=weeks)
                 self._log_audit_event(actor_email, actor_sub, "overview.privileged_read", {"name": name, "as_of": as_of, "people": len(people["people"]), "weeks": weeks})
@@ -1667,6 +1688,7 @@ class Handler(SimpleHTTPRequestHandler):
             chain = audit_store.verify_ingestion_chain(env_id)
             overview = okta_admins.build_overview(
                 env_id, as_of=as_of, access_model=model, service_accounts_total=accounts, weeks=weeks,
+                model_time=_access_model_time(env_id), okta_host=_okta_host(env_id, meta),
                 integrity={k: chain.get(k) for k in ("valid", "manifest_count", "reason", "head_hash")})
         except ValueError as exc:
             return self._send_json(400, {"error": str(exc)})
@@ -2836,6 +2858,10 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/overview":
                 # 5.50.0: counts only, for the executive dashboard. Admin-only; not available through an additional
                 # login gate (nginx answers 403 there). See _serve_overview.
+                return self._serve_overview(path, qs, owner_key, engine_owner, local_env_name)
+
+            if path == "/api/overview/people":
+                # The named list behind one Overview count (C1 or C5). Admin-only; every read is audited.
                 return self._serve_overview(path, qs, owner_key, engine_owner, local_env_name)
 
             if path == "/api/overview/privileged":

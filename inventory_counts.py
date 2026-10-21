@@ -22,7 +22,7 @@ OPA_SERIES = (
     ("opa.secret_folders", "Secret folders"), ("opa.secrets", "Secrets"),
     ("opa.saas_accounts", "SaaS app accounts"), ("opa.okta_ud_accounts", "Okta service accounts"),
     ("opa.ad_accounts", "Active Directory accounts"), ("opa.database_accounts", "Database accounts"),
-    ("opa.users_human", "Users"), ("opa.users_service", "Service users"), ("opa.groups", "Groups"),
+    ("opa.privileged_users", "Users with a privileged OPA role"), ("opa.users_human", "Users"), ("opa.users_service", "Service users"), ("opa.groups", "Groups"),
     ("opa.policies", "Security policies"), ("opa.policies_active", "Active security policies"),
     ("opa.relationships", "Relationships"), ("opa.assignments", "Assignments"),
     ("opa.group_memberships", "Group memberships"), ("opa.group_role_assignments", "Group role assignments"),
@@ -94,6 +94,9 @@ def opa_counts(model):
         out["opa.policy_resource_grants"] = sum(
             1 for p in policies for r in (p.get("rules") if isinstance(p.get("rules"), list) else []) if isinstance(r, dict)
             for res in (r.get("resolutions") if isinstance(r.get("resolutions"), list) else []) if isinstance(res, dict) and res.get("kind") == "resolved")
+    if isinstance(model.get("users"), list) and isinstance(model.get("groups"), list) and not any(u.get("groups_error") for u in users):
+        import okta_admins
+        out["opa.privileged_users"] = sum(1 for u in okta_admins.opa_role_index(model)["users"] if u["powerful_roles"])
     put("opa.relationships", _len(model, "relationships"), "relationships")
     put("opa.assignments", _len(model, "assignments"), "assignments")
     put("opa.gateways", _len(model, "gateways"), "gateways")

@@ -367,7 +367,8 @@ def test_c1_flags_inactive_absent_and_unreadable_principals(db):
     assert cap["status"] == "ok" and cap["meta"]["skipped_service_users"] == 1 and cap["meta"]["unreadable"] == 1
     audit_store.record_config_snapshot(ENV, oa.KIND_PRINCIPAL_STATUS, cap["items"], meta=cap["meta"])
     card = oa.build_cross_checks(ENV, access_model=_model())
-    assert card["state"] == "ok" and card["counts"] == {"checked": 3, "inactive_in_okta": 2, "absent_in_okta": 0, "unreadable": 1, "active": 0}
+    assert card["state"] == "ok"
+    assert {k: card["counts"][k] for k in ("checked", "inactive_in_okta", "absent_in_okta", "unreadable", "active")} == {"checked": 3, "inactive_in_okta": 2, "absent_in_okta": 0, "unreadable": 1, "active": 0}
     first = card["rows"][0]
     assert first["flag"] == "inactive" and first["opa_powerful_roles"] in (["pam_admin"], [])
     flags = oa.user_flags(ENV)

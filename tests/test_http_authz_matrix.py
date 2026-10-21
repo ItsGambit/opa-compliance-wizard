@@ -92,6 +92,7 @@ ROUTES = {
         Route("GET", "/api/environments/dev/config_snapshots", "env", None, 200, caps=('view_archive',)),
     # Admin-only; with no environment named or active the route's own 400 answers (the data paths are in test_okta_routes_5500.py).
     ("GET", "path == '/api/overview'"): Route("GET", "/api/overview", "admin", None, 400),
+    ("GET", "path == '/api/overview/people'"): Route("GET", "/api/overview/people", "admin", None, 400),
     ("GET", "path == '/api/overview/privileged'"): Route("GET", "/api/overview/privileged", "admin", None, 400),
     ("GET", "path == '/api/archives/orphaned'"): Route("GET", "/api/archives/orphaned", "admin", None, 200),
     ("GET", "path == '/api/reports'"): Route("GET", "/api/reports?environment=dev", "env", None, 200, caps=('view_archive',)),
