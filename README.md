@@ -145,7 +145,7 @@ Want to run it as a CLI instead, or host it for a team? See
 
 ## Upgrading
 
-**Nothing changes for you unless you choose it.** Upgrading to 5.47.0 changes no
+**Nothing changes for you unless you choose it.** Upgrading to 5.49.0 changes no
 behaviour of an existing install: the update check is **off**, `server/deploy.sh` and `--ref`
 keep working in place (with a note that the install can move to the upgrade layout), and no
 key has to be pinned. 5.46.0 added **signed releases** and the update check; 5.47.0 adds the
@@ -378,7 +378,8 @@ opt in: `python -m server.updater share-version on` (off by default).
 
 On a computer that has internet access, download from the release page either the three files (`ocw-<version>.tar.gz`, `.minisig`, `manifest.json`) or the
 **offline bundle** `ocw-<version>-offline.tar.gz` (with its `.sha256`): the same signed release plus the hash-pinned Python packages for Windows, macOS and
-Linux (x86-64 and ARM) on Python 3.9 to 3.14 (Linux needs glibc 2.28 or newer; Alpine is not covered). Carry it over on removable media; check the copy
+Linux (x86-64 and ARM) on Python 3.9 to 3.14 (Linux needs glibc 2.28 or newer; Alpine is not covered; macOS means Apple silicon: the pinned
+`cryptography` publishes no wheel for Intel Macs, so they are not in the bundle). Carry it over on removable media; check the copy
 with `sha256sum -c ocw-<version>-offline.tar.gz.sha256` if you like (the signature inside is what the install trusts).
 
 * **Local install:** `python launch.py upgrade --from-file ocw-<version>-offline.tar.gz`. Nothing is fetched from the internet; packages are installed with

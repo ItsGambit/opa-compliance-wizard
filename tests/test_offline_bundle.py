@@ -81,7 +81,7 @@ def build(signed, **kw):
 def test_build_collects_every_target_and_the_bundle_opens(signed, tmp_path):
     (bundle, info, digest), pip, out = build(signed)
     assert bundle.name == "ocw-5.49.0-offline.tar.gz" and (out / (bundle.name + ".sha256")).read_text() == f"{digest}  {bundle.name}\n"
-    assert len(pip.calls) == len(tool.OFFLINE_PYTHONS) * len(tool.OFFLINE_PLATFORMS)
+    assert len(pip.calls) == len(tool.OFFLINE_PYTHONS) * len(tool.OFFLINE_DEFAULT_PLATFORMS)
     assert set(info["wheels"]) == {"keyring-25.7.0-py3-none-any.whl", "pyjwt-2.15.1-py3-none-any.whl", "cffi-2.0.0-py3-none-any.whl",
                                    "pywin32_ctypes-0.2.3-py3-none-any.whl", "backports_tarfile-1.2.0-py3-none-any.whl"}
     opened = offline.open_bundle(bundle, tmp_path / "opened")
@@ -90,6 +90,11 @@ def test_build_collects_every_target_and_the_bundle_opens(signed, tmp_path):
     assert Path(opened.minisig).read_bytes() == Path(str(signed["tar"]) + ".minisig").read_bytes()
     assert opened.info["requirements_lock_sha256"] == hashlib.sha256(signed["lock"].encode()).hexdigest()
     assert opened.info["python_versions"] == list(tool.OFFLINE_PYTHONS)
+
+
+def test_intel_mac_is_opt_in_only():
+    assert "macos-x86_64" in tool.OFFLINE_PLATFORMS and "macos-x86_64" not in tool.OFFLINE_DEFAULT_PLATFORMS
+    assert set(tool.OFFLINE_DEFAULT_PLATFORMS) == set(tool.OFFLINE_PLATFORMS) - {"macos-x86_64"}
 
 
 def test_markers_decide_which_packages_each_target_needs(signed):
@@ -102,7 +107,8 @@ def test_markers_decide_which_packages_each_target_needs(signed):
     assert "backports-tarfile" in names("3.11", "linux-x86_64") and "backports-tarfile" not in names("3.12", "linux-x86_64")
     assert "cffi" in names("3.9", "macos-arm64") and "cffi" not in names("3.12", "macos-arm64")
     first = pip.calls[0]
-    assert "--python-version" in first and "--implementation" in first and first[first.index("--implementation") + 1] == "cp"
+    assert first[first.index("--python-version") + 1] == "3.9.99"  # not "3.9": pip would read that as 3.9.0 and refuse cryptography
+    assert "--implementation" in first and first[first.index("--implementation") + 1] == "cp"
     assert [first[i + 1] for i, a in enumerate(first) if a == "--platform"] == tool.OFFLINE_PLATFORMS["linux-x86_64"]["tags"]
 
 
@@ -186,6 +192,9 @@ def test_the_real_repo_lock_parses_and_every_target_resolves():
             chosen = {e["name"] for e in tool.entries_for(entries, py, plat)}
             assert "keyring" in chosen and "cryptography" in chosen
             assert ("pywin32-ctypes" in chosen) == (plat.startswith("windows"))
+            # one version of each package per target: a stale branch of the lock (3.9.0 only) must not add a second one
+            listed = [e["name"] for e in tool.entries_for(entries, py, plat)]
+            assert len(listed) == len(set(listed)), (py, plat)
 
 
 # --- the opener (hostile bundles) ---------------------------------------------------------------------------

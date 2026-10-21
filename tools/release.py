@@ -403,6 +403,11 @@ OFFLINE_PLATFORMS = {
                       "tags": ["win_amd64"]},
 }
 
+# Not in the default set: the pinned cryptography (50.x) ships no wheel for Intel Macs (found by the first real build), so a bundle
+# for them would fail at `pip download`. `--platform macos-x86_64` still tries, and fails with pip's own message, until the lock
+# pins a version that has one.
+OFFLINE_DEFAULT_PLATFORMS = tuple(p for p in OFFLINE_PLATFORMS if p != "macos-x86_64")
+
 
 def _marker_class():
     try:
@@ -442,6 +447,10 @@ def _norm(name):
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+_FIRST_SUPPORTED_MICRO = {"3.9": 2}
+_PIP_MICRO = 99  # pip reads a bare "3.9" as 3.9.0, which cryptography (Requires-Python !=3.9.0,!=3.9.1) refuses
+
+
 def _marker_env(py, platform):
     spec = OFFLINE_PLATFORMS[platform]
     base = {"implementation_name": "cpython", "platform_python_implementation": "CPython", "python_version": py,
@@ -449,7 +458,10 @@ def _marker_env(py, platform):
             "platform_machine": spec["platform_machine"], "platform_release": "", "platform_version": ""}
     # python_full_version / implementation_version: the marker may split a minor version (>= 3.9.2); take the union of an
     # early and a late patch release so no package that could apply is left out. Extra wheels are harmless.
-    return [dict(base, python_full_version=f"{py}.{micro}", implementation_version=f"{py}.{micro}") for micro in (0, 99)]
+    # 3.9.0 and 3.9.1 are not supported (cryptography excludes them) and the lock's `<= '3.9'` branch is true only for 3.9.0, so
+    # starting at 3.9.2 keeps that dead branch (an older cryptography that has no wheel for 3.9) out of the bundle.
+    first = _FIRST_SUPPORTED_MICRO.get(py, 0)
+    return [dict(base, python_full_version=f"{py}.{micro}", implementation_version=f"{py}.{micro}") for micro in (first, 99)]
 
 
 def entries_for(entries, py, platform):
@@ -478,7 +490,7 @@ def default_pip_runner(argv):
         raise ReleaseError("pip download failed: " + (proc.stderr or proc.stdout).strip()[-600:])
 
 
-def build_offline(tar_path, out_dir=None, pythons=OFFLINE_PYTHONS, platforms=tuple(OFFLINE_PLATFORMS), keys_path=None,
+def build_offline(tar_path, out_dir=None, pythons=OFFLINE_PYTHONS, platforms=OFFLINE_DEFAULT_PLATFORMS, keys_path=None,
                   runner=default_pip_runner):
     """Collect the hash-pinned wheels for `tar_path`'s requirements.lock and pack them with the signed release into
     ocw-<version>-offline.tar.gz. The release must already be signed (release.py sign): its signature is checked here
@@ -520,7 +532,7 @@ def build_offline(tar_path, out_dir=None, pythons=OFFLINE_PYTHONS, platforms=tup
                                         for e in chosen), encoding="utf-8")
                 print(f"==> pip download for Python {py}, {plat} ({len(chosen)} packages)")
                 argv = ["download", "-q", "--no-deps", "--only-binary=:all:", "--require-hashes", "-r", str(reqs), "-d", str(wheels),
-                        "--python-version", py, "--implementation", "cp"]
+                        "--python-version", f"{py}.{_PIP_MICRO}", "--implementation", "cp"]
                 for tag in OFFLINE_PLATFORMS[plat]["tags"]:
                     argv += ["--platform", tag]
                 runner(argv)
@@ -573,7 +585,7 @@ def build_offline(tar_path, out_dir=None, pythons=OFFLINE_PYTHONS, platforms=tup
 
 def cmd_build_offline(a):
     bundle, offline, digest = build_offline(a.tarball, a.out, tuple(a.python or OFFLINE_PYTHONS),
-                                            tuple(a.platform or OFFLINE_PLATFORMS), a.keys)
+                                            tuple(a.platform or OFFLINE_DEFAULT_PLATFORMS), a.keys)
     print(f"Built {bundle} ({len(offline['wheels'])} wheels, {bundle.stat().st_size // 1024 // 1024} MB) sha256 {digest}")
     print("The release inside is the signed one, unchanged; the wheels are checked by pip against the signed requirements.lock.")
     print("Upload it to the GitHub release next to the three signed files, with its .sha256 file.")
@@ -652,7 +664,7 @@ def build_parser():
     s.add_argument("tarball")
     s.add_argument("--out", help="output directory (default: next to the tarball)")
     s.add_argument("--python", action="append", help="Python minor version to include, e.g. 3.12 (repeatable; default 3.9-3.14)")
-    s.add_argument("--platform", action="append", choices=tuple(OFFLINE_PLATFORMS), help="platform to include (repeatable; default all)")
+    s.add_argument("--platform", action="append", choices=tuple(OFFLINE_PLATFORMS), help="platform to include (repeatable; default: all but macos-x86_64, which the pinned cryptography has no wheel for)")
     s.add_argument("--keys", help="key list to verify the signature against (default server/release_keys.json)")
     s.set_defaults(fn=cmd_build_offline)
     s = sub.add_parser("verify")
