@@ -473,6 +473,7 @@ T0=$SECONDS
 timeout 60 systemctl start ocw-upgrade.service && RC=0 || RC=$?
 check "the root service finished within 60 s with stray entries present" bash -c "test $RC -eq 0 && test $((SECONDS - T0)) -lt 60"
 check "/etc/hostname is unchanged" bash -c "test \"\$(sha256sum /etc/hostname | cut -d' ' -f1)\" = $HOSTNAME_SUM"
+for _ in $(seq 1 60); do [ -z "$(ls -A "$DATA/upgrade/inbox/requests")" ] && break; sleep 1; done   # a run the path unit started may still be draining it
 check "the stray inbox entries were moved away" bash -c "test -z \"\$(ls -A $DATA/upgrade/inbox/requests)\""
 sleep 3
 check "the service is not in a start loop (not failed)" bash -c "! systemctl is-failed --quiet ocw-upgrade.service"
