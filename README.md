@@ -219,8 +219,30 @@ sudo ocw-updater apply 5.48.0              # shows what changes, asks you to typ
 sudo server/deploy.sh --release 5.48.0     # the same two steps (this script is now a thin wrapper)
 ```
 
-When a release changes the updater's own units or the `ocw-updater` command (the release notes say so; 5.48.0 does), the updater refuses
-the upgrade with `needs_install_sh` until you run `sudo server/install.sh --refresh-updater` once from the new release's checkout.
+The units, the `ocw-updater` command and `server/install.sh` are replaced only by `install.sh`, never by the updater. `install.sh`
+records in the updater's config (`install_sh_version`) the version of the release it was last run from, and every release says in its
+manifest the newest version that changed those files (`install_sh_min_version`). The updater refuses an upgrade with
+`needs_install_sh` only while the recorded version is missing or older, and the message names the fix: unpack the release file for the
+new version (the one you downloaded, not the staging copy) and run
+
+```bash
+sudo server/install.sh --refresh-updater   # from the unpacked new release; refreshes units, command and updater, records the version, touches no data
+```
+
+then apply again. 5.48.0 changes only the `ocw-updater` command, so an install on the 5.47.0 layout can apply it directly (the 5.47.0
+updater only looks at a flag that is set when a unit file changed); it gets the new command and the record when you run the
+command above, which the next release will ask for (reason `needs_install_sh`) until you have.
+
+**Migrating a server that has additional login gates** (`setup-second-gate.sh`): neither `install.sh` nor the updater changes a gate's
+nginx site, and a site generated before 5.47.0 does not answer 403 on `/api/upgrade`. The dry run and the end of the real run list each
+gate and whether its site denies it. Regenerate them (from the live main site; each keeps its port, listen address and host; `nginx -t`
+first, the old site put back if it fails, the old copy kept in the install backup directory):
+
+```bash
+sudo server/install.sh --apply-nginx --regenerate-second-sites
+```
+
+The updater's preflight only reads those sites: it warns, and writes an Audit Log entry, while one lacks the deny.
 
 The sequence, with every step in the Audit Log (`upgrade.*`, one correlation id for the whole run) and
 the server journal (JSON lines): request accepted and validated; staged release re-verified by root (signature, version, every
