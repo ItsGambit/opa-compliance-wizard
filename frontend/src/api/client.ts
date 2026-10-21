@@ -157,7 +157,7 @@ export function fetchEnvironments(): Promise<EnvironmentsResponse> {
 // true for a verified admin, and for the operator of a local-mode run (no
 // login gate there; the server exempts it). is_admin stays the verified-admin
 // flag (Access Control needs the hosted step-up flow, so it keys off that).
-export function fetchWhoami(): Promise<{ email: string | null; is_local: boolean; is_admin: boolean; can_admin?: boolean }> {
+export function fetchWhoami(): Promise<{ email: string | null; is_local: boolean; is_admin: boolean; can_admin?: boolean; data_location_notice?: string | null }> {
   return apiFetch('/api/whoami')
 }
 
@@ -660,7 +660,7 @@ export function fetchConfigSnapshotExport(environment: string, snapshotId: numbe
 }
 
 /** Starts a background capture (Okta admins, or the Okta status of every OPA principal). */
-export function startOktaCapture(environment: string, kind: 'okta_admins' | 'opa_principal_status' | 'inventory_counts' | 'mfa_aggregates'): Promise<{ started: boolean; already_running: boolean }> {
+export function startOktaCapture(environment: string, kind: 'okta_admins' | 'opa_principal_status' | 'inventory_counts' | 'mfa_aggregates'): Promise<{ started: boolean; already_running: boolean; started_at?: string | null }> {
   return apiFetch(envPath(environment, 'okta_snapshots/capture'), { method: 'POST', body: JSON.stringify({ kind }) })
 }
 

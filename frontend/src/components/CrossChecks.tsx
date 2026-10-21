@@ -38,7 +38,7 @@ function C1Card({ card, onRun, running, rosterLoaded }: { card: CrossCheckCard; 
         </div>
         <div className="flex items-center gap-2">
           <button type="button" className="btn-secondary" disabled={running || !rosterLoaded} onClick={onRun}
-            title={rosterLoaded ? 'Look every OPA principal up in Okta (read-only) and store the result as a snapshot' : 'Open the Access Explorer once so the OPA roster is loaded'}>
+            title={rosterLoaded ? 'Look every OPA principal up in Okta (read-only) and store the result as a snapshot' : 'No OPA scan is stored yet. Select Refresh on the Overview, or Sync now in the footer, first.'}>
             <RefreshCw size={13} className={running ? 'animate-spin' : ''} aria-hidden="true" /> {running ? 'Looking up…' : card.state === 'never_run' ? 'Run lookup' : 'Run again'}
           </button>
           <ExportButtons sections={sections} filenameBase="opa-cross-check-lifecycle" />
@@ -46,7 +46,7 @@ function C1Card({ card, onRun, running, rosterLoaded }: { card: CrossCheckCard; 
       </div>
 
       {!rosterLoaded && (
-        <p className="text-xs text-warn">The OPA roster is not loaded in this session. Open the Access Explorer once, then come back to run the lookup.</p>
+        <p className="text-xs text-warn">No OPA scan stored yet. Select <strong>Refresh</strong> on the Overview (or <strong>Sync now</strong> in the footer) first, then run the lookup.</p>
       )}
       {card.state === 'never_run' && <p className="text-sm text-text-dim">{card.message}</p>}
       {card.state === 'refused' && <p className="text-sm text-loss" role="status">{card.message}</p>}

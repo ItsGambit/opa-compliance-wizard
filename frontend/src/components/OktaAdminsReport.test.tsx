@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { fetchConfigSnapshotDiff, fetchConfigSnapshots, fetchEnvironments, fetchOktaAdminsReport, logOktaAdminsExport, startOktaCapture } from '../api/client'
 import { okReport, REFUSED_MESSAGE, snapshot } from '../test/oktaFixtures'
 import { renderWithClient } from '../test/renderWithClient'
+import * as toasts from '../hooks/useToast'
 import { OktaAdminsReport } from './OktaAdminsReport'
 
 vi.mock('../api/client', () => ({
@@ -70,6 +71,25 @@ describe('OktaAdminsReport', () => {
     fireEvent.click(screen.getByRole('button', { name: /Capture now/ }))
     await waitFor(() => expect(startOktaCapture).toHaveBeenCalledWith('dev', 'okta_admins'))
     await waitFor(() => expect(vi.mocked(fetchOktaAdminsReport).mock.calls.length).toBeGreaterThan(1))
+  })
+
+  it('lists the daily sealed OPA access state as its own history, asked for by kind', async () => {
+    renderWithClient(<OktaAdminsReport />)
+    await screen.findByText('Alex Example')
+    const region = await screen.findByRole('region', { name: 'Daily OPA access state' })
+    expect(within(region).getByText(/Opening, comparing or exporting one needs the Live read permission/)).toBeTruthy()
+    expect(within(region).getAllByText('sealed').length).toBeGreaterThan(0)
+    expect(vi.mocked(fetchConfigSnapshots).mock.calls.map(c => c[1])).toEqual(expect.arrayContaining(['okta_admins', 'opa_access_state']))
+  })
+
+  it('says when the capture that is already running was started', async () => {
+    const spy = vi.spyOn(toasts, 'toast')
+    vi.mocked(startOktaCapture).mockResolvedValue({ started: false, already_running: true, started_at: '2026-10-21T08:41:00.000Z' })
+    renderWithClient(<OktaAdminsReport />)
+    await screen.findByText('Alex Example')
+    fireEvent.click(screen.getByRole('button', { name: /Capture now/ }))
+    await waitFor(() => expect(spy).toHaveBeenCalled())
+    expect(spy.mock.calls[0][0].title).toMatch(/^A capture is already running \(started .*2026.*\)$/)
   })
 
   it('disables the button while a capture is running and reports a failed one', async () => {

@@ -217,7 +217,7 @@ def paragraph(ctx):
         s += (f" and {t['opa_privileged']} {'holds' if t['opa_privileged'] == 1 else 'hold'} a privileged OPA role (pam_admin, resource_admin or delegated_resource_admin)")
         parts.append(s + ".")
     else:
-        parts.append(s + ". The OPA roster has not been read, so privileged OPA roles are not reported.")
+        parts.append(s + ". No OPA scan is stored yet, so privileged OPA roles are not reported.")
     if t["both"] is not None and ctx["okta_state"] == "ok":
         parts.append("Nobody holds both an Okta admin role and a privileged OPA role." if t["both"] == 0 else
                      f"{t['both']} {'person holds' if t['both'] == 1 else 'people hold'} both and {'is' if t['both'] == 1 else 'are'} listed for separation-of-duties review.")

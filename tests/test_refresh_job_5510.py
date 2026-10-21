@@ -288,7 +288,7 @@ def test_a_stop_during_the_log_part_leaves_the_cursor_saved_and_the_run_partial(
     rig.okta = Pages()
     job = rig.run(["log"])
     data = job.status_view()["parts"]["log"]
-    assert data["state"] == "cancelled" and "next sync continues" in data["message"]
+    assert data["state"] == "cancelled" and "the next run continues from there" in data["message"]
     stored = audit_store._get_connection().execute("SELECT poll_cursor FROM sync_state WHERE environment_id = ?", (rig.env,)).fetchone()[0]
     assert "after=c2" in stored  # progress saved
     assert audit_store._get_connection().execute("SELECT COUNT(*) FROM events WHERE environment_id = ?", (rig.env,)).fetchone()[0] == 1
@@ -560,3 +560,61 @@ def test_the_summary_line_counts_outcomes():
     parts = {"opa": {"state": "ok"}, "okta": {"state": "refused"}, "log": {"state": "timed_out"}}
     assert rj.summary_line(parts) == "1 of 3 parts completed; Okta scan refused, System Log timed out."
     assert rj.summary_line({"opa": {"state": "ok"}}) == "OPA scan completed."
+
+
+# -- the words ---------------------------------------------------------------------------------------------------------
+def test_no_refresh_message_uses_alarm_words_or_carries_a_url_or_a_name():
+    import re
+    samples = [
+        rj.opa_success_message({"users": 3, "groups": 2}, 2, "memory_only"),
+        *(rj.opa_failure(k, 403, "projects", "2026-10-21T02:20:00.000Z", "OpaApiError: 503", "users[0].note")[1] for k in ("refused", "redaction", "cancelled", "error")),
+        rj.opa_failure("error", None, None, None, "OpaApiError: 503")[1],
+        *(rj.log_failure(k, 403, "Read 2000 System Log pages in one run; the cursor is saved, so the next sync continues from where this one stopped.")[1] for k in ("refused", "cancelled", "partial", "error")),
+        rj.timed_out_message("opa", 45), rj.cancelled_message(), rj.cancelled_message(False),
+    ]
+    for text in samples:
+        assert not re.search(r"tamper|attack|malicious|security", text, re.I), text
+        assert "http://" not in text and "https://" not in text and "@" not in text, text
+        assert text.rstrip().endswith((".", ")")), text  # a sentence, not a fragment
+    assert any("previous scan from 21 Oct 2026, 02:20 UTC" in t for t in samples)  # times carry the zone
+    assert any("No earlier scan exists" in t for t in samples)
+    assert not any("archive is unchanged" in t.lower() for t in samples)  # events stored before a refusal or a stop are kept, so "unchanged" would be untrue
+
+
+# -- deleting an environment that is being refreshed ---------------------------------------------------------------------
+def test_deleting_an_environment_during_a_refresh_stops_it_first_and_leaves_no_job_or_stored_scan(matrix_server):  # noqa: F811
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+    audit_store.store_opa_model_cache(env_id, {"users": [], "groups": [], "policies": [], "warnings": []}, built_at="2026-10-21T02:20:00.000Z", duration_seconds=1.0)
+    assert audit_store.opa_model_cache_info(env_id)
+    job = rj.RefreshJob(env_id, ["opa"], "manual")
+    job.begin("opa")
+    with serve._refresh_jobs_lock:
+        serve._refresh_jobs[env_id] = job
+    stopped = threading.Event()
+
+    def worker():  # a part that notices the stop at its next checkpoint, as the real walkers do
+        job.cancel_events["opa"].wait(20)
+        job.finish("opa", "cancelled", rj.cancelled_message())
+        job.conclude()
+        stopped.set()
+    threading.Thread(target=worker, daemon=True).start()
+    resp = _call(base_url, "DELETE", f"/api/environments/dev?id={env_id}", headers=_who(OWNER_A))
+    assert resp.status_code == 200, resp.text
+    assert stopped.is_set() and job.part_state("opa") == "cancelled"
+    assert env_id not in serve._refresh_jobs and audit_store.opa_model_cache_info(env_id) is None
+
+
+def test_a_refresh_that_will_not_stop_blocks_the_delete_with_a_message_instead_of_purging_under_it(matrix_server, monkeypatch):  # noqa: F811
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+    monkeypatch.setattr(serve, "REFRESH_CANCEL_WAIT_SECS", 0.3)
+    job = rj.RefreshJob(env_id, ["opa"], "manual")
+    job.begin("opa")
+    with serve._refresh_jobs_lock:
+        serve._refresh_jobs[env_id] = job  # never stops
+    resp = _call(base_url, "DELETE", f"/api/environments/dev?id={env_id}", headers=_who(OWNER_A))
+    assert resp.status_code == 409 and resp.json()["reason"] == "refresh_stopping" and "Try again" in resp.json()["error"]
+    assert env_id in engine.list_all_environments()
+    job.finish("opa", "cancelled", "x")
+    job.conclude()

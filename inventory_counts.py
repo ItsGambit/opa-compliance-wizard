@@ -174,7 +174,7 @@ def capture_inventory(environment_id, okta_client=None, opa_client=None, model=N
         counts.update(okta)
         problems.extend(okta_problems)
     if not counts:
-        raise ValueError("Nothing could be counted: neither the OPA roster nor Okta was readable.")
+        raise ValueError("Nothing could be counted: neither the OPA scan nor Okta could be read. Nothing was recorded; try again.")
     items = [(key, {"series": key, "side": key.split(".", 1)[0], "label": LABELS.get(key, key), "count": int(value)})
              for key, value in sorted(counts.items())]
     return audit_store.record_config_snapshot(

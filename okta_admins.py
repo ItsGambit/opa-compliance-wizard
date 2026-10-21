@@ -569,7 +569,7 @@ def build_okta_admins_report(environment_id, as_of=None, access_model=None, now=
     if overlay_truncated:
         notes.append(f"Only the newest {PRIVILEGE_EVENTS_LIMIT} privilege events were used for the overlay.")
     if sod["state"] == "not_loaded":
-        notes.append("The OPA roster has not been loaded, so separation of duties is unknown. Open the Access Explorer once, then reload this report.")
+        notes.append("No OPA scan is stored yet, so separation of duties is unknown. Select \"Refresh\" on the Overview, then reload this report.")
     elif sod["state"] == "partial":
         notes.append("Some OPA users' group lists could not be read, so separation of duties may be incomplete.")
     notes.append("Admins who hold a role only through a group, and OAuth service apps with roles, are not listed yet "
@@ -911,7 +911,7 @@ def build_overview(environment_id, as_of=None, access_model=None, service_accoun
             ],
         }
         if privileged == [] and not (pids or plogins):
-            signins_mfa["privileged_message"] = "No privileged people are known yet (capture the Okta admins and load the OPA roster)."
+            signins_mfa["privileged_message"] = "No privileged people are known yet. Select \"Refresh\" to read the Okta admins and the OPA scan."
     import overview_extras as ox
     inv_summary = inventory_counts.series_summary(environment_id, as_of=as_of, now=now)
     snap_for_tiles = audit_store.latest_config_snapshot(environment_id, KIND_ADMINS, as_of=as_of)

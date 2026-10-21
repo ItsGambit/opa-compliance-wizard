@@ -6,7 +6,7 @@ import { useConfigSnapshotDiff, useConfigSnapshots, useEnvironments, useOktaAdmi
 import { toast } from '../hooks/useToast'
 import type { ApiErrorBody, OktaAdminRow, SodOverlap } from '../types'
 import { downloadTextFile } from '../utils/export'
-import { formatDateTime } from '../utils/format'
+import { formatDateTime, formatDateTimeZone } from '../utils/format'
 import { HighlightedText, useFuzzyFilter } from '../utils/fuzzySearch'
 import {
   OKTA_ROLE_LABELS, diffSummary, evidenceText, itemLabel, oktaAdminsExportSections, personName, roleLabel, scopeText,
@@ -135,8 +135,19 @@ function AdminsTable({ results }: { results: { item: OktaAdminRow; matches: { ke
   )
 }
 
-function SnapshotHistory({ environment, active }: { environment: string; active: number | null }) {
-  const { data: snapshots, isLoading } = useConfigSnapshots(environment, 'okta_admins')
+interface HistoryKind { kind: string; title: string; blurb: string; file: string; readLabel: string; refusedLabel: string }
+const ADMINS_HISTORY: HistoryKind = {
+  kind: 'okta_admins', title: 'Snapshot history', file: 'opa-okta-admins-snapshot', readLabel: 'read', refusedLabel: 'refused by Okta',
+  blurb: 'Every capture is stored and sealed into the same tamper-evident chain as the archived log, and is never deleted by retention. The Integrity check (deep) verifies them. A refused or failed capture is recorded too.',
+}
+// 5.51.0: one sealed record of who could reach what in OPA per day, taken from the scan the refresh just read.
+const ACCESS_STATE_HISTORY: HistoryKind = {
+  kind: 'opa_access_state', title: 'Daily OPA access state', file: 'opa-access-state-snapshot', readLabel: 'sealed', refusedLabel: 'not recorded',
+  blurb: 'Once a day the refresh seals who could reach what in OPA (users, groups, and the resources each policy resolves to, by id) into the same chain, from the scan it just read. Names and e-mails are in the records; resource names are not. Never deleted by retention. Opening, comparing or exporting one needs the Live read permission.',
+}
+
+function SnapshotHistory({ environment, active, history = ADMINS_HISTORY }: { environment: string; active: number | null; history?: HistoryKind }) {
+  const { data: snapshots, isLoading } = useConfigSnapshots(environment, history.kind)
   const [older, setOlder] = useState<string>(ALL)
   const [newer, setNewer] = useState<string>(ALL)
   const [busy, setBusy] = useState<number | null>(null)
@@ -153,7 +164,7 @@ function SnapshotHistory({ environment, active }: { environment: string; active:
     setBusy(id)
     try {
       const body = await fetchConfigSnapshotExport(environment, id)
-      downloadTextFile(`opa-okta-admins-snapshot-${id}.json`, JSON.stringify(body, null, 2), 'application/json')
+      downloadTextFile(`${history.file}-${id}.json`, JSON.stringify(body, null, 2), 'application/json')
     } catch (e) {
       toast({ title: 'Could not export the snapshot', description: (e as Error).message, variant: 'error' })
     } finally {
@@ -162,16 +173,13 @@ function SnapshotHistory({ environment, active }: { environment: string; active:
   }
 
   return (
-    <section className="card p-3 flex flex-col gap-3" aria-label="Snapshot history">
+    <section className="card p-3 flex flex-col gap-3" aria-label={history.title}>
       <div>
-        <h2 className="text-sm font-semibold text-text">Snapshot history</h2>
-        <p className="text-xs text-text-faint">
-          Every capture is stored and sealed into the same tamper-evident chain as the archived log, and is never deleted by retention.
-          The Integrity check (deep) verifies them. A refused or failed capture is recorded too.
-        </p>
+        <h2 className="text-sm font-semibold text-text">{history.title}</h2>
+        <p className="text-xs text-text-faint">{history.blurb}</p>
       </div>
       {isLoading && <span className="text-xs text-text-faint">Loading…</span>}
-      {snapshots && snapshots.length === 0 && <span className="text-xs text-text-faint">No captures yet.</span>}
+      {snapshots && snapshots.length === 0 && <span className="text-xs text-text-faint">{history.kind === 'opa_access_state' ? 'None yet: the first is sealed by the next refresh that reads OPA.' : 'No captures yet.'}</span>}
       {snapshots && snapshots.length > 0 && (
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
@@ -189,7 +197,7 @@ function SnapshotHistory({ environment, active }: { environment: string; active:
                 <tr key={s.snapshot_id} className={`border-b border-border/50 ${s.snapshot_id === active ? 'bg-accent-dim/40' : ''}`}>
                   <td className="px-2 py-1 whitespace-nowrap">{formatDateTime(s.captured_at)}{s.snapshot_id === active && <span className="text-xs text-text-faint"> · shown</span>}</td>
                   <td className="px-2 py-1">
-                    <StatusBadge label={s.status === 'ok' ? 'read' : s.status === 'refused' ? 'refused by Okta' : 'failed'} variant={s.status === 'ok' ? 'active' : 'error'} />
+                    <StatusBadge label={s.status === 'ok' ? history.readLabel : s.status === 'refused' ? history.refusedLabel : 'failed'} variant={s.status === 'ok' ? 'active' : 'error'} />
                   </td>
                   <td className="px-2 py-1">{s.item_count}</td>
                   <td className="px-2 py-1 font-mono text-xs text-text-faint" title={s.sha256}>{s.sha256.slice(0, 16)}…</td>
@@ -274,7 +282,10 @@ export function OktaAdminsReport() {
     setStarting(true)
     try {
       const r = await startOktaCapture(environment, 'okta_admins')
-      toast({ title: r.started ? 'Reading Okta' : 'A capture is already running', description: 'The report updates when it finishes.', variant: 'success' })
+      toast({
+        title: r.started ? 'Reading Okta' : `A capture is already running${r.started_at ? ` (started ${formatDateTimeZone(r.started_at)})` : ''}`,
+        description: 'The report updates when it finishes.', variant: 'success',
+      })
       await queryClient.invalidateQueries({ queryKey: ['okta_admins_report', environment] })
       await queryClient.invalidateQueries({ queryKey: ['config_snapshots', environment] })
     } catch (e) {
@@ -384,6 +395,7 @@ export function OktaAdminsReport() {
       )}
 
       {environment && <SnapshotHistory environment={environment} active={report?.as_of_snapshot?.snapshot_id ?? null} />}
+      {environment && <SnapshotHistory environment={environment} active={null} history={ACCESS_STATE_HISTORY} />}
     </div>
   )
 }

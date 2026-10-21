@@ -54,3 +54,14 @@ describe('exports', () => {
     expect(s[1].rows.map(r => r.Flag)).toEqual(['Inactive in Okta', 'Not found in Okta'])
   })
 })
+
+import { itemLabel as label } from './oktaAdmins'
+describe('itemLabel for the OPA access state (5.51.0)', () => {
+  it('names a user, group or policy by the name the record holds', () => {
+    expect(label('user:ou1', { name: 'alex@example.com', email: 'alex@example.com' })).toBe('alex@example.com')
+    expect(label('user:ou2', { name: 'svc-key' })).toBe('svc-key')
+    expect(label('group:g1', { name: 'PAM-Admins' })).toBe('PAM-Admins')
+    expect(label('policy:p1', { name: 'Servers' })).toBe('Servers')
+    expect(label('summary:counts', { counts: {} })).toBe('summary:counts')
+  })
+})

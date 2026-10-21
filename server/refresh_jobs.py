@@ -218,7 +218,7 @@ def _previous(previous_built_at):
             else "No earlier scan exists, so nothing is shown yet.")
 
 
-def opa_success_message(counts, warnings, stored):
+def opa_success_message(counts, warnings, stored, snapshot=None):
     bits = [f"{counts[k]} {k}" for k in ("users", "groups", "policies", "projects", "servers") if k in counts]
     text = "Scanned " + ", ".join(bits) + "." if bits else "Scan finished."
     if warnings:
@@ -226,6 +226,11 @@ def opa_success_message(counts, warnings, stored):
                  "(shown empty, listed on the Access Explorer).")
     if stored == "memory_only":
         text += " Kept in memory only: the scan is larger than 96 MB, so it was not stored and will be read again after a restart."
+    state = (snapshot or {}).get("state")
+    if state == "sealed":
+        text += f" Today's OPA access state ({snapshot.get('items')} records) was sealed into the evidence chain."
+    elif state == "error":
+        text += " Today's OPA access state could not be sealed; the scan itself is kept and the next refresh tries again."
     return text
 
 
@@ -250,15 +255,15 @@ def opa_failure(kind, status, failed_step, previous_built_at, error_class, key_p
 def log_failure(kind, status, previous_message=None):
     """(state, message) for the System Log part."""
     if kind == "refused":
-        return "refused", (f"Okta refused the System Log read (HTTP {status}). The archive is unchanged. "
+        return "refused", (f"Okta refused the System Log read (HTTP {status}). Events stored before the refusal are kept. "
                            "The token needs permission to read the System Log.")
     if kind == "cancelled":
-        return "cancelled", "Stopped on request. The events read so far are stored and the next sync continues from the saved position."
+        return "cancelled", "Stopped on request. Events fetched before the stop are saved; the next run continues from there."
     if kind == "partial":
         return "partial", previous_message or "Stopped early; progress is saved and the next run continues."
-    return "error", ("System Log sync failed" + (f": {previous_message}" if previous_message else "") +
-                     ". Events already stored are kept; the next run continues from the saved position. "
-                     "Retry from the Overview or check the sync settings.")
+    return "error", ("System Log sync stopped" + (f": {previous_message.rstrip('. ')}" if previous_message else "") +
+                     ". Events fetched before the stop are saved; the next run continues from there. "
+                     "Select \"Refresh\" to retry, or check the sync settings.")
 
 
 def timed_out_message(part, minutes, previous_kept=True):

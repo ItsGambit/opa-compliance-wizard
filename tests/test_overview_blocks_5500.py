@@ -68,7 +68,7 @@ def test_paragraph_says_when_sources_are_unavailable(db):
     oa.capture_and_store(ENV, FakeOkta(fail={"assignees": REFUSED}), captured_at="2026-10-21T01:00:00.000Z")
     o = oa.build_overview(ENV, now=NOW)
     p = o["paragraph"]
-    assert "cannot read admin role assignments" in p and "roster has not been read" in p and "has not been looked up" in p
+    assert "cannot read admin role assignments" in p and "No OPA scan is stored yet" in p and "has not been looked up" in p
     assert "Nobody holds both" not in p and o["tiles"]["opa_privileged"] is None and o["tiles"]["both"] is None
     assert oa.build_overview(ENV, now=NOW)["cross_checks"][1]["result"]["state"] == "refused"
 

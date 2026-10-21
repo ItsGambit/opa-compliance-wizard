@@ -44,7 +44,7 @@ describe('CrossChecks', () => {
   it('needs the OPA roster, and runs the lookup when it has it', async () => {
     vi.mocked(fetchCrossChecks).mockResolvedValue(response(c1Card({ state: 'never_run', message: 'Run the lookup to compare each OPA principal with its Okta user.', rows: [], counts: {}, inputs: { okta_snapshot: null, opa_roster_loaded: false } })))
     renderWithClient(<CrossChecks />)
-    expect(await screen.findByText(/roster is not loaded in this session/)).toBeTruthy()
+    expect(await screen.findByText(/No OPA scan stored yet\. Select/)).toBeTruthy()
     expect((screen.getByRole('button', { name: /Run lookup/ }) as HTMLButtonElement).disabled).toBe(true)
   })
 

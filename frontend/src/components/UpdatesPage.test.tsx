@@ -291,6 +291,12 @@ describe('Navigation and brand', () => {
     expect(screen.getByText(/produces audit evidence for Okta Privileged Access \(OPA\) tenants/)).toBeTruthy()
     expect(screen.getByText(/Not affiliated with or endorsed by Okta, Inc\. Okta and Okta Privileged Access are trademarks of Okta, Inc\./)).toBeTruthy()
     expect(screen.queryByText(/secret folders/i)).toBeNull()
+    expect(screen.queryByText(/other users of this computer may read/)).toBeNull()  // no notice unless the server sends one
+  })
+
+  it('About shows the one-line notice when the Windows data folder is readable by other users of the computer', () => {
+    render(<AboutDialog open onOpenChange={() => {}} dataLocationNotice="The archive is in a location other users of this computer may read: C:\\ProgramData\\opa. Move it with OPA_DATA_DIR." />)
+    expect(screen.getByRole('status').textContent).toMatch(/other users of this computer may read: .*Move it with OPA_DATA_DIR/)
   })
 })
 

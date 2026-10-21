@@ -6,9 +6,11 @@ import { DialogCloseButton } from './DialogCloseButton'
 interface Props {
   open: boolean
   onOpenChange: (open: boolean) => void
+  /** 5.51.0 (Windows): the data folder is one other users of this computer may read. One line, with how to move it. */
+  dataLocationNotice?: string | null
 }
 
-export function AboutDialog({ open, onOpenChange: setOpen }: Props) {
+export function AboutDialog({ open, onOpenChange: setOpen, dataLocationNotice }: Props) {
 
   return (
     <Dialog.Root open={open} onOpenChange={setOpen}>
@@ -40,6 +42,7 @@ export function AboutDialog({ open, onOpenChange: setOpen }: Props) {
                 and comes with no support commitment.
               </p>
             </div>
+            {dataLocationNotice && <p role="status" className="card p-3 bg-bg-hover border-warn text-text-dim">{dataLocationNotice}</p>}
             <p className="text-muted">{AFFILIATION}</p>
             <p className="text-muted">
               Licensed under MIT. Feedback and issues are welcome via the project's

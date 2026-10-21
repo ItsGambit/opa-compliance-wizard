@@ -327,7 +327,7 @@ def test_separation_of_duties_matches_okta_admins_with_opa_admin_roles(db):
 def test_sod_is_unknown_without_the_opa_roster(db):
     oa.capture_and_store(ENV, FakeOkta())
     r = oa.build_okta_admins_report(ENV)
-    assert r["separation_of_duties"]["state"] == "not_loaded" and any("OPA roster has not been loaded" in n for n in r["notes"])
+    assert r["separation_of_duties"]["state"] == "not_loaded" and any("No OPA scan is stored yet" in n for n in r["notes"])
 
 
 def test_sod_counts_delegated_resource_admin_groups_and_flags_partial_rosters(db):

@@ -5478,9 +5478,9 @@ SHARED_CAPABILITIES = (
     {"key": "reset_watermark", "label": "Reset the sync watermark", "builtin": "allow",
      "description": "Makes the next sync backfill the full 90-day window."},
     {"key": "sync_now", "label": "Run Sync now", "builtin": "deny",
-     "description": "Starts a compliance sync with the owner's Okta API token and the owner's saved sync settings."},
+     "description": "Starts a refresh (the OPA scan, the Okta scan and the System Log sync) with the owner's Okta API token and the owner's saved sync settings. The OPA scan also needs the Live read permission."},
     {"key": "sync_settings", "label": "Change sync settings", "builtin": "deny",
-     "description": "Turns the daily sync on or off and changes its time and ingestion scope. Retention stays the owner's (it deletes archived events)."},
+     "description": "Turns the daily refresh on or off and changes its time and the System Log ingestion scope. Retention stays the owner's (it deletes archived events)."},
 )
 SHARED_CAPABILITY_KEYS = tuple(c["key"] for c in SHARED_CAPABILITIES)
 SHARED_PERMISSION_VALUES = ("allow", "deny")

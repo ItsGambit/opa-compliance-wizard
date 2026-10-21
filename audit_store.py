@@ -267,6 +267,37 @@ def _audit_db_path():
     return os.path.join(data_dir or os.path.dirname(os.path.abspath(__file__)), "audit_store.db")
 
 
+def shared_location_notice(path=None, platform=None, environ=None):
+    """5.51.0: on Windows os.chmod cannot make the archive owner-only; the file inherits its folder's permissions. If the data folder is
+    one other users of the computer can read (C:\\Users\\Public, ProgramData, the root of a drive, a network share), say so in one line.
+    None everywhere else, and for any other Windows folder (typically inside the user's own profile). The app never rewrites ACLs."""
+    import ntpath
+    if (platform or os.name) != "nt":
+        return None
+    env = os.environ if environ is None else environ
+    folder = path or os.path.dirname(_audit_db_path())
+    norm = ntpath.normpath(folder)
+    low = ntpath.normcase(norm)
+    drive, rest = ntpath.splitdrive(norm)
+    shared = low.startswith("\\\\")  # a UNC path (a network share)
+    shared = shared or rest in ("", "\\")  # the root of a drive
+    for name, fallback in (("PUBLIC", "C:\\Users\\Public"), ("ProgramData", "C:\\ProgramData")):
+        root = ntpath.normcase(ntpath.normpath(env.get(name) or fallback))
+        shared = shared or low == root or low.startswith(root + "\\")
+    if not shared:
+        return None
+    return (f"The archive is in a location other users of this computer may read: {norm}. "
+            "Move it with OPA_DATA_DIR (the folder must be one only you can read).")
+
+
+def _warn_if_shared_location():
+    notice = shared_location_notice()
+    if notice:
+        import create_secret_folders as engine
+        engine.log("WARN", notice)
+    return notice
+
+
 # DATA-14: the archive holds names, e-mails, client IPs and pending admin
 # action payloads. Hosted mode already runs under systemd's UMask=0077; a
 # local/desktop run used the process umask (typically 022), creating a

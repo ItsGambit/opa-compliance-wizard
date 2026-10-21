@@ -612,6 +612,23 @@ def _audit_for(audit_ctx, action, details):
                            client_ip=audit_ctx.get("client_ip"), user_agent=audit_ctx.get("user_agent"))
 
 
+def _seal_access_state(environment_id, model, built_at, audit_ctx):
+    """The daily sealed OPA access state (phase B), taken from the scan just read: no extra OPA or Okta call. One a day (20 hours apart);
+    a failure here never fails the scan, it is reported and audited. Returns {"state": "sealed"|"not_due"|"error", ...}."""
+    import opa_access_state
+    try:
+        snap = opa_access_state.capture_if_due(environment_id, model, built_at=built_at)
+    except Exception as exc:
+        engine.log("WARN", f"Today's OPA access state could not be sealed ({type(exc).__name__}); the scan itself is kept.")
+        _audit_for(audit_ctx, "okta_snapshot.failed", {"kind": opa_access_state.KIND, "error": _failure_summary(exc)})
+        return {"state": "error", "error": _failure_summary(exc)}
+    if snap is None:
+        return {"state": "not_due"}
+    _audit_for(audit_ctx, "okta_snapshot.captured", {"kind": opa_access_state.KIND, "snapshot_id": snap["snapshot_id"], "status": snap["status"],
+                                                      "item_count": snap["item_count"], "trigger": (audit_ctx or {}).get("trigger")})
+    return {"state": "sealed", "snapshot_id": snap["snapshot_id"], "items": snap["item_count"]}
+
+
 def _run_access_job(storage_name, job_client, job_okta_client, correlation_id=None, audit_ctx=None):
     """The OPA scan: build the model, strip it for storage (a credential-shaped value fails the scan and nothing is
     stored), replace the stored scan, and publish the result to _access_jobs. The previous result stays readable
@@ -644,12 +661,14 @@ def _run_access_job(storage_name, job_client, job_okta_client, correlation_id=No
             engine.log("WARN", f"The OPA scan could not be stored ({store_problem}); it stays in memory until the next scan.")
         counts = audit_store.opa_model_counts(redacted)
         warnings = len(redacted.get("warnings") or [])
+        snapshot = _seal_access_state(storage_name, redacted, built_at, audit_ctx)
         with _access_jobs_lock:
             job = _access_jobs.setdefault(storage_name, {"status": "running", "steps": [], "error": None, "result": None})
             job.update(status="done", result=redacted, result_at=built_at, error=None, error_kind=None, source="scan",
                        stored=stored, store_problem=store_problem, duration_seconds=duration, warnings=warnings,
-                       counts=counts, previous=None)
-        _audit_for(audit_ctx, "access_scan.completed", {"seconds": duration, **counts, "warnings": warnings, "stored": stored})
+                       counts=counts, previous=None, snapshot=snapshot)
+        _audit_for(audit_ctx, "access_scan.completed", {"seconds": duration, **counts, "warnings": warnings, "stored": stored,
+                                                        **({"snapshot_id": snapshot["snapshot_id"]} if snapshot.get("snapshot_id") else {})})
     except engine.JobCancelled:
         _record_access_failure(storage_name, "The scan was stopped before it finished.", "cancelled", None, audit_ctx, None)
         _audit_for(audit_ctx, "access_scan.failed", {"reason": "cancelled"})
@@ -1123,7 +1142,7 @@ CAPTURE_KINDS = ("okta_admins", "opa_principal_status", "inventory_counts", "mfa
 def _capture_state(environment_id):
     with _capture_jobs_lock:
         job = dict(_capture_jobs.get(environment_id) or {"status": "idle"})
-    out = {k: job[k] for k in ("kind", "error", "finished_at") if job.get(k) is not None}
+    out = {k: job[k] for k in ("kind", "error", "finished_at", "started_at") if job.get(k) is not None}
     out["status"] = job["status"]
     return out
 
@@ -1248,7 +1267,7 @@ def _start_capture_job(env_id, env_name, owner, kind, model, actor_email, actor_
     with _capture_jobs_lock:
         if (_capture_jobs.get(env_id) or {}).get("status") == "running":
             return False
-        _capture_jobs[env_id] = {"status": "running", "kind": kind, "error": None, "finished_at": None}
+        _capture_jobs[env_id] = {"status": "running", "kind": kind, "error": None, "finished_at": None, "started_at": _utc_now_iso()}
     try:
         threading.Thread(
             target=_run_capture_job,
@@ -1568,9 +1587,9 @@ def _refresh_part_opa(job, ctx):
     status = entry.get("status")
     if status == "done" and isinstance(entry.get("result"), dict):
         job.fresh_model = entry["result"]
-        job.finish(part, "ok", rj.opa_success_message(entry.get("counts") or {}, entry.get("warnings") or 0, entry.get("stored")),
+        job.finish(part, "ok", rj.opa_success_message(entry.get("counts") or {}, entry.get("warnings") or 0, entry.get("stored"), entry.get("snapshot")),
                    built_at=entry.get("result_at"), counts=entry.get("counts") or {}, warnings=entry.get("warnings") or 0,
-                   stored=entry.get("stored"), steps=steps)
+                   stored=entry.get("stored"), steps=steps, snapshot=entry.get("snapshot"))
     elif status == "running":
         return  # still going (the job record was dropped under it, or a stubbed body returned): the supervisor decides
     else:
@@ -1644,7 +1663,7 @@ def _claim_capture(job, kind, deadline_mono):
     while True:
         with _capture_jobs_lock:
             if (_capture_jobs.get(env_id) or {}).get("status") != "running":
-                _capture_jobs[env_id] = {"status": "running", "kind": kind, "error": None, "finished_at": None}
+                _capture_jobs[env_id] = {"status": "running", "kind": kind, "error": None, "finished_at": None, "started_at": _utc_now_iso()}
                 return True
         if _wait_until(job, "okta", lambda: (_capture_jobs.get(env_id) or {}).get("status") != "running", deadline_mono) != "done":
             return False
@@ -3404,10 +3423,13 @@ class Handler(SimpleHTTPRequestHandler):
                 # local-mode operator is exempt server-side (see _can_admin)
                 # but is_admin is False there, so the UI used to hide the
                 # Audit Log and banner settings the server would serve.
+                import audit_store
                 return self._send_json(200, {
                     "email": email, "is_local": email is None,
                     "is_admin": _is_admin_from_headers(self.headers),
                     "can_admin": _can_admin(owner_key, self.headers),
+                    # 5.51.0: on Windows, a data folder other users of the computer may read (None everywhere else); shown in About
+                    "data_location_notice": audit_store.shared_location_notice(),
                 })
 
             if path == "/api/environments":
@@ -4542,12 +4564,13 @@ class Handler(SimpleHTTPRequestHandler):
                 if kind == "opa_principal_status":
                     model = _access_model_for(meta["environment_id"])
                     if model is None:
-                        return self._send_json(409, {"error": "No OPA scan stored yet. Refresh from the Overview first.",
+                        return self._send_json(409, {"error": 'No OPA scan stored yet. Select "Refresh" on the Overview first.',
                                                      "reason": "no_scan"})
                 started = _start_capture_job(
                     meta["environment_id"], name, meta.get("owner"), kind, model, actor_email, actor_sub,
                     self._request_client_ip(), self.headers.get("User-Agent"))
-                return self._send_json(200, {"started": started, "already_running": not started})
+                running_since = None if started else _capture_state(meta["environment_id"]).get("started_at")
+                return self._send_json(200, {"started": started, "already_running": not started, **({"started_at": running_since} if running_since else {})})
 
             if path.startswith("/api/environments/") and path.endswith("/okta_admins/export_log"):
                 # The CSV / Markdown export itself is built in the browser; this records that one was taken.
@@ -5164,6 +5187,7 @@ def main():
     import audit_store
     audit_store.init_db()
     _sweep_orphaned_scans()
+    audit_store._warn_if_shared_location()
 
     _seen_owners.add(LOCAL_OWNER_KEY_HEADER)
     _try_activate_saved_environment(LOCAL_OWNER_KEY_HEADER)

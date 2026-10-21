@@ -146,22 +146,32 @@ the dashboard does.
 Want to run it as a CLI instead, or host it for a team? See
 [docs/hosting.md](docs/hosting.md).
 
-## Data the Okta Admins report holds (5.50.0)
+## Data this tool stores locally (5.51.0)
 
-The Okta Admins report, the cross-check and the Overview read your Okta org with the environment's
-existing Okta API token and store the result locally, in this app's archive. Read-only: nothing is written
-to Okta (the optional group creation of the Folder Builder is the only write the app has ever made).
+The Overview, the Access Explorer, the Okta Admins report and the cross-checks read your OPA team and your Okta org with the
+environment's existing credentials (read-only: nothing is written to either, apart from the Folder Builder's own actions) and store the
+result locally, in this app's archive. One **Refresh** (on the Overview, or **Sync now** in the footer) reads the OPA scan, the Okta scan and
+the System Log in one job; the daily schedule runs the same job.
 
 | What is stored | Why | How it is removed |
 |---|---|---|
+| The OPA scan: resource groups, projects, groups and their roles, users (name, e-mail, type, group memberships), security policies with the resources they resolve to, servers, accounts (SaaS, Okta Universal Directory, Active Directory, database), connections, gateways, enrolled clients, Okta-managed devices (display name, platform, OS version, serial number, management state) | the Access Explorer, the Overview and the cross-checks open from the stored scan instead of reading OPA every time, also after a restart | replaced by every successful scan; deleted with the environment |
+| Daily OPA access state: one sealed record per user, group and policy (names, e-mails, roles, which resources a policy resolves to, by id), plus counts | evidence of who could reach what on a date | kept until the environment's archive is purged; never pruned |
 | Okta admins: user id, status, login, e-mail, first and last name, role assignments (role, status, dates, group or app targets, time-bound grants), custom roles and their permission names, resource sets | the Okta Admins report, as of any snapshot date | with the environment's archive (delete the environment with "also delete its archive", or purge an orphaned archive) |
 | The Okta status of each OPA user and Okta service account | the lifecycle cross-check | same |
 | Daily counts (OPA objects, Okta users, groups, apps, policies by type, admin role holders) | the Overview's inventory over time | same; counts only, no names |
 | Per person and week: counts of sign-ins and of multi-factor events by factor class | the Overview's sign-in and MFA figures | follows the event retention setting (weeks that ended before the cutoff are deleted at each sync; the all-people totals hold no names and stay), or with the archive |
 
-Never stored: Okta `credentials` objects, any profile attribute beyond login, e-mail and name, tokens.
-Snapshots (which hold the names in the first two rows) are sealed into the same tamper-evident chain as the archived log and are never pruned by
+Never stored: secret values, service-user key secrets, the OPA service key, the Okta token, Okta `credentials` objects, any Okta profile
+attribute beyond login, e-mail and name. (The stored scan does include device names and serial numbers, and people's names and e-mails: they
+are in the table above.) A scan that contains a credential-shaped value is refused and not stored. The sealed records (the access state, the
+Okta admins and the lifecycle status hold names) are part of the same tamper-evident chain as the archived log and are never pruned by
 retention: they are kept until the environment's archive is purged. A deep integrity check verifies them.
+
+**Keep the data folder on an encrypted disk.** The app does not encrypt the archive (`audit_store.db`, `audit_log.jsonl` and the environment
+store): use FileVault, BitLocker or LUKS for the disk the data directory is on. The app sets owner-only permissions on the archive on macOS and
+Linux. On Windows the file inherits its folder's permissions, and the app warns (in the log and in About) if the folder is one other users of the
+computer can read, such as `C:\Users\Public`, `C:\ProgramData`, the root of a drive or a network share; move it with `OPA_DATA_DIR`.
 
 **Which Okta role the token needs.** The Okta Admins report calls Okta's role-assignment APIs, which Okta
 only answers for a token whose admin can view roles and admin assignments: **Super Administrator**, or a
@@ -175,7 +185,7 @@ test the token's permissions up front: each screen says what it could not read.
 
 ## Upgrading
 
-**Nothing changes for you unless you choose it.** Upgrading to 5.50.0 changes no
+**Nothing changes for you unless you choose it.** Upgrading to 5.51.0 changes no
 behaviour of an existing install: the update check is **off**, `server/deploy.sh` and `--ref`
 keep working in place (with a note that the install can move to the upgrade layout), and no
 key has to be pinned. 5.46.0 added **signed releases** and the update check; 5.47.0 adds the

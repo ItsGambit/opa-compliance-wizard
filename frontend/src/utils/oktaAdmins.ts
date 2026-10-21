@@ -158,8 +158,8 @@ export function crossCheckExportSections(card: CrossCheckCard | undefined): Expo
 export function itemLabel(key: string, object: Record<string, unknown> | null): string {
   const text = (v: unknown) => (typeof v === 'string' && v ? v : null)
   if (object) {
-    if (key.startsWith('user:')) return text(object.login) ?? text(object.email) ?? key
-    return text(object.label) ?? key
+    if (key.startsWith('user:')) return text(object.login) ?? text(object.email) ?? text(object.name) ?? key
+    return text(object.label) ?? text(object.name) ?? key
   }
   return key
 }

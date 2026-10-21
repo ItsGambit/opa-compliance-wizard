@@ -1551,6 +1551,7 @@ export interface CaptureJobState {
   status: 'idle' | 'running' | 'done' | 'error'
   kind?: string
   error?: string | null
+  started_at?: string | null
   finished_at?: string | null
 }
 

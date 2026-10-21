@@ -50,6 +50,17 @@ environment's persisted sync state on every poll rather than keeping an
 in-memory countdown, so a `systemctl restart` (from a deploy, a crash
 recovery, or a manual restart) never causes a missed or duplicate sync.
 
+**The daily job is a refresh (5.51.0).** The scheduled run is the same job as the Overview's **Refresh** button: one job per environment with three
+parts that are reported separately, the OPA scan, the Okta scan (admin roles, lifecycle status, inventory counts, sign-in figures) and the System
+Log sync. The OPA scan and the log sync run side by side; the Okta scan follows the log so the two do not share Okta's rate budget. One part
+failing, being refused or timing out never hides the others, and a failed OPA part alone does not delay tomorrow's run: the retry back-off (one
+hour after a failed attempt) follows the log part, as before. Each part has its own deadline (OPA scan 45 minutes, System Log 90, Okta scan 30);
+a part that runs out is stopped at its next checkpoint and its previous data is kept. The OPA scan is stored in the archive database (one
+replaceable row per environment), so a restart no longer loses it, and a sealed record of the day's OPA access state joins the evidence chain
+(once a day, from the scan just read). `ocw-updater` waits up to 10 minutes for a running refresh, OPA scan included, before it refuses with
+`sync_in_progress`. Where the data folder is matters for the stored scan: keep `OPA_DATA_DIR` on an encrypted disk, and on Windows
+outside folders other users of the computer can read (the app warns at start if it is in one).
+
 **Why SQLite, not a "real" database server, for the audit archive:**
 this came up explicitly during design — wouldn't MySQL or Postgres
 scale better for a growing, multi-year archive? For this tool's actual

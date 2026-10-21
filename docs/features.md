@@ -125,10 +125,12 @@ retention indicator):
   configured window/size. The per-person weekly sign-in counts behind the
   Overview follow the time window; Okta snapshots (which hold names) are
   never pruned and go with a purge of the environment's archive.
-- **Schedule** — enable a daily sync, choose the run time (shown in
+- **Schedule** — enable the daily refresh, choose the run time (shown in
   UTC), and the background job keeps the archive current with
   delta-only pulls (it only asks Okta for events published after the
-  last successful sync — never a full re-fetch). This runs as a
+  last successful sync — never a full re-fetch). Since 5.51.0 the daily
+  run is the whole **refresh**: the OPA scan, the Okta scan and this System
+  Log sync, each reported on its own. This runs as a
   server-side background thread, so it works unattended on a hosted
   deployment; see [Hosting on a server](hosting.md#hosting-on-a-server-optional).
 - **First run, three ways in** — the first time sync is enabled for an
@@ -143,9 +145,12 @@ retention indicator):
   3. **Start fresh** — no backfill; the archive just grows from today
      forward.
 
-A manual **Sync now** action is always available alongside the
-schedule, for kicking off an out-of-band sync without waiting for the
-next scheduled run.
+A manual refresh is always available alongside the schedule: **Sync now**
+in the footer (every page) runs the whole refresh, and the Overview's
+**Refresh** does the same with a menu for a single part (OPA scan only, Okta
+scan only, System Log only). A refresh that is already running is attached to,
+never started twice. The sync settings dialog's **Sync System Log now** runs
+the System Log part only.
 
 ### Admin roles and the audit log (hosted deployments)
 
@@ -238,20 +243,29 @@ to `http://localhost:8766`) with `python serve.py` running separately.
 ### Access Explorer
 
 A second top-level tab (next to Folder Builder) for answering "who has
-access to what." Backed by a background job
-(`build_access_model`/`POST /api/access/bootstrap/start`, polled via
-`GET /api/access/bootstrap/status`) that fetches every resource group,
-project, group, user (+ their groups), and security policy once,
-resolves each policy rule down to a specific project where possible,
-and caches the result client-side — fetched once per session, with a
-manual **Refresh** button. This is not a cheap call — one API request
+access to what." Since 5.51.0 it opens from the **stored OPA scan**: the
+scan (`build_access_model`, run as the OPA part of the refresh job:
+`POST /api/environments/<name>/refresh` with `parts: ["opa"]`, polled via
+`GET .../refresh/status`) fetches every resource group, project, group,
+user (+ their groups), security policy and Okta-managed device once,
+resolves each policy rule down to a specific project where possible, and
+is kept in the archive database (one replaceable row per environment), so
+the page opens at once, also after a restart, and says when the scan was
+read ("OPA scan as of 21 Oct 2026, 02:20 UTC · 6 h ago", with an amber
+**Stale** badge from 24 hours and a red **Very stale** from 7 days). Only
+when no scan was ever stored does the full-page progress show. **Refresh
+OPA scan** reads OPA again (the OPA part only; the Overview's **Refresh**
+is the "everything" control). This is not a cheap call — one API request
 per folder/secret discovered, per project's server/SaaS/Okta-UD list,
 and per user's group membership; expect it to take up to a minute on a
-tenant with real data volume — so both the first load and Refresh show
-real step-by-step progress (which step is running, what's done, what's
-left) rather than a bare spinner, with a Retry button if a step fails.
-On Refresh, the previous result stays visible and interactive while a
-compact progress panel runs at the bottom of the screen.
+tenant with real data volume — so a refresh shows real step-by-step
+progress (which step is running, what's done, what's left), with the
+previous scan staying visible and interactive while a compact progress
+panel runs at the bottom of the screen. A refused or failed refresh keeps
+the previous scan and says what happened, that nothing was changed and what
+to do. Removing a user from a group also updates the stored scan, and the
+label then says "Edited since the scan". Last-accessed lookups and resource
+evidence stay live reads and say so.
 
 - **Resource Groups** — pick one, see its delegated admin group(s),
   its projects (with active/stale resource counts), and every policy
@@ -478,12 +492,12 @@ never from a live call, so "as of the audit date" and "now" are the same screen.
   snapshot);
 - **separation of duties**: Okta admins who also hold an OPA admin role (`pam_admin`, `resource_admin`,
   `delegated_resource_admin`, any role ending in `admin`, or membership of a resource group's delegated admin
-  group), matched by login or e-mail. This needs the OPA roster, so open the Access Explorer once per session;
+  group), matched by login or e-mail. This needs a stored OPA scan (select **Refresh** on the Overview, or **Sync now** in the footer);
   until then the report says separation of duties is unknown.
 
 It lists users with a **direct** role assignment. Roles held only through a group, and OAuth service apps with
 roles, are not listed yet. The **As of** picker lists the dates there is a snapshot for; **Capture now** reads Okta
-and stores a new one (a capture is also taken after each sync, at most every six hours); the history panel lists
+and stores a new one (a capture is also taken by each scheduled refresh, at most every six hours, and by every manual refresh); the history panel lists
 every capture (a refused one is recorded too), compares any two, and exports one as JSON with its hashes. CSV and
 Markdown exports carry the snapshot id and sha256 they were built from, and each export is recorded in the audit
 log. If the token cannot read role assignments the report shows the refusal message instead of an empty list.
@@ -492,7 +506,7 @@ log. If the token cannot read role assignments the report shows the refusal mess
 by its Okta user id, is looked up in Okta (`GET /api/v1/users/{id|login}`, read-only, bounded to 5,000 principals).
 Those whose Okta user is **deprovisioned or suspended**, or **not found**, are listed with their OPA roles as
 candidates for review, never as findings. OPA-native service users have no Okta identity and are not looked up.
-The Access Explorer Users view marks the same people. Run the lookup from the card (it needs the OPA roster).
+The Access Explorer Users view marks the same people. The lookup is part of every refresh; it can also be run from the card (it needs a stored OPA scan).
 
 **Configuration snapshots.** Each capture is stored as one row per object and sealed into the archive's
 hash chain (one manifest per snapshot; its sealed entries are the objects' hashes). The deep integrity check
@@ -500,7 +514,7 @@ re-reads and re-hashes them, so an edited, added or removed object, or a removed
 an environment's archive removes its snapshots; retention never prunes them. The same threat model as the archived
 log applies (see the integrity check's description).
 
-**Overview** (the first sidebar item, home page for administrators). Everything on it is counts read from stored snapshots and the archive, stamped with its time and source; people are behind a click (drawer, audited). `GET /api/overview` returns, per block, either its numbers or its
+**Overview** (the first sidebar item, home page for administrators; archive viewers with View archive and Live read see the counts too, never the lists of names). The sources strip shows when each source was read and the **Refresh** split button runs the OPA scan, the Okta scan and the System Log sync as one job, with a progress card that shows each part's state and, for a part that failed, the reason and **Retry this part**. Everything on it is counts read from stored snapshots and the archive, stamped with its time and source; people are behind a click (drawer, audited). `GET /api/overview` returns, per block, either its numbers or its
 state (`never_captured`, `refused`, `not_loaded`...): Okta admin role holders, OPA privileged users, separation-of-duties
 overlaps, C1 counts, OPA service accounts, archive coverage and chain status, weekly privilege grant and revoke counts,
 snapshot dates, the **inventory** (daily counts per series with first-seen date and 7- and 30-day change) and the

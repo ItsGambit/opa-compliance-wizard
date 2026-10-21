@@ -372,7 +372,7 @@ export default function App() {
       )}
       <BannerSettingsDialog open={bannerOpen} onOpenChange={setBannerOpen} />
       <AccessControlDialog open={accessControlOpen} onOpenChange={setAccessControlOpen} />
-      <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />
+      <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} dataLocationNotice={whoami?.data_location_notice} />
     </div>
   )
 }
