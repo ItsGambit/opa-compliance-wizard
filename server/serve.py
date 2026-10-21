@@ -808,6 +808,18 @@ def _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, trigger
             actor_email, actor_sub, f"{action_prefix}_completed", {"name": env_name, **result, **prune_result},
             client_ip=client_ip, user_agent=user_agent,
         )
+        # 5.50.0: after the log sync, record who holds an Okta admin role (a chained snapshot), at most
+        # every few hours. Never allowed to fail the sync that just finished.
+        try:
+            import okta_admins
+            snap = okta_admins.capture_if_due(env_id, okta_client)
+            if snap:
+                engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.captured", {
+                    "name": env_name, "kind": snap["kind"], "snapshot_id": snap["snapshot_id"], "status": snap["status"],
+                    "item_count": snap["item_count"], "error_code": (snap.get("meta") or {}).get("error_code"), "trigger": trigger,
+                }, client_ip=client_ip, user_agent=user_agent)
+        except Exception as snap_exc:
+            engine.log("WARN", f"okta admin snapshot after the sync of '{env_name}' failed: {type(snap_exc).__name__}")
     except Exception as exc:
         with _sync_jobs_lock:
             _sync_jobs[storage_name]["status"] = "error"
@@ -936,6 +948,82 @@ def _launch_claimed_sync(env_id, env_name, ingestion_scope, owner, trigger, acto
         kwargs={"trigger": trigger, "actor_email": actor_email, "actor_sub": actor_sub, "client_ip": client_ip, "user_agent": user_agent, "correlation_id": correlation_id},
         daemon=True,
     ).start()
+    return True
+
+
+# Okta snapshot captures (5.50.0): the admin list and the Okta status of every OPA principal are read
+# from Okta in a background thread (a few dozen to a few hundred calls), stored as a chained snapshot, and
+# the report routes poll `capture` below. One capture per environment at a time; nothing is retried.
+_capture_jobs_lock = threading.Lock()
+_capture_jobs = {}  # environment_id -> {"status": idle|running|done|error, "kind", "error", "finished_at"}
+CAPTURE_KINDS = ("okta_admins", "opa_principal_status")
+
+
+def _capture_state(environment_id):
+    with _capture_jobs_lock:
+        job = dict(_capture_jobs.get(environment_id) or {"status": "idle"})
+    out = {k: job[k] for k in ("kind", "error", "finished_at") if job.get(k) is not None}
+    out["status"] = job["status"]
+    return out
+
+
+def _access_model_for(environment_id):
+    """The last finished Access Explorer model for this environment (the OPA
+    roster: users, groups with roles, Okta-UD accounts), or None when it has
+    not been loaded in this server process."""
+    with _access_jobs_lock:
+        job = _access_jobs.get(environment_id)
+        if job and job.get("status") == "done" and isinstance(job.get("result"), dict):
+            return job["result"]
+    return None
+
+
+def _run_capture_job(env_id, env_name, owner, kind, model, correlation_id, actor_email, actor_sub, client_ip, user_agent):
+    import audit_store
+    import okta_admins
+    engine.CORRELATION_ID.set(correlation_id)
+    try:
+        creds = engine.get_environment_credentials_by_id(env_id, owner=owner)
+        if not creds.get("okta_url") or not creds.get("okta_api_token"):
+            raise ValueError("No Okta URL/API token configured for this environment.")
+        okta_client = engine.OktaClient(creds["okta_url"], creds["okta_api_token"])
+        if kind == okta_admins.KIND_ADMINS:
+            snap = okta_admins.capture_and_store(env_id, okta_client)
+        else:
+            cap = okta_admins.capture_principal_status(okta_client, model)
+            snap = audit_store.record_config_snapshot(
+                env_id, okta_admins.KIND_PRINCIPAL_STATUS, cap["items"], status=cap["status"],
+                source_endpoint=cap["source_endpoint"], meta=cap["meta"])
+        with _capture_jobs_lock:
+            _capture_jobs[env_id] = {"status": "done", "kind": kind, "error": None, "finished_at": _utc_now_iso()}
+        engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.captured", {
+            "name": env_name, "kind": kind, "snapshot_id": snap["snapshot_id"], "status": snap["status"],
+            "item_count": snap["item_count"], "error_code": (snap.get("meta") or {}).get("error_code"), "trigger": "manual",
+        }, client_ip=client_ip, user_agent=user_agent)
+    except Exception as exc:
+        message = _job_error_message(exc)
+        with _capture_jobs_lock:
+            _capture_jobs[env_id] = {"status": "error", "kind": kind, "error": message, "finished_at": _utc_now_iso()}
+        engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.failed", {"name": env_name, "kind": kind, "error": message},
+                               client_ip=client_ip, user_agent=user_agent)
+
+
+def _start_capture_job(env_id, env_name, owner, kind, model, actor_email, actor_sub, client_ip, user_agent):
+    """True if a capture was started, False if one is already running."""
+    with _capture_jobs_lock:
+        if (_capture_jobs.get(env_id) or {}).get("status") == "running":
+            return False
+        _capture_jobs[env_id] = {"status": "running", "kind": kind, "error": None, "finished_at": None}
+    try:
+        threading.Thread(
+            target=_run_capture_job,
+            args=(env_id, env_name, owner, kind, model, engine.CORRELATION_ID.get(), actor_email, actor_sub, client_ip, user_agent),
+            daemon=True,
+        ).start()
+    except BaseException:
+        with _capture_jobs_lock:
+            _capture_jobs.pop(env_id, None)
+        raise
     return True
 
 
@@ -1495,6 +1583,18 @@ class Handler(SimpleHTTPRequestHandler):
                 })
                 return True
         return False
+
+    def _environment_from_tail(self, path, tail, engine_owner):
+        """(name, meta) for /api/environments/<name><tail>, or None after sending
+        the 404. Visibility only: each route then checks its own capabilities
+        with self._capability_refused (visibility first, so a refusal is never
+        an existence oracle)."""
+        name = unquote(path[len("/api/environments/"):-len(tail)])
+        meta = engine.list_environments_for(engine_owner).get(name)
+        if meta is None:
+            self._send_json(404, {"error": f"No environment named '{name}' visible to this user."})
+            return None
+        return name, meta
 
     def _caller(self):
         """(owner_key, engine_owner, actor_email, actor_sub) for this request."""
@@ -2559,6 +2659,139 @@ class Handler(SimpleHTTPRequestHandler):
                 import audit_store
                 return self._send_json(200, audit_store.verify_ingestion_chain(meta["environment_id"], deep=False))
 
+            if path.startswith("/api/environments/") and path.endswith("/okta_admins"):
+                # 5.50.0: the Okta Admins report, computed from the stored snapshot (never a live Okta call).
+                # view_archive (the snapshot is archive evidence) + live_read (the separation-of-duties column
+                # joins the OPA roster that live_read exposes).
+                found = self._environment_from_tail(path, "/okta_admins", engine_owner)
+                if found is None:
+                    return
+                name, meta = found
+                if self._capability_refused(engine_owner, meta["environment_id"], ("view_archive", "live_read")):
+                    return
+                import audit_store
+                import okta_admins
+                as_of = (qs.get("as_of") or [None])[0] or None
+                try:
+                    audit_store.normalize_window(None, as_of)
+                    report = okta_admins.build_okta_admins_report(
+                        meta["environment_id"], as_of=as_of, access_model=_access_model_for(meta["environment_id"]))
+                except ValueError as exc:
+                    return self._send_json(400, {"error": str(exc)})
+                report["capture"] = _capture_state(meta["environment_id"])
+                _o, _e, actor_email, actor_sub = self._caller()
+                self._log_audit_event(actor_email, actor_sub, "okta_admins.report_read", {
+                    "name": name, "as_of": as_of, "state": report["state"], "admins": report["summary"].get("admins"),
+                    "snapshot_id": (report.get("as_of_snapshot") or {}).get("snapshot_id")})
+                return self._send_json(200, report)
+
+            if path.startswith("/api/environments/") and path.endswith("/cross_checks"):
+                # 5.50.0: lifecycle cross-check C1 (the Okta status of every OPA principal) and the per-user flags
+                # for the Access Explorer Users view. Stored snapshot + the cached OPA roster; no live call.
+                found = self._environment_from_tail(path, "/cross_checks", engine_owner)
+                if found is None:
+                    return
+                name, meta = found
+                if self._capability_refused(engine_owner, meta["environment_id"], ("view_archive", "live_read")):
+                    return
+                import okta_admins
+                env_id = meta["environment_id"]
+                model = _access_model_for(env_id)
+                cards = [okta_admins.build_cross_checks(env_id, access_model=model)]
+                _o, _e, actor_email, actor_sub = self._caller()
+                self._log_audit_event(actor_email, actor_sub, "cross_checks.read", {
+                    "name": name, "states": {c["id"]: c["state"] for c in cards}})
+                return self._send_json(200, {"cards": cards, "user_flags": okta_admins.user_flags(env_id),
+                                             "capture": _capture_state(env_id)})
+
+            if path.startswith("/api/environments/") and path.endswith("/config_snapshots/diff"):
+                found = self._environment_from_tail(path, "/config_snapshots/diff", engine_owner)
+                if found is None:
+                    return
+                name, meta = found
+                if self._capability_refused(engine_owner, meta["environment_id"], ("view_archive",)):
+                    return
+                import audit_store
+                try:
+                    older, newer = int((qs.get("older") or [""])[0]), int((qs.get("newer") or [""])[0])
+                except ValueError:
+                    return self._send_json(400, {"error": "older and newer must be snapshot ids"})
+                try:
+                    return self._send_json(200, audit_store.diff_config_snapshots(meta["environment_id"], older, newer))
+                except ValueError as exc:
+                    return self._send_json(404 if "not found" in str(exc) else 400, {"error": str(exc)})
+
+            if path.startswith("/api/environments/") and path.endswith("/config_snapshots/export"):
+                found = self._environment_from_tail(path, "/config_snapshots/export", engine_owner)
+                if found is None:
+                    return
+                name, meta = found
+                if self._capability_refused(engine_owner, meta["environment_id"], ("view_archive",)):
+                    return
+                import audit_store
+                try:
+                    snapshot_id = int((qs.get("snapshot_id") or [""])[0])
+                except ValueError:
+                    return self._send_json(400, {"error": "snapshot_id must be a snapshot id"})
+                exported = audit_store.export_config_snapshot(meta["environment_id"], snapshot_id)
+                if exported is None:
+                    return self._send_json(404, {"error": "No such snapshot in this environment."})
+                exported["verification"] = audit_store.verify_config_snapshot(meta["environment_id"], snapshot_id)
+                _o, _e, actor_email, actor_sub = self._caller()
+                self._log_audit_event(actor_email, actor_sub, "config_snapshot.exported", {
+                    "name": name, "snapshot_id": snapshot_id, "kind": exported["kind"], "sha256": exported["sha256"]})
+                return self._send_json(200, exported)
+
+            if path.startswith("/api/environments/") and path.endswith("/config_snapshots"):
+                found = self._environment_from_tail(path, "/config_snapshots", engine_owner)
+                if found is None:
+                    return
+                _name, meta = found
+                if self._capability_refused(engine_owner, meta["environment_id"], ("view_archive",)):
+                    return
+                import audit_store
+                kind = (qs.get("kind") or [None])[0] or None
+                if kind is not None and not re.match(r"^[a-z][a-z0-9_]{1,63}$", kind):
+                    return self._send_json(400, {"error": "kind is not a snapshot kind"})
+                return self._send_json(200, {"snapshots": audit_store.list_config_snapshots(meta["environment_id"], kind=kind, limit=200)})
+
+            if path == "/api/overview":
+                # 5.50.0: counts only, for the executive dashboard. Admin-only and not available through an additional
+                # login gate (nginx answers 403 there). Each Okta-derived block carries its own state, so a refused
+                # Okta read says "refused", never zero.
+                if not _can_admin(owner_key, self.headers):
+                    return self._send_json(403, {"error": "Admin access required for the overview."})
+                import audit_store
+                import okta_admins
+                name = (qs.get("environment") or qs.get("env") or [local_env_name])[0]
+                admin_id = (qs.get("id") or [None])[0]
+                if admin_id:
+                    meta = engine.list_all_environments().get(admin_id)
+                    name = (meta or {}).get("name")
+                    if meta is not None:
+                        meta = {**meta, "environment_id": admin_id}
+                elif not name:
+                    return self._send_json(400, {"error": "No active environment and none specified via ?environment="})
+                else:
+                    meta = engine.list_environments_for(engine_owner).get(name)
+                if meta is None:
+                    return self._send_json(404, {"error": f"No environment named '{name}' visible to this user."})
+                as_of = (qs.get("as_of") or [None])[0] or None
+                env_id = meta["environment_id"]
+                try:
+                    audit_store.normalize_window(None, as_of)
+                    model = _access_model_for(env_id)
+                    accounts = (len(model.get("saas_accounts") or []) + len(model.get("okta_accounts") or [])) if model else None
+                    chain = audit_store.verify_ingestion_chain(env_id)
+                    overview = okta_admins.build_overview(
+                        env_id, as_of=as_of, access_model=model, service_accounts_total=accounts,
+                        integrity={k: chain.get(k) for k in ("valid", "manifest_count", "reason", "head_hash")})
+                except ValueError as exc:
+                    return self._send_json(400, {"error": str(exc)})
+                _o, _e, actor_email, actor_sub = self._caller()
+                self._log_audit_event(actor_email, actor_sub, "overview.read", {"name": name, "as_of": as_of})
+                return self._send_json(200, overview)
+
             if path == "/api/archives/orphaned":
                 # DATA-12: archives whose environment no longer exists.
                 # Admin-only read (local mode exempt), same rule as
@@ -3369,6 +3602,45 @@ class Handler(SimpleHTTPRequestHandler):
             if path.startswith("/api/environments/") and path.endswith("/sync/import_csv"):
                 name = unquote(path[len("/api/environments/"):-len("/sync/import_csv")])
                 return self._environment_change("sync.import_csv", {"name": name, "body": payload})
+
+            if path.startswith("/api/environments/") and path.endswith("/okta_snapshots/capture"):
+                # 5.50.0: read Okta now (background) and store a chained snapshot: the Okta admin list, or the Okta
+                # status of every OPA principal. Uses the owner's stored Okta token, so a shared user needs both
+                # live_read and sync_now (the same permission "Sync now" needs).
+                found = self._environment_from_tail(path, "/okta_snapshots/capture", engine_owner)
+                if found is None:
+                    return
+                name, meta = found
+                if self._capability_refused(engine_owner, meta["environment_id"], ("live_read", "sync_now")):
+                    return
+                kind = payload.get("kind")
+                if kind not in CAPTURE_KINDS:
+                    return self._send_json(400, {"error": f"kind must be one of {list(CAPTURE_KINDS)}"})
+                model = None
+                if kind == "opa_principal_status":
+                    model = _access_model_for(meta["environment_id"])
+                    if model is None:
+                        return self._send_json(409, {"error": "The OPA roster is not loaded yet. Open the Access Explorer once, then try again.",
+                                                     "reason": "roster_not_loaded"})
+                started = _start_capture_job(
+                    meta["environment_id"], name, meta.get("owner"), kind, model, actor_email, actor_sub,
+                    self._request_client_ip(), self.headers.get("User-Agent"))
+                return self._send_json(200, {"started": started, "already_running": not started})
+
+            if path.startswith("/api/environments/") and path.endswith("/okta_admins/export_log"):
+                # The CSV / Markdown export itself is built in the browser; this records that one was taken.
+                found = self._environment_from_tail(path, "/okta_admins/export_log", engine_owner)
+                if found is None:
+                    return
+                name, _meta = found
+                if self._capability_refused(engine_owner, _meta["environment_id"], ("view_archive", "live_read")):
+                    return
+                fmt = payload.get("format")
+                as_of = payload.get("as_of")
+                if fmt not in ("csv", "md") or (as_of is not None and not isinstance(as_of, str)):
+                    return self._send_json(400, {"error": "format must be csv or md"})
+                self._log_audit_event(actor_email, actor_sub, "okta_admins.report_exported", {"name": name, "format": fmt, "as_of": as_of})
+                return self._send_json(200, {"logged": True})
 
             if path == "/api/access/bootstrap/start":
                 if not _require_client(self._send_json, local_client):

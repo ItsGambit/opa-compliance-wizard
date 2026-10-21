@@ -153,12 +153,15 @@ def _location_blocks(text):
 # request never reaches the backend. Admins change these from the main
 # gate's site.
 #
+# 5.50.0: the executive overview (/api/overview) joins the list; a site generated before 5.50.0 lacks its block
+# (run `sudo server/install.sh --regenerate-second-sites`, README "Upgrading").
+#
 # 5.47.0: host upgrades are a property of the whole backend as well: the update
 # status and settings (5.46.0) and the upgrade support-bundle download. A site
 # generated before 5.47.0 lacks this block; setup-second-gate.sh never rewrites an
 # existing site, so run `sudo server/install.sh --regenerate-second-sites`
 # (README, "Upgrading").
-SECOND_SITE_DENIED_PREFIXES = ("/api/access_control", "/api/shared_permissions", "/api/archives", "/api/upgrade")
+SECOND_SITE_DENIED_PREFIXES = ("/api/access_control", "/api/shared_permissions", "/api/archives", "/api/upgrade", "/api/overview")
 
 _ACCESS_CONTROL_BLOCK = (
     "\n    # GATE-04: access_control.json belongs to the MAIN org only --\n"
@@ -176,6 +179,10 @@ _ACCESS_CONTROL_BLOCK = (
     "    }\n"
     "    # 5.47.0: host upgrades (status, settings, support-bundle download) are whole-backend too.\n"
     "    location /api/upgrade {\n"
+    "        return 403;\n"
+    "    }\n"
+    "    # 5.50.0: the executive overview spans the whole backend (admin-only), so it is read from the main site only.\n"
+    "    location /api/overview {\n"
     "        return 403;\n"
     "    }\n"
     # Deleting an environment WITH its archive (DELETE

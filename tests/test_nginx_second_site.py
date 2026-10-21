@@ -264,7 +264,7 @@ def test_quoted_regex_location_is_seen_and_refused():
 from server.nginx_second_site import SECOND_SITE_DENIED_PREFIXES  # noqa: E402
 
 
-@pytest.mark.parametrize("prefix", ["/api/shared_permissions", "/api/archives", "/api/upgrade"])
+@pytest.mark.parametrize("prefix", ["/api/shared_permissions", "/api/archives", "/api/upgrade", "/api/overview"])
 def test_shared_permissions_and_archive_purge_are_denied_entirely(site, prefix):
     assert prefix in SECOND_SITE_DENIED_PREFIXES
     assert re.search(rf"location {re.escape(prefix)} \{{\s*return 403;\s*\}}", site)
@@ -273,7 +273,7 @@ def test_shared_permissions_and_archive_purge_are_denied_entirely(site, prefix):
 
 
 def test_access_control_deny_is_still_there_with_the_new_ones(site):
-    assert SECOND_SITE_DENIED_PREFIXES == ("/api/access_control", "/api/shared_permissions", "/api/archives", "/api/upgrade")
+    assert SECOND_SITE_DENIED_PREFIXES == ("/api/access_control", "/api/shared_permissions", "/api/archives", "/api/upgrade", "/api/overview")
     for prefix in SECOND_SITE_DENIED_PREFIXES:
         assert site.count(f"location {prefix} {{") == 1
 

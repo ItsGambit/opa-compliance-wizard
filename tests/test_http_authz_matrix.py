@@ -78,6 +78,20 @@ ROUTES = {
         Route("GET", "/api/environments/dev/sync/status", "env", None, 200, caps=('view_archive',)),
     ("GET", "path.startswith('/api/environments/') and path.endswith('/integrity')"):
         Route("GET", "/api/environments/dev/integrity", "env", None, 200, caps=('view_archive',)),
+    # 5.50.0: Okta Admins report, cross-checks, chained snapshots, the executive overview.
+    ("GET", "path.startswith('/api/environments/') and path.endswith('/okta_admins')"):
+        Route("GET", "/api/environments/dev/okta_admins", "env", None, 200, caps=('view_archive', 'live_read')),
+    ("GET", "path.startswith('/api/environments/') and path.endswith('/cross_checks')"):
+        Route("GET", "/api/environments/dev/cross_checks", "env", None, 200, caps=('view_archive', 'live_read')),
+    # Past the visibility and capability checks the route's own 400 (no snapshot ids) answers the owner.
+    ("GET", "path.startswith('/api/environments/') and path.endswith('/config_snapshots/diff')"):
+        Route("GET", "/api/environments/dev/config_snapshots/diff", "env", None, 400, caps=('view_archive',)),
+    ("GET", "path.startswith('/api/environments/') and path.endswith('/config_snapshots/export')"):
+        Route("GET", "/api/environments/dev/config_snapshots/export", "env", None, 400, caps=('view_archive',)),
+    ("GET", "path.startswith('/api/environments/') and path.endswith('/config_snapshots')"):
+        Route("GET", "/api/environments/dev/config_snapshots", "env", None, 200, caps=('view_archive',)),
+    # Admin-only; with no environment named or active the route's own 400 answers (the data paths are in test_okta_routes_5500.py).
+    ("GET", "path == '/api/overview'"): Route("GET", "/api/overview", "admin", None, 400),
     ("GET", "path == '/api/archives/orphaned'"): Route("GET", "/api/archives/orphaned", "admin", None, 200),
     ("GET", "path == '/api/reports'"): Route("GET", "/api/reports?environment=dev", "env", None, 200, caps=('view_archive',)),
     ("GET", "path.startswith('/api/reports/')"):
@@ -148,6 +162,10 @@ ROUTES = {
         Route("POST", "/api/environments/dev/sync/start", "env", {}, 200, caps=('sync_now',)),
     ("POST", "path.startswith('/api/environments/') and path.endswith('/sync/import_csv')"):
         Route("POST", "/api/environments/dev/sync/import_csv", "env", {"csv_path": "syslog_export.csv"}, 200, caps=('import_csv',), stepup='sync.import_csv'),
+    ("POST", "path.startswith('/api/environments/') and path.endswith('/okta_snapshots/capture')"):
+        Route("POST", "/api/environments/dev/okta_snapshots/capture", "env", {"kind": "okta_admins"}, 200, caps=('live_read', 'sync_now')),
+    ("POST", "path.startswith('/api/environments/') and path.endswith('/okta_admins/export_log')"):
+        Route("POST", "/api/environments/dev/okta_admins/export_log", "env", {"format": "csv"}, 200, caps=('view_archive', 'live_read')),
     ("POST", "path == '/api/access/bootstrap/start'"): Route("POST", "/api/access/bootstrap/start", "session", {}, 200, caps=('live_read',)),
     ("POST", "path == '/api/resource_groups'"):
         Route("POST", "/api/resource_groups", "session", {"name": "rg", "group_ids": ["g1"]}, 502, caps=('tenant_write',)),
@@ -296,9 +314,10 @@ def matrix_server(tmp_audit_store, tmp_environments_file, fake_keyring, tmp_audi
     # could otherwise write to whatever database the restored path points
     # at); the routes' own start/guard logic still runs in full.
     started = []
-    REAL_JOB_BODIES.update(sync=serve._run_sync_job, access=serve._run_access_job)
+    REAL_JOB_BODIES.update(sync=serve._run_sync_job, access=serve._run_access_job, capture=serve._run_capture_job)
     monkeypatch.setattr(serve, "_run_sync_job", lambda *a, **k: started.append(("sync", a)))
     monkeypatch.setattr(serve, "_run_access_job", lambda *a, **k: started.append(("access", a)))
+    monkeypatch.setattr(serve, "_run_capture_job", lambda *a, **k: started.append(("capture", a)))  # 5.50.0
     with serve._sessions_lock:
         serve._seen_owners.clear()
         serve._recorded_identities.clear()  # 5.43.0: each test starts with a fresh DB

@@ -58,7 +58,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.49.0
+# Version     : 5.50.0
 # =============================================================================
 
 import argparse
@@ -84,7 +84,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.49.0"
+SCRIPT_VERSION = "5.50.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 # ENG2-12: OPA's spec documents no pattern or length for a secret-folder
 # name (SecretFolderCreateRequest.name is a bare string); 255 is the limit
@@ -3336,6 +3336,120 @@ class OktaClient:
                     users.append(name)
             d["users"] = users
         return devices
+
+    # -- read-only walkers for the Okta Admins report and the lifecycle cross-check (5.50.0) --------------------
+    def list_all(self, path, list_key=None, max_items=100000):
+        """GET `path` and follow its pagination to the end, returning the
+        dict items of the list (the response itself, or its `list_key`
+        member). Follows the rel="next" Link header, or the body's
+        `_links.next.href` (which the role-assignment endpoints use), on THIS
+        org's origin only. A repeating link, a body that is not the expected
+        shape, or more than `max_items` items is an OktaApiError("invalid_
+        response"), never a silently short list."""
+        what = path.split("?", 1)[0]
+        items, seen, next_path = [], {path}, path
+        while next_path:
+            resp, headers = self.request("GET", next_path, return_headers=True)
+            page = resp.get(list_key) if (list_key and isinstance(resp, dict)) else resp
+            if page is None and list_key and isinstance(resp, dict):
+                page = []
+            if not isinstance(page, list):
+                raise OktaApiError(API_STATUS_INVALID_RESPONSE, what, "the response is not a list")
+            items.extend(x for x in page if isinstance(x, dict))
+            if len(items) > max_items:
+                raise OktaApiError(API_STATUS_INVALID_RESPONSE, what, f"more than {max_items} results; stopping")
+            if not page:
+                break
+            candidate = _next_page_path(self.base_url, headers, seen, OktaApiError, what)
+            if candidate is None and isinstance(resp, dict):
+                href = ((resp.get("_links") or {}).get("next") or {}).get("href") if isinstance(resp.get("_links"), dict) else None
+                if isinstance(href, str):
+                    candidate = _same_origin_path(self.base_url, href)
+                    if candidate is None or candidate.split("?", 1)[0] != what:
+                        raise OktaApiError(API_STATUS_INVALID_RESPONSE, what, "unusable pagination link")
+                    if candidate in seen:
+                        raise OktaApiError(API_STATUS_INVALID_RESPONSE, what, "pagination loop: the next-page link repeats a page")
+                    seen.add(candidate)
+            next_path = candidate
+        return items
+
+    def list_users_with_role_assignments(self, limit_total=100000):
+        """GET /api/v1/iam/assignees/users (okta.roles.read): users holding a
+        role assignment -- [{id, orn, _links}]. Raises OktaApiError E0000006
+        (HTTP 403) for a token whose admin cannot view roles and admin
+        assignments."""
+        return self.list_all("/api/v1/iam/assignees/users?limit=100", "value", max_items=limit_total)
+
+    def get_user(self, user_id_or_login):
+        """GET /api/v1/users/{id|login}. The caller must keep only the fields
+        it needs: the response includes a `credentials` object."""
+        resp = self.request("GET", f"/api/v1/users/{_path_id(user_id_or_login)}")
+        if not isinstance(resp, dict):
+            raise OktaApiError(API_STATUS_INVALID_RESPONSE, "/api/v1/users/{id}", "the response is not an object")
+        return resp
+
+    def list_user_roles(self, user_id):
+        """GET /api/v1/users/{id}/roles -- every role assigned to the user."""
+        resp = self.request("GET", f"/api/v1/users/{_path_id(user_id)}/roles")
+        if resp is None:
+            return []
+        if not isinstance(resp, list):
+            raise OktaApiError(API_STATUS_INVALID_RESPONSE, "/api/v1/users/{id}/roles", "the response is not a list")
+        return [r for r in resp if isinstance(r, dict)]
+
+    def list_role_group_targets(self, user_id, role_assignment_id):
+        """GET /api/v1/users/{id}/roles/{roleAssignmentId}/targets/groups
+        (USER_ADMIN, HELP_DESK_ADMIN, GROUP_MEMBERSHIP_ADMIN; [] = not scoped)."""
+        return self.list_all(f"/api/v1/users/{_path_id(user_id)}/roles/{_path_id(role_assignment_id)}/targets/groups?limit=20")
+
+    def list_role_app_targets(self, user_id, role_assignment_id):
+        """GET .../targets/catalog/apps (APP_ADMIN)."""
+        return self.list_all(f"/api/v1/users/{_path_id(user_id)}/roles/{_path_id(role_assignment_id)}/targets/catalog/apps?limit=20")
+
+    def get_role_governance(self, user_id, role_assignment_id):
+        """GET .../roles/{id}/governance -- time-bound grants. Orgs without the
+        feature answer an error (E0000015); the caller treats that as 'not enabled'."""
+        resp = self.request("GET", f"/api/v1/users/{_path_id(user_id)}/roles/{_path_id(role_assignment_id)}/governance")
+        return resp if isinstance(resp, dict) else {}
+
+    def list_custom_roles(self):
+        """GET /api/v1/iam/roles -> the `roles` list."""
+        return self.list_all("/api/v1/iam/roles", "roles")
+
+    def list_custom_role_permissions(self, role_id):
+        """GET /api/v1/iam/roles/{id}/permissions -> the `permissions` list."""
+        return self.list_all(f"/api/v1/iam/roles/{_path_id(role_id)}/permissions", "permissions")
+
+    def list_resource_sets(self):
+        """GET /api/v1/iam/resource-sets -> the `resource-sets` list."""
+        return self.list_all("/api/v1/iam/resource-sets", "resource-sets")
+
+    def get_system_log_page(self, path):
+        """One System Log page for polling-mode sync (audit_store.
+        sync_okta_events): GET `path` (a /api/v1/logs path+query on THIS org
+        only) and return (events, next_path). `next_path` is the response's
+        rel="next" link as a same-origin path, or None when there is none.
+        Unlike get_system_log this does not walk the links itself and does not
+        treat a repeating link as an error (an empty polling page may repeat
+        its own link); the caller stops on an empty page and guards against a
+        non-empty page repeating. A body that is not a JSON list, or a `next`
+        link to another origin or another endpoint, is an invalid response,
+        never silently "no more events"."""
+        if (not isinstance(path, str) or not path.startswith(SYSTEM_LOG_PATH + "?")
+                or "\n" in path or "\r" in path):
+            raise OktaApiError(API_STATUS_INVALID_RESPONSE, SYSTEM_LOG_PATH, "not a System Log path")
+        resp, headers = self.request("GET", path, return_headers=True)
+        if resp is None:
+            resp = []
+        if not isinstance(resp, list):
+            raise OktaApiError(API_STATUS_INVALID_RESPONSE, SYSTEM_LOG_PATH, "the response is not a list of events")
+        link = _parse_next_link(headers)
+        next_path = None
+        if link:
+            next_path = _same_origin_path(self.base_url, link)
+            if next_path is None or not next_path.startswith(SYSTEM_LOG_PATH + "?"):
+                raise OktaApiError(API_STATUS_INVALID_RESPONSE, SYSTEM_LOG_PATH, "unusable pagination link")
+        return resp, next_path
 
     def get_system_log(self, filter_expr=None, since=None, until=None, limit=1000, sort_order="DESCENDING", max_pages=50):
         """GET /api/v1/logs, following the Link: rel="next" header until
