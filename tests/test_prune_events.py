@@ -16,6 +16,11 @@ class FakeOktaClient:
     def __init__(self, responses):
         self._responses = list(responses)
 
+    def get_system_log_page(self, path):  # 5.50.0 polling pass: an empty page means "caught up"
+        self.__dict__.setdefault("page_paths", []).append(path)
+        pages = self.__dict__.setdefault("pages", [])
+        return pages.pop(0) if pages else ([], None)
+
     def get_system_log(self, since, until, limit, sort_order, max_pages):
         if self._responses:
             return self._responses.pop(0)

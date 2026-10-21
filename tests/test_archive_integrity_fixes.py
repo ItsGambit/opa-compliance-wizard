@@ -45,6 +45,11 @@ class FakeOktaClient:
         self._responses = list(responses)
         self.calls = []
 
+    def get_system_log_page(self, path):  # 5.50.0 polling pass: an empty page means "caught up"
+        self.__dict__.setdefault("page_paths", []).append(path)
+        pages = self.__dict__.setdefault("pages", [])
+        return pages.pop(0) if pages else ([], None)
+
     def get_system_log(self, since, until, limit, sort_order, max_pages):
         self.calls.append((since, until))
         if self._responses:
@@ -173,7 +178,8 @@ def test_csv_import_never_touches_the_live_sync_watermark_and_skips_unparseable_
     # The next live sync still behaves as a resume from the LIVE watermark, not the file's.
     client = FakeOktaClient([([], True)])
     audit_store.sync_okta_events(client, ENV, "all")
-    assert client.calls[0][0] < before["last_synced_at"]  # overlap window before the live watermark
+    from urllib.parse import parse_qs, urlsplit
+    assert parse_qs(urlsplit(client.page_paths[0]).query)["since"][0] < before["last_synced_at"]  # polling resume: overlap before the live watermark
 
 
 def test_csv_import_on_a_fresh_environment_does_not_skip_the_first_live_backfill(schema, tmp_path):

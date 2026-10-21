@@ -150,7 +150,9 @@ def _schema_sql(conn, names):
                                                  % ",".join("?" * len(names)), names)}
 
 
-def test_migration_008_is_additive_and_leaves_the_evidence_chain_alone(tmp_audit_store):
+def test_migration_008_is_additive_and_leaves_the_evidence_chain_alone(tmp_audit_store, monkeypatch):
+    # 5.50.0: later migrations (10 adds columns to events) are outside what this test pins.
+    monkeypatch.setattr(audit_store, "MIGRATIONS", {k: v for k, v in audit_store.MIGRATIONS.items() if k <= 9})
     conn = audit_store._get_connection()
     conn.execute("BEGIN IMMEDIATE")
     for version in range(1, 8):

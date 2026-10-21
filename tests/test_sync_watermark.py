@@ -17,6 +17,7 @@ copies before deleting, so the data wasn't actually lost, just briefly
 sitting in a temp file instead of the real one) and environments.json
 was restored. Every test below now takes BOTH fixtures whenever it
 triggers a schema-creating/migrating call, as a direct result."""
+from urllib.parse import parse_qs, urlsplit
 from datetime import datetime, timedelta, timezone
 
 import audit_store
@@ -36,6 +37,11 @@ class FakeOktaClient:
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = []
+
+    def get_system_log_page(self, path):  # 5.50.0 polling pass: an empty page means "caught up"
+        self.__dict__.setdefault("page_paths", []).append(path)
+        pages = self.__dict__.setdefault("pages", [])
+        return pages.pop(0) if pages else ([], None)
 
     def get_system_log(self, since, until, limit, sort_order, max_pages):
         self.calls.append((since, until))
@@ -181,13 +187,12 @@ def test_resuming_after_incomplete_chunk_retries_same_window(tmp_audit_store, tm
     # test), which is expected, not a regression. FakeOktaClient
     # auto-completes any further trailing chunk needed to reach "now"
     # (see its docstring).
-    second_client = FakeOktaClient([
-        ([_event("evt-3", day1_since)], True),  # the retried (previously-failed) chunk
-    ])
+    second_client = FakeOktaClient([])
+    second_client.pages = [([_event("evt-3", day1_since)], None)]  # 5.50.0: the resume is a polling pass from the watermark
     second_result = audit_store.sync_okta_events(second_client, environment, "all", since=None)
     assert second_result["complete"] is True
 
-    retried_since = second_client.calls[0][0]
+    retried_since = parse_qs(urlsplit(second_client.page_paths[0]).query)["since"][0]
     assert retried_since <= retained_watermark  # resumes at/before day 1's end, never after it
     expected_earliest = (
         datetime.fromisoformat(retained_watermark.replace("Z", "+00:00"))

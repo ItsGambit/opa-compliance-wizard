@@ -9,6 +9,7 @@ Okta's 90-day retention makes the gap unrecoverable later.
 Uses the same FakeOktaClient/_event helpers as test_sync_watermark.py
 (duplicated here rather than imported, matching that file's own
 precedent of being self-contained)."""
+from urllib.parse import parse_qs, urlsplit
 from datetime import datetime, timedelta, timezone
 
 import audit_store
@@ -20,6 +21,11 @@ class FakeOktaClient:
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = []
+
+    def get_system_log_page(self, path):  # 5.50.0 polling pass: an empty page means "caught up"
+        self.__dict__.setdefault("page_paths", []).append(path)
+        pages = self.__dict__.setdefault("pages", [])
+        return pages.pop(0) if pages else ([], None)
 
     def get_system_log(self, since, until, limit, sort_order, max_pages):
         self.calls.append((since, until))
@@ -58,7 +64,7 @@ def test_resume_rescans_an_overlap_window_before_the_stored_watermark(tmp_audit_
     second_client = FakeOktaClient([([], True)])
     audit_store.sync_okta_events(second_client, ENV, "all", since=None)
 
-    first_call_since = second_client.calls[0][0]
+    first_call_since = parse_qs(urlsplit(second_client.page_paths[0]).query)["since"][0]  # 5.50.0: polling resume
     expected = (
         datetime.fromisoformat(first_published.replace("Z", "+00:00"))
         - timedelta(seconds=audit_store.WATERMARK_OVERLAP_SECONDS)
@@ -88,10 +94,11 @@ def test_a_late_indexed_event_below_the_watermark_is_not_permanently_lost(tmp_au
         datetime.fromisoformat(watermark_published.replace("Z", "+00:00")) - timedelta(minutes=2)
     ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-    second_client = FakeOktaClient([([_event("evt-late", late_published)], True)])
+    second_client = FakeOktaClient([])
+    second_client.pages = [([_event("evt-late", late_published)], None)]
     audit_store.sync_okta_events(second_client, ENV, "all", since=None)
 
-    first_requested_since = second_client.calls[0][0]
+    first_requested_since = parse_qs(urlsplit(second_client.page_paths[0]).query)["since"][0]
     assert first_requested_since <= late_published  # the window covers the late event's own published time
 
     conn = audit_store._get_connection()

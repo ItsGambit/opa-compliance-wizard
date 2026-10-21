@@ -46,6 +46,11 @@
       "since": "5.43.0",
       "rollback_safe": true,
       "description": "Adds per-user shared-permission exceptions and known identities"
+    },
+    "10": {
+      "since": "5.50.0",
+      "rollback_safe": false,
+      "description": "Adds chained configuration snapshots, the System Log polling cursor and indexed correlation fields"
     }
   }
 }
