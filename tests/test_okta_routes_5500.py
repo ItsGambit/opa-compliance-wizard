@@ -26,6 +26,25 @@ def _wait_capture(serve, env_id):
     raise AssertionError("capture did not finish")
 
 
+def _refresh_now(serve, env, name, okta, parts, trigger="manual", timeout=30):
+    """Runs one refresh job to its end with `okta` standing in for the Okta client, and returns the job record. (Post-sync
+    captures are the refresh job's `okta` part since 5.51.0, so these tests drive the job, not the bare sync.)"""
+    import server.refresh_jobs as rj
+    orig = engine.OktaClient
+    engine.OktaClient = lambda *a, **k: okta
+    try:
+        out = serve._start_refresh_job(env, name, parts=parts, trigger=trigger)
+        assert out["started"], out
+        job = serve._refresh_jobs[env]
+        end = time.monotonic() + timeout
+        while job.status == "running" and time.monotonic() < end:
+            time.sleep(0.05)
+        assert job.status == "done", job.status_view()
+        return job
+    finally:
+        engine.OktaClient = orig
+
+
 def _put_model(serve, env_id, model):
     with serve._access_jobs_lock:
         serve._access_jobs[env_id] = {"status": "done", "steps": [], "error": None, "result": model}
@@ -204,7 +223,8 @@ def test_overview_explicit_id_is_still_admin_only(matrix_server):
 def test_sync_job_takes_a_snapshot_after_the_sync_and_never_fails_because_of_it(tmp_audit_store, tmp_environments_file, fake_keyring, tmp_audit_log, monkeypatch):
     import server.serve as serve
     audit_store.run_migrations()
-    _, env = engine.upsert_environment("dev", {"base_domain": "a.example.com", "team_name": "t", "key_id": "k", "key_secret": "s"})
+    _, env = engine.upsert_environment("dev", {"base_domain": "a.example.com", "team_name": "t", "key_id": "k", "key_secret": "s",
+                                               "okta_url": "https://example.okta.com", "okta_api_token": "t"})
 
     class NoNetwork:  # the daily inventory count must never reach a real host from a test
         def __init__(self, *a, **k):
@@ -222,18 +242,19 @@ def test_sync_job_takes_a_snapshot_after_the_sync_and_never_fails_because_of_it(
 
         def get_system_log_page(self, path):
             return [], None
-    serve._run_sync_job(env, "dev", Sync(), "all", engine.LOCAL_OWNER_KEY)
-    assert serve._sync_jobs[env]["status"] == "done"
+    job = _refresh_now(serve, env, "dev", Sync(), ["log", "okta"], trigger="scheduled")
+    assert serve._sync_jobs[env]["status"] == "done" and job.part_state("log") == "ok"
     assert audit_store.list_config_snapshots(env, kind="okta_admins")[0]["status"] == "ok"
     assert audit_store.list_config_snapshots(env, kind="inventory_counts") == []  # Okta here has no counting endpoint: nothing countable, no snapshot, sync still done
     # a second sync inside the minimum interval does not hit Okta's role endpoints again
     fake = Sync()
-    serve._run_sync_job(env, "dev", fake, "all", engine.LOCAL_OWNER_KEY)
+    _refresh_now(serve, env, "dev", fake, ["log", "okta"], trigger="scheduled")
     assert not [c for c in fake.calls if c[0] == "assignees"] and len(audit_store.list_config_snapshots(env, kind="okta_admins")) == 1
     # and a snapshot that blows up leaves the sync "done"
     monkeypatch.setattr(oa, "capture_if_due", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
-    serve._run_sync_job(env, "dev", Sync(), "all", engine.LOCAL_OWNER_KEY)
-    assert serve._sync_jobs[env]["status"] == "done"
+    job = _refresh_now(serve, env, "dev", Sync(), ["log", "okta"], trigger="scheduled")
+    assert serve._sync_jobs[env]["status"] == "done" and job.part_state("log") == "ok"  # the log part is not failed by the capture
+    assert job.part_state("okta") == "error"  # and the failure is reported, not hidden
 
 
 # --- 5.50.0 overview additions: inventory, MFA aggregates, the audited privileged-people list -------------
@@ -318,7 +339,8 @@ def test_automatic_capture_failures_are_audited_with_the_trigger_and_the_invento
     import server.serve as serve
 
     audit_store.run_migrations()
-    _, env = engine.upsert_environment("dev", {"base_domain": "a.example.com", "team_name": "t", "key_id": "k", "key_secret": "s"})
+    _, env = engine.upsert_environment("dev", {"base_domain": "a.example.com", "team_name": "t", "key_id": "k", "key_secret": "s",
+                                               "okta_url": "https://example.okta.com", "okta_api_token": "t"})
 
     class NoNetwork:
         def __init__(self, *a, **k):
@@ -337,16 +359,16 @@ def test_automatic_capture_failures_are_audited_with_the_trigger_and_the_invento
         def get_system_log_page(self, path):
             return [], None
     monkeypatch.setattr(oa, "capture_if_due", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
-    serve._run_sync_job(env, "dev", Sync(), "all", engine.LOCAL_OWNER_KEY, trigger="scheduled")
+    job = _refresh_now(serve, env, "dev", Sync(), ["log", "okta"], trigger="scheduled")
     rows = [json.loads(line) for line in open(tmp_audit_log, encoding="utf-8") if line.strip()]
     failed = [r for r in rows if r["action"] == "okta_snapshot.failed"]
     assert any(r["details"]["kind"] == "okta_admins" and r["details"]["trigger"] == "scheduled" for r in failed)
-    assert serve._sync_jobs[env]["status"] == "done"  # still never fails the sync
+    assert serve._sync_jobs[env]["status"] == "done" and job.part_state("log") == "ok"  # still never fails the sync
     # a successful inventory capture records how long it took
     import inventory_counts
     monkeypatch.setattr(inventory_counts, "capture_if_due", lambda *a, **k: audit_store.record_config_snapshot(env, "inventory_counts", [("okta.users", {"count": 1})]))
     monkeypatch.setattr(oa, "capture_if_due", lambda *a, **k: None)
-    serve._run_sync_job(env, "dev", Sync(), "all", engine.LOCAL_OWNER_KEY, trigger="manual")
+    _refresh_now(serve, env, "dev", Sync(), ["log", "okta"], trigger="manual")
     rows = [json.loads(line) for line in open(tmp_audit_log, encoding="utf-8") if line.strip()]
     captured = [r for r in rows if r["action"] == "okta_snapshot.captured" and r["details"]["kind"] == "inventory_counts"]
     assert captured and isinstance(captured[-1]["details"]["inventory_seconds"], float)
@@ -365,7 +387,8 @@ def test_failed_capture_audit_entries_carry_the_error_class_and_status_not_the_r
     import server.serve as serve
 
     audit_store.run_migrations()
-    _, env = engine.upsert_environment("dev", {"base_domain": "secret-team.example.com", "team_name": "secret-team", "key_id": "k", "key_secret": "s"})
+    _, env = engine.upsert_environment("dev", {"base_domain": "secret-team.example.com", "team_name": "secret-team", "key_id": "k", "key_secret": "s",
+                                               "okta_url": "https://example.okta.com", "okta_api_token": "t"})
 
     class Leaky:
         def __init__(self, *a, **k):
@@ -386,7 +409,7 @@ def test_failed_capture_audit_entries_carry_the_error_class_and_status_not_the_r
         def count_okta_objects(self, *a, **k):
             raise engine.OktaApiError(500, "https://example.okta.com/api/v1/users", "x")
     monkeypatch.setattr(oa, "capture_if_due", lambda *a, **k: (_ for _ in ()).throw(engine.OktaApiError(500, "https://example.okta.com/api/v1/iam", "x")))
-    serve._run_sync_job(env, "dev", Sync(), "all", engine.LOCAL_OWNER_KEY, trigger="scheduled")
+    _refresh_now(serve, env, "dev", Sync(), ["log", "okta"], trigger="scheduled")
     raw = open(tmp_audit_log, encoding="utf-8").read()
     failed = [json.loads(line) for line in raw.splitlines() if '"okta_snapshot.failed"' in line]
     assert {f["details"]["kind"] for f in failed} >= {"okta_admins", "inventory_counts"}

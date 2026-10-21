@@ -711,6 +711,43 @@ def _access_model_view(environment_id, hydrate=True):
     return {"model": cached["model"], "built_at": cached["built_at"], "source": "cache", "modified_at": cached.get("modified_at")}
 
 
+def _patch_scan_member_removed(environment_id, group_id, user_name):
+    """After a user is removed from a group in OPA, applies the same change to the scan the Access Explorer shows (memory) and
+    to the stored scan, and records when it was edited ("edited since the scan"). Best effort: the removal itself already
+    happened in OPA, so a failure here is logged and the next scan corrects it. Returns True when a scan was patched."""
+    import audit_store
+    patched = False
+    stamp = _utc_now_iso()
+    with _access_jobs_lock:
+        job = _access_jobs.get(environment_id)
+        held = _scan_slot_previous(job) if job else None
+        model = job.get("result") if job and isinstance(job.get("result"), dict) else (held or {}).get("result")
+        if isinstance(model, dict):
+            for user in model.get("users") or []:
+                if isinstance(user, dict) and user.get("name") == user_name and isinstance(user.get("groups"), list):
+                    user["groups"] = [g for g in user["groups"] if not (isinstance(g, dict) and g.get("id") == group_id)]
+                    patched = True
+            if patched:
+                for slot in (job, job.get("previous") if job else None):
+                    if isinstance(slot, dict):
+                        slot["modified_at"] = stamp
+    try:
+        if patched:
+            audit_store.update_opa_model_cache(environment_id, model, modified_at=stamp)
+        else:
+            cached = audit_store.load_opa_model_cache(environment_id)
+            if cached is not None:
+                for user in cached["model"].get("users") or []:
+                    if isinstance(user, dict) and user.get("name") == user_name and isinstance(user.get("groups"), list):
+                        user["groups"] = [g for g in user["groups"] if not (isinstance(g, dict) and g.get("id") == group_id)]
+                        patched = True
+                if patched:
+                    audit_store.update_opa_model_cache(environment_id, cached["model"], modified_at=stamp)
+    except Exception as exc:
+        engine.log("WARN", f"The stored OPA scan could not be updated after a group change ({type(exc).__name__}); the next scan corrects it.")
+    return patched
+
+
 # ENG2-05: wizard writes to one security policy are serialised (see the
 # policy route). Keyed by (environment_id, policy_id); the dict only ever
 # holds one small lock per policy the wizard has written to.
@@ -1686,8 +1723,9 @@ def _refresh_part_okta(job, ctx):
     def do_principals():
         model = model_for_counts()
         if model is None:
-            why = "the OPA scan did not finish" if "opa" in job.parts else "no OPA scan is stored yet; run the OPA scan first"
-            return "skipped", f"Not run: {why}.", {}
+            if "opa" in job.parts:
+                return "skipped", "Not run: the OPA scan did not finish. It runs with the next refresh.", {}
+            return "skipped", "Not run: no OPA scan is stored yet. Select Refresh to scan OPA first.", {}
         cap = okta_admins.capture_principal_status(okta_client, model)
         snap = audit_store.record_config_snapshot(env_id, okta_admins.KIND_PRINCIPAL_STATUS, cap["items"], status=cap["status"],
                                                   source_endpoint=cap["source_endpoint"], meta=cap["meta"])
@@ -1706,8 +1744,8 @@ def _refresh_part_okta(job, ctx):
         snapshot_audit(snap, snap["kind"], inventory_seconds=round(time.monotonic() - started, 1))
         text = f"{snap['item_count']} series recorded."
         if model is None:
-            text = "Okta counts recorded; OPA counts missing today because the OPA scan did not finish." if "opa" in job.parts \
-                else "Okta counts recorded; OPA counts missing because no OPA scan is stored yet."
+            text = "Okta counts recorded. OPA counts are missing from today's snapshot because the OPA scan did not finish." if "opa" in job.parts \
+                else "Okta counts recorded. OPA counts are missing from this snapshot because no OPA scan is stored yet."
         return "ok", text, {"snapshot_id": snap["snapshot_id"], "items": snap["item_count"], "okta_only": model is None}
 
     def await_model():
@@ -4971,6 +5009,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if not group:
                     return self._send_json(404, {"error": f"Unknown group id '{group_id}'"})
                 local_client.remove_user_from_group(group["name"], user_name)
+                _patch_scan_member_removed(_local_env_id, group_id, user_name)
                 self._log_audit_event(actor_email, actor_sub, "group.remove_member", {
                     "env_name": local_env_name, "group_id": group_id, "user_name": user_name,
                 })
