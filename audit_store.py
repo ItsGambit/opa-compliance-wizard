@@ -1799,7 +1799,8 @@ def _verify_ingestion_chain_snapshot(conn, environment_id, deep, sync_in_progres
         elif unsealed:
             result.update({
                 "valid": False, "broken_at": None,
-                "reason": f"{unsealed} events are stored but not sealed into the evidence chain (a sync was interrupted); "
+                "reason": f"{unsealed} curated events are stored but not sealed into the evidence chain (a sync was interrupted, "
+                          "or events were re-flagged as curated after an upgrade); "
                           "the next sync seals them in a recovery manifest",
             })
     return result

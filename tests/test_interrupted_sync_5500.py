@@ -58,7 +58,7 @@ def test_a_killed_sync_leaves_events_that_verify_reports_and_the_next_sync_seals
     conn = audit_store._get_connection()
     assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 5 and conn.execute("SELECT COUNT(*) FROM manifest_entries").fetchone()[0] == 0
     v = audit_store.verify_ingestion_chain(ENV, deep=True)
-    assert v["valid"] is False and v["unsealed_events"] == 5 and "5 events are stored but not sealed" in v["reason"]
+    assert v["valid"] is False and v["unsealed_events"] == 5 and "5 curated events are stored but not sealed" in v["reason"]
     # the next sync seals them first, in a recovery manifest that says what it is, then continues from the saved cursor
     resumed = Pages({_next("c2"): ([_event("n1", 2)], _next("c3"))})
     result = audit_store.sync_okta_events(resumed, ENV, "all")
