@@ -122,7 +122,9 @@ retention indicator):
   Curated events are the evidence trail itself, so they're **never**
   auto-pruned by this setting regardless of scope — retention only
   ever prunes non-curated ("everything" scope) events past the
-  configured window/size.
+  configured window/size. The per-person weekly sign-in counts behind the
+  Overview follow the time window; Okta snapshots (which hold names) are
+  never pruned and go with a purge of the environment's archive.
 - **Schedule** — enable a daily sync, choose the run time (shown in
   UTC), and the background job keeps the archive current with
   delta-only pulls (it only asks Okta for events published after the

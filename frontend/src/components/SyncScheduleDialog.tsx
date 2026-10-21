@@ -295,7 +295,7 @@ function SyncScheduleContent({ env, restoreDraft }: Props) {
                 </div>
                 <p className="text-[0.6875rem] text-text-faint">
                   Curated events are never pruned regardless of retention or ingestion scope. Leave a limit empty for
-                  no limit — 0 is not accepted. The size cap counts this environment's own archived event payload.
+                  no limit — 0 is not accepted. The size cap counts this environment's own archived event payload. The per-person weekly sign-in counts behind the Overview follow the retention window. Names in Okta snapshots (admins, the Okta status of OPA principals) are kept until the environment's archive is purged.
                   {!env.is_own && ' Only the owner can change retention: it deletes archived events.'}
                 </p>
                 </fieldset>

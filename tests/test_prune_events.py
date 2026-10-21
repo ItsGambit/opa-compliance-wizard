@@ -137,3 +137,28 @@ def test_retention_prune_leaves_recent_events_with_targets_alone(tmp_audit_store
     assert conn.execute(
         "SELECT COUNT(*) FROM event_targets WHERE environment_id = ?", (ENV,)
     ).fetchone()[0] == 1
+
+
+def test_retention_also_deletes_per_person_weekly_rows_older_than_the_cutoff(tmp_audit_store, tmp_environments_file):
+    """5.50.0 (M2): mfa_week_user holds a login and factor counts per week; it must not outlive the events it was counted from.
+    The all-people totals hold no names and stay; a week at or after the cutoff week stays."""
+    audit_store.run_migrations()
+    env = "99999999-9999-9999-9999-999999999999"
+    conn = audit_store._get_connection()
+    now = datetime.now(timezone.utc)
+    old = (now - timedelta(days=60)).strftime("%Y-%m-%d")
+    old = (datetime.strptime(old, "%Y-%m-%d") - timedelta(days=datetime.strptime(old, "%Y-%m-%d").weekday())).strftime("%Y-%m-%d")
+    new = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+    new = (datetime.strptime(new, "%Y-%m-%d") - timedelta(days=datetime.strptime(new, "%Y-%m-%d").weekday())).strftime("%Y-%m-%d")
+    for week in (old, new):
+        conn.execute("INSERT INTO mfa_week_user VALUES (?,?,?,?,?,?)", (env, week, "00u1", "a@example.com", "signin", 5))
+        conn.execute("INSERT INTO mfa_week_totals VALUES (?,?,?,?)", (env, week, "signin", 5))
+    other = "88888888-0000-0000-0000-000000000001"
+    conn.execute("INSERT INTO mfa_week_user VALUES (?,?,?,?,?,?)", (other, old, "00u9", "z@example.com", "signin", 1))
+    conn.commit()
+    audit_store.prune_events(env, retention_days=30)
+    assert [r[0] for r in conn.execute("SELECT week FROM mfa_week_user WHERE environment_id = ?", (env,))] == [new]
+    assert conn.execute("SELECT COUNT(*) FROM mfa_week_totals WHERE environment_id = ?", (env,)).fetchone()[0] == 2  # no names: kept
+    assert conn.execute("SELECT COUNT(*) FROM mfa_week_user WHERE environment_id = ?", (other,)).fetchone()[0] == 1  # another environment untouched
+    audit_store.prune_events(env, retention_days=None)  # no time retention configured: nothing more is deleted
+    assert conn.execute("SELECT COUNT(*) FROM mfa_week_user WHERE environment_id = ?", (env,)).fetchone()[0] == 1

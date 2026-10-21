@@ -2790,6 +2790,12 @@ def _delete_pruned_targets(conn, environment_id, events_where_sql, events_where_
     )
 
 
+def _week_monday(published):
+    """The Monday (YYYY-MM-DD) of the week a canonical timestamp falls in: weeks labelled before it ended before it."""
+    dt = datetime.strptime(published[:10], "%Y-%m-%d")
+    return (dt - timedelta(days=dt.weekday())).strftime("%Y-%m-%d")
+
+
 def prune_events(environment_id, retention_days=None, max_size_mb=None):
     """Deletes non-curated rows older than retention_days. Curated rows
     (is_curated=1) are NEVER auto-pruned regardless of ingestion_scope --
@@ -2827,6 +2833,9 @@ def prune_events(environment_id, retention_days=None, max_size_mb=None):
                     (environment_id, cutoff),
                 )
                 pruned_total += cur.rowcount
+                # 5.50.0: the per-person weekly sign-in rows follow the events they were counted from (weeks that ended before
+                # the cutoff go; the all-people totals hold no names and stay). Snapshots are not touched: they are curated.
+                conn.execute("DELETE FROM mfa_week_user WHERE environment_id = ? AND week < ?", (environment_id, _week_monday(cutoff)))
                 conn.commit()
             except Exception:
                 conn.rollback()  # DATA-11

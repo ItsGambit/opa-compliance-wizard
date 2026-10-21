@@ -157,11 +157,11 @@ to Okta (the optional group creation of the Folder Builder is the only write the
 | Okta admins: user id, status, login, e-mail, first and last name, role assignments (role, status, dates, group or app targets, time-bound grants), custom roles and their permission names, resource sets | the Okta Admins report, as of any snapshot date | with the environment's archive (delete the environment with "also delete its archive", or purge an orphaned archive) |
 | The Okta status of each OPA user and Okta service account | the lifecycle cross-check | same |
 | Daily counts (OPA objects, Okta users, groups, apps, policies by type, admin role holders) | the Overview's inventory over time | same; counts only, no names |
-| Per person and week: counts of sign-ins and of multi-factor events by factor class | the Overview's sign-in and MFA figures | same |
+| Per person and week: counts of sign-ins and of multi-factor events by factor class | the Overview's sign-in and MFA figures | follows the event retention setting (weeks that ended before the cutoff are deleted at each sync; the all-people totals hold no names and stay), or with the archive |
 
 Never stored: Okta `credentials` objects, any profile attribute beyond login, e-mail and name, tokens.
-Snapshots are sealed into the same tamper-evident chain as the archived log and are never pruned by
-retention; a deep integrity check verifies them.
+Snapshots (which hold the names in the first two rows) are sealed into the same tamper-evident chain as the archived log and are never pruned by
+retention: they are kept until the environment's archive is purged. A deep integrity check verifies them.
 
 **Which Okta role the token needs.** The Okta Admins report calls Okta's role-assignment APIs, which Okta
 only answers for a token whose admin can view roles and admin assignments: **Super Administrator**, or a
