@@ -12,6 +12,7 @@ import type {
   CrossChecksResponse,
   OktaAdminsReport,
   Overview,
+  PrivilegedPerson,
   ComplianceReportResponse,
   CreateGroupResponse,
   CsvRow,
@@ -659,7 +660,7 @@ export function fetchConfigSnapshotExport(environment: string, snapshotId: numbe
 }
 
 /** Starts a background capture (Okta admins, or the Okta status of every OPA principal). */
-export function startOktaCapture(environment: string, kind: 'okta_admins' | 'opa_principal_status'): Promise<{ started: boolean; already_running: boolean }> {
+export function startOktaCapture(environment: string, kind: 'okta_admins' | 'opa_principal_status' | 'inventory_counts' | 'mfa_aggregates'): Promise<{ started: boolean; already_running: boolean }> {
   return apiFetch(envPath(environment, 'okta_snapshots/capture'), { method: 'POST', body: JSON.stringify({ kind }) })
 }
 
@@ -669,8 +670,17 @@ export function logOktaAdminsExport(environment: string, format: 'csv' | 'md', a
 }
 
 /** Admin-only aggregate of counts for the executive dashboard. */
-export function fetchOverview(environment: string, asOf?: string): Promise<Overview> {
+export function fetchOverview(environment: string, asOf?: string, weeks?: number): Promise<Overview> {
   const params = new URLSearchParams({ environment })
   if (asOf) params.set('as_of', asOf)
+  if (weeks) params.set('weeks', String(weeks))
   return apiFetch(`/api/overview?${params.toString()}`)
+}
+
+/** The names behind the Overview's privileged sign-in / MFA figures. Admin-only; every read is audited. */
+export function fetchPrivilegedPeople(environment: string, asOf?: string, weeks?: number): Promise<{ weeks: number; people: PrivilegedPerson[]; generated_at: string; note: string }> {
+  const params = new URLSearchParams({ environment })
+  if (asOf) params.set('as_of', asOf)
+  if (weeks) params.set('weeks', String(weeks))
+  return apiFetch(`/api/overview/privileged?${params.toString()}`)
 }

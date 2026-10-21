@@ -725,7 +725,31 @@ def user_flags(environment_id):
 # ---------------------------------------------------------------------------
 # Overview: counts only
 # ---------------------------------------------------------------------------
-def build_overview(environment_id, as_of=None, access_model=None, service_accounts_total=None, now=None, integrity=None):
+def privileged_identity_sets(environment_id, access_model=None, as_of=None):
+    """(okta_user_ids, logins, sources): the people counted as privileged for the sign-in / MFA cohort --
+    Okta admin role holders in the as-of snapshot (by Okta user id) and OPA users with an OPA admin role
+    (by login / e-mail, which is how the System Log names them). `sources` maps each to why."""
+    snap = audit_store.latest_config_snapshot(environment_id, KIND_ADMINS, as_of=as_of)
+    ids, logins, sources = set(), set(), {}
+    if snap:
+        for item in snap["items"]:
+            obj = item["object"] if isinstance(item["object"], dict) else {}
+            if obj.get("kind") == "user" and obj.get("id") and obj.get("roles"):
+                ids.add(obj["id"])
+                if obj.get("login"):
+                    logins.add(obj["login"].lower())
+                sources.setdefault(obj["id"], set()).add("okta_admin")
+    index = opa_role_index(access_model)
+    for u in index["users"]:
+        if u["powerful_roles"]:
+            for key in (u.get("email"), u.get("name")):
+                if isinstance(key, str) and key.strip():
+                    logins.add(key.strip().lower())
+                    sources.setdefault("login:" + key.strip().lower(), set()).add("opa_admin")
+    return ids, logins, sources
+
+
+def build_overview(environment_id, as_of=None, access_model=None, service_accounts_total=None, now=None, integrity=None, weeks=26):
     """Counts for the executive dashboard, one cheap aggregate. Every Okta-derived
     block carries its own state ("ok" | "refused" | "never_captured" | "error" |
     "not_loaded") so a block whose Okta read was refused says so instead of
@@ -750,8 +774,39 @@ def build_overview(environment_id, as_of=None, access_model=None, service_accoun
     admin_block = {"state": admins["state"], "message": admins.get("message"), "count": admins["summary"].get("admins"),
                    "by_role": admins["summary"].get("by_role", {}), "time_bound": admins["summary"].get("time_bound"),
                    "snapshot": admins.get("as_of_snapshot")}
+    import inventory_counts
+    import signin_mfa
+    end = now
+    if as_of:
+        bound = audit_store.normalize_window(None, as_of)[1]
+        parsed = audit_store._canonical_published(bound)
+        if parsed:
+            end = min(now, datetime.fromisoformat(parsed.replace("Z", "+00:00")))
+    mfa_state = signin_mfa.built(environment_id)
+    if mfa_state is None:
+        signins_mfa = {"state": "not_built", "message": "The sign-in and MFA figures have not been built from the archive yet.", "weeks": []}
+    else:
+        pids, plogins, _src = privileged_identity_sets(environment_id, access_model, as_of)
+        everyone = signin_mfa.weekly(environment_id, weeks, end)
+        privileged = signin_mfa.weekly(environment_id, weeks, end, actor_ids=pids, actor_alts=plogins) if (pids or plogins) else []
+        signins_mfa = {
+            "state": "ok", "built_at": mfa_state["built_at"], "updated_at": mfa_state["updated_at"], "events_used": mfa_state["events_used"],
+            "weeks": [w["week"] for w in everyone], "everyone": everyone, "privileged": privileged,
+            "privileged_cohort": {"okta_admins": len(pids), "opa_admin_logins": len(plogins)} if (pids or plogins) else None,
+            "scope": coverage.get("ingestion_scope"),
+            "notes": [
+                "Sign-in volume is successful user.session.start events in the archive; MFA figures are successful and failed "
+                "user.authentication.auth_via_mfa events, classified by the factor the event names. Password-only is derived "
+                "(sign-ins minus multi-factor sign-ins in the same week) and is not observed.",
+                "The privileged group is today's Okta admin role holders and OPA users with an OPA admin role, applied to the whole history.",
+            ],
+        }
+        if privileged == [] and not (pids or plogins):
+            signins_mfa["privileged_message"] = "No privileged people are known yet (capture the Okta admins and load the OPA roster)."
     return {
         "environment_id": environment_id, "as_of": as_of, "generated_at": _iso(now),
+        "inventory": inventory_counts.series_summary(environment_id, as_of=as_of, now=now),
+        "signins_mfa": signins_mfa,
         "okta_admins": admin_block,
         "opa_privileged_users": {"state": index["state"], "count": sum(1 for u in index["users"] if u["powerful_roles"]) if index["state"] != "not_loaded" else None,
                                  "users_total": len(index["users"]) if index["state"] != "not_loaded" else None},
@@ -768,3 +823,44 @@ def build_overview(environment_id, as_of=None, access_model=None, service_accoun
         "weekly_privilege_events": weekly,
         "snapshot_dates": [{"snapshot_id": s["snapshot_id"], "captured_at": s["captured_at"], "status": s["status"]} for s in snapshots],
     }
+
+
+def privileged_people_report(environment_id, access_model=None, as_of=None, weeks=26, now=None):
+    """The people behind the privileged cohort of the Overview's sign-in / MFA figures (names), with each
+    person's own figures over the window. Okta admin role holders (as-of snapshot) and OPA users with an
+    OPA admin role, merged by login. Served only by the audited, admin-only endpoint."""
+    import signin_mfa
+    now = now or _now()
+    snap = audit_store.latest_config_snapshot(environment_id, KIND_ADMINS, as_of=as_of)
+    people = {}  # lower login or id -> person
+
+    def person(key):
+        return people.setdefault(key, {"login": None, "name": None, "okta_user_id": None, "okta_roles": [], "okta_status": None, "opa_roles": []})
+
+    if snap:
+        for item in snap["items"]:
+            o = item["object"] if isinstance(item["object"], dict) else {}
+            if o.get("kind") == "user" and o.get("id") and o.get("roles"):
+                p = person((o.get("login") or o["id"]).lower())
+                p.update(login=o.get("login"), okta_user_id=o["id"], okta_status=o.get("status"),
+                         name=" ".join(x for x in (o.get("first_name"), o.get("last_name")) if x) or None,
+                         okta_roles=sorted({r["type"] for r in o["roles"] if r.get("type")}))
+    for u in opa_role_index(access_model)["users"]:
+        if u["powerful_roles"]:
+            key = next((k.strip().lower() for k in (u.get("email"), u.get("name")) if isinstance(k, str) and k.strip()), None)
+            if key:
+                p = people.get(key) or person(key)
+                p["login"] = p["login"] or key
+                p["opa_roles"] = u["powerful_roles"]
+    ids = {p["okta_user_id"] for p in people.values() if p["okta_user_id"]}
+    logins = {p["login"].lower() for p in people.values() if p["login"]}
+    figures = signin_mfa.privileged_people(environment_id, ids, logins, weeks, now)
+    by_id = {f["actor_id"]: f for f in figures}
+    by_login = {(f["login"] or "").lower(): f for f in figures if f["login"]}
+    out = []
+    for key, p in people.items():
+        f = by_id.get(p["okta_user_id"]) or by_login.get((p["login"] or "").lower())
+        out.append({**p, "figures": {k: f[k] for k in ("signins", "mfa_success", "phishing_resistant_share", "sms_voice", "mfa_failed", "by_class")} if f else None})
+    out.sort(key=lambda x: ((x["login"] or "").lower(), x["okta_user_id"] or ""))
+    return {"weeks": weeks, "people": out, "generated_at": _iso(now),
+            "note": "Each person's figures are their own sign-ins and multi-factor events in the archive over the window."}

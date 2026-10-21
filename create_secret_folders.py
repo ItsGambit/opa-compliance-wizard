@@ -3338,14 +3338,16 @@ class OktaClient:
         return devices
 
     # -- read-only walkers for the Okta Admins report and the lifecycle cross-check (5.50.0) --------------------
-    def list_all(self, path, list_key=None, max_items=100000):
+    def list_all(self, path, list_key=None, max_items=100000, stop_at_cap=False):
         """GET `path` and follow its pagination to the end, returning the
         dict items of the list (the response itself, or its `list_key`
         member). Follows the rel="next" Link header, or the body's
         `_links.next.href` (which the role-assignment endpoints use), on THIS
         org's origin only. A repeating link, a body that is not the expected
         shape, or more than `max_items` items is an OktaApiError("invalid_
-        response"), never a silently short list."""
+        response"), never a silently short list -- unless the caller passes
+        stop_at_cap=True (inventory counts), which returns the first
+        `max_items` items and lets the caller see len(...) >= max_items."""
         what = path.split("?", 1)[0]
         items, seen, next_path = [], {path}, path
         while next_path:
@@ -3357,6 +3359,8 @@ class OktaClient:
                 raise OktaApiError(API_STATUS_INVALID_RESPONSE, what, "the response is not a list")
             items.extend(x for x in page if isinstance(x, dict))
             if len(items) > max_items:
+                if stop_at_cap:
+                    return items[:max_items]
                 raise OktaApiError(API_STATUS_INVALID_RESPONSE, what, f"more than {max_items} results; stopping")
             if not page:
                 break
@@ -3411,6 +3415,24 @@ class OktaClient:
         feature answer an error (E0000015); the caller treats that as 'not enabled'."""
         resp = self.request("GET", f"/api/v1/users/{_path_id(user_id)}/roles/{_path_id(role_assignment_id)}/governance")
         return resp if isinstance(resp, dict) else {}
+
+    def count_okta_objects(self, kind, policy_type=None, max_items=50000):
+        """(count, capped) of apps, groups, users or policies of one type, by
+        paging the list endpoints (Okta has no count endpoint). Read-only; a
+        user count covers the users Okta's list returns (it omits DEPROVISIONED
+        ones). capped is True when the cap was reached (the count is then a
+        lower bound)."""
+        paths = {"apps": "/api/v1/apps?limit=200", "groups": "/api/v1/groups?limit=200", "users": "/api/v1/users?limit=200"}
+        if kind == "policies":
+            if not isinstance(policy_type, str) or not re.fullmatch(r"[A-Z_]{3,64}", policy_type):
+                raise ValueError("policy_type must be an Okta policy type such as OKTA_SIGN_ON")
+            path = f"/api/v1/policies?type={policy_type}"
+        elif kind in paths:
+            path = paths[kind]
+        else:
+            raise ValueError("unknown object kind")
+        items = self.list_all(path, max_items=max_items, stop_at_cap=True)
+        return len(items), len(items) >= max_items
 
     def list_custom_roles(self):
         """GET /api/v1/iam/roles -> the `roles` list."""
@@ -6521,6 +6543,7 @@ def build_access_model(client, okta_client=None, on_progress=None):
 
     _report(on_progress, "index_resources", "start")
     indexed_count = 0
+    folder_total = secret_total = 0  # 5.50.0: counts for the inventory time series (the model itself keeps only id lookups)
     for rg, rg_projects in projects_by_rg:
         for project in rg_projects:
             project = dict(project)
@@ -6536,6 +6559,8 @@ def build_access_model(client, okta_client=None, on_progress=None):
             proj_ref_named = {**proj_ref, "resource_group_name": rg["name"]}
 
             folders, secrets = fetch_all_folders_and_secrets(client, rg["id"], project["id"])
+            folder_total += len(folders)
+            secret_total += len(secrets)
             for f in folders:
                 if f.get("id"):
                     indexes["secret_folders"][f["id"]] = proj_ref
@@ -6762,6 +6787,8 @@ def build_access_model(client, okta_client=None, on_progress=None):
         "relationships": relationships,
         "clients": clients,
         "devices": devices,
+        # 5.50.0: totals across every project, for the daily inventory counts (counts only; no names).
+        "inventory_totals": {"secret_folders": folder_total, "secrets": secret_total},
         # ENG2-07: sections that came back empty because the service key
         # may not read them -- the UI shows these instead of implying "none".
         "warnings": warnings,

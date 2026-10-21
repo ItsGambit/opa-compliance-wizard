@@ -820,6 +820,20 @@ def _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, trigger
                 }, client_ip=client_ip, user_agent=user_agent)
         except Exception as snap_exc:
             engine.log("WARN", f"okta admin snapshot after the sync of '{env_name}' failed: {type(snap_exc).__name__}")
+        # Daily inventory counts (OPA and Okta, counts only) and the incremental sign-in / MFA aggregates.
+        try:
+            import inventory_counts
+            import signin_mfa
+            creds = engine.get_environment_credentials_by_id(env_id, owner=owner)
+            opa_client = engine.OpaClient(creds["base_domain"], creds["team_name"], creds["key_id"], creds["key_secret"])
+            inv = inventory_counts.capture_if_due(env_id, okta_client=okta_client, opa_client=opa_client, model=_access_model_for(env_id))
+            if inv:
+                engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.captured", {
+                    "name": env_name, "kind": inv["kind"], "snapshot_id": inv["snapshot_id"], "status": inv["status"],
+                    "item_count": inv["item_count"], "trigger": trigger}, client_ip=client_ip, user_agent=user_agent)
+            signin_mfa.refresh(env_id)
+        except Exception as inv_exc:
+            engine.log("WARN", f"inventory counts / MFA aggregates after the sync of '{env_name}' failed: {type(inv_exc).__name__}")
     except Exception as exc:
         with _sync_jobs_lock:
             _sync_jobs[storage_name]["status"] = "error"
@@ -956,7 +970,7 @@ def _launch_claimed_sync(env_id, env_name, ingestion_scope, owner, trigger, acto
 # the report routes poll `capture` below. One capture per environment at a time; nothing is retried.
 _capture_jobs_lock = threading.Lock()
 _capture_jobs = {}  # environment_id -> {"status": idle|running|done|error, "kind", "error", "finished_at"}
-CAPTURE_KINDS = ("okta_admins", "opa_principal_status")
+CAPTURE_KINDS = ("okta_admins", "opa_principal_status", "inventory_counts", "mfa_aggregates")
 
 
 def _capture_state(environment_id):
@@ -984,11 +998,24 @@ def _run_capture_job(env_id, env_name, owner, kind, model, correlation_id, actor
     engine.CORRELATION_ID.set(correlation_id)
     try:
         creds = engine.get_environment_credentials_by_id(env_id, owner=owner)
-        if not creds.get("okta_url") or not creds.get("okta_api_token"):
+        if kind != "mfa_aggregates" and (not creds.get("okta_url") or not creds.get("okta_api_token")):
             raise ValueError("No Okta URL/API token configured for this environment.")
-        okta_client = engine.OktaClient(creds["okta_url"], creds["okta_api_token"])
+        okta_client = engine.OktaClient(creds["okta_url"], creds["okta_api_token"]) if creds.get("okta_api_token") else None
+        if kind == "mfa_aggregates":
+            import signin_mfa
+            result = signin_mfa.refresh(env_id)
+            with _capture_jobs_lock:
+                _capture_jobs[env_id] = {"status": "done", "kind": kind, "error": None, "finished_at": _utc_now_iso()}
+            engine.log_audit_event(actor_email, actor_sub, "okta_snapshot.captured", {
+                "name": env_name, "kind": kind, "events_scanned": result["events_scanned"], "trigger": "manual"},
+                client_ip=client_ip, user_agent=user_agent)
+            return
         if kind == okta_admins.KIND_ADMINS:
             snap = okta_admins.capture_and_store(env_id, okta_client)
+        elif kind == "inventory_counts":
+            import inventory_counts
+            opa_client = engine.OpaClient(creds["base_domain"], creds["team_name"], creds["key_id"], creds["key_secret"])
+            snap = inventory_counts.capture_inventory(env_id, okta_client=okta_client, opa_client=opa_client, model=model)
         else:
             cap = okta_admins.capture_principal_status(okta_client, model)
             snap = audit_store.record_config_snapshot(
@@ -1595,6 +1622,57 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json(404, {"error": f"No environment named '{name}' visible to this user."})
             return None
         return name, meta
+
+    def _serve_overview(self, path, qs, owner_key, engine_owner, local_env_name):
+        """GET /api/overview and GET /api/overview/privileged (see the routes in do_GET)."""
+        # 5.50.0: counts only (/api/overview), or the audited list of the privileged people behind the
+        # sign-in / MFA figures (/api/overview/privileged). Admin-only and not available through an
+        # additional login gate (nginx answers 403 there for the whole /api/overview prefix). Each
+        # Okta-derived block carries its own state, so a refused read says "refused", never zero.
+        privileged = path.endswith("/privileged")
+        if not _can_admin(owner_key, self.headers):
+            return self._send_json(403, {"error": "Admin access required for the overview."})
+        import audit_store
+        import okta_admins
+        name = (qs.get("environment") or qs.get("env") or [local_env_name])[0]
+        admin_id = (qs.get("id") or [None])[0]
+        if admin_id:
+            meta = engine.list_all_environments().get(admin_id)
+            name = (meta or {}).get("name")
+            if meta is not None:
+                meta = {**meta, "environment_id": admin_id}
+        elif not name:
+            return self._send_json(400, {"error": "No active environment and none specified via ?environment="})
+        else:
+            meta = engine.list_environments_for(engine_owner).get(name)
+        if meta is None:
+            return self._send_json(404, {"error": f"No environment named '{name}' visible to this user."})
+        as_of = (qs.get("as_of") or [None])[0] or None
+        try:
+            weeks = int((qs.get("weeks") or [26])[0])
+        except ValueError:
+            return self._send_json(400, {"error": "weeks must be an integer"})
+        if not 1 <= weeks <= 156:
+            return self._send_json(400, {"error": "weeks must be between 1 and 156"})
+        env_id = meta["environment_id"]
+        _o, _e, actor_email, actor_sub = self._caller()
+        try:
+            audit_store.normalize_window(None, as_of)
+            model = _access_model_for(env_id)
+            if privileged:
+                people = okta_admins.privileged_people_report(env_id, access_model=model, as_of=as_of, weeks=weeks)
+                self._log_audit_event(actor_email, actor_sub, "overview.privileged_read", {"name": name, "as_of": as_of, "people": len(people["people"]), "weeks": weeks})
+                return self._send_json(200, people)
+            accounts = (len(model.get("saas_accounts") or []) + len(model.get("okta_accounts") or [])) if model else None
+            chain = audit_store.verify_ingestion_chain(env_id)
+            overview = okta_admins.build_overview(
+                env_id, as_of=as_of, access_model=model, service_accounts_total=accounts, weeks=weeks,
+                integrity={k: chain.get(k) for k in ("valid", "manifest_count", "reason", "head_hash")})
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        overview["capture"] = _capture_state(env_id)
+        self._log_audit_event(actor_email, actor_sub, "overview.read", {"name": name, "as_of": as_of})
+        return self._send_json(200, overview)
 
     def _caller(self):
         """(owner_key, engine_owner, actor_email, actor_sub) for this request."""
@@ -2756,41 +2834,13 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_json(200, {"snapshots": audit_store.list_config_snapshots(meta["environment_id"], kind=kind, limit=200)})
 
             if path == "/api/overview":
-                # 5.50.0: counts only, for the executive dashboard. Admin-only and not available through an additional
-                # login gate (nginx answers 403 there). Each Okta-derived block carries its own state, so a refused
-                # Okta read says "refused", never zero.
-                if not _can_admin(owner_key, self.headers):
-                    return self._send_json(403, {"error": "Admin access required for the overview."})
-                import audit_store
-                import okta_admins
-                name = (qs.get("environment") or qs.get("env") or [local_env_name])[0]
-                admin_id = (qs.get("id") or [None])[0]
-                if admin_id:
-                    meta = engine.list_all_environments().get(admin_id)
-                    name = (meta or {}).get("name")
-                    if meta is not None:
-                        meta = {**meta, "environment_id": admin_id}
-                elif not name:
-                    return self._send_json(400, {"error": "No active environment and none specified via ?environment="})
-                else:
-                    meta = engine.list_environments_for(engine_owner).get(name)
-                if meta is None:
-                    return self._send_json(404, {"error": f"No environment named '{name}' visible to this user."})
-                as_of = (qs.get("as_of") or [None])[0] or None
-                env_id = meta["environment_id"]
-                try:
-                    audit_store.normalize_window(None, as_of)
-                    model = _access_model_for(env_id)
-                    accounts = (len(model.get("saas_accounts") or []) + len(model.get("okta_accounts") or [])) if model else None
-                    chain = audit_store.verify_ingestion_chain(env_id)
-                    overview = okta_admins.build_overview(
-                        env_id, as_of=as_of, access_model=model, service_accounts_total=accounts,
-                        integrity={k: chain.get(k) for k in ("valid", "manifest_count", "reason", "head_hash")})
-                except ValueError as exc:
-                    return self._send_json(400, {"error": str(exc)})
-                _o, _e, actor_email, actor_sub = self._caller()
-                self._log_audit_event(actor_email, actor_sub, "overview.read", {"name": name, "as_of": as_of})
-                return self._send_json(200, overview)
+                # 5.50.0: counts only, for the executive dashboard. Admin-only; not available through an additional
+                # login gate (nginx answers 403 there). See _serve_overview.
+                return self._serve_overview(path, qs, owner_key, engine_owner, local_env_name)
+
+            if path == "/api/overview/privileged":
+                # The audited list of the privileged people behind the Overview's sign-in / MFA figures. Admin-only.
+                return self._serve_overview(path, qs, owner_key, engine_owner, local_env_name)
 
             if path == "/api/archives/orphaned":
                 # DATA-12: archives whose environment no longer exists.
@@ -3617,6 +3667,8 @@ class Handler(SimpleHTTPRequestHandler):
                 if kind not in CAPTURE_KINDS:
                     return self._send_json(400, {"error": f"kind must be one of {list(CAPTURE_KINDS)}"})
                 model = None
+                if kind == "inventory_counts":
+                    model = _access_model_for(meta["environment_id"])  # reused when loaded, built fresh otherwise
                 if kind == "opa_principal_status":
                     model = _access_model_for(meta["environment_id"])
                     if model is None:

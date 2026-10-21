@@ -1543,7 +1543,54 @@ export interface ConfigSnapshotDiff {
 
 export type OverviewBlockState = 'ok' | 'never_captured' | 'refused' | 'error' | 'no_snapshot_for_date' | 'not_loaded' | 'partial' | 'never_run'
 
+export interface InventorySeries {
+  key: string
+  label: string
+  side: 'opa' | 'okta'
+  first_seen: string
+  latest: number
+  latest_at: string
+  /** Change since the newest snapshot at least 7 / 30 days older than the latest; null when there is none that old (never inferred). */
+  delta_7d: number | null
+  delta_30d: number | null
+  points: { t: string; count: number }[]
+}
+
+export interface MfaWeek {
+  week: string
+  signins: number
+  mfa_success: number
+  by_class: Record<string, number>
+  unclassified: number
+  phishing_resistant: number
+  phishing_resistant_share: number | null
+  sms_voice: number
+  /** Derived (sign-ins minus multi-factor sign-ins), not observed. */
+  password_only_derived: number
+  mfa_failed: number
+  mfa_failure_rate: number | null
+}
+
+export interface PrivilegedPerson {
+  login: string | null
+  name: string | null
+  okta_user_id: string | null
+  okta_roles: string[]
+  okta_status: string | null
+  opa_roles: string[]
+  figures: { signins: number; mfa_success: number; phishing_resistant_share: number | null; sms_voice: number; mfa_failed: number; by_class: Record<string, number> } | null
+}
+
 export interface Overview {
+  inventory: { state: 'ok' | 'never_captured'; series: InventorySeries[]; snapshots: number; latest: string | null; problems: { series: string; state: string }[] }
+  signins_mfa:
+    | { state: 'not_built'; message: string; weeks: [] }
+    | {
+        state: 'ok'; built_at: string | null; updated_at: string | null; events_used: number; weeks: string[]
+        everyone: MfaWeek[]; privileged: MfaWeek[]; privileged_cohort: { okta_admins: number; opa_admin_logins: number } | null
+        scope: string | null; notes: string[]; privileged_message?: string
+      }
+  capture?: CaptureJobState
   environment_id: string
   as_of: string | null
   generated_at: string

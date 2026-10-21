@@ -388,10 +388,11 @@ export function useConfigSnapshotDiff(environment: string | undefined, older: nu
   })
 }
 
-export function useOverview(environment: string | undefined, asOf?: string, enabled = true) {
+export function useOverview(environment: string | undefined, asOf?: string, enabled = true, weeks?: number) {
   return useQuery({
-    queryKey: ['overview', environment, asOf ?? null],
-    queryFn: () => fetchOverview(environment!, asOf),
+    queryKey: ['overview', environment, asOf ?? null, weeks ?? null],
+    queryFn: () => fetchOverview(environment!, asOf, weeks),
+    refetchInterval: (query: { state: { data?: { capture?: { status?: string } } } }) => (query.state.data?.capture?.status === 'running' ? 2000 : false),
     enabled: !!environment && enabled,
     retry: false,
     refetchOnWindowFocus: false,

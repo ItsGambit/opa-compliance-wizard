@@ -54,6 +54,8 @@ export function overview(over: Partial<Overview> = {}): Overview {
     opa_service_accounts: { state: 'ok', count: 4 },
     archive: { has_archive: true, coverage_days: 80, oldest_event: '2026-07-14T00:00:00.000Z', last_sync_completed_at: '2026-10-03T00:00:00.000Z', last_sync_status: 'success', ingestion_scope: 'curated', chain: null },
     weekly_privilege_events: { grants: 2, revokes: 1, since: '2026-09-26T00:00:00.000Z', revokes_archived: true },
+    inventory: { state: 'never_captured', series: [], snapshots: 0, latest: null, problems: [] },
+    signins_mfa: { state: 'not_built', message: 'not built', weeks: [] },
     snapshot_dates: [{ snapshot_id: 7, captured_at: snapshot.captured_at, status: 'ok' }], ...over,
   }
 }

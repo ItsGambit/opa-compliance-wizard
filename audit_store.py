@@ -804,6 +804,9 @@ def _migration_010_snapshots_polling_sync_and_correlation(conn):
       sync resumes from its stored watermark in polling mode (see
       sync_okta_events): no gap, and the 1-hour overlap is deduplicated
       by event uuid.
+    - mfa_week_totals / mfa_week_user / mfa_agg_state: the weekly sign-in and
+      MFA aggregates behind the Overview (see signin_mfa.py), refreshed
+      incrementally from the archive; derived data, rebuildable from events.
     - events.transaction_id / root_session_id / api_token_id: the
       System Log correlation fields (transaction.id,
       authenticationContext.rootSessionId, transaction.detail.
@@ -838,6 +841,31 @@ def _migration_010_snapshots_polling_sync_and_correlation(conn):
         );
         CREATE INDEX IF NOT EXISTS idx_config_snapshot_items_env
             ON config_snapshot_items (environment_id);
+        CREATE TABLE IF NOT EXISTS mfa_week_totals (
+            environment_id TEXT NOT NULL,
+            week TEXT NOT NULL,
+            key TEXT NOT NULL,
+            count INTEGER NOT NULL,
+            PRIMARY KEY (environment_id, week, key)
+        );
+        CREATE TABLE IF NOT EXISTS mfa_week_user (
+            environment_id TEXT NOT NULL,
+            week TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            actor_alt TEXT,
+            key TEXT NOT NULL,
+            count INTEGER NOT NULL,
+            PRIMARY KEY (environment_id, week, actor_id, key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfa_week_user_actor ON mfa_week_user (environment_id, actor_id);
+        CREATE INDEX IF NOT EXISTS idx_mfa_week_user_alt ON mfa_week_user (environment_id, actor_alt);
+        CREATE TABLE IF NOT EXISTS mfa_agg_state (
+            environment_id TEXT PRIMARY KEY,
+            last_rowid INTEGER NOT NULL DEFAULT 0,
+            events_used INTEGER NOT NULL DEFAULT 0,
+            built_at TEXT,
+            updated_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS backfill_markers (
             name TEXT PRIMARY KEY,
             completed_at TEXT NOT NULL
@@ -1873,6 +1901,41 @@ def list_config_snapshots(environment_id, kind=None, limit=200):
     return [_snapshot_row(r) for r in conn.execute(sql, params)]
 
 
+def config_series(environment_id, kind, as_of=None, limit_snapshots=1000):
+    """Time series from the objects of successful snapshots of one kind whose objects each carry a
+    numeric "count": {"snapshots": [{snapshot_id, captured_at, meta}], "series": {item_key: [(captured_at, count)]}},
+    oldest first, at most the newest `limit_snapshots` snapshots up to `as_of`. One indexed read; the
+    objects are tiny (counts only)."""
+    _require_positive_limit(limit_snapshots)
+    conn = _get_connection()
+    sql = "SELECT snapshot_id, captured_at, meta_json FROM config_snapshots WHERE environment_id = ? AND kind = ? AND status = 'ok'"
+    params = [environment_id, kind]
+    if as_of:
+        sql += " AND captured_at <= ?"
+        params.append(normalize_window(None, as_of)[1])
+    sql += " ORDER BY captured_at DESC, snapshot_id DESC LIMIT ?"
+    params.append(min(int(limit_snapshots), 5000))
+    snaps = list(reversed(conn.execute(sql, params).fetchall()))
+    out = {"snapshots": [], "series": {}}
+    for snap in snaps:
+        meta = None
+        try:
+            meta = json.loads(snap["meta_json"]) if snap["meta_json"] else None
+        except ValueError:
+            pass
+        out["snapshots"].append({"snapshot_id": snap["snapshot_id"], "captured_at": snap["captured_at"], "meta": meta})
+        for r in conn.execute("SELECT item_key, json FROM config_snapshot_items WHERE snapshot_id = ? AND environment_id = ?",
+                              (snap["snapshot_id"], environment_id)):
+            try:
+                obj = json.loads(r["json"])
+            except ValueError:
+                continue
+            count = obj.get("count") if isinstance(obj, dict) else None
+            if isinstance(count, int) and not isinstance(count, bool):
+                out["series"].setdefault(r["item_key"], []).append((snap["captured_at"], count))
+    return out
+
+
 def get_config_snapshot(environment_id, snapshot_id, with_items=True):
     """The snapshot (scoped to this environment -- another environment's id
     answers None) with, by default, `items`: [{"key", "sha", "object"}]."""
@@ -2881,7 +2944,7 @@ def list_orphaned_archives():
 
 
 # Every table holding one environment's archive, in purge order (children first).
-ARCHIVE_TABLES = ("event_targets", "events", "sync_state", "config_snapshot_items", "config_snapshots", "manifest_entries", "chain_heads", "ingestion_manifests")
+ARCHIVE_TABLES = ("event_targets", "events", "sync_state", "config_snapshot_items", "config_snapshots", "mfa_week_user", "mfa_week_totals", "mfa_agg_state", "manifest_entries", "chain_heads", "ingestion_manifests")
 
 
 def archive_has_rows(environment_id):

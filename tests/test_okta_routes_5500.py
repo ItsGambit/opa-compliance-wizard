@@ -206,6 +206,16 @@ def test_sync_job_takes_a_snapshot_after_the_sync_and_never_fails_because_of_it(
     audit_store.run_migrations()
     _, env = engine.upsert_environment("dev", {"base_domain": "a.example.com", "team_name": "t", "key_id": "k", "key_secret": "s"})
 
+    class NoNetwork:  # the daily inventory count must never reach a real host from a test
+        def __init__(self, *a, **k):
+            pass
+
+        def __getattr__(self, name):
+            def call(*a, **k):
+                raise engine.OpaApiError(599, name, "no network in tests")
+            return call
+    monkeypatch.setattr(engine, "OpaClient", NoNetwork)
+
     class Sync(FakeOkta):
         def get_system_log(self, **k):
             return [], True
@@ -215,6 +225,7 @@ def test_sync_job_takes_a_snapshot_after_the_sync_and_never_fails_because_of_it(
     serve._run_sync_job(env, "dev", Sync(), "all", engine.LOCAL_OWNER_KEY)
     assert serve._sync_jobs[env]["status"] == "done"
     assert audit_store.list_config_snapshots(env, kind="okta_admins")[0]["status"] == "ok"
+    assert audit_store.list_config_snapshots(env, kind="inventory_counts") == []  # Okta here has no counting endpoint: nothing countable, no snapshot, sync still done
     # a second sync inside the minimum interval does not hit Okta's role endpoints again
     fake = Sync()
     serve._run_sync_job(env, "dev", fake, "all", engine.LOCAL_OWNER_KEY)
@@ -223,3 +234,58 @@ def test_sync_job_takes_a_snapshot_after_the_sync_and_never_fails_because_of_it(
     monkeypatch.setattr(oa, "capture_if_due", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     serve._run_sync_job(env, "dev", Sync(), "all", engine.LOCAL_OWNER_KEY)
     assert serve._sync_jobs[env]["status"] == "done"
+
+
+# --- 5.50.0 overview additions: inventory, MFA aggregates, the audited privileged-people list -------------
+class _CountingOkta(FakeOkta):
+    def count_okta_objects(self, kind, policy_type=None, max_items=50000):
+        return 5, False
+
+
+def test_inventory_and_mfa_captures_run_in_the_background(matrix_server, monkeypatch, tmp_audit_log):
+    import signin_mfa
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+    monkeypatch.setattr(serve, "_run_capture_job", REAL_JOB_BODIES["capture"])
+    monkeypatch.setattr(engine, "OktaClient", lambda url, tok: _CountingOkta())
+    url = "/api/environments/dev/okta_snapshots/capture"
+    assert _call(base_url, "POST", url, {"kind": "inventory_counts"}, _who(OWNER_A)).json()["started"] is True
+    assert _wait_capture(serve, env_id)["status"] == "done"
+    snaps = audit_store.list_config_snapshots(env_id, kind="inventory_counts")
+    keys = {i["key"] for i in audit_store.get_config_snapshot(env_id, snaps[0]["snapshot_id"])["items"]}
+    assert "opa.users_human" in keys and "okta.users" in keys  # the loaded roster was reused, Okta was counted
+    audit_store._insert_rows(audit_store._get_connection(), env_id, [audit_store._normalize_live_event({
+        "uuid": "s1", "eventType": "user.session.start", "published": "2026-10-20T10:00:00.000Z", "actor": {"id": "00u1"}, "outcome": {"result": "SUCCESS"}, "target": []})], "all")
+    assert _call(base_url, "POST", url, {"kind": "mfa_aggregates"}, _who(OWNER_A)).json()["started"] is True
+    assert _wait_capture(serve, env_id)["status"] == "done" and signin_mfa.built(env_id)["events_used"] == 1
+
+
+def test_overview_weeks_validation_and_new_blocks(matrix_server):
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+    engine.set_environment_shared("dev", OWNER_A, True)
+    get = lambda q: _call(base_url, "GET", "/api/overview?environment=dev" + q, headers=_who(ADMIN, admin=True))  # noqa: E731
+    o = get("&weeks=8").json()
+    assert o["inventory"]["state"] == "never_captured" and o["signins_mfa"]["state"] == "not_built"
+    for bad in ("&weeks=x", "&weeks=0", "&weeks=157", "&weeks=-3"):
+        assert get(bad).status_code == 400
+    import signin_mfa
+    audit_store._insert_rows(audit_store._get_connection(), env_id, [audit_store._normalize_live_event({
+        "uuid": "s1", "eventType": "user.session.start", "published": "2026-10-20T10:00:00.000Z", "actor": {"id": "00u1"}, "outcome": {"result": "SUCCESS"}, "target": []})], "all")
+    signin_mfa.refresh(env_id)
+    assert len(get("&weeks=8").json()["signins_mfa"]["weeks"]) == 8
+
+
+def test_privileged_people_endpoint_is_admin_only_audited_and_separate(matrix_server, tmp_audit_log):
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+    engine.set_environment_shared("dev", OWNER_A, True)
+    oa.capture_and_store(env_id, FakeOkta())
+    _put_model(serve, env_id, _model())
+    url = "/api/overview/privileged?environment=dev"
+    assert _call(base_url, "GET", url, headers=_who(OWNER_A)).status_code == 403
+    r = _call(base_url, "GET", url, headers=_who(ADMIN, admin=True))
+    assert r.status_code == 200 and {p["login"] for p in r.json()["people"]} >= {"alex@example.com", "sam@example.com"}
+    assert "overview.privileged_read" in _audit_actions(tmp_audit_log)
+    o = _call(base_url, "GET", "/api/overview?environment=dev", headers=_who(ADMIN, admin=True)).text
+    assert "alex@example.com" not in o  # the people only come from the audited endpoint
