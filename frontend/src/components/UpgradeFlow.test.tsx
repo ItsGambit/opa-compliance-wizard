@@ -171,7 +171,8 @@ describe('04 schedule dialog', () => {
 
   it('switching the zone keeps the moment', async () => {
     const dlg = await openDialog()
-    fireEvent.click(within(dlg).getByRole('radio', { name: 'UTC' }))
+    // On a machine whose own zone is UTC (CI) the dialog offers "My local time — UTC" instead of a separate UTC choice.
+    fireEvent.click(within(dlg).getByRole('radio', { name: /^(UTC|My local time — UTC)$/ }))
     expect((within(dlg).getByLabelText('Time') as HTMLInputElement).value).toBe('02:30')
     vi.mocked(Date.now).mockRestore()
   })
