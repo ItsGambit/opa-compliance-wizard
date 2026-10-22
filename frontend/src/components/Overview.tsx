@@ -1,14 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { useQueryClient } from '@tanstack/react-query'
-import { Copy, FileText, RefreshCw, Users } from 'lucide-react'
+import { ChevronDown, Copy, FileText, List, RefreshCw } from 'lucide-react'
 import { startOktaCapture } from '../api/client'
 import { useEnvironments, useOverview, usePeopleList, useReportDefs, useWhoami } from '../api/hooks'
 import { useIntegrityCheck } from '../hooks/useIntegrityCheck'
 import { useRefreshActions, useRefreshStatus } from '../hooks/useRefresh'
 import { toast } from '../hooks/useToast'
 import type { CrossCheckRow, InventorySeries, MfaWeek, Overview as OverviewData, SodOverlap } from '../types'
-import { downloadTextFile, toCsv } from '../utils/export'
+import { downloadTextFile, exportSections, toCsv } from '../utils/export'
 import { formatDateTime, formatDateTimeZone } from '../utils/format'
 import { activeRow, can, refreshReason } from '../utils/environmentRows'
 import { ageText, completedWords, formatDayYear, formatTimeOnly, isActive, ordinal, requestedParts, scanFreshness, staleBadgeText } from '../utils/refresh'
@@ -19,6 +19,7 @@ import {
 import { oktaStateText } from '../utils/oktaAdmins'
 import { canAdminFrom } from '../utils/whoami'
 import { DialogCloseButton } from './DialogCloseButton'
+import { ActionMenu } from './ActionMenu'
 import { ExportButtons } from './ExportButtons'
 import { RefreshControl } from './RefreshControl'
 import { RefreshProgressCard } from './RefreshProgressCard'
@@ -52,17 +53,25 @@ function SectionHead({ id, title, children, badge }: { id: string; title: string
   )
 }
 
-function Tile({ label, value, sub, flag, onOpen, openLabel }: { label: string; value: string | number; sub?: string; flag?: boolean; onOpen?: () => void; openLabel?: string }) {
+function Tile({ label, value, unit, sub, flag, na, onOpen, openLabel }: {
+  label: string; value: string | number; unit?: string; sub?: React.ReactNode; flag?: boolean; na?: boolean; onOpen?: () => void; openLabel?: string
+}) {
+  // A figure that cannot be shown says so in plain text (the mockup's "na" tile), not in 28 px type.
   return (
     <li className={`card p-3.5 flex flex-col gap-1 min-h-[7.25rem] ${flag ? 'border-warn/55' : ''}`}>
       <span className="text-xs text-muted font-medium">{label}</span>
-      <span className="text-[1.75rem] font-semibold leading-tight text-text flex items-baseline gap-1.5 flex-wrap">
-        {onOpen ? (
-          <button type="button" onClick={onOpen} aria-label={openLabel ?? `Open the list: ${label}`} className="text-accent-text underline underline-offset-2 decoration-accent-text/40 inline-flex items-baseline gap-1">
-            {value}<Users size={13} aria-hidden="true" className="self-center" />
-          </button>
-        ) : value}
-      </span>
+      {na ? (
+        <span className="text-sm font-medium text-text-dim leading-snug">{value}</span>
+      ) : (
+        <span className="text-[1.75rem] font-semibold leading-tight text-text flex items-baseline gap-1.5 flex-wrap">
+          {onOpen ? (
+            <button type="button" onClick={onOpen} aria-label={openLabel ?? `Open the list: ${label}`} className="text-accent-text underline underline-offset-4 decoration-accent-text/40 inline-flex items-baseline gap-1">
+              {value}<List size={13} aria-hidden="true" className="self-center" />
+            </button>
+          ) : value}
+          {unit && <small className="text-xs font-normal text-muted">{unit}</small>}
+        </span>
+      )}
       {sub && <span className="text-[0.6875rem] text-muted leading-snug break-words">{sub}</span>}
     </li>
   )
@@ -79,8 +88,21 @@ function ChartCard({ title, subtitle, children, how }: { title: string; subtitle
   )
 }
 
-const roleText = (m: Record<string, number>) =>
-  Object.entries(m).map(([k, v]) => `${v} ${k.replace(/_ADMIN$/, '').replace(/_/g, ' ').toLowerCase()}`).join(' · ')
+const OKTA_ROLE_NAMES: Record<string, string> = {
+  SUPER_ADMIN: 'Super', ORG_ADMIN: 'Organization', APP_ADMIN: 'Application', USER_ADMIN: 'Group', READ_ONLY_ADMIN: 'Read-only', HELP_DESK_ADMIN: 'Help desk',
+  MOBILE_ADMIN: 'Mobile', API_ACCESS_MANAGEMENT_ADMIN: 'API access', REPORT_ADMIN: 'Report', GROUP_MEMBERSHIP_ADMIN: 'Group membership', CUSTOM: 'Custom',
+}
+/** "3 Super · 2 Organization · ..." (the mockup's wording for Okta roles). */
+const oktaRoleText = (m: Record<string, number>) =>
+  Object.entries(m).map(([k, v]) => `${v} ${OKTA_ROLE_NAMES[k] ?? k.replace(/_ADMIN$/, '').replace(/_/g, ' ').toLowerCase().replace(/^./, c => c.toUpperCase())}`).join(' · ')
+/** "3 pam_admin · 4 resource_admin" (OPA roles keep their names). */
+const opaRoleText = (m: Record<string, number>) => Object.entries(m).map(([k, v]) => `${v} ${k}`).join(' · ')
+
+/** The paragraph with its key figures in bold, as the approved mockup draws it. The text itself is the server's; only these three phrases are emphasised. */
+const FIGURE_PHRASES = /(\d[\d,]* (?:people|person) (?:hold|holds) an Okta admin role|\d[\d,]* hold(?:s)? a privileged OPA role|\d[\d,]* (?:people|person) (?:hold|holds) both)/g
+function BoldFigures({ text }: { text: string }) {
+  return <>{text.split(FIGURE_PHRASES).map((part, i) => (i % 2 === 1 ? <strong key={i}>{part}</strong> : part))}</>
+}
 
 // ── People drawer ───────────────────────────────────────────────────────────────────────────────────────────────
 type DrawerList = 'c1' | 'c5' | 'mfa_nonpr' | 'mfa_smsvoice'
@@ -536,7 +558,16 @@ function EvidenceReadiness({ o, environment, onOpenReports }: { o: OverviewData;
 }
 
 // ── Page ────────────────────────────────────────────────────────────────────────────────────────────────────────
-export function OverviewPage({ onOpenReports }: { onOpenReports: () => void }) {
+interface OverviewPageProps {
+  onOpenReports: () => void
+  /** Where the count links go (administrators only: those pages hold names). */
+  onOpenOktaAdmins?: () => void
+  onOpenAccessUsers?: () => void
+  onOpenServiceAccounts?: () => void
+  onOpenEnvironments?: () => void
+}
+
+export function OverviewPage({ onOpenReports, onOpenOktaAdmins, onOpenAccessUsers, onOpenServiceAccounts, onOpenEnvironments }: OverviewPageProps) {
   const { data: environments } = useEnvironments()
   const { data: whoami } = useWhoami()
   const canAdmin = canAdminFrom(whoami)  // 5.51.0: an archive viewer sees the counts; the lists of names are administrators-only
@@ -597,39 +628,76 @@ export function OverviewPage({ onOpenReports }: { onOpenReports: () => void }) {
       )}
       {o.as_of && <div className="card p-2.5 text-xs text-text-dim" role="status">You are viewing {formatDateTime(o.as_of)}. Tiles, the paragraph and the cross-checks are read from the sealed snapshot of that time and the archive up to then; the charts keep their window.</div>}
 
-      <div className="card p-3 flex flex-wrap items-end justify-between gap-3">
-        <div className="flex flex-wrap items-end gap-4">
-          <div className="flex flex-col gap-1"><span className="section-label">Environment</span><span className="text-input inline-flex items-center min-w-40">{environment}</span></div>
-          <div className="flex flex-col gap-1"><span className="section-label">As of</span><Select ariaLabel="As of" value={asOf} onValueChange={setAsOf} placeholder="As of" options={asOfOptions} /></div>
-        </div>
-        <div className="flex items-end gap-2 flex-wrap">
-          <ExportButtons sections={exportBits} filenameBase="opa-overview-counts" />
-          <div className="flex flex-col gap-1"><span className="section-label">Paper</span><Select ariaLabel="Paper size" value={paper} onValueChange={v => setPaper(v as 'A4' | 'Letter')} placeholder="Paper" options={[{ value: 'A4', label: 'A4' }, { value: 'Letter', label: 'Letter' }]} /></div>
-          <button type="button" className="btn-primary" onClick={printPdf}><FileText size={13} aria-hidden="true" /> PDF for leadership</button>
-        </div>
+      {/* One row, as in the approved mockup: Environment, As of, Export…, PDF for leadership. */}
+      <div className="flex flex-wrap items-center gap-3">
+        <button type="button" className="text-input inline-flex items-center gap-1.5 !py-1.5 !px-2.5 min-h-[2.125rem]" onClick={onOpenEnvironments} disabled={!onOpenEnvironments}
+          aria-label={`Environment: ${environment}. Open Environments`}>
+          <span className="text-muted text-xs">Environment</span> {environment}<ChevronDown size={13} aria-hidden="true" className="text-muted" />
+        </button>
+        <label className="inline-flex items-center gap-1.5 text-xs text-muted">As of <Select ariaLabel="As of" value={asOf} onValueChange={setAsOf} placeholder="As of" options={asOfOptions} /></label>
+        <ActionMenu label="Export…" menuLabel="Export" items={[
+          { key: 'csv', label: 'Counts as CSV', disabled: exportBits.length === 0, onSelect: () => exportSections(exportBits, 'csv', 'opa-overview-counts') },
+          { key: 'md', label: 'Counts as Markdown', disabled: exportBits.length === 0, onSelect: () => exportSections(exportBits, 'md', 'opa-overview-counts') },
+          { key: 'a4', label: 'Paper size: A4', kind: 'radio', checked: paper === 'A4', separated: true, onSelect: () => setPaper('A4') },
+          { key: 'letter', label: 'Paper size: Letter', kind: 'radio', checked: paper === 'Letter', onSelect: () => setPaper('Letter') },
+        ]} />
+        <button type="button" className="btn-primary" onClick={printPdf}><FileText size={13} aria-hidden="true" /> PDF for leadership</button>
       </div>
 
       <SourcesStrip o={o} environment={environment} canRun={canRun} disabledReason={row ? refreshReason(row) : ''} onRefresh={parts => void start(parts)} />
       {refresh && refresh.status !== 'idle' && <RefreshProgressCard status={refresh} environment={environment} canRun={canRun} onRetry={part => void start([part])} onStop={() => void stop()} />}
 
       <section aria-labelledby="ov-state" className="card p-4">
-        <div className="flex items-start justify-between gap-3 flex-wrap">
-          <div><h2 id="ov-state" className="text-sm font-semibold text-text">State of privileged access</h2><p className="text-xs text-muted">Written from the figures below as of {formatDateTime(o.as_of ?? o.generated_at)}. The same paragraph opens the PDF one-pager.</p></div>
+        <div className="flex items-start justify-between gap-3 flex-wrap mb-2.5">
+          <h2 id="ov-state" className="text-sm font-semibold text-text">State of privileged access</h2>
+          <p className="text-xs text-muted m-0 text-right">Written from the figures below as of {formatDateTime(o.as_of ?? o.generated_at)}. The same paragraph opens the PDF one-pager.</p>
         </div>
-        <p className="text-sm leading-relaxed text-text mt-2 max-w-[110ch]">{o.paragraph}</p>
+        <p className="text-sm leading-relaxed text-text m-0 max-w-[110ch]"><BoldFigures text={o.paragraph} /></p>
         <button type="button" onClick={copy} className="mt-2 text-xs text-accent-text underline underline-offset-2 inline-flex items-center gap-1"><Copy size={12} aria-hidden="true" /> {copied ? 'Copied' : 'Copy paragraph'}</button>
       </section>
 
       <ul className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 list-none p-0 m-0" aria-label="Key figures">
-        <Tile label="People with Okta admin roles" value={o.okta_admins.state === 'ok' ? t.okta_people : o.okta_admins.state === 'refused' ? 'Not readable' : 'n/a'}
-          sub={o.okta_admins.state === 'ok' ? `${roleText(t.okta_by_role)} (a person can hold several) · as of ${dayLabel(o.sources.okta_snapshot.captured_at ?? '')}` : o.okta_admins.message ?? 'No snapshot yet'} />
-        <Tile label="People with privileged OPA roles" value={t.opa_privileged ?? 'n/a'} sub={t.opa_privileged == null ? 'No OPA scan stored yet. Select Refresh to scan now.' : `${roleText(t.opa_by_role)} · via group roles`} />
-        <Tile label="Hold both (separation of duties)" value={t.both ?? 'n/a'} flag={(t.both ?? 0) > 0} onOpen={canAdmin && (t.both ?? 0) > 0 ? () => setDrawer('c5') : undefined}
-          sub={t.both == null ? 'needs the Okta admin list and an OPA scan' : (t.both ?? 0) > 0 ? `to review · Okta admin who is also an OPA admin${canAdmin ? '' : ' · list: administrators only'}` : 'none · Okta admin who is also an OPA admin'} />
-        <Tile label="Left Okta, still in OPA" value={left.state === 'ok' && left.effective_known ? leftN : left.state === 'refused' ? 'Not readable' : 'n/a'} flag={leftN > 0} onOpen={canAdmin && leftN > 0 ? () => setDrawer('c1') : undefined}
-          sub={left.state === 'ok' ? `${left.people ?? 0} people + ${left.accounts ?? 0} service account(s) · cross-check C1${canAdmin || leftN === 0 ? '' : ' · list: administrators only'}` : left.state === 'never_run' ? 'run the lookup on the Cross-checks page' : 'cross-check C1'} />
-        <Tile label="OPA service accounts and service users" value={t.service.total ?? 'n/a'} sub={t.service.total == null ? 'No OPA scan stored yet. Select Refresh to scan now.' : `+ ${t.service.service_users} service users · ${t.service.saas} SaaS · ${t.service.okta_ud} Okta Universal Directory`} />
-        <Tile label="Evidence archive" value={t.archive_days != null ? `${t.archive_days}` : 'n/a'} sub={`days held · Okta keeps 90 · ${o.sources.archive.last_sync_status === 'error' ? 'last sync failed' : `last sync ${relative(o.sources.archive.last_sync_completed_at)}`}`} />
+        {o.okta_admins.state === 'ok' ? (
+          <Tile label="People with Okta admin roles" value={t.okta_people} onOpen={canAdmin && onOpenOktaAdmins && t.okta_people > 0 ? onOpenOktaAdmins : undefined} openLabel="Open the Okta Admins report"
+            sub={`${oktaRoleText(t.okta_by_role)} (a person can hold several) · as of ${formatDayYear(o.sources.okta_snapshot.captured_at)}`} />
+        ) : o.okta_admins.state === 'refused' ? (
+          <Tile na label="People with Okta admin roles" value="Not readable with this token"
+            sub={`${o.sources.okta_snapshot.newest_attempt_error_code ? `Okta error ${o.sources.okta_snapshot.newest_attempt_error_code} on today's refresh.` : 'Okta refused the read.'} Needs okta.iam.read.${o.sources.okta_snapshot.captured_at ? ` The last readable snapshot (${dayLabel(o.sources.okta_snapshot.captured_at)}) is used by the As-of picker.` : ''}`} />
+        ) : (
+          <Tile na label="People with Okta admin roles" value="Not captured yet" sub={o.okta_admins.message ?? 'No snapshot yet. Select Refresh to read Okta.'} />
+        )}
+        {t.opa_privileged != null ? (
+          <Tile label="People with privileged OPA roles" value={t.opa_privileged} onOpen={canAdmin && onOpenAccessUsers && t.opa_privileged > 0 ? onOpenAccessUsers : undefined} openLabel="Open Access Explorer, Users"
+            sub={`${opaRoleText(t.opa_by_role)} · via group roles${o.sources.opa_model.built_at ? ` · OPA scan ${formatDateTime(o.sources.opa_model.built_at)}` : ''}`} />
+        ) : (
+          <Tile na label="People with privileged OPA roles" value="No OPA scan stored yet" sub="Select Refresh to scan now." />
+        )}
+        {t.both != null ? (
+          <Tile label="Hold both (separation of duties)" value={t.both} unit={t.both > 0 ? 'to review' : 'none'} flag={t.both > 0} onOpen={canAdmin && t.both > 0 ? () => setDrawer('c5') : undefined}
+            sub={`Okta Super, Org or App admin who is also an OPA admin · from the Okta Admins report${canAdmin || t.both === 0 ? '' : ' · list: administrators only'}`} />
+        ) : o.okta_admins.state === 'refused' ? (
+          <Tile na label="Hold both (separation of duties)" value="Needs admin roles" sub="Not computed while role assignments cannot be read." />
+        ) : (
+          <Tile na label="Hold both (separation of duties)" value="Needs an OPA scan" sub="Needs the Okta admin list and an OPA scan." />
+        )}
+        {left.state === 'ok' && left.effective_known ? (
+          <Tile label="Left Okta, still in OPA" value={leftN} unit={leftN === 0 ? 'none' : undefined} flag={leftN > 0} onOpen={canAdmin && leftN > 0 ? () => setDrawer('c1') : undefined}
+            sub={`Deprovisioned or suspended in Okta, OPA access still effective · cross-check C1${o.lifecycle_c1?.snapshot?.captured_at ? ` · Okta status read ${formatDateTime(o.lifecycle_c1.snapshot.captured_at)}` : ''}${canAdmin || leftN === 0 ? '' : ' · list: administrators only'}`} />
+        ) : left.state === 'refused' ? (
+          <Tile na label="Left Okta, still in OPA" value="Not readable with this token" sub="Okta refused the user lookup. Cross-check C1." />
+        ) : left.state === 'never_run' ? (
+          <Tile na label="Left Okta, still in OPA" value="Not run yet" sub="Run the lookup on the Cross-checks page, or select Refresh." />
+        ) : (
+          <Tile na label="Left Okta, still in OPA" value="Not available" sub="Cross-check C1 needs an OPA scan and the Okta lookup." />
+        )}
+        {t.service.total != null ? (
+          <Tile label="OPA service accounts and service users" value={t.service.total} unit={`+ ${t.service.service_users} service users`} onOpen={canAdmin && onOpenServiceAccounts && t.service.total > 0 ? onOpenServiceAccounts : undefined} openLabel="Open the Service Accounts dashboard"
+            sub={`${t.service.saas} SaaS · ${t.service.okta_ud} Okta Universal Directory · ${t.service.service_users} OPA service users with API keys`} />
+        ) : (
+          <Tile na label="OPA service accounts and service users" value="No OPA scan stored yet" sub="Select Refresh to scan now." />
+        )}
+        <Tile label="Evidence archive" value={t.archive_days != null ? `${t.archive_days}` : 'n/a'} unit="days held"
+          sub={<>Okta keeps 90 · {o.sources.archive.last_sync_status === 'error' ? 'last sync failed' : `last sync ${relative(o.sources.archive.last_sync_completed_at)}`} · chain {o.sources.chain ? <StatusBadge label={o.sources.chain.valid ? 'intact' : 'broken'} variant={o.sources.chain.valid ? 'active' : 'error'} /> : 'not checked'}</>} />
       </ul>
 
       <Trends o={o} />

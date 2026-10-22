@@ -262,4 +262,61 @@ describe('OverviewPage', () => {
     expect(await screen.findByText('Lists are available on the main sign-in. This sign-in shows the counts only.')).toBeTruthy()
     expect(screen.queryByText(/Could not load the list/)).toBeNull()
   })
+
+  it('the controls are one row (Environment, As of, Export…, PDF for leadership); the old controls card, the Paper select and the CSV / MD pair are gone (P1)', async () => {
+    const onOpenEnvironments = vi.fn()
+    renderWithClient(<OverviewPage onOpenReports={vi.fn()} onOpenEnvironments={onOpenEnvironments} />)
+    await screen.findByText(/14 people hold/)
+    fireEvent.click(screen.getByRole('button', { name: /Environment: prod-example\. Open Environments/ }))
+    expect(onOpenEnvironments).toHaveBeenCalled()
+    expect(screen.getByLabelText('As of')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Export…/ }).getAttribute('aria-haspopup')).toBe('menu')
+    expect(screen.getByRole('button', { name: /PDF for leadership/ })).toBeTruthy()
+    expect(screen.queryByLabelText('Paper size')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /Export…/ }))
+    expect(screen.getByRole('menuitemradio', { name: 'Paper size: A4' }).getAttribute('aria-checked')).toBe('true')
+    expect(screen.getByRole('menuitem', { name: 'Counts as CSV' })).toBeTruthy()
+  })
+
+  it('tiles use the mockup wording, a unit beside the figure, and count links with the list icon that go to the pages that hold the people (P2)', async () => {
+    const goto = { onOpenOktaAdmins: vi.fn(), onOpenAccessUsers: vi.fn(), onOpenServiceAccounts: vi.fn() }
+    renderWithClient(<OverviewPage onOpenReports={vi.fn()} {...goto} />)
+    await screen.findByText(/14 people hold/)
+    const tiles = screen.getByRole('list', { name: 'Key figures' })
+    expect(within(tiles).getByText(/3 Super · 2 Organization · 5 Application · 4 Group · 3 Read-only \(a person can hold several\) · as of .*2026/)).toBeTruthy()
+    expect(within(tiles).getByText(/3 pam_admin · 4 resource_admin · 5 delegated_resource_admin · via group roles/)).toBeTruthy()
+    expect(within(tiles).getByText(/Okta Super, Org or App admin who is also an OPA admin · from the Okta Admins report/)).toBeTruthy()
+    expect(within(tiles).getByText('days held')).toBeTruthy()
+    expect(within(tiles).getByText(/19 SaaS · 8 Okta Universal Directory · 4 OPA service users with API keys/)).toBeTruthy()
+    expect(within(tiles).getByText('+ 4 service users')).toBeTruthy()
+    fireEvent.click(within(tiles).getByRole('button', { name: 'Open the Okta Admins report' }))
+    fireEvent.click(within(tiles).getByRole('button', { name: 'Open Access Explorer, Users' }))
+    fireEvent.click(within(tiles).getByRole('button', { name: 'Open the Service Accounts dashboard' }))
+    expect(goto.onOpenOktaAdmins).toHaveBeenCalled(); expect(goto.onOpenAccessUsers).toHaveBeenCalled(); expect(goto.onOpenServiceAccounts).toHaveBeenCalled()
+  })
+
+  it('when Okta refused the admin roles the tiles say so in plain text with the error code, not "Not readable" in large type (P2)', async () => {
+    const base = overview()
+    vi.mocked(fetchOverview).mockResolvedValue(overview({
+      okta_admins: { state: 'refused', message: 'refused', count: null, by_role: {}, time_bound: null, snapshot: null },
+      tiles: { ...base.tiles, okta_people: 0, both: null },
+      sources: { ...base.sources, okta_snapshot: { ...base.sources.okta_snapshot, newest_attempt_status: 'refused', newest_attempt_error_code: 'E0000006' } },
+    }))
+    renderWithClient(<OverviewPage onOpenReports={vi.fn()} />)
+    await screen.findByText(/14 people hold/)
+    const tiles = screen.getByRole('list', { name: 'Key figures' })
+    expect(within(tiles).getByText('Not readable with this token').className).not.toMatch(/text-\[1\.75rem\]/)
+    expect(within(tiles).getByText(/Okta error E0000006 on today's refresh\. Needs okta\.iam\.read\. The last readable snapshot \(.*\) is used by the As-of picker\./)).toBeTruthy()
+    expect(within(tiles).getByText('Needs admin roles')).toBeTruthy()
+    expect(within(tiles).getByText('Not computed while role assignments cannot be read.')).toBeTruthy()
+    expect(within(tiles).queryByText('n/a')).toBeNull()
+  })
+
+  it('the state paragraph has its key figures in bold and its note on the right (P2)', async () => {
+    renderWithClient(<OverviewPage onOpenReports={vi.fn()} />)
+    const bold = await screen.findByText('14 people hold an Okta admin role')
+    expect(bold.tagName).toBe('STRONG')
+    expect(screen.getByText('9 hold a privileged OPA role').tagName).toBe('STRONG')
+    expect(screen.getByText('1 person holds both').tagName).toBe('STRONG')
+  })
 })

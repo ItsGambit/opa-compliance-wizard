@@ -1669,7 +1669,7 @@ export interface Overview {
   viewing_as_of: string | null
   attention: { kind: 'sync' | 'snapshot' | 'chain' | 'scheduled_opa'; text: string }[]
   sources: {
-    okta_snapshot: { captured_at: string | null; index: number | null; snapshots_total: number; first_at: string | null; state: string; newest_attempt_status: string | null; newest_attempt_at: string | null; days_old: number | null }
+    okta_snapshot: { captured_at: string | null; index: number | null; snapshots_total: number; first_at: string | null; state: string; newest_attempt_status: string | null; newest_attempt_at: string | null; newest_attempt_error_code?: string | null; days_old: number | null }
     archive: { has_archive: boolean; oldest: string | null; newest: string | null; days_held: number | null; events: number | null; last_sync_completed_at: string | null; last_sync_status: string | null; last_sync_error: string | null; sync_mode: string | null; scope: string | null; days_since_sync: number | null }
     chain: { valid: boolean | null; manifest_count: number | null; reason: string | null; head_hash: string | null } | null
     opa_model: {

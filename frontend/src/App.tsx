@@ -324,9 +324,11 @@ export default function App() {
               </p>
             </div>
             <div className="flex items-center gap-3">
-              <span className="text-xs text-text-faint">
-                Connected: <span className="text-text-dim font-medium">{environments?.active}</span>
-              </span>
+              {activeTab !== 'overview' && (
+                <span className="text-xs text-text-faint">
+                  Connected: <span className="text-text-dim font-medium">{environments?.active}</span>
+                </span>
+              )}
               <UserMenu />
             </div>
           </header>
@@ -334,7 +336,9 @@ export default function App() {
 
           <SharedEnvironmentNotice />
 
-          {activeTab === 'overview' && canViewOverview && <OverviewPage onOpenReports={() => navigate({ tab: 'reports', reportsSubTab: 'browse' })} />}
+          {activeTab === 'overview' && canViewOverview && <OverviewPage onOpenReports={() => navigate({ tab: 'reports', reportsSubTab: 'browse' })}
+            onOpenOktaAdmins={() => navigate({ tab: 'reports', reportsSubTab: 'okta_admins' })} onOpenAccessUsers={() => navigate({ tab: 'access', accessSubTab: 'users' })}
+            onOpenServiceAccounts={() => navigate({ tab: 'reports', reportsSubTab: 'service_accounts' })} onOpenEnvironments={() => setEnvironmentsOpen(true)} />}
           {activeTab === 'reports' && reportsSubTab === 'browse' && (
             <ComplianceReports selectedReport={route.reportKey} onSelectReport={key => navigate({ tab: 'reports', reportsSubTab: 'browse', reportKey: key })} />
           )}
