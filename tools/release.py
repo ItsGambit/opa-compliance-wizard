@@ -330,10 +330,17 @@ def build_release(version, repo=REPO, out_dir=None, frontend_dist=None, min_upgr
     return tar_path, manifest
 
 
+def sign_hint(tar_path):
+    """The real next step after `build`: the KMS signing command (the key alias is the project's release key)."""
+    return (f"release.py sign {tar_path} --signer kms --kms-key alias/ocw-release-primary --aws-profile <profile> --require-minisign\n"
+            "      (signing needs boto3, a maintainer-tools-only dependency: pip install boto3 into a separate virtual environment "
+            "and run release.py with that python)")
+
+
 def cmd_build(a):
     tar_path, manifest = build_release(a.version, Path(a.repo), a.out, a.frontend_dist, a.min_upgrade_from, a.downtime_seconds)
     print(f"Built {tar_path} ({len(manifest['files'])} files, commit {manifest['commit'][:12]})")
-    print(f"Next: release.py sign {tar_path} --key <primary.key>")
+    print(f"Next: {sign_hint(tar_path)}")
 
 
 # --- sign / verify ---------------------------------------------------------------
