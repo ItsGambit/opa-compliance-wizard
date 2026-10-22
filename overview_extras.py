@@ -166,8 +166,8 @@ def attention(src, now=None):
         out.append({"kind": "sync", "text": _sync_attention_text(a, now), "short": short})
     timeouts = (src.get("refresh") or {}).get("log_timeouts") or 0
     if timeouts >= 2:
-        out.append({"kind": "sync_timeout", "text": f"The archive sync timed out {timeouts} runs in a row. It keeps its place and the next run continues "
-                    "from there; if it keeps happening, check how much Okta is returning or contact support."})
+        out.append({"kind": "sync_timeout", "text": f"The System Log sync timed out {timeouts} runs in a row. It keeps its place, and the next run continues from there. "
+                    "If it keeps happening, check how much Okta is returning, or open an issue on the project's GitHub page."})
     if o.get("newest_attempt_status") in ("refused", "error") and o.get("newest_attempt_at"):
         out.append({"kind": "snapshot", "text": "The newest Okta configuration capture " + ("was refused by Okta." if o["newest_attempt_status"] == "refused" else "failed.")})
     elif (o.get("days_old") or 0) >= 2:

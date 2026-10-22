@@ -907,7 +907,8 @@ def test_the_banner_says_the_sync_is_timing_out_only_after_two_runs_in_a_row(rig
     texts = lambda: [a["text"] for a in oa.build_overview(rig.env)["attention"]]  # noqa: E731
     assert not [t for t in texts() if "timed out" in t]  # once is not yet a pattern
     rig.run(["log"], trigger="scheduled")
-    assert [t for t in texts() if "timed out 2 runs in a row" in t]
+    banner = [t for t in texts() if "The System Log sync timed out 2 runs in a row" in t]
+    assert banner and "open an issue on the project's GitHub page" in banner[0] and "support" not in banner[0]
     rig.okta = SyncOkta()
     rig.run(["log"], trigger="scheduled")  # a run that finishes ends the streak
     assert not [t for t in texts() if "timed out" in t]
