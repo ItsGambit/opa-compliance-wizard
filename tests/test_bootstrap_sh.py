@@ -73,8 +73,32 @@ def full_tree_files():
     return files
 
 
+# Programs whose presence on the HOST must not change what a test sees: the tests decide (through stubs) which of them "exist".
+HOST_PACKAGE_PROGRAMS = {"nginx", "gnome-keyring-daemon", "dpkg-query", "dpkg", "apt-get", "apt", "apt-cache", "systemctl", "loginctl", "useradd",
+                         "userdel", "runuser", "getent", "openssl", "python3", "python"}
+
+
+@pytest.fixture(scope="session")
+def host_tools(tmp_path_factory):
+    """A directory of links to the host's ordinary tools (sed, awk, tar, df, ...) WITHOUT the programs a test must control. The tests'
+    PATH is the stub directory plus this one, so a runner that happens to have nginx or a keyring daemon installed behaves like a
+    clean server."""
+    d = tmp_path_factory.mktemp("host-tools")
+    seen = set()
+    for src in ("/usr/bin", "/bin", "/usr/sbin", "/sbin"):
+        if not os.path.isdir(src):
+            continue
+        for name in os.listdir(src):
+            path = os.path.join(src, name)
+            if name in seen or name in HOST_PACKAGE_PROGRAMS or not (os.path.isfile(path) and os.access(path, os.X_OK)):
+                continue
+            seen.add(name)
+            os.symlink(path, d / name)
+    return d
+
+
 class BW:
-    def __init__(self, tmp_path):
+    def __init__(self, tmp_path, host_tools):
         self.w = tmp_path
         self.key, self.standby = TestKey(), TestStandby()
         self.kl = key_list([self.key, self.standby])
@@ -96,7 +120,7 @@ class BW:
         self.opt, self.data = tmp_path / "opt", tmp_path / "var-lib"
         self.releases = {}
         Backend.version = "5.52.0"
-        self.env = dict(os.environ, PATH=f"{self.stub / 'bin'}:{os.environ['PATH']}", STUB=str(self.stub), OCW_INSTALL_TEST="1", OCW_TEST_MODE="1", OCW_FAST="1",
+        self.env = dict(os.environ, PATH=f"{self.stub / 'bin'}:{host_tools}", STUB=str(self.stub), OCW_INSTALL_TEST="1", OCW_TEST_MODE="1", OCW_FAST="1",
                         OCW_OS_RELEASE=str(self.os_release), OCW_UNAME_M="x86_64", OCW_SYSTEMD_DIR=str(tmp_path / "systemd"), OCW_MIN_FREE_KB_TEST="1024",
                         OCW_OPT_DIR=str(self.opt), OCW_DATA_DIR=str(self.data), OCW_UNIT_DIR=str(tmp_path / "units"), OCW_BIN_DIR=str(tmp_path / "bin"),
                         OCW_ENV_FILE=str(tmp_path / "etc" / "opa-compliance-wizard.env"), OCW_SUDOERS_DIR=str(tmp_path / "sudoers"),
@@ -172,8 +196,8 @@ class BW:
 
 
 @pytest.fixture
-def bw(tmp_path):
-    w = BW(tmp_path)
+def bw(tmp_path, host_tools):
+    w = BW(tmp_path, host_tools)
     yield w
     w.server.close()
 
