@@ -155,7 +155,7 @@ def cmd_status(a, cfg, host):
     last_target = (s.get("state") or {}).get("version_to")
     for r in s["staged"]:
         # A tree staged by an earlier attempt stays on disk until it is applied or pruned: say so when the last run was about another version.
-        earlier = f"   (staged earlier, not part of the last run: {last_target})" if last_target and last_target != r["version"] else ""
+        earlier = f"   (staged earlier, not part of the last run: {r['version']})" if last_target and last_target != r["version"] else ""
         print(f"staged         {r['version']}   verified ok, venv built, sha256 {str(r['sha256'])[:8]}…{str(r['sha256'])[-4:]}{earlier}")
     for r in s["schedule"]:
         print(f"schedule       {r['not_before']} (entered as {r['entered'] or 'UTC'}) by {r['by']}, upgrade {r['correlation_id']}")

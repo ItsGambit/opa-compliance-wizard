@@ -210,7 +210,7 @@ OPA_STEP_NOUNS = {
     "resource_groups": "listing resource groups", "groups": "listing groups", "users": "listing users", "workload_roles": "listing workload roles",
     "clients": "listing enrolled clients", "devices": "listing Okta-managed devices", "projects": "listing projects",
     "index_resources": "reading folders, secrets and resources", "user_groups": "reading user group memberships",
-    "policies": "listing security policies", "resolve": "resolving policy access",
+    "key_exchange": "exchanging the key for a token", "policies": "listing security policies", "resolve": "resolving policy access",
 }
 
 

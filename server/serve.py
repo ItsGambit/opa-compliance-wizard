@@ -1580,11 +1580,12 @@ def _wait_until(job, part, condition, deadline_mono=None):
         time.sleep(REFRESH_ADOPT_POLL_SECS)
 
 
-def _store_clients(job, ctx):
-    """(OpaClient, OktaClient|None) built from the environment's stored credentials, by id, under its real owner: a refresh
-    never shares a client with a request, and a session switch cannot affect it."""
+def _store_clients(job, ctx, need_opa=True):
+    """(OpaClient|None, OktaClient|None) built from the environment's stored credentials, by id, under its real owner: a refresh
+    never shares a client with a request, and a session switch cannot affect it. The OPA client exchanges the service key when it is
+    built, so only the OPA part builds it (need_opa): the Okta part must not depend on OPA accepting the key."""
     creds = engine.get_environment_credentials_by_id(job.environment_id, owner=ctx["owner"])
-    opa_client = engine.OpaClient(creds["base_domain"], creds["team_name"], creds["key_id"], creds["key_secret"])
+    opa_client = engine.OpaClient(creds["base_domain"], creds["team_name"], creds["key_id"], creds["key_secret"]) if need_opa else None
     okta_client = engine.OktaClient(creds["okta_url"], creds["okta_api_token"]) if creds.get("okta_url") and creds.get("okta_api_token") else None
     return opa_client, okta_client
 
@@ -1604,6 +1605,17 @@ def _refresh_part_opa(job, ctx):
         opa_client, okta_client = _store_clients(job, ctx)
     except (KeyError, engine.CredentialStoreUnavailable) as exc:
         job.finish(part, "error", f"The saved credentials could not be read: {exc} Nothing was changed.")
+        return
+    except engine.JobCancelled:
+        job.finish(part, "cancelled", rj.cancelled_message())
+        return
+    except Exception as exc:  # the key exchange happens in the client's constructor: a refusal or an outage is a result, not an internal error
+        refused = isinstance(exc, engine.OpaApiError) and exc.status in (401, 403)
+        state, message = rj.opa_failure("refused" if refused else "error", getattr(exc, "status", None), "key_exchange", previous_at,
+                                        type(exc).__name__)
+        engine.log("WARN", f"OPA key exchange for '{ctx['env_name']}' failed: {type(exc).__name__}")
+        _audit_for(_refresh_audit(job, ctx), "access_scan.failed", {"error": _failure_summary(exc)})
+        job.finish(part, state, message, previous_built_at=previous_at, audit_line=rj.audit_line("refused" if refused else "error", type(exc).__name__))
         return
     adopted = False
     with _access_jobs_lock:
@@ -1731,7 +1743,7 @@ def _refresh_part_okta(job, ctx):
         job.finish(part, "cancelled", rj.cancelled_message())
         return
     try:
-        _opa_client, okta_client = _store_clients(job, ctx)
+        _opa_client, okta_client = _store_clients(job, ctx, need_opa=False)
     except (KeyError, engine.CredentialStoreUnavailable) as exc:
         job.finish(part, "error", f"The saved credentials could not be read: {exc} Nothing was changed.")
         return

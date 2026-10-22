@@ -373,6 +373,41 @@ def test_opa_refused_while_okta_and_log_succeed_keeps_the_others_and_says_why(ri
     assert view["summary"] == "2 of 3 parts completed; OPA scan refused."
 
 
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_refused_key_exchange_refuses_the_opa_part_only_and_okta_and_the_log_still_run(rig, tmp_audit_log, status):
+    rig.run(["opa"])
+    before = audit_store.opa_model_cache_info(rig.env)["built_at"]
+
+    class Refusing:
+        def __init__(self, *a, **k):
+            raise engine.OpaApiError(status, "https://x.example.com/token", "denied")
+    rig.monkeypatch.setattr(engine, "OpaClient", Refusing)
+    view = rig.run().status_view()
+    message = view["parts"]["opa"]["message"]
+    assert view["parts"]["opa"]["state"] == "refused"
+    assert f"OPA refused the service key when exchanging the key for a token (HTTP {status})" in message
+    assert "Internal error" not in message and "https://" not in message
+    assert "the scan from" in message and "is still shown and stored" in message and "open Environments" in message
+    assert view["parts"]["okta"]["state"] == "ok" and view["parts"]["log"]["state"] == "ok"
+    sub = view["parts"]["okta"]["sub"]
+    assert sub["admins"]["state"] == "ok"
+    assert sub["principal_status"]["state"] == "skipped" and "OPA scan did not finish" in sub["principal_status"]["message"]
+    assert "OPA counts are missing" in sub["inventory"]["message"]
+    assert audit_store.opa_model_cache_info(rig.env)["built_at"] == before
+    assert view["summary"] == "2 of 3 parts completed; OPA scan refused."
+    assert any(r["action"] == "access_scan.failed" for r in rig.audit(tmp_audit_log))  # the line the panel shows is true
+
+
+def test_a_network_failure_building_the_opa_client_is_an_error_with_a_plain_message_not_an_internal_error(rig):
+    class Down:
+        def __init__(self, *a, **k):
+            raise engine.OpaApiError(503, "https://x.example.com/token", "down")
+    rig.monkeypatch.setattr(engine, "OpaClient", Down)
+    view = rig.run(["opa"]).status_view()
+    assert view["parts"]["opa"]["state"] == "error" and "Internal error" not in view["parts"]["opa"]["message"]
+    assert "OPA did not answer as expected" in view["parts"]["opa"]["message"]
+
+
 def test_okta_admin_roles_refused_seals_one_refused_snapshot_and_the_other_subparts_finish(rig):
     rig.okta = type("Refusing", (SyncOkta,), {})(fail={"assignees": REFUSED})
     job = rig.run(["okta"])

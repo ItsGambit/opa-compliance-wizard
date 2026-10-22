@@ -376,7 +376,7 @@ describe('09 success and 10 failure', () => {
     const what = await screen.findByText(/the web page did not load/)
     expect(what.textContent).toMatch(/The previous release was put back and is running\..*Next: The previous release is running\. Download the support bundle.*\(Reason code health_healthz\.\)/)
     unmount()
-    vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ run: { ...ROLLED, failure: null, health: [], reason_code: 'release_files_mismatch', result: 'failed', step: 'staged' }, failures: {} }))
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ run: { ...ROLLED, failure: null, health: [], reason_code: 'release_files_mismatch', result: 'failed', step: 'staged', updated_at: new Date().toISOString() }, failures: {} }))
     renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
     expect(await screen.findByText(/the prepared files do not match the signed release/)).toBeTruthy()  // no reason_text recorded: the fallback sentence
   })
@@ -446,7 +446,7 @@ describe('09 success and 10 failure', () => {
   })
 
   it('refused before anything was switched', async () => {
-    vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ run: makeRun({ result: 'failed', step: 'staged', reason_code: 'hash_mismatch', failed_step: 'staged', backup: null, bundle: null }) }))
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ run: makeRun({ updated_at: new Date().toISOString(), result: 'failed', step: 'staged', reason_code: 'hash_mismatch', failed_step: 'staged', backup: null, bundle: null }) }))
     renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
     expect(await screen.findByText('The upgrade to 5.48.0 failed before anything was switched')).toBeTruthy()
     expect(screen.getByText(/does not match the signed hash/)).toBeTruthy()

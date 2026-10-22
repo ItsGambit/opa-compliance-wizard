@@ -226,7 +226,7 @@ def test_status_labels_a_staged_version_that_is_not_the_one_the_last_run_refused
     ocw_cli.main(["status"], m.cfg(), m.host)
     out = capsys.readouterr().out
     line = next(l for l in out.splitlines() if l.startswith("staged") and "5.47.1" in l)
-    assert "staged earlier, not part of the last run" in line
+    assert line.rstrip().endswith("(staged earlier, not part of the last run: 5.47.1)")  # its own version, not the last run's
 
 
 def test_the_release_files_next_step_does_not_send_the_reader_to_the_command_they_are_reading():
