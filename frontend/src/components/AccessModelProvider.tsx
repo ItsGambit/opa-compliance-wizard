@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { fetchAccessModel, ApiError } from '../api/client'
+import { fetchAccessModel, ApiError, cancelRefresh } from '../api/client'
 import { useEnvironments } from '../api/hooks'
 import { useAccessScanJob } from '../hooks/useAccessScanJob'
 import { AccessModelContext, type AccessModelMeta } from '../hooks/useAccessModel'
@@ -83,13 +83,15 @@ export function AccessModelProvider({ children }: { children: ReactNode }) {
     fetchAccessModel().then(r => { if (gen === loadGeneration.current) adopt(r) }).catch(() => {})
   }, [refreshStatus, builtAt, jobPhase, adopt])
 
+  const stop = useCallback(() => { if (environment) void cancelRefresh(environment).catch(() => {}) }, [environment])
+
   const updateModel = useCallback((update: (m: AccessModel) => AccessModel) => {
     setModel(prev => (prev ? update(prev) : prev))
     setMeta(prev => (prev ? { ...prev, modified_at: new Date().toISOString() } : prev))
   }, [])
 
   return (
-    <AccessModelContext.Provider value={{ job, model, meta, loading, loadError, ensureLoaded, refresh, updateModel }}>
+    <AccessModelContext.Provider value={{ job, model, meta, loading, loadError, ensureLoaded, refresh, stop, updateModel }}>
       {children}
     </AccessModelContext.Provider>
   )

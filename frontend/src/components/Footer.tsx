@@ -2,7 +2,7 @@ import { REPO_CHANGELOG_URL, REPO_README_URL } from '../utils/links'
 import { RefreshCw } from 'lucide-react'
 import { useEnvironments, useSyncStatus, useUpgradeStatus, useVersion, useWhoami } from '../api/hooks'
 import { useRefreshActions, useRefreshStatus, useRefreshWatcher } from '../hooks/useRefresh'
-import { formatDateTime } from '../utils/format'
+import { formatDateTime, formatDateTimeZone } from '../utils/format'
 import { activeRow, can, refreshReason } from '../utils/environmentRows'
 import { completedText, isActive, latestRefresh, requestedParts } from '../utils/refresh'
 import { canAdminFrom } from '../utils/whoami'
@@ -64,7 +64,13 @@ export function Footer() {
               only by a sync that finished successfully (DATA-05), which is what
               "last sync" should mean here. */}
           {latest ? (
-            <span>Last refresh: {formatDateTime(latest.finishedAt)} · {latest.failing.length === 0 ? completedText(latest.done, latest.total) : `${completedText(latest.done, latest.total)}; ${latest.failing.join(', ')} did not complete`}</span>
+            <>
+              {/* One short line (the footer must stay on one line); which part did not complete is in the tooltip and the description. */}
+              <span title={latest.failing.length ? `${latest.failing.join(', ')} did not complete` : undefined} aria-describedby={latest.failing.length ? 'footer-refresh-detail' : undefined}>
+                Last refresh {formatDateTimeZone(latest.finishedAt)} · {completedText(latest.done, latest.total)}
+              </span>
+              {latest.failing.length > 0 && <span id="footer-refresh-detail" className="sr-only">{latest.failing.join(', ')} did not complete</span>}
+            </>
           ) : (
             <span>Last sync: {syncStatus?.sync_state?.last_sync_completed_at ? formatDateTime(syncStatus.sync_state.last_sync_completed_at) : 'never'}</span>
           )}

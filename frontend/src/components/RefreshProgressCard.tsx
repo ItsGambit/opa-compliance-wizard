@@ -4,7 +4,7 @@ import type { BootstrapStepEvent } from '../api/client'
 import type { JobPhase } from '../hooks/useAccessScanJob'
 import type { RefreshPart, RefreshPartName, RefreshStatus } from '../types'
 import {
-  ACTIVE_PART_STATES, completedText, elapsedText, isActive, isFailed, OKTA_SUB_LABELS, partAnnouncement, REFRESH_PART_LABELS, requestedParts, stateBadge, tally,
+  ACTIVE_PART_STATES, completedText, elapsedText, formatTimeOnly, isActive, isFailed, OKTA_SUB_LABELS, partAnnouncement, REFRESH_PART_LABELS, requestedParts, stateBadge, tally,
 } from '../utils/refresh'
 import { formatDateTimeZone } from '../utils/format'
 import { deriveSteps } from '../utils/bootstrapSteps'
@@ -51,20 +51,20 @@ function opaSteps(part: RefreshPart): StepRow[] {
 
 function oktaSteps(part: RefreshPart, opaRunning: boolean): StepRow[] {
   const sub = part.sub ?? {}
+  const firstWaiting = Object.keys(OKTA_SUB_LABELS).find(k => sub[k]?.state === 'waiting')  // only the step that really waits is annotated
   return Object.keys(OKTA_SUB_LABELS).filter(k => sub[k] && sub[k].state !== 'not_requested').map(k => {
     const s = sub[k]
     const status: StepRow['status'] = s.state === 'ok' ? 'done' : s.state === 'running' ? 'active' : s.state === 'refused' || s.state === 'error' ? 'error'
       : s.state === 'skipped' || s.state === 'cancelled' ? 'skipped' : 'pending'
-    const detail = s.state === 'waiting' ? (opaRunning ? 'waiting for the OPA scan' : 'waiting') : status === 'done' || status === 'error' || status === 'skipped' ? s.message : undefined
+    const detail = s.state === 'waiting' ? (k === firstWaiting ? (opaRunning ? 'waiting for the OPA scan' : 'waiting') : undefined) : status === 'done' || status === 'error' || status === 'skipped' ? s.message : undefined
     return { key: k, label: OKTA_SUB_LABELS[k], status, detail }
   })
 }
 
+/** The System Log row's one line: the server's own message when it ended (it holds the count), else the newest step. */
 function logDetail(part: RefreshPart): string | undefined {
-  if (part.state === 'ok') {
-    const n = part.events_new ?? 0
-    return `${n.toLocaleString()} new event${n === 1 ? '' : 's'}${part.adopted ? ' · used a sync that was already running' : ''}`
-  }
+  if (part.state === 'ok') return `${part.message ?? `${(part.events_new ?? 0).toLocaleString()} new events stored.`}${part.adopted ? ' Used a sync that was already running.' : ''}`
+  if (isFailed(part.state)) return undefined  // the failure message below says it
   const last = [...(part.steps ?? [])].reverse().find(s => s.detail)
   return last?.detail ?? undefined
 }
@@ -75,16 +75,21 @@ function PartRow({ name, part, opaRunning, elapsed, canRun, onRetry }: { name: R
   const failed = isFailed(part.state)
   const steps = name === 'opa' ? opaSteps(part) : name === 'okta' ? oktaSteps(part, opaRunning) : []
   const showSteps = isActive(part.state) || failed || (name === 'okta' && part.state !== 'ok')
+  const doneSteps = steps.filter(x => x.status === 'done').length
+  const percent = name === 'opa' && part.state === 'running' && steps.length ? Math.round((doneSteps / steps.length) * 100) : null
+  const sub = name === 'log' && part.mode ? `archive sync (${part.mode})` : labels.sub
   return (
-    <div className={`grid gap-3 rounded-lg border bg-bg-elevated p-3 sm:grid-cols-[9.5rem_7rem_1fr_5.5rem] ${failed ? 'border-loss/45' : 'border-border-sub'}`}>
-      <div className="text-[0.8125rem] font-semibold text-text">{labels.name}<small className="block font-normal text-[0.6875rem] text-muted">{labels.sub}</small></div>
+    <div className={`grid gap-3 rounded-lg border bg-bg-elevated p-3 min-[900px]:grid-cols-[9.5rem_7rem_1fr_5.5rem] ${failed ? 'border-loss/45' : 'border-border-sub'}`}>
+      <div className="text-[0.8125rem] font-semibold text-text">{labels.name}<small className="block font-normal text-[0.6875rem] text-muted">{sub}</small></div>
       <div><StatusBadge label={badge.label} variant={TONE_VARIANT[badge.tone]} /></div>
       <div className="text-xs text-text-dim leading-relaxed min-w-0">
         {name === 'log' && logDetail(part) && <div>{logDetail(part)}</div>}
         {showSteps && <Steps rows={steps} />}
-        {part.state !== 'running' && part.state !== 'pending' && part.message && <div className={`mt-1 ${failed ? 'text-loss' : 'text-text'}`}>{part.message}</div>}
+        {percent != null && <div className="h-1 rounded-full bg-bg-hover overflow-hidden mt-1.5" role="progressbar" aria-label="OPA scan progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}><span className="block h-full rounded-full bg-accent" style={{ width: `${percent}%` }} /></div>}
+        {name !== 'log' && part.state !== 'running' && part.state !== 'pending' && part.message && <div className={`mt-1 ${failed ? 'text-loss' : 'text-text'}`}>{part.message}</div>}
+        {name === 'log' && failed && part.message && <div className="mt-1 text-loss">{part.message}</div>}
         {failed && canRun && (
-          <div className="mt-1.5"><button type="button" className="text-accent-text underline underline-offset-2 text-xs" onClick={() => onRetry(name)}>Retry this part<span className="sr-only">: {labels.name}</span></button></div>
+          <div className="mt-1"><button type="button" aria-label={`Retry this part: ${labels.name}`} className="text-accent-text underline underline-offset-2 text-xs inline-flex items-center min-h-6 min-w-6 py-1 pr-2" onClick={() => onRetry(name)}>Retry this part</button></div>
         )}
       </div>
       <div className="text-[0.6875rem] text-muted text-right tabular-nums">{elapsed}</div>
@@ -94,6 +99,8 @@ function PartRow({ name, part, opaRunning, elapsed, canRun, onRetry }: { name: R
 
 interface Props {
   status: RefreshStatus
+  /** The environment's name, in the title. */
+  environment?: string
   canRun: boolean
   onRetry: (part: RefreshPartName) => void
   onStop: () => void
@@ -104,7 +111,7 @@ interface Props {
 /** The Overview's refresh progress (5.51.0): three rows with a state badge, the current step and the outcome of each part. Visible while a
  * refresh runs and for a minute after; then one line with "Details". Screen readers hear each part's end state once, in a polite live region
  * (not every step), and the summary at the end. */
-export function RefreshProgressCard({ status, canRun, onRetry, onStop, now: fixedNow }: Props) {
+export function RefreshProgressCard({ status, environment, canRun, onRetry, onStop, now: fixedNow }: Props) {
   const [tick, setTick] = useState(() => Date.now())
   const [detailsOpen, setDetailsOpen] = useState(false)
   const running = status.status === 'running'
@@ -149,39 +156,49 @@ export function RefreshProgressCard({ status, canRun, onRetry, onStop, now: fixe
 
   if (status.status === 'idle') return null
   const t = tally(status)
+  const parts = requestedParts(status)
   const collapsed = !running && !detailsOpen && finishedMs != null && clock - finishedMs >= COLLAPSE_AFTER_MS
   const live = <div role="status" aria-live="polite" className="sr-only" data-testid="refresh-live">{announcement}</div>
-  const summary = running ? 'Refreshing…' : t.failing.length === 0 ? `Refresh finished ${formatDateTime(status.finished_at)}: ${completedText(t.done, t.total)}.` : `Refresh finished ${formatDateTime(status.finished_at)}: ${completedText(t.done, t.total)}; ${t.failing.map(p => `${REFRESH_PART_LABELS[p].name} ${status.parts[p].state === 'refused' ? 'refused' : status.parts[p].state === 'timed_out' ? 'timed out' : 'did not complete'}`).join(', ')}.`
+  const took = elapsedText(status.started_at ?? undefined, status.finished_at ?? undefined, clock)
+  const failingWords = t.failing.map(p => `${REFRESH_PART_LABELS[p].name} ${status.parts[p].state === 'refused' ? 'refused' : status.parts[p].state === 'timed_out' ? 'timed out' : 'did not complete'}`).join(', ')
+  const names = requestedParts(status).map(p => REFRESH_PART_LABELS[p].name)
+  const read = [
+    status.parts.log.state === 'ok' && status.parts.log.events_new != null ? `${status.parts.log.events_new.toLocaleString()} new event${status.parts.log.events_new === 1 ? '' : 's'}` : null,
+    status.parts.opa.state === 'ok' && status.parts.opa.counts?.users != null ? `${status.parts.opa.counts.users.toLocaleString()} principals` : null,
+  ].filter(Boolean)
+  const summary = t.failing.length === 0
+    ? `Refresh finished ${formatDateTimeZone(status.finished_at)} (${took}): ${names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`} ${names.length === 1 ? '' : 'all '}completed${read.length ? ` · ${read.join(' · ')}` : ''}`
+    : `Refresh finished ${formatDateTimeZone(status.finished_at)} (${took}): ${completedText(t.done, t.total)}; ${failingWords}.`
 
   if (collapsed) {
     return (
-      <section aria-label="Refresh progress" className="card px-4 py-2.5">
+      <section aria-label="Refresh progress" className="card px-4 py-2.5 flex flex-col gap-1">
         {live}
-        <div className="flex items-center justify-between gap-3 flex-wrap">
-          <span className="text-[0.8125rem] font-semibold text-text flex items-center gap-2"><StatusBadge label={t.failing.length === 0 ? 'Completed' : `${t.done} of ${t.total} completed`} variant={t.failing.length === 0 ? 'active' : 'warn'} /> {summary}</span>
-          <button type="button" className="text-accent-text underline underline-offset-2 text-xs" onClick={() => setDetailsOpen(true)}>Details</button>
-        </div>
+        <span className="text-[0.8125rem] font-semibold text-text flex items-center gap-2 flex-wrap"><StatusBadge label={t.failing.length === 0 ? 'Completed' : `${t.done} of ${t.total} completed`} variant={t.failing.length === 0 ? 'active' : 'warn'} /> {summary}</span>
+        <div><button type="button" className="text-accent-text underline underline-offset-2 text-xs min-h-6 inline-flex items-center" onClick={() => setDetailsOpen(true)}>Details</button></div>
       </section>
     )
   }
-  const parts = requestedParts(status)
   const order = (['opa', 'log', 'okta'] as RefreshPartName[]).filter(p => parts.includes(p))
   const opaRunning = status.parts.opa.state === 'running'
   const elapsedFor = (p: RefreshPartName) => elapsedText(status.parts[p].started_at, status.parts[p].finished_at, clock)
   return (
     <section aria-label="Refresh progress" className="card p-4 flex flex-col gap-3">
       {live}
-      <div className="flex items-start justify-between gap-3 flex-wrap">
-        <h2 className="text-sm font-semibold text-text flex items-center gap-2">
-          {running ? 'Refreshing' : 'Refresh finished'}
+      <div className="flex flex-col gap-1">
+        <h2 className="text-sm font-semibold text-text flex items-center gap-2 flex-wrap">
+          {running ? `Refreshing ${environment ?? ''}`.trim() : `Refresh of ${environment ?? 'this environment'} finished`}
           <StatusBadge label={running ? `running · ${elapsedText(status.started_at ?? undefined, undefined, clock)}` : completedText(t.done, t.total)} variant={running ? 'exists' : t.failing.length === 0 ? 'active' : 'warn'} />
         </h2>
+        <p className="text-xs text-muted m-0">
+          {status.started_at ? `Started ${formatDateTimeZone(status.started_at)}${status.started_by ? ` by ${status.started_by}` : ''}` : ''}
+          {running
+            ? (parts.includes('okta') && (parts.includes('opa') || parts.includes('log')) ? " · OPA scan and System Log run side by side; the Okta scan follows the log so the two do not share Okta's rate budget." : '')
+            : <> · finished {formatTimeOnly(status.finished_at)} ({took}) · Audit Log: refresh.completed</>}
+        </p>
         <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-xs text-muted">
-            {status.started_at ? `Started ${formatDateTimeZone(status.started_at)}` : ''}{status.finished_at ? ` · finished ${formatDateTimeZone(status.finished_at)}` : ''}
-          </span>
           {running && canRun && <button type="button" className="btn-secondary" onClick={onStop} disabled={status.cancel_requested}>{status.cancel_requested ? 'Stopping…' : 'Stop'}</button>}
-          {!running && detailsOpen && <button type="button" className="text-accent-text underline underline-offset-2 text-xs" onClick={() => setDetailsOpen(false)}>Hide</button>}
+          {!running && detailsOpen && <button type="button" className="text-accent-text underline underline-offset-2 text-xs min-h-6 inline-flex items-center" onClick={() => setDetailsOpen(false)}>Hide</button>}
         </div>
       </div>
       <div className="flex flex-col gap-2">
@@ -191,6 +208,3 @@ export function RefreshProgressCard({ status, canRun, onRetry, onStop, now: fixe
   )
 }
 
-function formatDateTime(iso: string | null): string {
-  return formatDateTimeZone(iso)
-}

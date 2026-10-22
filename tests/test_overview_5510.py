@@ -176,3 +176,8 @@ def test_the_archive_viewer_body_holds_no_name_or_e_mail_from_any_source_the_ove
     for lists in ("/api/overview/people?environment=dev&list=c5", "/api/overview/privileged?environment=dev"):
         r = _call(base_url, "GET", lists, headers=_who(OWNER_B))
         assert r.status_code == 403 and not any(s in r.text for s in SENTINELS)
+
+
+def test_the_sources_name_the_okta_host_and_the_chain_check_time_is_the_overview_time(db):
+    o = oa.build_overview(ENV, now=NOW, okta_host="example.okta.com")
+    assert o["sources"]["okta_org"]["host"] == "example.okta.com" and o["generated_at"].startswith("2026-10-21T12:00")

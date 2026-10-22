@@ -234,39 +234,53 @@ export function KeysSummaryCard({ status, onOpenKeys }: { status: UpgradeStatus;
   )
 }
 
+type HistoryRow = NonNullable<UpgradeStatus['upgrade']>['history'][number]
+
+/** What `ocw-updater` prints for the same run, built from the same fields, so the page and the command line show the same sentences. */
+function cliLine(r: HistoryRow): string | null {
+  if (!r.reason_text) return null
+  const from = r.version_from ?? '?'
+  const to = r.version_to ?? '?'
+  if (r.result === 'rolled_back') return `rolled back to ${from}: ${r.reason_text} ${r.changed ?? ''}\nNext: ${r.next_step ?? ''}  (reason code ${r.reason_code}; audit: upgrade.rolled_back)`
+  return `failed  ${from}→${to}  Refused before anything was switched: ${r.reason_text} ${r.changed ?? ''}\nNext: ${r.next_step ?? ''}  (reason code ${r.reason_code})`
+}
+
+function HistoryEntry({ r }: { r: HistoryRow }) {
+  const title = r.action === 'apply' ? `${r.version_from} → ${r.version_to}` : `${r.action} ${r.version_to ?? ''}`
+  const when = formatDateTime(r.started_at)
+  const failed = r.result !== 'completed'
+  const badge = r.result === 'completed' ? <Badge tone="ok">Completed</Badge> : r.result === 'rolled_back' ? <Badge tone="warn">Rolled back</Badge>
+    : r.result === 'failed' ? <Badge tone="err">Refused</Badge> : <Badge tone="err">{r.result ?? 'Unknown'}</Badge>
+  const cli = cliLine(r)
+  return (
+    <section className="card p-4" aria-label={`${r.reason_code ?? r.result ?? 'upgrade'}: ${title}`}>
+      <div className="grid gap-3 grid-cols-[1fr_auto] items-start">
+        <div>
+          <h3 className="text-[0.8125rem] font-semibold text-text m-0 mb-1 flex items-center gap-2 flex-wrap">{r.reason_code && failed ? `${r.reason_code} · ` : ''}{title} · {when} {badge}{r.seconds != null && <span className="text-xs font-normal text-muted">in {Math.round(r.seconds)} s</span>}</h3>
+          {failed && r.reason_code && <p className="text-xs text-text-dim m-0">{r.reason_text ?? `${describeReason(r.reason_code)}.`}</p>}
+          {failed && (r.changed || r.next_step) && <p className="text-xs m-0 mt-1.5 text-text">{r.changed && <strong>{r.changed}</strong>}{r.next_step && <> Next: {r.next_step}</>}</p>}
+          {!failed && <p className="text-xs text-text-dim m-0">Completed{r.seconds != null ? ` in ${Math.round(r.seconds)} s` : ''}. Correlation <code className="font-mono">{r.correlation_id}</code>.</p>}
+        </div>
+        {r.reason_code && failed && <div className="text-xs text-muted text-right">reason code<br /><code className="font-mono">{r.reason_code}</code></div>}
+      </div>
+      {cli && <pre className="mt-2.5 mb-0 p-3 rounded-lg border border-border bg-bg-elevated text-text-dim font-mono text-xs leading-relaxed whitespace-pre-wrap break-words" aria-label="The same words on the command line">{cli}</pre>}
+      {failed && <p className="text-xs text-muted mt-2 mb-0">Correlation <code className="font-mono">{r.correlation_id}</code></p>}
+    </section>
+  )
+}
+
 function HistoryCard({ status }: { status: UpgradeStatus }) {
   const rows = status.upgrade?.history ?? []
   if (rows.length === 0) return null
   return (
-    <section className="card p-4" aria-labelledby="t-hist">
-      <h2 className={CARD_TITLE} id="t-hist">Upgrade history</h2>
-      <table className="w-full text-xs border-collapse">
-        <thead><tr className="text-left">
-          {['Upgrade', 'When', 'Result', 'Correlation'].map(h => <th key={h} scope="col" className="section-label pb-1 pr-3">{h}</th>)}
-        </tr></thead>
-        <tbody>
-          {rows.map(r => (
-            <tr key={`${r.correlation_id}-${r.started_at}`} className="border-t border-border-sub align-top">
-              <td className="py-1.5 pr-3 text-text">{r.action === 'apply' ? `${r.version_from} → ${r.version_to}` : `${r.action} ${r.version_to ?? ''}`}</td>
-              <td className="py-1.5 pr-3 text-text-dim">{formatDateTime(r.started_at)}</td>
-              <td className="py-1.5 pr-3 text-text-dim">
-                {r.result === 'completed' ? <Badge tone="ok">Completed</Badge> : r.result === 'rolled_back' ? <Badge tone="warn">Rolled back</Badge> : <Badge tone="err">{r.result ?? 'Unknown'}</Badge>}
-                {r.seconds != null && <> in {Math.round(r.seconds)} s</>}
-                {r.reason_code && (
-                  <div className="mt-0.5 text-text-dim">
-                    {r.reason_text ?? `${describeReason(r.reason_code)}.`}
-                    {r.changed && <> {r.changed}</>}
-                    {r.next_step && <> Next: {r.next_step}</>}
-                    {' '}<span className="text-muted">(<code className="font-mono">{r.reason_code}</code>)</span>
-                  </div>
-                )}
-              </td>
-              <td className="py-1.5 text-text-dim"><code className="font-mono">{r.correlation_id}</code></td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      <p className="text-xs text-muted mt-2 mb-0">Every step of each upgrade is an entry in the Audit Log under its correlation id.</p>
+    <section className="flex flex-col gap-3" aria-labelledby="t-hist">
+      <div className="card p-4">
+        <h2 className={CARD_TITLE} id="t-hist">Upgrade history</h2>
+        <p className="text-xs text-muted mt-1 mb-0">
+          Each entry states what happened, whether anything on the server changed, and what to do next. The words come from the updater's own state file, so <code className="font-mono">ocw-updater status</code> prints the same sentences (shown under each entry). Every step of each upgrade is an entry in the Audit Log under its correlation id.
+        </p>
+      </div>
+      {rows.map(r => <HistoryEntry key={`${r.correlation_id}-${r.started_at}`} r={r} />)}
     </section>
   )
 }

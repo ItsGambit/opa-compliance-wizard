@@ -202,6 +202,9 @@ export interface RefreshPart {
   counts?: Record<string, number>
   warnings?: number
   events_new?: number
+  mode?: string | null
+  /** For a failed OPA scan: the audit entry that records it, e.g. "access_scan.failed (OpaApiError: 403)". */
+  audit_line?: string
   adopted?: boolean
   /** The Okta scan's four sub-parts. */
   sub?: Record<string, { state: string; message?: string }>
@@ -216,6 +219,8 @@ export interface RefreshStatus {
   parts: Record<RefreshPartName, RefreshPart>
   cancel_requested: boolean
   summary: string | null
+  /** "you", "the schedule" or "another user": never a name. */
+  started_by?: string | null
 }
 export interface RefreshRecord {
   finished_at: string | null
@@ -1674,7 +1679,7 @@ export interface Overview {
       counts?: Record<string, number>; warnings_count?: number; modified_at?: string | null; last_scan_outcome?: RefreshPartState | null
     }
     refresh?: { schedule: { enabled: boolean; run_time: string }; last_scheduled: RefreshRecord | null; last_manual: RefreshRecord | null }
-    okta_org: { users: number | null }
+    okta_org: { users: number | null; host?: string | null }
   }
   tiles: {
     okta_people: number

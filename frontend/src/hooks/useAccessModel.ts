@@ -25,6 +25,8 @@ export interface AccessModelContextValue {
   ensureLoaded: () => void
   /** Reads OPA again (the OPA part of the refresh). */
   refresh: () => void
+  /** Stops the refresh that is running. */
+  stop: () => void
   /** Local correction after a successful "remove from group". */
   updateModel: (update: (model: AccessModel) => AccessModel) => void
 }

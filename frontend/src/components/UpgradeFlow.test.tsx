@@ -363,19 +363,25 @@ describe('09 success and 10 failure', () => {
     expect(await screen.findByText(/the prepared files do not match the signed release/)).toBeTruthy()  // no reason_text recorded: the fallback sentence
   })
 
-  it('upgrade history shows the words and keeps the raw code secondary', async () => {
+  it('upgrade history is an intro card and one card per attempt: Refused badge, bold "changed" sentence, the code second, and the same words as the command line', async () => {
     const history = [{ correlation_id: 'upg-aaaa0001', action: 'apply', version_from: '5.46.0', version_to: '5.48.0', result: 'failed', reason_code: 'environment_unexpected',
       reason_text: 'The release\'s Python environment has something the updater does not expect.', changed: 'Nothing was changed on the server.',
       next_step: 'From the unpacked release folder, run `sudo server/install.sh --refresh-updater`, then try again.', started_at: '2026-10-20T02:30:02Z', updated_at: '2026-10-20T02:31:00Z', seconds: 40, backup: null, bundle: null },
     { correlation_id: 'upg-aaaa0002', action: 'apply', version_from: '5.45.0', version_to: '5.46.0', result: 'failed', reason_code: 'tree_mismatch', started_at: '2026-10-01T02:30:02Z', updated_at: '2026-10-01T02:31:00Z', seconds: 3, backup: null, bundle: null }]
     vi.mocked(fetchUpgradeStatus).mockResolvedValue(AVAILABLE({ history: history as never }))
     renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
-    const table = (await screen.findByRole('region', { name: 'Upgrade history' }))
-    expect(within(table).getByText(/Python environment has something the updater does not expect/)).toBeTruthy()
-    expect(within(table).getByText(/Nothing was changed on the server\./)).toBeTruthy()
-    expect(within(table).getByText('environment_unexpected', { selector: 'code' })).toBeTruthy()
-    // a row recorded by an earlier release has no words: the sentence for its code, not a bare code
-    expect(within(table).getByText(/did not pass the updater's checks \(older release\)/)).toBeTruthy()
+    const region = await screen.findByRole('region', { name: 'Upgrade history' })
+    expect(within(region).getByText(/prints the same sentences \(shown under each entry\)/)).toBeTruthy()  // the intro card
+    const entry = within(region).getByRole('region', { name: /environment_unexpected: 5\.46\.0 → 5\.48\.0/ })
+    expect(within(entry).getByText('Refused')).toBeTruthy()  // not the raw word "failed"
+    expect(within(entry).getByText('Nothing was changed on the server.', { selector: 'strong' })).toBeTruthy()
+    expect(within(entry).getByText('environment_unexpected', { selector: 'code' })).toBeTruthy()  // the code, labelled, at the side
+    const cli = within(entry).getByLabelText('The same words on the command line')
+    expect(cli.textContent).toMatch(/^failed {2}5\.46\.0→5\.48\.0 {2}Refused before anything was switched: The release's Python environment .* Nothing was changed on the server\.\nNext: From the unpacked release folder.*\(reason code environment_unexpected\)$/)
+    // a row recorded by an earlier release has no words: the sentence for its code, and no command-line block
+    const old = within(region).getByRole('region', { name: /tree_mismatch: 5\.45\.0 → 5\.46\.0/ })
+    expect(within(old).getByText(/did not pass the updater's checks \(older release\)/)).toBeTruthy()
+    expect(within(old).queryByLabelText('The same words on the command line')).toBeNull()
   })
 
   it('rolled back: what happened, where you are, the bundle download, clear-failure and restore on the command line', async () => {

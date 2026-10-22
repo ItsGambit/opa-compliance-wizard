@@ -3,7 +3,7 @@
 import { StrictMode } from 'react'
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, fetchAccessModel, fetchEnvironments, fetchRefreshStatus, startRefresh } from '../api/client'
+import { ApiError, cancelRefresh, fetchAccessModel, fetchEnvironments, fetchRefreshStatus, fetchSyncStatus, startRefresh } from '../api/client'
 import { renderWithClient } from '../test/renderWithClient'
 import type { AccessModel, AccessModelResponse, RefreshStatus } from '../types'
 import { AccessExplorer } from './AccessExplorer'
@@ -11,7 +11,7 @@ import { AccessModelProvider } from './AccessModelProvider'
 
 vi.mock('../api/client', async importOriginal => ({
   ...(await importOriginal<typeof import('../api/client')>()),
-  fetchAccessModel: vi.fn(), startRefresh: vi.fn(), fetchRefreshStatus: vi.fn(), fetchEnvironments: vi.fn(),
+  fetchAccessModel: vi.fn(), startRefresh: vi.fn(), fetchRefreshStatus: vi.fn(), fetchEnvironments: vi.fn(), fetchSyncStatus: vi.fn(), cancelRefresh: vi.fn(),
 }))
 vi.mock('./ResourceGroupsTab', () => ({ ResourceGroupsTab: () => <div>resource groups view</div> }))
 vi.mock('./ExportButtons', () => ({ ExportButtons: () => null }))
@@ -28,15 +28,18 @@ const status = (over: Partial<RefreshStatus> = {}): RefreshStatus => ({
 })
 const noScan = () => new ApiError('No stored OPA scan for this environment yet.', 404, { error: 'x', reason: 'no_scan' })
 
+const toolbarRefresh = () => screen.getAllByRole('button', { name: /Refresh OPA scan/ }).at(-1)!  // the stale banner has one too (first)
+
 beforeEach(() => {
   vi.clearAllMocks()
   vi.mocked(fetchEnvironments).mockResolvedValue({ environments: [], active: 'dev' } as never)
   vi.mocked(fetchRefreshStatus).mockResolvedValue(status())
+  vi.mocked(fetchSyncStatus).mockResolvedValue({ status: 'idle', steps: [], error: null, sync_state: null, is_first_sync: false })
   vi.mocked(startRefresh).mockResolvedValue({ started: true, already_running: false, job_id: 'j1' })
 })
 
 function Shell({ show }: { show: boolean }) {
-  return <AccessModelProvider>{show ? <AccessExplorer subTab="resource_groups" /> : <div>other page</div>}</AccessModelProvider>
+  return <AccessModelProvider>{show ? <AccessExplorer subTab="resource_groups" onOpenEnvironments={() => {}} /> : <div>other page</div>}</AccessModelProvider>
 }
 const renderShell = (show = true) => renderWithClient(<Shell show={show} />)
 
@@ -49,7 +52,7 @@ describe('AccessExplorer', () => {
     expect(screen.getByText(/OPA scan as of/)).toBeTruthy()
     expect(screen.getByText(/6 h ago/)).toBeTruthy()
     expect(screen.getByText('Current')).toBeTruthy()
-    expect(screen.getByRole('button', { name: /Refresh OPA scan/ })).toBeTruthy()
+    expect(toolbarRefresh()).toBeTruthy()
   })
 
   it('starts the first scan only when none was ever stored (no_scan), with the full-page panel', async () => {
@@ -93,7 +96,7 @@ describe('AccessExplorer', () => {
       .mockResolvedValue(status({ status: 'done', job_id: 'j1', parts_requested: ['opa'], parts: { opa: { state: 'ok' }, okta: { state: 'not_requested' }, log: { state: 'not_requested' } } }))
     renderShell()
     await screen.findByText('Stale · 1 day')
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Refresh OPA scan/ })) })
+    await act(async () => { fireEvent.click(toolbarRefresh()) })
     expect(await screen.findByText(/Showing the OPA scan as of/)).toBeTruthy()
     expect(screen.getByText('resource groups view')).toBeTruthy()  // the old data stays while refreshing
     expect(await screen.findByText('Current', undefined, { timeout: 4000 })).toBeTruthy()  // swapped in place
@@ -107,18 +110,26 @@ describe('AccessExplorer', () => {
     vi.mocked(fetchRefreshStatus)
       .mockResolvedValueOnce(status())
       .mockResolvedValue(status({ status: 'done', job_id: 'j1', parts_requested: ['opa'], parts: {
-        opa: { state: 'refused', message: 'OPA refused the service key for projects (HTTP 403). The previous scan is kept.' }, okta: { state: 'not_requested' }, log: { state: 'not_requested' } } }))
+        opa: { state: 'refused', audit_line: 'access_scan.failed (OpaApiError: 403)', steps: [{ key: 'users', status: 'start', detail: null }], step_defs: [['resource_groups', 'Fetching resource groups'], ['users', 'Fetching users'], ['projects', 'Fetching projects']], message: 'OPA refused the service key when listing projects (HTTP 403). Nothing was changed: the scan from 21 Oct 2026, 02:20 UTC is still shown and stored. To fix: open Environments and check the service key; it needs read access to the team\'s users, groups, projects and policies. Then retry.' }, okta: { state: 'not_requested' }, log: { state: 'not_requested' } } }))
     renderShell()
     await screen.findByText('resource groups view')
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Refresh OPA scan/ })) })
-    expect(await screen.findByText(/OPA refused the service key for projects \(HTTP 403\)/)).toBeTruthy()
-    expect(screen.getByText(/Refresh failed:/)).toBeTruthy()
-    expect(screen.getByText(/is still shown\./)).toBeTruthy()
+    await act(async () => { fireEvent.click(toolbarRefresh()) })
+    // the panel leads with the outcome: title, bold what-happened sentence, nothing changed, "To fix:", then the buttons and the audit line
+    expect(await screen.findByText('Refresh refused')).toBeTruthy()
+    expect(screen.getByText('OPA refused the service key when listing projects', { selector: 'strong' })).toBeTruthy()
+    const text = screen.getByTestId('failure-text').textContent!
+    expect(text).toMatch(/^OPA refused the service key when listing projects \(HTTP 403\)\. Nothing was changed: the scan from .* is still shown and stored\. To fix: open Environments/)
+    expect(screen.getByText('To fix:', { selector: 'strong' })).toBeTruthy()
+    const panel = screen.getByTestId('failure-text').parentElement!
+    const order = ['Refresh refused', 'failure-text', 'Retry', 'Open Environments', 'Dismiss', 'Audit Log: access_scan.failed (OpaApiError: 403)']
+    const html = panel.textContent!
+    expect(order.filter(x => x !== 'failure-text').map(x => html.indexOf(x))).toEqual([...order.filter(x => x !== 'failure-text').map(x => html.indexOf(x))].sort((a, b) => a - b))
+    expect(panel.className).not.toMatch(/overflow-y|max-h/)  // never a scroll box that hides the message
+    expect(within(panel).queryByText('Fetching projects')).toBeNull()  // steps that never started are not listed
     expect(screen.getByText('resource groups view')).toBeTruthy()
     const label = screen.getByText(/OPA scan as of/).parentElement!
     expect(within(label).getByText('Current')).toBeTruthy()
-    const refresh = screen.getByRole('button', { name: /Refresh OPA scan/ })
-    expect(refresh.getAttribute('aria-disabled')).toBe('false')
+    expect(toolbarRefresh().getAttribute('aria-disabled')).toBe('false')
   })
 
   it('Refresh OPA scan while a job without the OPA part runs shows the server\'s busy message and keeps the old scan and label (not "done")', async () => {
@@ -127,9 +138,8 @@ describe('AccessExplorer', () => {
     vi.mocked(startRefresh).mockRejectedValue(new ApiError('A refresh of System Log is running. The OPA scan can start when it finishes.', 409, { error: 'x', reason: 'busy_other_parts' }))
     renderShell()
     await screen.findByText('Stale · 1 day')
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Refresh OPA scan/ })) })
-    expect(await screen.findByText(/A refresh of System Log is running\. The OPA scan can start when it finishes\./)).toBeTruthy()
-    expect(screen.getByText(/is still shown\./)).toBeTruthy()
+    await act(async () => { fireEvent.click(toolbarRefresh()) })
+    expect((await screen.findByTestId('failure-text')).textContent).toBe('A refresh of System Log is running. The OPA scan can start when it finishes.')
     expect(screen.getByText('Stale · 1 day')).toBeTruthy()  // the label did not change
     expect(fetchAccessModel).toHaveBeenCalledTimes(1)  // nothing was fetched as if a scan had finished
   })
@@ -138,7 +148,7 @@ describe('AccessExplorer', () => {
     vi.mocked(fetchAccessModel).mockResolvedValue(stored({ modified_at: new Date().toISOString() }))
     renderShell()
     await screen.findByText('resource groups view')
-    const button = screen.getByRole('button', { name: /Refresh OPA scan/ })
+    const button = toolbarRefresh()
     const help = document.getElementById(button.getAttribute('aria-describedby')!)!
     expect(help.textContent).toMatch(/read from the stored scan/)
     expect(screen.getByText('Edited since the scan')).toBeTruthy()
@@ -157,5 +167,42 @@ describe('AccessExplorer', () => {
     vi.mocked(fetchAccessModel).mockResolvedValue(stored())
     renderWithClient(<StrictMode><Shell show /></StrictMode>)
     expect(await screen.findByText('resource groups view')).toBeTruthy()
+  })
+
+  it('a stale scan shows the warning bar with the age, why the scheduled refresh did not read OPA, and what to do', async () => {
+    vi.mocked(fetchAccessModel).mockResolvedValue(stored({ built_at: hoursAgo(50) }))
+    vi.mocked(fetchSyncStatus).mockResolvedValue({ status: 'idle', steps: [], error: null, is_first_sync: false, sync_state: { last_refresh: { scheduled: {
+      finished_at: '2026-10-21T02:20:00.000Z', parts: { opa: { state: 'timed_out', message: 'Stopped after 45 minutes. The previous data is kept. Try again.' } } } } } } as never)
+    renderShell()
+    const bar = (await screen.findByText(/This OPA scan is 2 days old\./)).closest('div')!
+    await waitFor(() => expect(bar.textContent).toMatch(/The scheduled refresh on .*2026 did not finish its OPA part \(Stopped after 45 minutes\)\./))
+    expect(bar.textContent).toMatch(/Policies, groups and memberships may have changed since .*2026/)
+    expect(within(bar).getByRole('button', { name: 'Refresh OPA scan' })).toBeTruthy()
+    expect(within(bar).queryByRole('link', { name: /Audit Log entry/ })).toBeNull()  // the Audit Log is for administrators
+  })
+
+  it('no warning bar for a current scan; the toolbar says Export CSV and Export Markdown and the footnote names the scan', async () => {
+    vi.mocked(fetchAccessModel).mockResolvedValue(stored())
+    renderShell()
+    await screen.findByText('resource groups view')
+    expect(screen.queryByText(/This OPA scan is/)).toBeNull()
+    expect(screen.getByText(/Policy grants come from the stored OPA scan \(.*2026.*\)\. "Last accessed" and "Resource evidence" read the archive/)).toBeTruthy()
+  })
+
+  it('while refreshing the bottom panel has a progress bar, Stop and the sentence that the scan stays on screen', async () => {
+    vi.mocked(fetchAccessModel).mockResolvedValue(stored({ built_at: hoursAgo(6) }))
+    vi.mocked(fetchRefreshStatus).mockResolvedValueOnce(status()).mockResolvedValue(status({ status: 'running', job_id: 'j1', parts_requested: ['opa'], parts: {
+      opa: { state: 'running', step_defs: [['a', 'Resource groups'], ['b', 'Groups'], ['c', 'Users'], ['d', 'Projects']], steps: [{ key: 'a', status: 'done', detail: '4' }, { key: 'b', status: 'start', detail: null }] },
+      okta: { state: 'not_requested' }, log: { state: 'not_requested' } } }))
+    vi.mocked(cancelRefresh).mockResolvedValue({ cancelling: true, job_id: 'j1' })
+    renderShell()
+    await screen.findByText('Current')
+    await act(async () => { fireEvent.click(toolbarRefresh()) })
+    const bar = await screen.findByRole('progressbar', { name: 'Scan progress' })
+    expect(bar.getAttribute('aria-valuenow')).toBe('25')
+    expect(screen.getByText(/stays on screen until the new one finishes\./)).toBeTruthy()
+    expect(screen.getByText('Users')).toBeTruthy()  // the whole list while it runs (the mockup's panel)
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    await waitFor(() => expect(cancelRefresh).toHaveBeenCalledWith('dev'))
   })
 })

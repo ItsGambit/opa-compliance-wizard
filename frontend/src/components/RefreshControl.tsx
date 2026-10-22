@@ -32,6 +32,7 @@ const REFRESH_ITEMS: { key: string; label: string; hint: string; parts?: Refresh
  * Escape closes and returns focus to the caret, Tab and a click outside close. */
 export function RefreshControl({ running, disabledReason, onRefresh, extras = [] }: Props) {
   const [open, setOpen] = useState(false)
+  const mainRef = useRef<HTMLButtonElement>(null)
   const caretRef = useRef<HTMLButtonElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
@@ -68,13 +69,16 @@ export function RefreshControl({ running, disabledReason, onRefresh, extras = []
   }
 
   const refreshBlocked = blocked || running
-  const pick = (disabled: boolean, run: () => void) => () => { if (disabled) return; setOpen(false); run() }
+  // After a choice the menu unmounts: focus goes back to the main Refresh button (it stays focusable even while the refresh runs), so a keyboard
+  // user is not dropped at the top of the page and can find the progress right after it.
+  const pick = (disabled: boolean, run: () => void) => () => { if (disabled) return; setOpen(false); run(); mainRef.current?.focus() }
 
   return (
     <div className="flex flex-col gap-1">
       <div className="relative inline-flex" ref={wrapRef}>
         <button
           type="button"
+          ref={mainRef}
           className="btn-primary rounded-r-none"
           aria-disabled={refreshBlocked}
           aria-describedby={blocked ? reasonId : undefined}

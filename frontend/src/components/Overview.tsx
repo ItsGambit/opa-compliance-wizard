@@ -11,7 +11,7 @@ import type { CrossCheckRow, InventorySeries, MfaWeek, Overview as OverviewData,
 import { downloadTextFile, toCsv } from '../utils/export'
 import { formatDateTime, formatDateTimeZone } from '../utils/format'
 import { activeRow, can, refreshReason } from '../utils/environmentRows'
-import { ageText, completedText, isActive, requestedParts, scanFreshness, staleBadgeText } from '../utils/refresh'
+import { ageText, completedWords, formatDayYear, formatTimeOnly, isActive, ordinal, requestedParts, scanFreshness, staleBadgeText } from '../utils/refresh'
 import { exportAllReports } from '../utils/reportExports'
 import {
   FACTOR_ROWS, approx, dayLabel, inventoryCsv, leadershipPdfHtml, overviewExportSections, pct, seriesValues, signed, weekReadout, windowFigures,
@@ -182,7 +182,7 @@ function ScheduleRow({ o }: { o: OverviewData }) {
   const last = r.last_scheduled
   const parts = last ? (['opa', 'log', 'okta'] as const).filter(p => last.parts[p]) : []
   const ok = parts.filter(p => last!.parts[p]!.state === 'ok').length
-  const lastText = last?.finished_at ? ` · last run ${formatDateTimeZone(last.finished_at)} · ${completedText(ok, parts.length)}` : ' · no scheduled run yet'
+  const lastText = last?.finished_at ? ` · last run ${formatDateTime(last.finished_at)} · ${completedWords(ok, parts.length)}` : ' · no scheduled run yet'
   return <span>{r.schedule.enabled ? `Daily at ${r.schedule.run_time} UTC${lastText}` : `The daily refresh is off${last?.finished_at ? lastText.replace(' · last run', ' · last scheduled run') : ''}. Turn it on in the environment's sync settings.`}</span>
 }
 
@@ -208,15 +208,20 @@ function SourcesStrip({ o, environment, canRun, disabledReason, onRefresh }: {
         </div>
         <div className="flex flex-col gap-0.5">
           <span className="section-label">Okta configuration (who holds which role)</span>
-          {s.okta_snapshot.captured_at ? (
-            <span>Okta configuration snapshot {formatDateTimeZone(s.okta_snapshot.captured_at)}{s.okta_snapshot.index ? ` (${s.okta_snapshot.index}${s.okta_snapshot.index === 1 ? 'st' : s.okta_snapshot.index === 2 ? 'nd' : s.okta_snapshot.index === 3 ? 'rd' : 'th'} snapshot` : ''}{s.okta_snapshot.first_at ? `, since ${dayLabel(s.okta_snapshot.first_at)})` : s.okta_snapshot.index ? ')' : ''} · sealed into the evidence chain <StatusBadge label="Chained" variant="active" /></span>
-          ) : <span>No readable snapshot yet{s.okta_snapshot.newest_attempt_status === 'refused' ? ': Okta refused the last capture' : ''}.</span>}
+          {s.okta_snapshot.captured_at ? (() => {
+            const when = formatDateTimeZone(s.okta_snapshot.captured_at)
+            const which = s.okta_snapshot.index ? ` (${ordinal(s.okta_snapshot.index)} daily snapshot${s.okta_snapshot.first_at ? `, daily since ${formatDayYear(s.okta_snapshot.first_at)}` : ''})` : ''
+            // A refused newest capture is said here, not hidden: the figures use the last readable snapshot.
+            return s.okta_snapshot.newest_attempt_status === 'refused'
+              ? <span>Last readable snapshot {when}{which} · <strong>the newest capture was refused by Okta</strong> <StatusBadge label="Refused" variant="error" /></span>
+              : <span>Okta configuration snapshot {when}{which} · sealed into the evidence chain <StatusBadge label="Chained" variant="active" /></span>
+          })() : <span>No readable snapshot yet{s.okta_snapshot.newest_attempt_status === 'refused' ? ': Okta refused the last capture' : ''}.</span>}
         </div>
         <div className="flex flex-col gap-0.5">
           <span className="section-label">System Log archive (what happened)</span>
           {s.archive.has_archive ? (
             <span>
-              {s.archive.days_held} days held{s.archive.oldest ? `, ${dayLabel(s.archive.oldest)} to ${dayLabel(s.archive.newest ?? '')}` : ''} (Okta keeps 90) · {s.archive.events?.toLocaleString()} events · last sync {formatDateTimeZone(s.archive.last_sync_completed_at)} ({relative(s.archive.last_sync_completed_at)}){' '}
+              {s.archive.days_held} days held{s.archive.oldest ? `, ${formatDayYear(s.archive.oldest)} to ${formatDateTimeZone(s.archive.newest)}` : ''} (Okta keeps 90) · {s.archive.events?.toLocaleString()} events · last sync {formatDateTime(s.archive.last_sync_completed_at)} ({relative(s.archive.last_sync_completed_at)}){' '}
               {s.archive.last_sync_status === 'error' ? <StatusBadge label="Sync failed" variant="error" /> : <StatusBadge label="Current" variant="active" />}
             </span>
           ) : <span>No archive yet: select <strong>Refresh</strong> to read the System Log.</span>}
@@ -224,13 +229,13 @@ function SourcesStrip({ o, environment, canRun, disabledReason, onRefresh }: {
         <div className="flex flex-col gap-0.5">
           <span className="section-label">Evidence chain</span>
           <span>
-            {(chain ?? s.chain) ? <>{chain ? 'Verified now' : 'Last check'} · {(chain ?? s.chain)!.manifest_count} manifests (syncs and snapshots), {(chain ?? s.chain)!.valid ? '0 breaks' : 'a break was found'}{(chain ?? s.chain)!.head_hash ? ` · head ${(chain ?? s.chain)!.head_hash!.slice(0, 8)}…` : ''}{' '}
+            {(chain ?? s.chain) ? <>{chain ? 'Verified now' : `Verified ${formatDateTimeZone(o.generated_at)}`} · {(chain ?? s.chain)!.manifest_count} manifests (syncs and snapshots), {(chain ?? s.chain)!.valid ? '0 breaks' : 'a break was found'}{(chain ?? s.chain)!.head_hash ? ` · head ${(chain ?? s.chain)!.head_hash!.slice(0, 8)}…` : ''}{' '}
               <StatusBadge label={(chain ?? s.chain)!.valid ? 'Intact' : 'Broken'} variant={(chain ?? s.chain)!.valid ? 'active' : 'error'} /></> : 'Not checked yet.'}
           </span>
         </div>
         <div className="flex flex-col gap-0.5">
           <span className="section-label">Okta org</span>
-          <span>{s.okta_org.users != null ? `${s.okta_org.users.toLocaleString()} users (informational)` : 'No count yet'}</span>
+          <span>{s.okta_org.users != null ? `${s.okta_org.users.toLocaleString()} users${s.okta_org.host ? ` in ${s.okta_org.host}` : ''} (informational)` : 'No count yet'}</span>
         </div>
         <div className="flex flex-col gap-0.5">
           <span className="section-label">Scheduled refresh</span>
@@ -247,7 +252,11 @@ function SourcesStrip({ o, environment, canRun, disabledReason, onRefresh }: {
             ...(o.signins_mfa.state === 'not_built' ? [{ key: 'signins', label: 'Build sign-in figures from the archive', onSelect: () => void buildSignins() }] : []),
           ]}
         />
-        <span className="text-xs text-muted self-center">Refresh reads OPA and Okta again and syncs the System Log. Each part is logged in the Audit Log. Reads only; nothing is written to OPA or Okta.</span>
+        <span className="text-xs text-muted self-center">
+          {running
+            ? `Started by ${refresh?.started_by ?? 'you'} at ${formatTimeOnly(refresh?.started_at)}. A second click attaches to this run; nothing is started twice.`
+            : 'Refresh reads OPA and Okta again and syncs the System Log. Each part is logged in the Audit Log. Reads only; nothing is written to OPA or Okta.'}
+        </span>
       </div>
     </section>
   )
@@ -599,7 +608,7 @@ export function OverviewPage({ onOpenReports }: { onOpenReports: () => void }) {
       </div>
 
       <SourcesStrip o={o} environment={environment} canRun={canRun} disabledReason={row ? refreshReason(row) : ''} onRefresh={parts => void start(parts)} />
-      {refresh && refresh.status !== 'idle' && <RefreshProgressCard status={refresh} canRun={canRun} onRetry={part => void start([part])} onStop={() => void stop()} />}
+      {refresh && refresh.status !== 'idle' && <RefreshProgressCard status={refresh} environment={environment} canRun={canRun} onRetry={part => void start([part])} onStop={() => void stop()} />}
 
       <section aria-labelledby="ov-state" className="card p-4">
         <div className="flex items-start justify-between gap-3 flex-wrap">

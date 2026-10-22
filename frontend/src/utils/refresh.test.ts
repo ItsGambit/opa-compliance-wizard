@@ -18,7 +18,10 @@ describe('refresh wording', () => {
   })
 
   it('the finish toast names the parts that did not complete, and says the rest is updated', () => {
-    expect(finishToast(job({ opa: 'ok', okta: 'ok', log: 'ok' }))).toEqual({ title: 'Refresh finished: all 3 parts completed', variant: 'success' })
+    const all = job({ opa: 'ok', okta: 'ok', log: 'ok' })
+    all.parts.okta.sub = { admins: { state: 'ok' }, principal_status: { state: 'ok' }, inventory: { state: 'ok' }, mfa_aggregates: { state: 'skipped' } }
+    expect(finishToast(all)).toEqual({ title: 'Refresh finished: all 3 parts completed', variant: 'success',
+      description: 'Audit Log: refresh.started, access_scan.completed, sync.manual_completed, okta_snapshot.captured ×3, refresh.completed.' })
     const partial = finishToast(job({ opa: 'ok', okta: 'refused', log: 'timed_out' }))
     expect(partial.variant).toBe('warning')
     expect(partial.title).toBe('Refresh finished: 1 of 3 parts completed')
@@ -64,5 +67,15 @@ describe('refresh wording', () => {
     expect(formatDateTimeZone('2026-10-21T02:20:00.000Z')).toMatch(/[A-Z]{2,5}|GMT/)
     expect(formatDateTimeZone(null)).toBe('—')
     expect(formatDateTimeZone('not a date')).toBe('not a date')
+  })
+})
+
+import { completedWords, formatTimeOnly, ordinal } from './refresh'
+describe('wording helpers (mockup fidelity)', () => {
+  it('ordinals and "all three parts"', () => {
+    expect([1, 2, 3, 4, 11, 12, 13, 21, 13].map(ordinal)).toEqual(['1st', '2nd', '3rd', '4th', '11th', '12th', '13th', '21st', '13th'])
+    expect(completedWords(3, 3)).toBe('all three parts completed')
+    expect(completedWords(2, 3)).toBe('2 of 3 parts completed')
+    expect(formatTimeOnly('2026-10-21T08:48:00.000Z')).toMatch(/\d{2}:\d{2}/)
   })
 })

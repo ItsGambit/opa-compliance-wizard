@@ -109,3 +109,20 @@ describe('RefreshControl disabled with a reason (M4)', () => {
     expect(onRefresh).toHaveBeenCalledWith()
   })
 })
+
+describe('RefreshControl focus (U17)', () => {
+  it('after a menu choice (Enter or click) focus returns to the main Refresh button, not the page body', () => {
+    const { caret, onRefresh } = setup()
+    fireEvent.click(caret)
+    const item = screen.getByRole('menuitem', { name: /OPA scan only/ })
+    item.focus()
+    fireEvent.click(item)
+    expect(onRefresh).toHaveBeenCalledWith(['opa'])
+    expect(screen.queryByRole('menu')).toBeNull()
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: /^Refresh$/ }))
+    // an extra (Verify the chain) does the same
+    fireEvent.click(caret)
+    fireEvent.click(screen.getByRole('menuitem', { name: /Verify the chain/ }))
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: /^Refresh$/ }))
+  })
+})

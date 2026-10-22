@@ -99,8 +99,10 @@ describe('Footer', () => {
         finished_at: '2026-10-21T02:20:00.000Z', trigger: 'scheduled', parts: { opa: { state: 'ok' }, log: { state: 'ok' }, okta: { state: 'refused' } } } } },
     } as never)
     renderWithClient(<Footer />)
-    const line = await screen.findByText(/Last refresh:/)
-    expect(line.textContent).toMatch(/2 of 3 parts completed; Okta scan did not complete/)
+    const line = await screen.findByText(/Last refresh /)
+    expect(line.textContent).toMatch(/^Last refresh .*2026.* · 2 of 3 parts completed$/)  // one short line; the detail is in the tooltip and the description
+    expect(line.getAttribute('title')).toBe('Okta scan did not complete')
+    expect(document.getElementById(line.getAttribute('aria-describedby')!)!.textContent).toBe('Okta scan did not complete')
     expect(screen.queryByText(/Last sync:/)).toBeNull()
   })
 

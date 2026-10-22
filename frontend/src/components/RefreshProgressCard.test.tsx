@@ -76,7 +76,8 @@ describe('RefreshProgressCard', () => {
     const { rerender } = render(<RefreshProgressCard status={done} now={new Date('2026-10-21T08:42:30.000Z').getTime()} {...noop} />)
     expect(screen.queryByRole('button', { name: 'Details' })).toBeNull()  // still the full card
     rerender(<RefreshProgressCard status={done} now={new Date('2026-10-21T08:43:30.000Z').getTime()} {...noop} />)
-    expect(screen.getByText(/all 3 parts completed/)).toBeTruthy()
+    expect(screen.getByText(/OPA scan, System Log and Okta scan all completed/)).toBeTruthy()  // what ran, not only a count
+    expect(screen.getByText(/Refresh finished .*\(1 min 00 s\)/)).toBeTruthy()  // with how long it took
     fireEvent.click(screen.getByRole('button', { name: 'Details' }))
     expect(screen.getByText('OPA scan')).toBeTruthy()
   })
@@ -94,5 +95,26 @@ describe('RefreshProgressCard', () => {
     const { container } = render(<RefreshProgressCard status={idle} {...noop} />)
     expect(container.innerHTML).toBe('')
     act(() => {})
+  })
+
+  it('Retry this part: its name has no stray space and its target is at least 24 px high (U18); rows are one column under 900 px (U16)', () => {
+    const failed = withParts(base(), { opa: { state: 'error', message: 'x' } }, { status: 'done', finished_at: '2026-10-21T08:43:00.000Z' })
+    const { container } = render(<RefreshProgressCard status={failed} environment="prod-example" now={NOW} {...noop} />)
+    const retry = screen.getByRole('button', { name: 'Retry this part: OPA scan' })
+    expect(retry.className).toMatch(/min-h-6/)
+    const row = container.querySelector('div.grid')!
+    expect(row.className).toMatch(/min-\[900px\]:grid-cols-/)
+    expect(row.className).not.toMatch(/(^| )sm:grid-cols/)
+  })
+
+  it('leads with the environment, who started it and how long it took; the running card explains the two lanes and holds Stop under the line', () => {
+    const running = { ...base(), started_by: 'you' } as RefreshStatus
+    const { rerender } = render(<RefreshProgressCard status={running} environment="prod-example" now={NOW} {...noop} />)
+    expect(screen.getByText('Refreshing prod-example')).toBeTruthy()
+    expect(screen.getByText(/by you · OPA scan and System Log run side by side; the Okta scan follows the log so the two do not share Okta's rate budget\./)).toBeTruthy()
+    const done = withParts(running, { opa: { state: 'ok' }, log: { state: 'ok' }, okta: { state: 'ok' } }, { status: 'done', finished_at: '2026-10-21T08:43:12.000Z' })
+    rerender(<RefreshProgressCard status={done} environment="prod-example" now={NOW} {...noop} />)
+    expect(screen.getByText('Refresh of prod-example finished')).toBeTruthy()
+    expect(screen.getByText(/by you · finished .* \(2 min 12 s\) · Audit Log: refresh\.completed/)).toBeTruthy()
   })
 })

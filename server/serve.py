@@ -1342,7 +1342,7 @@ def _scan_time(environment_id):
     return info["built_at"] if info else None
 
 
-def _refresh_status(environment_id):
+def _refresh_status(environment_id, caller_sub=None):
     """The JSON for GET .../refresh/status: the job's record with the live step lists of the parts that are running."""
     with _refresh_jobs_lock:
         job = _refresh_jobs.get(environment_id)
@@ -1357,6 +1357,7 @@ def _refresh_status(environment_id):
         with _sync_jobs_lock:
             steps["log"] = list((_sync_jobs.get(environment_id) or {}).get("steps") or [])
     view = job.status_view(steps)
+    view["started_by"] = "the schedule" if job.trigger == "scheduled" else ("you" if job.started_by_sub == caller_sub else "another user")
     if "opa" in job.parts:
         view["parts"]["opa"]["step_defs"] = engine.ACCESS_MODEL_STEPS  # the ordered [key, label] list the step display needs
     return view
@@ -1398,7 +1399,7 @@ def _start_refresh_job(env_id, env_name, parts=None, trigger="manual", owner=eng
                                        client_ip=client_ip, user_agent=user_agent)
             return {"started": False, "already_running": True, "upgrade_starting": False, "job_id": current.job_id}
         # Claimed under the lock that checked it (FE-04): two requests in the same tick can never both start a job.
-        job = rj.RefreshJob(env_id, parts, trigger, options=options)
+        job = rj.RefreshJob(env_id, parts, trigger, options=options, started_by_sub=actor_sub)
         _refresh_jobs[env_id] = job
     ctx = {"env_name": env_name, "owner": owner, "ingestion_scope": ingestion_scope or "curated", "actor_email": actor_email,
            "actor_sub": actor_sub, "client_ip": client_ip, "user_agent": user_agent, "minutes_late": minutes_late,
@@ -1616,7 +1617,8 @@ def _refresh_part_opa(job, ctx):
     else:
         state, message = rj.opa_failure(entry.get("error_kind") or "error", entry.get("error_status"), entry.get("failed_step"),
                                         previous_at, entry.get("error_class") or "an error", entry.get("key_path"))
-        job.finish(part, state, message, steps=steps, previous_built_at=previous_at)
+        job.finish(part, state, message, steps=steps, previous_built_at=previous_at,
+                   audit_line=f"access_scan.failed ({entry.get('error_class') or 'cancelled'})")
 
 
 # -- the log part ------------------------------------------------------------------------------------------------------
@@ -3526,7 +3528,8 @@ class Handler(SimpleHTTPRequestHandler):
                 _name, meta = found
                 if self._capability_refused(engine_owner, meta["environment_id"], ("live_read",)):
                     return
-                return self._send_json(200, _refresh_status(meta["environment_id"]))
+                _o, _e, _email, caller_sub = self._caller()
+                return self._send_json(200, _refresh_status(meta["environment_id"], caller_sub=caller_sub))
 
             if path.startswith("/api/environments/") and path.endswith("/sync/status"):
                 name = unquote(path[len("/api/environments/"):-len("/sync/status")])

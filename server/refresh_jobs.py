@@ -63,8 +63,9 @@ def format_time(iso):
 class RefreshJob:
     """The record of one refresh. All reads and writes of its fields go through the lock; status() returns a plain copy."""
 
-    def __init__(self, environment_id, parts, trigger, options=None):
+    def __init__(self, environment_id, parts, trigger, options=None, started_by_sub=None):
         self.environment_id = environment_id
+        self.started_by_sub = started_by_sub  # compared with the asking caller; never sent out
         self.job_id = uuid.uuid4().hex[:12]
         self.parts = list(parts)
         self.trigger = trigger
@@ -184,7 +185,7 @@ class RefreshJob:
 
 def idle_view():
     return {"status": "idle", "job_id": None, "trigger": None, "started_at": None, "finished_at": None, "parts_requested": [],
-            "parts": {p: {"state": "not_requested"} for p in PARTS}, "cancel_requested": False, "summary": None}
+            "parts": {p: {"state": "not_requested"} for p in PARTS}, "cancel_requested": False, "summary": None, "started_by": None}
 
 
 def summary_line(parts):
@@ -206,16 +207,17 @@ def _state_words(state):
 
 # -- the wording of each outcome (spec section 3.5) ---------------------------------------------------------------------
 OPA_STEP_NOUNS = {
-    "resource_groups": "resource groups", "groups": "groups", "users": "users", "workload_roles": "workload roles",
-    "clients": "enrolled clients", "devices": "Okta-managed devices", "projects": "projects",
-    "index_resources": "folders, secrets and resources", "user_groups": "user group memberships",
-    "policies": "security policies", "resolve": "policy resolution",
+    "resource_groups": "listing resource groups", "groups": "listing groups", "users": "listing users", "workload_roles": "listing workload roles",
+    "clients": "listing enrolled clients", "devices": "listing Okta-managed devices", "projects": "listing projects",
+    "index_resources": "reading folders, secrets and resources", "user_groups": "reading user group memberships",
+    "policies": "listing security policies", "resolve": "resolving policy access",
 }
 
 
 def _previous(previous_built_at):
-    return (f"The previous scan from {format_time(previous_built_at)} is kept." if previous_built_at
-            else "No earlier scan exists, so nothing is shown yet.")
+    """What is still true after a failed scan, for the sentence 'Nothing was changed: <this>.'"""
+    return (f"the scan from {format_time(previous_built_at)} is still shown and stored" if previous_built_at
+            else "no scan is stored yet, so nothing is shown yet")
 
 
 def opa_success_message(counts, warnings, stored, snapshot=None):
@@ -235,21 +237,21 @@ def opa_success_message(counts, warnings, stored, snapshot=None):
 
 
 def opa_failure(kind, status, failed_step, previous_built_at, error_class, key_path=None):
-    """(state, message) for a failed OPA scan. kind: refused (401/403 on a section the model cannot do without), redaction,
-    cancelled or error (the network, a 5xx, anything else)."""
+    """(state, message) for a failed OPA scan: what happened (bold in the UI), that nothing was changed, and what to do ("To fix:").
+    kind: refused (401/403 on a section the model cannot do without), redaction, cancelled or error (the network, a 5xx, anything else)."""
     keep = _previous(previous_built_at)
     if kind == "refused":
-        section = OPA_STEP_NOUNS.get(failed_step, "a required section")
-        return "refused", (f"OPA refused the service key for {section} (HTTP {status}). {keep} "
-                           "Check the key in Environments; the key needs read access to the team.")
+        what = OPA_STEP_NOUNS.get(failed_step, "reading a required section")
+        return "refused", (f"OPA refused the service key when {what} (HTTP {status}). Nothing was changed: {keep}. "
+                           "To fix: open Environments and check the service key; it needs read access to the team's users, groups, projects and policies. Then retry.")
     if kind == "redaction":
         where = f" at {key_path}" if key_path else ""
-        return "error", (f"The scan was not stored: a value shaped like a credential was found{where}. Nothing was written. "
-                         "Report this to the maintainers with the key path.")
+        return "error", (f"The scan was not stored: a value shaped like a credential was found{where}. Nothing was changed: {keep}. "
+                         "To fix: report this to the maintainers with the key path.")
     if kind == "cancelled":
-        return "cancelled", f"Stopped before the scan finished. {keep}"
-    return "error", (f"OPA did not answer as expected ({error_class}). {keep} "
-                     "Try again; if it keeps failing, check the OPA host and the server's network.")
+        return "cancelled", f"Stopped before the scan finished. Nothing was changed: {keep}."
+    return "error", (f"OPA did not answer as expected ({error_class}). Nothing was changed: {keep}. "
+                     "To fix: try again; if it keeps failing, check the OPA host and the server's network.")
 
 
 def log_failure(kind, status, previous_message=None):

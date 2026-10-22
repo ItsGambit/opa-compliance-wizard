@@ -22,20 +22,21 @@ export function ToastProvider() {
 }
 
 function ToastItem({ message: m, onDismiss }: { message: ToastMessage; onDismiss: () => void }) {
-  const borderColor = m.variant === 'error' ? 'border-loss/40' : m.variant === 'success' ? 'border-win/40' : m.variant === 'warning' ? 'border-warn/40' : 'border-border'
-  const titleColor  = m.variant === 'error' ? 'text-loss' : m.variant === 'success' ? 'text-win' : m.variant === 'warning' ? 'text-warn' : 'text-text'
+  // A neutral card with a coloured left edge (the approved mockup's toast); the state is also in the words of the title.
+  const edge = m.variant === 'error' ? 'border-l-loss' : m.variant === 'success' ? 'border-l-win' : m.variant === 'warning' ? 'border-l-warn' : 'border-l-border'
+  const titleColor = 'text-text'
 
   return (
     <Toast.Root
       open
       duration={m.duration ?? (m.variant === 'error' || m.variant === 'warning' ? ERROR_TOAST_DURATION_MS : undefined)}
       onOpenChange={open => { if (!open) onDismiss() }}
-      className={`bg-bg-elevated border ${borderColor} rounded-lg shadow-xl px-4 py-3 flex items-start gap-3
+      className={`bg-bg-elevated border border-border border-l-[3px] ${edge} rounded-lg shadow-xl px-4 py-3 flex items-start gap-3
         data-[state=open]:animate-[slide-in-from-right_0.2s_ease-out]
         data-[state=closed]:animate-[slide-out-to-right_0.15s_ease-in]`}
     >
       <div className="flex-1 min-w-0">
-        <Toast.Title className={`text-sm font-medium ${titleColor}`}>{m.title}</Toast.Title>
+        <Toast.Title className={`text-sm font-semibold ${titleColor}`}>{m.title}</Toast.Title>
         {m.description && (
           <Toast.Description className="text-xs text-text-faint mt-0.5">{m.description}</Toast.Description>
         )}

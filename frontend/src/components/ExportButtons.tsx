@@ -10,9 +10,11 @@ interface Props {
   disabledReason?: string
   /** Called after a file was produced (e.g. to record the export in the audit log). */
   onExport?: (format: 'csv' | 'md') => void
+  /** "Export CSV" and "Export Markdown" instead of "CSV" and "MD" (the Access Explorer's toolbar). */
+  verbose?: boolean
 }
 
-export function ExportButtons({ sections, filenameBase, disabledReason, onExport }: Props) {
+export function ExportButtons({ sections, filenameBase, disabledReason, onExport, verbose }: Props) {
   const hasData = sections.some(s => s.rows.length > 0) && !disabledReason
   return (
     <div className="flex items-center gap-1.5">
@@ -23,7 +25,7 @@ export function ExportButtons({ sections, filenameBase, disabledReason, onExport
         onClick={() => { exportSections(sections, 'csv', filenameBase); onExport?.('csv') }}
         title={disabledReason ?? 'Export as CSV'}
       >
-        <Download size={12} aria-hidden="true" /> CSV
+        <Download size={12} aria-hidden="true" /> {verbose ? 'Export CSV' : 'CSV'}
       </button>
       <button
         type="button"
@@ -32,7 +34,7 @@ export function ExportButtons({ sections, filenameBase, disabledReason, onExport
         onClick={() => { exportSections(sections, 'md', filenameBase); onExport?.('md') }}
         title={disabledReason ?? 'Export as Markdown'}
       >
-        <Download size={12} aria-hidden="true" /> MD
+        <Download size={12} aria-hidden="true" /> {verbose ? 'Export Markdown' : 'MD'}
       </button>
     </div>
   )

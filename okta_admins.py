@@ -918,7 +918,7 @@ def build_overview(environment_id, as_of=None, access_model=None, service_accoun
     admin_users = [i["object"] for i in (snap_for_tiles["items"] if snap_for_tiles else []) if isinstance(i["object"], dict) and i["object"].get("kind") == "user" and i["object"].get("roles")]
     eff = effective_access(access_model)
     c5_card = _c5_card(admins, index)
-    src = ox.sources(environment_id, end, as_of, admins, model_time, (len(eff[0]) + len(eff[1])) if eff else None, inv_summary, integrity, scan=scan, schedule=schedule)
+    src = ox.sources(environment_id, end, as_of, admins, model_time, (len(eff[0]) + len(eff[1])) if eff else None, inv_summary, integrity, scan=scan, schedule=schedule, okta_host=okta_host)
     tl = ox.tiles(admin_users, index, cross, admins["separation_of_duties"], access_model, inv_summary, src["archive"]["days_held"])
     weekly_priv = ox.weekly_event_counts(environment_id, list(GRANT_EVENT_TYPES), end)
     req_types = ["access.request.create", "access.request.resolve", "access.request.expire"]

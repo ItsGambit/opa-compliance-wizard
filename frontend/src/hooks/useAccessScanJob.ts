@@ -12,9 +12,12 @@ interface JobState {
   events: BootstrapStepEvent[]
   error: string | null
   result: AccessModelResponse | null
+  /** The OPA part's end state when it failed ("refused", "error", "timed_out", "cancelled") and the audit entry that records it. */
+  failureState: string | null
+  auditLine: string | null
 }
 
-const INITIAL_STATE: JobState = { phase: 'idle', stepDefs: [], events: [], error: null, result: null }
+const INITIAL_STATE: JobState = { phase: 'idle', stepDefs: [], events: [], error: null, result: null, failureState: null, auditLine: null }
 
 const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err))
 
@@ -56,7 +59,7 @@ export function useAccessScanJob() {
               const result = await fetchAccessModel()  // awaited once, before anything else happens
               if (gen === generation.current) setState(s => ({ ...s, phase: 'done', result }))
             } else {
-              setState(s => ({ ...s, phase: 'error', error: part.message ?? 'The OPA scan did not complete.' }))
+              setState(s => ({ ...s, phase: 'error', error: part.message ?? 'The OPA scan did not complete.', failureState: part.state, auditLine: part.audit_line ?? null }))
             }
             return 'stop'
           },

@@ -300,7 +300,7 @@ export default function App() {
               </h1>
               <p className="text-xs text-muted mt-1 max-w-[72ch]">
                 {activeTab === 'overview' &&
-                  'Okta and OPA privileged access in one place: who can change the gate, who can open the vault, who holds both, and whether the evidence behind it is complete. Counts of people open the list behind them (administrators). Home page for administrators; archive viewers see the counts.'}
+                  'Okta and OPA privileged access in one place: who can change the gate, who can open the vault, who holds both, and whether the evidence behind it is complete. Counts of people open the list behind them. Home page for administrators and archive viewers; other users land on Compliance Reports.'}
                 {activeTab === 'reports' && reportsSubTab === 'browse' &&
                   'Audit evidence for SOC 2 / SOX / ISO 27001 and similar frameworks, generated from OPA + core Okta audit history.'}
                 {activeTab === 'reports' && reportsSubTab === 'secrets_access' &&
@@ -312,7 +312,7 @@ export default function App() {
                 {activeTab === 'reports' && reportsSubTab === 'cross_checks' &&
                   'Questions only a tool that sees both Okta and OPA can answer. Candidates for review, not findings.'}
                 {activeTab === 'access' &&
-                  'Explore who has access to what, across resource groups, projects, policies, users, and groups.'}
+                  'Who can reach what in OPA: resource groups, projects, resources, policies, relationships, users and groups, resolved from the stored OPA scan. Live lookups (last accessed, resource evidence) say so where they appear.'}
                 {activeTab === 'builder' &&
                   'Pick or create a resource group and project, build the folder tree, then preview and create.'}
                 {activeTab === 'audit_log' &&
@@ -342,7 +342,7 @@ export default function App() {
           {activeTab === 'reports' && reportsSubTab === 'service_accounts' && <ServiceAccountsDashboard />}
           {activeTab === 'reports' && reportsSubTab === 'okta_admins' && <OktaAdminsReport />}
           {activeTab === 'reports' && reportsSubTab === 'cross_checks' && <CrossChecks />}
-          {activeTab === 'access' && <AccessExplorer subTab={accessSubTab} />}
+          {activeTab === 'access' && <AccessExplorer subTab={accessSubTab} onOpenEnvironments={() => setEnvironmentsOpen(true)} canAdmin={canAdmin} />}
           {activeTab === 'builder' && <FolderBuilder />}
           {activeTab === 'audit_log' && canAdmin && <AuditLogPage />}
           {activeTab === 'updates' && canAdmin && <UpdatesPage onOpenKeys={() => setActiveTab('update_keys')} onHeader={setUpdatesHeader} />}

@@ -219,4 +219,37 @@ describe('OverviewPage', () => {
     renderWithClient(<OverviewPage onOpenReports={vi.fn()} />)
     expect(await screen.findByText(/administrator access, or the View archive and Live read permissions on this environment/)).toBeTruthy()
   })
+
+  it('a refused newest Okta capture is said in the sources strip, with the last readable snapshot (U8)', async () => {
+    const base = overview()
+    vi.mocked(fetchOverview).mockResolvedValue({ ...base, sources: { ...base.sources, okta_snapshot: { ...base.sources.okta_snapshot, newest_attempt_status: 'refused' } } })
+    renderWithClient(<OverviewPage onOpenReports={vi.fn()} />)
+    await screen.findByText(/14 people hold/)
+    const strip = screen.getByRole('region', { name: 'Where the figures come from' })
+    expect(within(strip).getByText(/Last readable snapshot/)).toBeTruthy()
+    expect(within(strip).getByText('the newest capture was refused by Okta')).toBeTruthy()
+    expect(within(strip).getByText('Refused')).toBeTruthy()
+    expect(within(strip).queryByText('Chained')).toBeNull()
+  })
+
+  it('the sources strip uses the approved wording: ordinal daily snapshot, years on the archive range, Verified, the Okta host (U13)', async () => {
+    const base = overview()
+    vi.mocked(fetchOverview).mockResolvedValue({ ...base, sources: { ...base.sources, okta_org: { users: 1240, host: 'example.okta.com' } } })
+    renderWithClient(<OverviewPage onOpenReports={vi.fn()} />)
+    await screen.findByText(/14 people hold/)
+    const strip = screen.getByRole('region', { name: 'Where the figures come from' })
+    expect(within(strip).getByText(/\(13th daily snapshot, daily since .*2026\)/)).toBeTruthy()
+    expect(within(strip).getByText(/412 days held, .*2025 to .*2026/)).toBeTruthy()
+    expect(within(strip).getByText(/Verified .*2026.* · 418 manifests/)).toBeTruthy()
+    expect(within(strip).getByText(/1,240 users in example\.okta\.com \(informational\)/)).toBeTruthy()
+  })
+
+  it('while a refresh runs the note beside the control says who started it and that a second click attaches', async () => {
+    vi.mocked(fetchRefreshStatus).mockResolvedValue({
+      status: 'running', job_id: 'j2', trigger: 'manual', started_at: '2026-10-21T08:41:00.000Z', finished_at: null, parts_requested: ['opa'], cancel_requested: false, summary: null, started_by: 'you',
+      parts: { opa: { state: 'running' }, log: { state: 'not_requested' }, okta: { state: 'not_requested' } },
+    } as RefreshStatus)
+    renderWithClient(<OverviewPage onOpenReports={vi.fn()} />)
+    expect(await screen.findByText(/Started by you at .*\. A second click attaches to this run; nothing is started twice\./)).toBeTruthy()
+  })
 })

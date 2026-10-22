@@ -84,7 +84,7 @@ def _opa_model_block(model_time, effective_principals, scan, refresh):
     return out
 
 
-def sources(environment_id, now, as_of, admins_report, model_time, effective_principals, inventory_series, integrity, scan=None, schedule=None):
+def sources(environment_id, now, as_of, admins_report, model_time, effective_principals, inventory_series, integrity, scan=None, schedule=None, okta_host=None):
     snaps = audit_store.list_config_snapshots(environment_id, kind="okta_admins", limit=1000)
     ok = [s for s in snaps if s["status"] == "ok"]
     ok.sort(key=lambda s: s["captured_at"])
@@ -115,7 +115,7 @@ def sources(environment_id, now, as_of, admins_report, model_time, effective_pri
         "chain": integrity,
         "opa_model": _opa_model_block(model_time, effective_principals, scan, refresh),
         "refresh": refresh,
-        "okta_org": {"users": users_series["latest"] if users_series else None},
+        "okta_org": {"users": users_series["latest"] if users_series else None, "host": okta_host},
     }
 
 

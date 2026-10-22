@@ -272,7 +272,7 @@ def test_a_stop_ends_the_scan_at_the_next_checkpoint_and_leaves_the_previous_sca
     assert job.part_state("opa") == "cancelled" and len(indexed) < 10
     after = audit_store.opa_model_cache_info(rig.env)
     assert after["built_at"] == before["built_at"]  # the stored scan is still the earlier one
-    assert "previous scan" in job.status_view()["parts"]["opa"]["message"]
+    assert "still shown and stored" in job.status_view()["parts"]["opa"]["message"]
 
 
 def test_a_stop_during_the_log_part_leaves_the_cursor_saved_and_the_run_partial(rig):
@@ -343,8 +343,8 @@ def test_opa_refused_while_okta_and_log_succeed_keeps_the_others_and_says_why(ri
     job = rig.run()
     view = job.status_view()
     assert view["parts"]["opa"]["state"] == "refused"
-    assert "HTTP 403" in view["parts"]["opa"]["message"] and "projects" in view["parts"]["opa"]["message"]
-    assert "previous scan from" in view["parts"]["opa"]["message"] and "https://" not in view["parts"]["opa"]["message"]
+    assert "HTTP 403" in view["parts"]["opa"]["message"] and "listing projects" in view["parts"]["opa"]["message"]
+    assert "Nothing was changed: the scan from" in view["parts"]["opa"]["message"] and "To fix:" in view["parts"]["opa"]["message"] and "https://" not in view["parts"]["opa"]["message"]
     assert view["parts"]["log"]["state"] == "ok" and view["parts"]["okta"]["state"] == "ok"
     sub = view["parts"]["okta"]["sub"]
     assert sub["principal_status"]["state"] == "skipped" and "OPA scan did not finish" in sub["principal_status"]["message"]
@@ -576,8 +576,8 @@ def test_no_refresh_message_uses_alarm_words_or_carries_a_url_or_a_name():
         assert not re.search(r"tamper|attack|malicious|security", text, re.I), text
         assert "http://" not in text and "https://" not in text and "@" not in text, text
         assert text.rstrip().endswith((".", ")")), text  # a sentence, not a fragment
-    assert any("previous scan from 21 Oct 2026, 02:20 UTC" in t for t in samples)  # times carry the zone
-    assert any("No earlier scan exists" in t for t in samples)
+    assert any("the scan from 21 Oct 2026, 02:20 UTC is still shown and stored" in t for t in samples)  # the time carries its zone, once
+    assert any("no scan is stored yet" in t for t in samples)
     assert not any("archive is unchanged" in t.lower() for t in samples)  # events stored before a refusal or a stop are kept, so "unchanged" would be untrue
 
 
@@ -770,3 +770,32 @@ def test_the_sync_status_route_shows_the_refresh_outcomes_only_to_callers_who_ma
     engine.set_shared_permissions({"live_read": "allow"}, environment_id=env_id)
     assert get(_who(OWNER_B)).json()["sync_state"]["last_refresh"]["scheduled"]["parts"]["opa"]["state"] == "refused"
     assert _call(base_url, "GET", "/api/environments/dev/refresh/status", headers=_who(OWNER_B)).status_code == 200
+
+
+# -- UI fidelity round: what the screens need from the status ----------------------------------------------------------------------
+def test_the_status_says_who_started_it_without_naming_anyone_and_a_refused_scan_carries_its_audit_line(matrix_server, monkeypatch):  # noqa: F811
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+    engine.set_environment_shared("dev", OWNER_A, True)
+    engine.set_shared_permissions({"live_read": "allow", "sync_now": "allow"}, environment_id=env_id)
+    monkeypatch.setattr(serve, "_run_refresh_job", lambda job, ctx: time.sleep(0.3))
+    assert _call(base_url, "POST", "/api/environments/dev/refresh", {"parts": ["log"]}, _who(OWNER_A)).status_code == 200
+    mine = _call(base_url, "GET", "/api/environments/dev/refresh/status", headers=_who(OWNER_A)).json()
+    other = _call(base_url, "GET", "/api/environments/dev/refresh/status", headers=_who(OWNER_B)).json()
+    assert mine["started_by"] == "you" and other["started_by"] == "another user" and OWNER_A not in json.dumps(other)
+    time.sleep(0.5)
+    with serve._refresh_jobs_lock:
+        serve._refresh_jobs.pop(env_id, None)
+    job = rj.RefreshJob(env_id, ["opa"], "scheduled")
+    with serve._refresh_jobs_lock:
+        serve._refresh_jobs[env_id] = job
+    assert _call(base_url, "GET", "/api/environments/dev/refresh/status", headers=_who(OWNER_A)).json()["started_by"] == "the schedule"
+
+
+def test_a_refused_scan_message_leads_with_what_happened_then_nothing_changed_then_to_fix(rig):  # noqa: F811
+    rig.builder = lambda client, okta_client=None, on_progress=None: (
+        on_progress("users", "start", None), (_ for _ in ()).throw(engine.OpaApiError(403, "https://x.example.com/u", "denied")))[1]
+    data = rig.run(["opa"]).status_view()["parts"]["opa"]
+    assert data["state"] == "refused" and data["audit_line"] == "access_scan.failed (OpaApiError: 403)"
+    assert data["message"].startswith("OPA refused the service key when listing users (HTTP 403). Nothing was changed: no scan is stored yet")
+    assert "To fix: open Environments and check the service key" in data["message"] and data["message"].endswith("Then retry.")

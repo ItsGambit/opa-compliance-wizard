@@ -75,6 +75,46 @@ export function completedText(done: number, total: number): string {
   return done === total ? `all ${total} parts completed` : `${done} of ${total} parts completed`
 }
 
+/** The audit entries a refresh wrote, as the success toast lists them ("Audit Log: refresh.started, access_scan.completed, ..."). */
+export function auditLine(status: RefreshStatus): string {
+  const parts = requestedParts(status)
+  const names = ['refresh.started']
+  if (parts.includes('opa')) names.push('access_scan.completed')
+  if (parts.includes('log')) names.push(status.trigger === 'scheduled' ? 'sync.scheduled_completed' : 'sync.manual_completed')
+  if (parts.includes('okta')) {
+    const ok = Object.values(status.parts.okta.sub ?? {}).filter(x => x.state === 'ok').length
+    if (ok > 0) names.push(`okta_snapshot.captured ×${ok}`)
+  }
+  names.push('refresh.completed')
+  return `Audit Log: ${names.join(', ')}.`
+}
+
+/** "all three parts completed" (the sources strip's wording) next to completedText's "all 3 parts completed". */
+export function completedWords(done: number, total: number): string {
+  return total === 3 && done === 3 ? 'all three parts completed' : completedText(done, total)
+}
+
+/** "13th". */
+export function ordinal(n: number): string {
+  const mod100 = n % 100
+  if (mod100 >= 11 && mod100 <= 13) return `${n}th`
+  return `${n}${({ 1: 'st', 2: 'nd', 3: 'rd' } as Record<number, string>)[n % 10] ?? 'th'}`
+}
+
+/** "08:48": a time on the same day as a time already shown with its date and zone. */
+export function formatTimeOnly(iso: string | null | undefined): string {
+  if (!iso) return ''
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+}
+
+/** "4 Sep 2025". */
+export function formatDayYear(iso: string | null | undefined): string {
+  if (!iso) return ''
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? String(iso) : d.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })
+}
+
 /** The finish toast (the Overview and every other page use the same words). */
 export function finishToast(status: RefreshStatus): { title: string; description?: string; variant: 'success' | 'warning' } {
   const t = tally(status)
@@ -84,7 +124,7 @@ export function finishToast(status: RefreshStatus): { title: string; description
     return only ? { title: `Refresh finished: ${label} ${stateWords(status.parts[only].state)}`, description: 'The data from before is kept. Details are on the Overview.', variant: 'warning' }
       : { title: `Refresh finished: ${label} completed`, variant: 'success' }
   }
-  if (t.failing.length === 0) return { title: `Refresh finished: ${completedText(t.done, t.total)}`, variant: 'success' }
+  if (t.failing.length === 0) return { title: `Refresh finished: ${completedText(t.done, t.total)}`, description: auditLine(status), variant: 'success' }
   return {
     title: `Refresh finished: ${completedText(t.done, t.total)}`,
     description: `${t.failing.map(p => `${REFRESH_PART_LABELS[p].name} ${stateWords(status.parts[p].state)}.`).join(' ')} The figures from the other parts are updated.`,
