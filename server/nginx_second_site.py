@@ -153,18 +153,15 @@ def _location_blocks(text):
 # request never reaches the backend. Admins change these from the main
 # gate's site.
 #
-# 5.50.0: the admin-only Overview joins the list; a site generated before 5.50.0 lacks its block
+# 5.50.0: the admin-only Overview (/api/overview, including /people and /privileged) joins the list; a site generated before 5.50.0 lacks its block
 # (run `sudo server/install.sh --regenerate-second-sites`, README "Upgrading").
-# 5.51.0: the Overview's counts are served through a second site (the bare /api/overview goes through the /api/ proxy), so only
-# the sub-paths (the lists of people) are denied by prefix (`/api/overview/`), plus the server-level raw-request-line rule for ?id=
-# and percent-escapes. A site generated before 5.51.0 still denies the bare path: install.sh --check flags it for regeneration.
 #
 # 5.47.0: host upgrades are a property of the whole backend as well: the update
 # status and settings (5.46.0) and the upgrade support-bundle download. A site
 # generated before 5.47.0 lacks this block; setup-second-gate.sh never rewrites an
 # existing site, so run `sudo server/install.sh --regenerate-second-sites`
 # (README, "Upgrading").
-SECOND_SITE_DENIED_PREFIXES = ("/api/access_control", "/api/shared_permissions", "/api/archives", "/api/upgrade", "/api/overview/")
+SECOND_SITE_DENIED_PREFIXES = ("/api/access_control", "/api/shared_permissions", "/api/archives", "/api/upgrade", "/api/overview")
 
 _ACCESS_CONTROL_BLOCK = (
     "\n    # GATE-04: access_control.json belongs to the MAIN org only --\n"
@@ -184,9 +181,8 @@ _ACCESS_CONTROL_BLOCK = (
     "    location /api/upgrade {\n"
     "        return 403;\n"
     "    }\n"
-    "    # 5.51.0: the Overview's lists of people (/api/overview/people, /privileged) are read from the main site only. The bare\n"
-    "    # /api/overview (counts) goes through the /api/ proxy: see the server-level rule below and docs/hosting.md.\n"
-    "    location /api/overview/ {\n"
+    "    # 5.50.0: the Overview (admin-only, with its people lists) is read from the main site only.\n"
+    "    location /api/overview {\n"
     "        return 403;\n"
     "    }\n"
     # Deleting an environment WITH its archive (DELETE
@@ -205,15 +201,6 @@ _ACCESS_CONTROL_BLOCK = (
     "    # purge (?purge_archive=1); a location can't match a query string.\n"
     "    set $opa_second_site_delete \"$request_method $request_uri\";\n"
     "    if ($opa_second_site_delete ~* \"^DELETE [^?]*\\?.*(purge|%)\") {\n"
-    "        return 403;\n"
-    "    }\n"
-    # 5.51.0: a second-site user is an administrator to the backend (the gate admits only its org's admin group), so the Overview's
-    # counts are served there without the view_archive + live_read check, and `?id=<uuid>` would address ANY environment. A
-    # location cannot see the query string, so the raw request line is checked at server level, like the delete rule above: any
-    # GET of /api/overview carrying an id= parameter, or a percent-escape in the query (serve.py would decode it into one), is refused.
-    "    # 5.51.0: /api/overview?id=<uuid> addresses any environment; refused here, whatever its position in the query.\n"
-    "    set $opa_second_site_overview \"$request_method $request_uri\";\n"
-    "    if ($opa_second_site_overview ~* \"^GET /api/overview[^?]*\\?(.*&)?id=|^GET /api/overview[^?]*\\?.*%\") {\n"
     "        return 403;\n"
     "    }\n"
 )
@@ -292,15 +279,13 @@ def build(main_site, gate_port, listen, host, name, allow_public_listen=False):
     # denied route) and win over the prefix deny block (regex locations beat
     # prefix ones in nginx), as could a longer prefix location.
     for prefix in SECOND_SITE_DENIED_PREFIXES:
-        word = prefix.rstrip("/").rsplit("/", 1)[-1]
+        word = prefix.rsplit("/", 1)[-1]
         if any(word in path for path, _ in _location_blocks(b) if path != prefix):
             raise ValueError(f"another location matching {prefix} survived -- it could shadow the deny block")
         if not re.search(rf"location {re.escape(prefix)} \{{\s*return 403;\s*\}}", structure):
             raise ValueError(f"{prefix} deny block was not inserted")
     if "if ($opa_second_site_delete ~* " not in structure or "set $opa_second_site_delete " not in structure:
         raise ValueError("the purge-on-delete deny was not inserted")
-    if "if ($opa_second_site_overview ~* " not in structure or "set $opa_second_site_overview " not in structure:
-        raise ValueError("the overview ?id= deny was not inserted")
     if re.search(r"location\s+(=\s*)?/api/access_control/save", structure):
         raise ValueError("the main site's own access_control/save location survived -- it would shadow the deny block")
     header = (f"# OPA auth gate '{name}' on {host}. Generated from sites-available/opa-secrets-wizard by\n"
