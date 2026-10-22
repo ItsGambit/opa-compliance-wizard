@@ -2,8 +2,8 @@
  * true, is_admin false) sees the Audit Log and banner settings the server
  * already serves them; Access Control stays hidden (it needs the hosted
  * step-up MFA flow). */
-import { render, screen } from '@testing-library/react'
-import { beforeAll, describe, expect, it } from 'vitest'
+import { fireEvent, render, screen } from '@testing-library/react'
+import { beforeAll, describe, expect, it, vi } from 'vitest'
 import { SideNav } from './SideNav'
 
 beforeAll(() => {
@@ -62,5 +62,29 @@ describe('SideNav Overview entry (5.51.0)', () => {
     viewer.unmount()
     renderNav({ canAdmin: false, canViewOverview: false })
     expect(screen.queryAllByText('Overview')).toHaveLength(0)
+  })
+})
+
+describe('SideNav Okta Admins (P3)', () => {
+  it('is a top-level item after the Access Explorer, and Compliance Reports no longer lists it as a sub-item', () => {
+    const noop = () => {}
+    const onReports = vi.fn()
+    render(<SideNav activeTab="reports" onTabChange={noop} accessSubTabs={[]} accessSubTab="" onAccessSubTabChange={noop} reportsSubTab="browse" onReportsSubTabChange={onReports}
+      onOpenEnvironments={noop} onOpenBanner={noop} onOpenAccessControl={noop} onOpenAbout={noop} />)
+    const labels = screen.getAllByRole('button').map(b => b.textContent)
+    expect(labels.indexOf('Okta Admins')).toBeGreaterThan(labels.indexOf('Access Explorer'))
+    expect(labels.indexOf('Okta Admins')).toBeLessThan(labels.indexOf('Folder Builder'))
+    expect(screen.getAllByText('Okta Admins')).toHaveLength(1)  // not also under Compliance Reports
+    fireEvent.click(screen.getByText('Okta Admins'))
+    expect(onReports).toHaveBeenCalledWith('okta_admins')
+  })
+
+  it('marks Okta Admins current on its page and Compliance Reports current elsewhere', () => {
+    const noop = () => {}
+    const { unmount } = render(<SideNav activeTab="reports" onTabChange={noop} accessSubTabs={[]} accessSubTab="" onAccessSubTabChange={noop} reportsSubTab="okta_admins" onReportsSubTabChange={noop}
+      onOpenEnvironments={noop} onOpenBanner={noop} onOpenAccessControl={noop} onOpenAbout={noop} />)
+    expect(screen.getByText('Okta Admins').closest('button')!.getAttribute('aria-current')).toBe('page')
+    expect(screen.getByText('Compliance Reports').closest('button')!.getAttribute('aria-current')).toBeNull()
+    unmount()
   })
 })

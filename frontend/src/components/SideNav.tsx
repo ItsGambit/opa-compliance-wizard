@@ -337,15 +337,15 @@ export function SideNav({
             />
           )}
           <NavItem
-            active={activeTab === 'reports'}
+            active={activeTab === 'reports' && reportsSubTab !== 'okta_admins'}
             label={TOP_LEVEL_LABEL.reports}
             icon={TOP_LEVEL_ICON.reports}
             onClick={() => { onTabChange('reports'); closeDrawer() }}
             collapsed={collapsed}
           />
-          {!collapsed && activeTab === 'reports' && (
+          {!collapsed && activeTab === 'reports' && reportsSubTab !== 'okta_admins' && (
             <div className="pl-6 flex flex-col gap-0.5 mb-1">
-              {REPORTS_SUB_TABS.map(sub => (
+              {REPORTS_SUB_TABS.filter(sub => sub.value !== 'okta_admins').map(sub => (  // Okta Admins is a top-level item (5.51.0, as in the approved mockup)
                 <NavItem
                   key={sub.value}
                   active={reportsSubTab === sub.value}
@@ -376,6 +376,14 @@ export function SideNav({
               ))}
             </div>
           )}
+
+          <NavItem
+            active={activeTab === 'reports' && reportsSubTab === 'okta_admins'}
+            label="Okta Admins"
+            icon={ShieldCheck}
+            onClick={() => { onReportsSubTabChange('okta_admins'); closeDrawer() }}
+            collapsed={collapsed}
+          />
 
           <NavItem
             active={activeTab === 'builder'}

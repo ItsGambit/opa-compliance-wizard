@@ -181,3 +181,11 @@ def test_the_archive_viewer_body_holds_no_name_or_e_mail_from_any_source_the_ove
 def test_the_sources_name_the_okta_host_and_the_chain_check_time_is_the_overview_time(db):
     o = oa.build_overview(ENV, now=NOW, okta_host="example.okta.com")
     assert o["sources"]["okta_org"]["host"] == "example.okta.com" and o["generated_at"].startswith("2026-10-21T12:00")
+
+
+def test_a_refused_capture_names_its_okta_error_code_in_the_sources(db):
+    oa.capture_and_store(ENV, FakeOkta(), captured_at="2026-10-20T02:14:00.000Z")
+    from test_okta_admins_5500 import REFUSED
+    oa.capture_and_store(ENV, FakeOkta(fail={"assignees": REFUSED}))
+    src = oa.build_overview(ENV)["sources"]["okta_snapshot"]
+    assert src["newest_attempt_status"] == "refused" and src["newest_attempt_error_code"] == "E0000006" and src["captured_at"].startswith("2026-10-20")

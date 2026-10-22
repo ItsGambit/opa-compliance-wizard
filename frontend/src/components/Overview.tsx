@@ -102,7 +102,9 @@ function PeopleDrawer({ environment, list, asOf, onClose }: { environment: strin
             This list contains names. Opening it is recorded in the Audit Log. Candidates for review, not findings.
           </Dialog.Description>
           {isLoading && <span className="text-sm text-text-faint">Loading…</span>}
-          {isError && <div className="text-sm text-loss">Could not load the list: {(error as Error).message}</div>}
+          {isError && ((error as { status?: number } | null)?.status === 403
+            ? <div className="text-sm text-text-dim" role="status">Lists are available on the main sign-in. This sign-in shows the counts only.</div>
+            : <div className="text-sm text-loss">Could not load the list: {(error as Error).message}</div>)}
           {data && data.state === 'refused' && <div className="text-sm text-loss" role="status">{data.message}</div>}
           {data && data.state !== 'refused' && data.people.length === 0 && <span className="text-sm text-text-dim">Nobody is on this list.</span>}
           {data && list === 'c1' && data.people.length > 0 && (

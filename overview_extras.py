@@ -101,6 +101,7 @@ def sources(environment_id, now, as_of, admins_report, model_time, effective_pri
             "first_at": ok[0]["captured_at"] if ok else None, "state": admins_report.get("state"),
             "newest_attempt_status": newest_snapshot["status"] if newest_snapshot else None,
             "newest_attempt_at": newest_snapshot["captured_at"] if newest_snapshot else None,
+            "newest_attempt_error_code": ((newest_snapshot.get("meta") or {}).get("error_code") if newest_snapshot and newest_snapshot["status"] != "ok" else None),
             "days_old": _days_between((admins_report.get("as_of_snapshot") or {}).get("captured_at"), now) if admins_report.get("as_of_snapshot") else None,
         },
         "archive": {

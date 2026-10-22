@@ -14,9 +14,9 @@ import { GroupRemoveControl } from './explorer/GroupRemoveControl'
 import { RailGroupsExpander } from './explorer/RailGroupsExpander'
 import { CountList, FilterMenu } from './explorer/RailParts'
 import { ResourceAccessView } from './explorer/ResourceAccessView'
+import { UserRail } from './explorer/UserRail'
 import { useGrantsExplorer } from './explorer/useGrantsExplorer'
 import { ExportButtons } from './ExportButtons'
-import { Select } from './Select'
 
 /** Okta lifecycle flags per OPA user id (cross-check C1), from the newest lookup; absent when none has been run. */
 export interface OktaUserFlags {
@@ -34,12 +34,6 @@ interface Props {
   onUserGroupRemoved: (userId: string, groupId: string) => void
 }
 
-function flagSuffix(flag: 'inactive' | 'absent' | 'unknown' | null | undefined): string {
-  if (flag === 'inactive') return ' (Okta: inactive)'
-  if (flag === 'absent') return ' (Okta: not found)'
-  return ''
-}
-
 export function UsersTab({ model, okta, onUserGroupRemoved }: Props) {
   const [userId, setUserId] = useState<string | undefined>(undefined)
   // One stable "now" per screen so relative times do not shift while reading.
@@ -47,23 +41,7 @@ export function UsersTab({ model, okta, onUserGroupRemoved }: Props) {
   const user = model.users.find(u => u.id === userId)
   const isServiceAccount = user?.user_type === 'service'
 
-  // FIX (external review, 2026-09-30): an inline model.users.map(...) in
-  // the JSX below created a brand new array every render regardless of
-  // whether model.users actually changed -- on a tenant with a large user
-  // count, this defeats the Select component's internal useFuzzyFilter
-  // memoization (which keys off array identity) and rebuilds its whole
-  // search index on every keystroke/render, not just when the user list
-  // itself changes.
-  const userOptions = useMemo(
-    () => model.users.map(u => ({
-      value: u.id,
-      label: (u.details?.full_name || u.name) + flagSuffix(okta?.users[u.id]?.flag),
-      // Not shown, but typed often: e-mail, login name, first/last name.
-      keywords: [u.details?.email, u.name, u.details?.first_name, u.details?.last_name].filter((v): v is string => !!v),
-      labelClassName: u.user_type === 'service' ? 'text-warn' : undefined,
-    })),
-    [model.users, okta]
-  )
+  const flags = useMemo(() => (okta ? Object.fromEntries(Object.entries(okta.users).map(([id, u]) => [id, u.flag])) : undefined), [okta])
 
   const oktaFlag = user ? okta?.users[user.id]?.flag ?? null : null
   const groupIds = useMemo(() => new Set(user?.groups.map(g => g.id) ?? []), [user])
@@ -160,10 +138,7 @@ export function UsersTab({ model, okta, onUserGroupRemoved }: Props) {
 
   const rail = (
     <>
-      <div className="flex flex-col gap-1">
-        <span className="section-label">User</span>
-        <Select ariaLabel="User" value={userId} onValueChange={setUserId} placeholder="Select a user" options={userOptions} />
-      </div>
+      <UserRail users={model.users} flags={flags} selectedId={userId} onSelect={setUserId} />
       {user && (
         <>
           <div className="flex flex-col gap-1">

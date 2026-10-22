@@ -264,16 +264,16 @@ def test_quoted_regex_location_is_seen_and_refused():
 from server.nginx_second_site import SECOND_SITE_DENIED_PREFIXES  # noqa: E402
 
 
-@pytest.mark.parametrize("prefix", ["/api/shared_permissions", "/api/archives", "/api/upgrade", "/api/overview"])
+@pytest.mark.parametrize("prefix", ["/api/shared_permissions", "/api/archives", "/api/upgrade", "/api/overview/"])
 def test_shared_permissions_and_archive_purge_are_denied_entirely(site, prefix):
     assert prefix in SECOND_SITE_DENIED_PREFIXES
     assert re.search(rf"location {re.escape(prefix)} \{{\s*return 403;\s*\}}", site)
     # Nothing else in the site can win over the deny for these routes.
-    assert [p for p, _ in _location_blocks(site) if prefix.rsplit("/", 1)[-1] in p] == [prefix]
+    assert [p for p, _ in _location_blocks(site) if prefix.rstrip("/").rsplit("/", 1)[-1] in p] == [prefix]
 
 
 def test_access_control_deny_is_still_there_with_the_new_ones(site):
-    assert SECOND_SITE_DENIED_PREFIXES == ("/api/access_control", "/api/shared_permissions", "/api/archives", "/api/upgrade", "/api/overview")
+    assert SECOND_SITE_DENIED_PREFIXES == ("/api/access_control", "/api/shared_permissions", "/api/archives", "/api/upgrade", "/api/overview/")
     for prefix in SECOND_SITE_DENIED_PREFIXES:
         assert site.count(f"location {prefix} {{") == 1
 
@@ -289,9 +289,9 @@ def test_delete_with_archive_purge_is_denied_at_server_level(site):
     # Server level (not inside a location): it runs before any location is chosen.
     for _path, blk in _location_blocks(site):
         assert "opa_second_site_delete" not in blk
-    # four server-level ifs: this site's delete rule and (5.47.0) the three of the maintenance-page check
+    # five server-level ifs: the delete rule, the Overview ?id= rule (5.51.0) and (5.47.0) the three of the maintenance-page check
     # (flag file present, not the page's own internal URI, then return 503)
-    assert structure.count("if (") == 4 and "-f $ocw_maintenance_page" in site
+    assert structure.count("if (") == 5 and "-f $ocw_maintenance_page" in site
     assert "if ($uri = /__ocw_maintenance)" in site
 
 
@@ -355,3 +355,68 @@ def test_missing_denies_finds_a_site_generated_before_the_upgrade_deny_existed(s
 def test_regenerating_from_the_read_back_parameters_reproduces_the_site(site):
     port, listen, host = site_params(site)
     assert build(MAIN, port, listen, host, "second") == site
+
+
+# ---------------------------------------------------------------------------
+# 5.51.0: the Overview's counts are served through a second site (option B): only the lists of people are denied by prefix, and the
+# raw request line is checked for ?id= (a second-site user is an administrator to the backend, so ?id= would address any environment).
+# ---------------------------------------------------------------------------
+import urllib.parse  # noqa: E402
+
+OVERVIEW_RULE = re.compile(r"^GET /api/overview[^?]*\?(.*&)?id=|^GET /api/overview[^?]*\?.*%", re.I)
+
+
+def test_the_rendered_site_has_exactly_one_overview_location_and_it_is_the_sub_path_deny(site):
+    blocks = [p for p, _ in _location_blocks(site) if "overview" in p]
+    assert blocks == ["/api/overview/"]
+    assert not re.search(r"location\s+=\s*/api/overview", _structure(site))  # an exact-match block could not fall through to the proxy
+    assert re.search(r"location /api/overview/ \{\s*return 403;\s*\}", site)
+
+
+def test_the_overview_rule_is_server_level_on_the_raw_request_line_and_in_the_site(site):
+    assert 'set $opa_second_site_overview "$request_method $request_uri";' in site
+    assert 'if ($opa_second_site_overview ~* "^GET /api/overview[^?]*\\?(.*&)?id=|^GET /api/overview[^?]*\\?.*%") {' in site
+    for _path, blk in _location_blocks(site):
+        assert "opa_second_site_overview" not in blk
+    assert "$uri" not in site.split("set $opa_second_site_overview", 1)[1].split("}", 1)[0]
+
+
+@pytest.mark.parametrize("request_line,refused", [
+    ("GET /api/overview?environment=dev", False),
+    ("GET /api/overview?environment=dev&weeks=13", False),
+    ("GET /api/overview?id=0b1c2d3e-0000-4000-8000-000000000001", True),
+    ("GET /api/overview?environment=dev&id=0b1c2d3e-0000-4000-8000-000000000001", True),
+    ("GET /api/overview?environment=dev&ID=x", True),
+    ("GET /api/overview?environment=%64ev", True),            # a percent-escape in the query: serve.py would decode it
+    ("GET /api/overview?%69d=x", True),
+    ("GET /api/overview/?id=x", True),
+    ("GET /api/overview?valid=1", False),                      # 'id=' must be a parameter name, not the tail of another one
+])
+def test_the_overview_rule_refuses_id_and_percent_escapes_and_passes_the_ui_requests(request_line, refused):
+    assert bool(OVERVIEW_RULE.search(request_line)) is refused
+
+
+def test_an_escaped_slash_in_the_path_is_refused_by_the_sub_path_deny_after_nginx_decodes_it():
+    # nginx matches locations on the decoded, normalised URI: /api/overview%2Fpeople is /api/overview/people there, so the prefix deny
+    # answers 403 (and serve.py, which routes on the raw path, would not serve it either).
+    assert urllib.parse.unquote("/api/overview%2Fpeople").startswith("/api/overview/")
+
+
+def test_a_site_generated_before_5_51_0_is_flagged_for_regeneration():
+    from server.nginx_second_site import missing_denies
+    old = build(MAIN, 8768, "127.0.0.1:8080", "opa.example.com", "x")
+    assert missing_denies(old) == []
+    legacy = old.replace("location /api/overview/ {", "location /api/overview {")
+    assert missing_denies(legacy) == ["/api/overview/"]
+
+
+def test_build_refuses_when_the_overview_rule_is_missing(monkeypatch):
+    import server.nginx_second_site as nss
+    monkeypatch.setattr(nss, "_ACCESS_CONTROL_BLOCK", nss._ACCESS_CONTROL_BLOCK.split("    # 5.51.0: /api/overview?id=")[0])
+    with pytest.raises(ValueError, match="overview \\?id= deny"):
+        build(MAIN, 8768, "127.0.0.1:8080", "opa.example.com", "x")
+
+
+def test_the_main_site_is_unchanged_by_the_second_site_rules():
+    main = (Path(__file__).resolve().parent.parent / "server" / "nginx-opa-secrets-wizard.conf").read_text(encoding="utf-8")
+    assert "opa_second_site" not in main and "/api/overview" not in main

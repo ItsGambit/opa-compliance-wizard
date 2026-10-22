@@ -212,7 +212,7 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
      `/var/lib/opa-compliance-wizard`; the backend unit also has `ProtectSystem=strict` (the gate unit does not: it creates its
      session key under `/etc` on first start);
    * the app's archive path (`OPA_AUDIT_DB_PATH`, below) and every other data file follow `OPA_DATA_DIR`;
-   * a second gate's site generated before 5.50.0 also lacks the `/api/overview` deny block (the admin-only Overview, with its people lists); regenerate as below (the installer's note now names every denied route);
+   * a second gate's site generated before 5.50.0 also lacks the `/api/overview` deny block, and one generated before 5.51.0 still denies the bare `/api/overview` (the counts are served through second sites since 5.51.0; the sub-paths and `?id=` are denied); regenerate as below (the installer's note now names every denied route);
    * the per-environment routes of 5.50.0 (Okta Admins, cross-checks, snapshots, capture) are shared-environment routes like the reports: through an
      additional gate they answer only for a verified-issuer per-user exception that holds the capability they check (`view_archive` plus `live_read`);
    * a second gate's site generated before 5.47.0 lacks the `/api/upgrade` deny block. `setup-second-gate.sh` never rewrites an existing
@@ -813,6 +813,16 @@ it routes on can't differ.) Admins change these settings
 from the main gate's site. A site generated before 5.43.0 has none of
 these blocks (nor the `X-Auth-Issuer` forwarding per-user exceptions need)
 until it is rebuilt as described below.
+
+**The Overview through an additional gate (5.51.0).** The Overview's counts (`GET /api/overview?environment=...`) are served through the
+generated site; its lists of people (`/api/overview/people`, `/api/overview/privileged`) answer `403` there (a prefix deny on
+`/api/overview/`), and a server-level check on the raw request line refuses any `GET /api/overview` that carries an `id=` parameter or a
+percent-escape in the query (`?id=<uuid>` would address any environment of the backend). The gate admits only its own org's administrator
+group, and the backend does not know which gate a request came from, so these users are administrators to it: **through a second site the
+counts are served to every signed-in user of that org for every environment visible to them, without the View archive plus Live read
+check, and the read is audited as `viewer: admin`.** The Overview's people links answer 403 there and the page says "Lists are available
+on the main sign-in." Sites generated before 5.51.0 deny the bare `/api/overview` instead: `install.sh --check` flags them, and
+`sudo bash server/install.sh --regenerate-second-sites` rewrites them (do this after upgrading).
 
 `server/deploy.sh` restarts every enabled `opa-auth-gate-*` unit after the
 main gate, so deploys keep both gates on the same code.

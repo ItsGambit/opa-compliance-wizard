@@ -252,4 +252,14 @@ describe('OverviewPage', () => {
     renderWithClient(<OverviewPage onOpenReports={vi.fn()} />)
     expect(await screen.findByText(/Started by you at .*\. A second click attaches to this run; nothing is started twice\./)).toBeTruthy()
   })
+
+  it('a 403 on a people list (an additional sign-in site refuses the lists) says where to find them, not an error', async () => {
+    vi.mocked(fetchOverview).mockResolvedValue(overview({ tiles: { ...overview().tiles, left_okta: { people: 3, accounts: 1, state: 'ok', effective_known: true } } }))
+    vi.mocked(fetchPeopleList).mockRejectedValue(Object.assign(new Error('Request failed with status 403'), { status: 403 }))
+    renderWithClient(<OverviewPage onOpenReports={vi.fn()} />)
+    await screen.findByText(/14 people hold/)
+    fireEvent.click(screen.getByRole('button', { name: /Open the list: Left Okta, still in OPA/ }))
+    expect(await screen.findByText('Lists are available on the main sign-in. This sign-in shows the counts only.')).toBeTruthy()
+    expect(screen.queryByText(/Could not load the list/)).toBeNull()
+  })
 })

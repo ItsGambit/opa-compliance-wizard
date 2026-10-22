@@ -8,7 +8,6 @@ import { UsersTab, type OktaUserFlags } from './UsersTab'
 
 vi.mock('../api/client', () => ({ removeUserFromGroup: vi.fn() }))
 vi.mock('../api/hooks', () => ({ useUserResourceAccess: vi.fn() }))
-vi.mock('./Select', async () => ({ Select: (await import('../test/MockSelect')).MockSelect }))
 vi.mock('./ExportButtons', () => ({ ExportButtons: () => <div>export</div> }))
 
 beforeEach(() => {
@@ -18,7 +17,8 @@ beforeEach(() => {
 
 function open(okta?: OktaUserFlags) {
   renderWithClient(<UsersTab model={exampleModel} okta={okta} onUserGroupRemoved={vi.fn()} />)
-  fireEvent.change(screen.getByLabelText('User'), { target: { value: 'u1' } })
+  const options = screen.getAllByRole('option')
+  fireEvent.click(options.find(o => o.textContent?.includes('Example Admin') || o.textContent?.includes('admin@example.test')) ?? options[0])
 }
 
 describe('UsersTab Okta lifecycle flag', () => {
@@ -27,7 +27,7 @@ describe('UsersTab Okta lifecycle flag', () => {
     const rail = screen.getByRole('complementary')
     expect(within(rail).getByRole('status').textContent).toMatch(/deprovisioned or suspended.*still an OPA principal.*candidate for review/)
     expect(within(rail).getByRole('status').textContent).toMatch(/Looked up/)
-    expect(screen.getByRole('option', { name: /\(Okta: inactive\)/ })).toBeTruthy()  // the picker says it too, not by colour alone
+    expect(screen.getByRole('option', { name: /Okta: inactive/ })).toBeTruthy()  // the list says it too, not by colour alone
   })
 
   it('says a missing Okta user is missing, and an unread one is unread', () => {

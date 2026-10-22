@@ -10,7 +10,6 @@ import { UsersTab } from './UsersTab'
 
 vi.mock('../api/client', () => ({ removeUserFromGroup: vi.fn() }))
 vi.mock('../api/hooks', () => ({ useUserResourceAccess: vi.fn() }))
-vi.mock('./Select', async () => ({ Select: (await import('../test/MockSelect')).MockSelect }))
 vi.mock('./ExportButtons', () => ({ ExportButtons: ({ filenameBase }: { filenameBase: string }) => <div>export {filenameBase}</div> }))
 
 const lookupResult = (data: unknown) => ({ data, isError: false, error: null, refetch: vi.fn(), isFetching: false })
@@ -23,7 +22,8 @@ beforeEach(() => {
 
 function open(model: AccessModel = exampleModel, onRemoved = vi.fn()) {
   renderWithClient(<UsersTab model={model} onUserGroupRemoved={onRemoved} />)
-  fireEvent.change(screen.getByLabelText('User'), { target: { value: 'u1' } })
+  const options = screen.getAllByRole('option')
+  fireEvent.click(options.find(o => o.textContent?.includes('Example Admin') || o.textContent?.includes('admin@example.test')) ?? options[0])
   return onRemoved
 }
 
