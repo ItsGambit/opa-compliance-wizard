@@ -912,3 +912,27 @@ def test_revoke_tool_refusals(tmp_path):
         tool.AzureKeyVaultSigner(client=FakeVault(standby, bad_len=True)).sign_digest(b"x" * 32)
     # never automated: without a terminal it refuses before touching any cloud
     assert tool.main(["--azure-key", "https://v/keys/k", "--revoke", "x", "--reason", "r", "--advisory-url", "https://a"]) == 1
+
+
+# -- 5.52.0 (F3): the hints name the real signing command and the boto3 install ---------------------------------------------------
+def test_build_prints_the_real_kms_signing_command(tagged_repo, tmp_path, capsys):
+    import argparse
+    tool = load_tool("release")
+    repo, dist = tagged_repo
+    tool.cmd_build(argparse.Namespace(version="5.50.0", repo=str(repo), out=str(tmp_path / "o"), frontend_dist=str(dist),
+                                      min_upgrade_from=tool.DEFAULT_MIN_UPGRADE_FROM, downtime_seconds=tool.DEFAULT_DOWNTIME_SECONDS))
+    out = capsys.readouterr().out
+    assert "--key <primary.key>" not in out
+    assert (f"release.py sign {tmp_path / 'o' / 'ocw-5.50.0.tar.gz'} --signer kms --kms-key alias/ocw-release-primary "
+            "--aws-profile <profile> --require-minisign") in out
+    assert "boto3" in out and "separate virtual environment" in out
+
+
+def test_sign_without_boto3_says_how_to_install_it_in_a_separate_virtualenv(monkeypatch):
+    tool = load_tool("release")
+    monkeypatch.setitem(sys.modules, "boto3", None)  # makes `import boto3` raise ImportError
+    with pytest.raises(tool.ReleaseError) as caught:
+        tool.AwsKmsBackend("alias/example")
+    text = str(caught.value)
+    assert "boto3" in text and "maintainer tools only" in text and "never of the app" in text
+    assert "python3 -m venv" in text and "pip install boto3" in text and "separate virtual environment" in text

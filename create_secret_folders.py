@@ -58,7 +58,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.51.0
+# Version     : 5.52.0
 # =============================================================================
 
 import argparse
@@ -84,7 +84,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.51.0"
+SCRIPT_VERSION = "5.52.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 # ENG2-12: OPA's spec documents no pattern or length for a secret-folder
 # name (SecretFolderCreateRequest.name is a bare string); 255 is the limit
@@ -6867,6 +6867,7 @@ def build_access_model(client, okta_client=None, on_progress=None):
 MODEL_REDACTED_KEYS = frozenset((
     "credentials", "password", "secret", "secret_value", "value", "key_secret", "api_token", "token", "access_token",
     "refresh_token", "private_key", "client_secret", "authorization", "cookie", "jwt",
+    "api_key", "apikey", "secret_key", "access_key", "passwd",  # 5.52.0
 ))
 # Okta device fields the Resources tab renders (plus the id); everything else a device profile carries is dropped.
 DEVICE_ALLOWED_FIELDS = ("id", "status", "created", "lastUpdated", "profile", "authenticator_enrollments", "users")
@@ -6876,10 +6877,10 @@ DEVICE_ALLOWED_PROFILE_FIELDS = (
 )
 DEVICE_ALLOWED_ENROLLMENT_FIELDS = ("id", "key", "name", "status")
 _MODEL_MAX_DEPTH = 40
-# Searched for INSIDE a string (a header, a sentence), with boundaries: an Okta API token is exactly 42 characters, so a longer
-# run (a 64-character hex digest that starts with 00) is not one.
+# Searched for INSIDE a string (a header, a sentence), with boundaries: an Okta API token is 42 characters (accepted: 40 to 44 after the
+# leading 00, 5.52.0), so a longer run (a 64-character hex digest that starts with 00) is not one.
 _JWT_SHAPE = re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
-_SSWS_SHAPE = re.compile(r"(?<![A-Za-z0-9_-])00[A-Za-z0-9_-]{40}(?![A-Za-z0-9_-])")
+_SSWS_SHAPE = re.compile(r"(?<![A-Za-z0-9_-])00[A-Za-z0-9_-]{40,44}(?![A-Za-z0-9_-])")
 # Heuristic shapes (5.51.0 review H1): these run over data that is almost entirely human-chosen names, so they are narrow.
 _STRONG_PREFIX_SHAPE = re.compile(r"^(?:ghp_|github_pat_|xox[abpr]-)[A-Za-z0-9_-]{8,}")  # never occur in a name
 _SOFT_PREFIX_SHAPE = re.compile(r"^(?:opk_|sk-)(?:[a-z0-9]{1,8}-){0,3}(?P<rest>[A-Za-z0-9_-]{24,})$")  # sk-proj-..., sk-ant-api03-...  # a name like sk-prod-db-01 is far shorter and has separators
@@ -6973,11 +6974,13 @@ def _redact_value(value, path, depth, name_key=False, hits=None):
                 # kept there (the canary below still reads it); dropped everywhere else.
                 if not (lowered == "value" and "account_name_format" in value):
                     continue
+            # Name status is inherited by a string (or a list of strings) under a name-like key, never by a nested object (5.52.0).
             out[key] = _redact_value(item, f"{path}.{_path_segment(key)}" if path else _path_segment(key), depth + 1,
-                                     name_key or lowered in NAME_LIKE_KEYS or lowered.endswith(NAME_LIKE_SUFFIXES), hits)
+                                     (name_key and not isinstance(item, dict)) or lowered in NAME_LIKE_KEYS or lowered.endswith(NAME_LIKE_SUFFIXES), hits)
         return out
     if isinstance(value, (list, tuple)):
-        return [_redact_value(item, f"{path}[{i}]", depth + 1, name_key, hits) for i, item in enumerate(value)]
+        return [_redact_value(item, f"{path}[{i}]", depth + 1, name_key and not isinstance(item, dict), hits)
+                for i, item in enumerate(value)]
     if isinstance(value, str):
         if _exact_credential_shape(value):
             raise ModelRedactionError(path)

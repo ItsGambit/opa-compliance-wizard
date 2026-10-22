@@ -77,7 +77,7 @@ export function Footer() {
           {/* aria-disabled, not disabled (WCAG 2.1.1, 1.3.1): the button stays focusable so its reason is read out. */}
           <button
             type="button"
-            onClick={() => { if (!isSyncing && canRefresh) void start() }}
+            onClick={() => { if (!isSyncing && canRefresh) void start(undefined, 'Sync now') }}
             aria-disabled={isSyncing || !canRefresh}
             aria-describedby={reason ? 'footer-sync-reason' : undefined}
             title={reason || (isSyncing ? 'A refresh is running' : 'Refresh: read OPA and Okta again and sync the System Log')}

@@ -318,12 +318,49 @@ describe('Audit log rows for update events (artboard 11)', () => {
   })
 })
 
+describe('Updates page: a stored latest release older than the installed one (5.52.0)', () => {
+  const OLD = { ...NEWER.latest, version: '5.45.0' }
+
+  it('says the check predates the installed version and offers Check now', async () => {
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({
+      installed_version: '5.46.0', installed_at: '2026-10-20T03:00:00Z', latest: OLD, update_available: false,
+      last_check: { ...makeStatus().last_check, at: '2026-10-19T09:00:00Z' },
+    }))
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    expect(await screen.findByText('Not checked since upgrade')).toBeTruthy()
+    expect(screen.getByText(/Not checked since this version was installed/)).toBeTruthy()
+    expect(screen.queryByText('Up to date')).toBeNull()
+    expect(screen.queryByText(/no newer release/)).toBeNull()
+    expect(screen.getByRole('button', { name: /Check now/ })).toBeTruthy()
+  })
+
+  it('after a check made once this version was installed, says up to date as of that check and what it saw', async () => {
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({
+      installed_version: '5.46.0', installed_at: '2026-10-18T03:00:00Z', latest: OLD, update_available: false,
+      last_check: { ...makeStatus().last_check, at: '2026-10-19T09:00:00Z' },
+    }))
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    expect(await screen.findByText('Up to date')).toBeTruthy()
+    expect(screen.getByText(/Up to date as of the last check \(.*\); the last check saw 5\.45\.0\./)).toBeTruthy()
+    expect(screen.queryByText(/Not checked since this version was installed/)).toBeNull()
+  })
+
+  it('leaves an equal or newer stored latest alone', async () => {
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({ latest: { ...NEWER.latest, version: '5.46.0' } }))
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    expect(await screen.findByText('Up to date')).toBeTruthy()
+    expect(screen.getByText(/no newer release/)).toBeTruthy()
+  })
+})
+
 describe('helpers', () => {
   it('maps status to the badge state, sizes and failure codes', () => {
     expect(updateState(FIRST_RUN)).toBe('not_enabled')
     expect(updateState(makeStatus({ check: { ...makeStatus().check, enabled: false, frequency: 'off' } }))).toBe('off')
     expect(updateState(makeStatus({ ...NEWER }))).toBe('update_available')
     expect(updateState(makeStatus())).toBe('up_to_date')
+    expect(updateState(makeStatus({ installed_version: '5.46.0', installed_at: '2026-10-20T03:00:00Z', latest: { ...NEWER.latest, version: '5.45.0' } }))).toBe('stale')
+    expect(updateState(makeStatus({ installed_version: '5.46.0', installed_at: '2026-10-18T03:00:00Z', latest: { ...NEWER.latest, version: '5.45.0' } }))).toBe('up_to_date')
     expect(updateState(makeStatus({ last_check: { ...makeStatus().last_check, at: null } }))).toBe('waiting')
     expect(formatBytes(15_500_000)).toBe('14.8 MB')
     expect(formatBytes(null)).toBe('')

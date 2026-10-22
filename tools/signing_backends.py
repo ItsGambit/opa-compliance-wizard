@@ -46,8 +46,11 @@ def _require(module, extra):
     try:
         return __import__(module, fromlist=["x"])
     except ImportError:
-        raise ReleaseError(f"{module.split('.')[0]} is needed for this signer ({extra}); it is an optional dependency of "
-                           "the maintainer tools only, never of the app")
+        name = module.split('.')[0]
+        raise ReleaseError(f"{name} is needed for this signer; it is an optional dependency of the maintainer tools only, never of the app. "
+                           f"Install it into a separate virtual environment, not the app's: python3 -m venv <release-venv> && "
+                           f"<release-venv>/bin/pip install {name} (on Windows: <release-venv>\\Scripts\\pip), then run "
+                           f"release.py with that environment's python. ({extra})")
 
 
 def run_command(cmd, check=True):

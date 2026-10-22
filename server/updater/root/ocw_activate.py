@@ -63,7 +63,7 @@ import ocw_bundle  # noqa: E402
 import ocw_host  # noqa: E402
 import ocw_trust  # noqa: E402
 
-ACTIVATOR_VERSION = "5.51.0"
+ACTIVATOR_VERSION = "5.52.0"
 STEP_ORDER = ["validated", "downloaded", "staged", "preflight", "backup", "switching", "restarting", "health_check", "completed"]
 STEP_LABEL = {"validated": "Received and validated", "downloaded": "Downloaded", "staged": "Verified and staged",
               "preflight": "Preflight", "backup": "Backup", "switching": "Switching", "restarting": "Restarting",

@@ -21,6 +21,7 @@ saves it via POST /api/environments.
 """
 
 import argparse
+import contextlib
 import csv as _csv
 import hashlib
 import hmac
@@ -1126,7 +1127,8 @@ def _launch_claimed_sync(env_id, env_name, ingestion_scope, owner, trigger, acto
     engine.log_audit_event(actor_email, actor_sub, f"{action_prefix}_start", start_details, client_ip=client_ip, user_agent=user_agent)
     sync_kwargs = {"trigger": trigger, "actor_email": actor_email, "actor_sub": actor_sub, "client_ip": client_ip, "user_agent": user_agent, "correlation_id": correlation_id}
     if inline:
-        _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, **sync_kwargs)
+        with _flag_registered("sync", env_id):
+            _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, **sync_kwargs)
         return True
     threading.Thread(
         target=_run_sync_job, args=(env_id, env_name, okta_client, ingestion_scope, owner),
@@ -1486,8 +1488,15 @@ def _run_refresh_job(job, ctx):
 
 def _supervise(job, lanes):
     grace_until = {}
+    cancel_seen_at = None
     while _refresh_current(job):
         for part in job.overdue():
+            if job.is_cancelled():
+                # A Stop that landed before the deadline is a Stop: the part ends at its checkpoint as "cancelled", not "timed_out".
+                # Only for the kill grace, so a part stuck inside one call that never returns still ends the job (as timed_out).
+                cancel_seen_at = cancel_seen_at or time.monotonic()
+                if time.monotonic() - cancel_seen_at < rj.KILL_GRACE_SECS:
+                    break
             minutes = rj.PART_DEADLINES_SECS[part] // 60
             if job.finish(part, "timed_out", rj.timed_out_message(part, minutes)):
                 job.cancel_events[part].reason = "timed_out"  # so the sync can record a deadline, not a Stop
@@ -1558,9 +1567,53 @@ def _persist_last_refresh(job, finished_at=None):
     log_state = view["parts"].get("log", {}).get("state") if "log" in job.parts else None
     if log_state == "timed_out":  # consecutive runs whose log part hit its deadline (the Overview names a pattern, not one slow run)
         stored["log_timeouts"] = int(stored.get("log_timeouts") or 0) + 1
-    elif log_state == "ok":
+    elif log_state:  # any other outcome of the log part (ok, error, cancelled, skipped) ends the streak: it counts runs IN A ROW
         stored["log_timeouts"] = 0
     audit_store._upsert_sync_state(audit_store._get_connection(), job.environment_id, last_refresh_json=json.dumps(stored, sort_keys=True))
+
+
+# -- a scan or sync that was told to stop is not adopted (5.52.0) -----------------------------------------------------------
+# A part that runs a scan or a sync in its own thread registers that thread's cancel flag while it runs. A later refresh that finds the
+# slot still "running" looks the flag up: when it is already set (a Stop, or the part's deadline passed) the work is on its way out and its
+# result will be a stop, so the later refresh waits for it to exit and then runs a fresh one instead of adopting it.
+_running_flags_lock = threading.Lock()
+_running_flags = {}  # ("access" | "sync", environment_id) -> the cancel Event of the thread running it
+
+
+@contextlib.contextmanager
+def _flag_registered(kind, environment_id):
+    flag = engine.CANCEL_FLAG.get()
+    if flag is None:
+        yield
+        return
+    key = (kind, environment_id)
+    with _running_flags_lock:
+        _running_flags[key] = flag
+    try:
+        yield
+    finally:
+        with _running_flags_lock:
+            if _running_flags.get(key) is flag:
+                _running_flags.pop(key, None)
+
+
+def _scan_is_stopping(kind, environment_id):
+    with _running_flags_lock:
+        flag = _running_flags.get((kind, environment_id))
+    return flag is not None and flag.is_set()
+
+
+def _wait_out_a_stopping_run(job, part, kind, environment_id, still_running):
+    """True when the caller may go on (nothing is stopping, or it has exited); False when this part itself was stopped or ran out of time
+    while waiting (the part is finished as cancelled; a deadline is the supervisor's to record)."""
+    if not _scan_is_stopping(kind, environment_id):
+        return True
+    reason = _wait_until(job, part, lambda: not still_running(), time.monotonic() + rj.PART_DEADLINES_SECS[part])
+    if reason == "done":
+        return True
+    if reason == "cancelled":
+        job.finish(part, "cancelled", rj.cancelled_message())
+    return False
 
 
 # -- waiting for something another thread is doing ------------------------------------------------------------------------
@@ -1617,6 +1670,8 @@ def _refresh_part_opa(job, ctx):
         _audit_for(_refresh_audit(job, ctx), "access_scan.failed", {"error": _failure_summary(exc)})
         job.finish(part, state, message, previous_built_at=previous_at, audit_line=rj.audit_line("refused" if refused else "error", type(exc).__name__))
         return
+    if not _wait_out_a_stopping_run(job, part, "access", env_id, lambda: (_access_jobs.get(env_id) or {}).get("status") == "running"):
+        return
     adopted = False
     with _access_jobs_lock:
         current = _access_jobs.get(env_id)
@@ -1632,7 +1687,8 @@ def _refresh_part_opa(job, ctx):
                 job.finish(part, "cancelled", "Stopped waiting for the scan that was already running; it continues.")
             return
     else:
-        _run_access_job(env_id, opa_client, okta_client, correlation_id=ctx.get("correlation_id"), audit_ctx=_refresh_audit(job, ctx))
+        with _flag_registered("access", env_id):
+            _run_access_job(env_id, opa_client, okta_client, correlation_id=ctx.get("correlation_id"), audit_ctx=_refresh_audit(job, ctx))
     with _access_jobs_lock:
         entry = dict(_access_jobs.get(env_id) or {})
     steps = list(entry.get("steps") or [])
@@ -1660,6 +1716,8 @@ def _refresh_part_log(job, ctx):
     engine.CANCEL_FLAG.set(flag)
     if flag.is_set():
         job.finish(part, "cancelled", rj.cancelled_message())
+        return
+    if not _wait_out_a_stopping_run(job, part, "sync", env_id, lambda: (_sync_jobs.get(env_id) or {}).get("status") == "running"):
         return
     trigger = "scheduled" if job.trigger == "scheduled" else "manual"
     # The sync's own start/skip/refusal logic (slot claim under the lock, upgrade quiesce, a refused credential recorded as an
