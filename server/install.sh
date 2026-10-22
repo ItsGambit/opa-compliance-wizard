@@ -584,6 +584,7 @@ if [ -n "$REMOVE_SUDOERS" ]; then
 else
   plan "leave any old deploy sudoers lines alone (add --remove-legacy-sudoers to remove them)"
 fi
+[ "${#REVOCATIONS[@]}" -eq 0 ] || plan "apply ${#REVOCATIONS[@]} verified key revocation(s) to root's trust list and keep them for the application (upgrade/revocations)"
 plan "enable ocw-upgrade.path and ocw-upgrade.service (boot-time resume)"
 # every unit that would be rewritten must have the lines the rewrite works from: checked now, on a scratch copy, so a
 # surprising unit stops the run (the dry run too) before anything has been changed
@@ -686,6 +687,7 @@ fresh_account() { # the application account, its lingering user manager, and the
     *) die "the account $APP_USER has no usable home directory ('$APP_HOME')" ;;
   esac
   case "$APP_HOME" in *[[:space:]]* | *\|* | *\&* | *\\*) die "the home directory of $APP_USER contains spaces or | & \\ ('$APP_HOME')" ;; esac
+  if [ -n "$APP_WILL_CREATE" ]; then chmod 0700 "$APP_HOME"; fi   # the keyring and the application's files live under it
   loginctl enable-linger "$APP_USER" || die "could not enable lingering for $APP_USER (loginctl enable-linger)"
 }
 
@@ -741,6 +743,7 @@ fresh_nginx() { # the site, linked and loaded; put back if nginx refuses it
   chmod 0700 "$BACKUP_DIR"
   if [ -e "$_site" ]; then _had_site=1; cp -p "$_site" "$BACKUP_DIR/opa-secrets-wizard.site.before"; fi
   [ ! -L "$_link" ] || _had_link=1
+  if [ -e "$_link" ] && [ -z "$_had_link" ]; then die "$_link exists and is not a link; move it aside and run the same command again"; fi
   "$PY3" -I "$HELPERS" render-site --template "$SOURCE_DIR/server/nginx-opa-secrets-wizard.conf" --out "$_site" --server-name "$SERVER_NAME" \
     --env-file "$ENV_FILE" --group "$APP_GROUP" --port "$CONF_PORT" || die "could not write the nginx site (above)"
   ln -sfn "$_site" "$_link"
@@ -797,7 +800,7 @@ fresh_health() { # true when the backend is active with no restarts and answers 
   return 1
 }
 
-fresh_apply_revocations() { # verified key revocations: root's trust list now, the application's key state through its own CLI
+apply_revocations() { # verified key revocations: root's trust list now, the application's key state through its own CLI
   local _r
   [ "${#REVOCATIONS[@]}" -gt 0 ] || return 0
   note "==> Key revocations"
@@ -1119,7 +1122,6 @@ PY
   note "    delete it yourself when you are satisfied. Unit/env backups are in $BACKUP_DIR."
 elif [ "$MODE" = "fresh" ]; then
   ln -sfn "releases/$VERSION" "$OPT_DIR/current"
-  fresh_apply_revocations
 fi
 
 if [ -n "$APPLY_NGINX" ]; then
@@ -1216,6 +1218,7 @@ note "    recorded install_sh_version=$VERSION in $OPT_DIR/updater/config.json"
 systemctl daemon-reload
 systemctl enable ocw-upgrade.path ocw-upgrade.service >/dev/null 2>&1 || note "WARNING: could not enable ocw-upgrade.path / ocw-upgrade.service"
 systemctl start ocw-upgrade.path || note "WARNING: could not start ocw-upgrade.path"
+apply_revocations
 if [ "$MODE" = "fresh" ]; then
   fresh_finish
   print_fresh_done

@@ -75,6 +75,15 @@ jobs:
         run: git ls-files -z '*.sh' | xargs -0 -n1 bash -n
       - name: ShellCheck (warnings and errors)
         run: git ls-files -z '*.sh' | xargs -0 shellcheck --severity=warning
+      # get-ocw.sh (the one-line installer, 5.52.0) is generated from server/get-ocw.sh.in with the verifier and the key list
+      # embedded, so the template alone has placeholders: check the template and the rendered script (what users run).
+      - name: Render get-ocw.sh and check it (bash -n, ShellCheck)
+        run: |
+          bash -n server/get-ocw.sh.in
+          shellcheck --severity=warning server/get-ocw.sh.in
+          python3 tools/render_bootstrap.py 0.0.0 "$RUNNER_TEMP/get-ocw.sh"
+          bash -n "$RUNNER_TEMP/get-ocw.sh"
+          shellcheck --severity=warning "$RUNNER_TEMP/get-ocw.sh"
 
   frontend:
     runs-on: ubuntu-latest

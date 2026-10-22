@@ -50,6 +50,7 @@ worth reporting privately.
 |---|---|
 | Just run it on my own machine | Quickstart, below |
 | Understand what each feature does | [docs/features.md](docs/features.md) |
+| Install it on a clean server with one command | [Installing on a server](#installing-on-a-server) |
 | Host it for a team, with Okta login | [docs/hosting.md](docs/hosting.md) |
 | Use the CLI instead of the dashboard | [docs/hosting.md](docs/hosting.md#running-it-as-a-cli-instead) |
 | See a live-verified API quirk or gotcha | [docs/api-notes.md](docs/api-notes.md) |
@@ -113,6 +114,71 @@ there is no earlier build, the launcher stops instead of opening a page
 that can't load. If a dashboard server from this folder is still running
 on the port, it asks before stopping it (and never touches any other
 process).
+
+## Installing on a server
+
+One command installs a signed release on a clean **Debian 12 or 13, or Ubuntu 22.04, 24.04 or 26.04** server (x86-64 or ARM, with
+systemd, run as root): it checks the system, downloads the release and its signature, **verifies the signature against the
+project's release key before anything is installed**, applies any published key revocation, and runs the installer from the
+verified release. That installer creates the application account, the settings file with generated secrets, the services and the
+nginx site with a certificate, starts the backend and checks it. It installs `nginx`, the keyring packages and `python3-venv` from
+your distribution when they are missing, and leaves the login gate waiting for your Okta settings.
+
+```bash
+curl -fsSLO https://github.com/ItsGambit/opa-compliance-wizard/releases/latest/download/get-ocw.sh && sudo bash get-ocw.sh
+```
+
+The file is downloaded first and then run (not piped into a shell): a script that is cut short halfway does nothing, you can read it
+before it runs, and it asks its questions through your terminal. Variants:
+
+```bash
+sudo bash get-ocw.sh --dry-run                     # the whole plan after a real download and verification; nothing is changed
+sudo bash get-ocw.sh --version 5.52.0              # a specific release (the default is the latest stable one)
+sudo bash get-ocw.sh --from-dir /media/usb/ocw     # no internet: ocw-X.Y.Z.tar.gz and its .minisig (and revocation.json) brought over
+sudo bash get-ocw.sh --uninstall --keep-data       # remove the software; every data file stays
+```
+
+It asks for the server's public name (or IP address) and for the TLS certificate (your own, or a temporary self-signed one that makes
+browsers warn until you install a trusted one), shows the plan, and asks once. For scripts, `--yes` needs the choices spelled out:
+`--server-name HOST` and `--cert FILE --key FILE`, `--self-signed` or `--no-nginx`. Nothing ever takes a secret on the command line:
+the three secrets the application needs are generated inside the installer and written to `/etc/opa-compliance-wizard.env` (mode
+0600); they are never printed and never logged. The log of every run is `/var/log/ocw-install/<time>.log` (mode 0600).
+
+**What you trust.** The first file (`get-ocw.sh`, a few hundred lines of shell plus the verifier) is fetched over TLS from the
+project's GitHub release; everything after it is checked against the signing key held in a cloud HSM, which no GitHub credential can
+use. To remove the dependency on GitHub's account for that first file, verify `get-ocw.sh` with `minisign` before running it:
+
+```bash
+curl -fsSLO https://github.com/ItsGambit/opa-compliance-wizard/releases/latest/download/get-ocw.sh
+curl -fsSLO https://github.com/ItsGambit/opa-compliance-wizard/releases/latest/download/get-ocw.sh.minisig
+minisign -Vm get-ocw.sh -P RWQZ6MDGT7XfiNw30FMcGZ/sL1IZFaHr+f7So4QAvmFg77qt3/Fcr2Ka -H    # key id 88DFB54FC6C0E819
+less get-ocw.sh                                                                          # read it
+sudo bash get-ocw.sh
+```
+
+That key line is published in the same repository as the script, so it only helps if you get it from somewhere GitHub's account does
+not control: the command trusts GitHub for the first file; to check it independently, compare the key id with the project's security
+advisories page. Python packages are installed with `pip --require-hashes` from the hash-pinned list inside the signed release;
+system packages come signed from your distribution. **No independent third-party audit of this installer or the project has been
+performed.**
+
+**What it does not do (5.52.0).**
+
+- Red Hat family systems (RHEL, Rocky, Alma, Fedora, Amazon Linux) are recognised and refused, with the reason and nothing changed:
+  follow [docs/hosting.md](docs/hosting.md) by hand. Debian 11 and older, Ubuntu 20.04 and older, Alpine, servers without systemd as
+  PID 1 (most containers, WSL1) and macOS are refused too, each with its own reason. A Docker image is on the backlog.
+- It does not set up Okta. The four Okta settings (commented in the settings file) and the client secret and admin-check token (in the
+  application's keyring) are still entered by you; the last lines of the run print the exact steps. The login gate is installed
+  and enabled but **not started** until you have done that.
+- The offline bundle is not accepted by `--from-dir` yet (bring the release file, its signature and `--wheelhouse DIR` for the packages).
+- `--uninstall` keeps the data (the archive, audit log, settings file, session key, TLS files, the application account and the packages).
+  Removing them is a manual step, listed in [docs/hosting.md](docs/hosting.md#uninstalling).
+
+A server that already runs the upgrade layout is left alone (the command prints its status and exits; upgrade from the Updates page or
+`sudo ocw-updater apply <version>`; `sudo bash get-ocw.sh --refresh-updater` refreshes the updater, the units and the command from a
+release). A server that runs from a home directory is migrated with the migration's own checks and rollback, after two confirmations.
+An interrupted fresh install is resumed by running the same command again; it never overwrites a data or settings file. Exit status:
+`0` done, `2` refused and nothing was changed, `3` failed and everything was put back, `4` failed and you have to act (the message says what).
 
 ## Quickstart (desktop dashboard)
 
@@ -199,6 +265,7 @@ archive, switches versions, health-checks the result and rolls back by itself if
 | *No release signing key pinned* (only a fork or self-built copy whose `server/release_keys.json` is empty; 5.46.0 ships with the project's keys) | `deploy.sh --release` refuses with "no release key pinned"; the Updates screen says so. Everything else works exactly as before. |
 | *Key pinned* | `deploy.sh --release <version>` verifies every download against it. |
 | *Key revoked* (see below) | Releases signed by the old key after the revocation are refused; you apply the published revocation, then install the new release. |
+| *Installed with `get-ocw.sh`* (5.52.0, see [Installing on a server](#installing-on-a-server)) | The release was verified against the pinned key before it was unpacked; `ocw-updater status` shows the key that signed it. The updater layout is in place from the first minute. |
 
 ### The update check (off by default)
 
@@ -267,6 +334,7 @@ new version (the one you downloaded, not the staging copy) and run
 
 ```bash
 sudo server/install.sh --refresh-updater   # from the unpacked new release; refreshes units, command and updater, records the version, touches no data
+sudo bash get-ocw.sh --refresh-updater     # 5.52.0 and newer: the same, downloading and verifying the release for you
 ```
 
 then apply again. 5.48.0 changes only the `ocw-updater` command, so an install on the 5.47.0 layout can apply it directly (the 5.47.0
@@ -523,7 +591,8 @@ wants `base64("Ed" || id || key)`, which `tools/release.py pubkey` prints):
 minisign -Vm ocw-5.47.0.tar.gz -P <public key> -H
 ```
 
-(`-H` requires the prehashed signature format the project uses.) `minisign` checks the
+The release key's minisign line (key id `88DFB54FC6C0E819`) is `RWQZ6MDGT7XfiNw30FMcGZ/sL1IZFaHr+f7So4QAvmFg77qt3/Fcr2Ka`; the same check
+works for `get-ocw.sh` and `get-ocw.sh.minisig`. (`-H` requires the prehashed signature format the project uses.) `minisign` checks the
 signature and the signed comment; the project's verifier additionally checks the
 version, file name and the manifest of every file inside, and that the key is a current
 release key. Prefer the project's verifier.

@@ -75,7 +75,21 @@ workload that doesn't need it — the honest tradeoff isn't "SQLite vs.
 a faster database," it's "one file vs. a whole extra service," and for
 this tool's single-server-process design, the file wins.
 
-**First install: what the server needs** (Debian/Ubuntu commands; adapt
+**What the installer does for you (5.52.0).** On a clean Debian 12/13 or Ubuntu 22.04/24.04/26.04 server one command does everything
+in the list below that needs root, in the right order, and starts the backend:
+`curl -fsSLO https://github.com/ItsGambit/opa-compliance-wizard/releases/latest/download/get-ocw.sh && sudo bash get-ocw.sh`
+(see the README's [Installing on a server](../README.md#installing-on-a-server) for what is checked and what you trust). It installs
+the packages (`nginx`, `gnome-keyring`, `dbus-user-session`, `python3-venv`, `openssl`) after you confirmed the plan; creates the
+application account `ocw` (a regular account, home `/var/lib/opa-compliance-wizard/home`, shell `nologin`) and turns on lingering for
+it; writes `/etc/opa-compliance-wizard.env` (mode 0600) with `DEPLOYMENT_MODE=hosted`, three generated secrets, the allowed origin
+and the Okta lines commented out; writes the two application units with the account's real numeric id in `/run/user/<uid>` (the
+unit templates carry `__APP_UID__` and `__APP_USER_HOME__`; the installer fills them in); writes the login gate's session key;
+makes the nginx site from the release's template with your server name, the proxy secret and a certificate (yours, or a temporary
+self-signed one); starts the backend and checks it, also through nginx. The login gate is installed and enabled but **not started**:
+it refuses to start without the Okta settings, which you enter (steps 1-4 below; the last lines of the installer's output name the
+exact commands). Run it again after a failure and it resumes; it never overwrites a data or settings file.
+
+**By hand (other distributions, or to see what the installer does).** **First install: what the server needs** (Debian/Ubuntu commands; adapt
 for your distro). The hosted services can't start without these, and an
 improvised fix on the login path tends to be an insecure one, so do them
 before the numbered steps below:
@@ -91,9 +105,10 @@ before the numbered steps below:
   and `cd frontend && npm ci --ignore-scripts && npx vite build`.
 - The app user's systemd "user manager" must keep running without a login
   session, because the keyring daemon lives in `/run/user/<uid>`: `sudo
-  loginctl enable-linger <app-user>`. The units name that directory as
-  `/run/user/1000`; if `id -u <app-user>` isn't `1000`, change it in both
-  units.
+  loginctl enable-linger <app-user>`. The unit templates carry `__APP_UID__`
+  (and `__APP_USER_HOME__`) where the directory is named; `server/install.sh`
+  fills them in from `id -u <app-user>`. Installing a unit by hand, replace
+  them yourself in both units (older releases hardcoded `1000`).
 - The environment file holds secrets (`KEYRING_UNLOCK_PASSWORD`,
   `NGINX_PROXY_SECRET`, `INTERNAL_API_SHARED_SECRET`): create it owner-only
   before writing anything into it, `sudo install -m 600 -o <app-user> -g
@@ -660,6 +675,25 @@ trail as anyone else's -- this is meant to support compliance work, not
 to be a quiet backdoor.
 
 ---
+
+## Uninstalling
+
+`sudo bash get-ocw.sh --uninstall --keep-data` (or `sudo server/install.sh --uninstall --keep-data` from the installed release) stops and
+removes the services, the `ocw-updater` command, `/opt/opa-compliance-wizard`, the staging account and its downloads, and the nginx
+site (it keeps the site while an additional login gate exists, because those sites reuse its rate-limit zone), after you type
+`UNINSTALL`. It **keeps** everything that holds your data or settings, so installing again finds them:
+
+| Kept | Path (defaults) |
+|---|---|
+| The archive, audit log, access control, environments, upgrade backups and the application account's home with its keyring | `/var/lib/opa-compliance-wizard` |
+| The settings file (with the generated secrets) and the login gate's session key | `/etc/opa-compliance-wizard.env`, `/etc/opa-secrets-wizard-session.key` |
+| The TLS certificate and key | `/etc/nginx/ssl/opa-secrets-wizard.crt` and `.key` |
+| The application account, the distribution packages, every `*.migrated-*` file and the directory of a legacy install | `ocw` (`userdel`), `apt` |
+
+**Removing the data too is a manual step**, on purpose: it deletes the only copy of evidence that may be older than Okta's own log
+retention. Make a backup first (see "Backing up and restoring the archive"), then remove the paths above yourself when you are sure.
+Additional login gates (`opa-auth-gate-*`, their environment files, sites and session keys, `cloudflared`) were created by
+`setup-second-gate.sh` and are left alone: remove them first.
 
 ## Running it as a CLI instead
 

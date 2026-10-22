@@ -62,8 +62,8 @@ Generic steps; use your own names and never write account ids, vault names or ke
 4. Alert on **every** `Sign`, and on `PutKeyPolicy`, `DisableKey`, `ScheduleKeyDeletion`, `CreateGrant`, `CancelKeyDeletion`.
    `Sign` appears in CloudTrail as a read-only management event, so an EventBridge rule needs state
    `ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS` (CLI or CloudFormation, not the console). Send alerts somewhere a
-   compromised computer cannot delete (a phone number or a second mailbox). **A release makes exactly two `Sign` calls** (the
-   file digest, then signature + trusted comment); `release.py` prints their request ids for the release log. Any other `Sign`
+   compromised computer cannot delete (a phone number or a second mailbox). **A release makes exactly four `Sign` calls** (5.52.0: the
+   file digest, then signature + trusted comment, for the tarball and again for `get-ocw.sh`); `release.py` prints their request ids for the release log. Any other `Sign`
    is an incident: disable the key and start the revocation procedure.
 
 **Standby key, Azure Key Vault**
@@ -111,18 +111,33 @@ python tools/release.py sign release-out/ocw-5.47.0.tar.gz --signer kms --kms-ke
 `manifest.json` (version, commit, build time, `min_upgrade_from`, per-file sha256, changelog excerpt, downtime estimate) and a
 reproducible `.tar.gz`. `sign` makes the two KMS calls, writes `ocw-5.47.0.tar.gz.minisig` (trusted comment capped at 4000 bytes),
 and then **verifies its own output** with the app's verifier against `server/release_keys.json` and, with `--require-minisign`, with
-`minisign -V -H`; it deletes the signature and stops if either refuses. Check that the alert mailbox received exactly two Sign
+`minisign -V -H`; it deletes the signature and stops if either refuses. Check that the alert mailbox received exactly four Sign
 notifications before you publish. Then:
 
-1. On GitHub create the release for tag `v5.47.0` as a **draft**, attach exactly `ocw-5.47.0.tar.gz`, `ocw-5.47.0.tar.gz.minisig`
-   and `manifest.json`, paste the CHANGELOG entry, then publish.
+1. On GitHub create the release for tag `v5.47.0` as a **draft**, attach exactly the five files `release.py sign` lists: `ocw-5.47.0.tar.gz`,
+   `ocw-5.47.0.tar.gz.minisig`, `manifest.json`, `get-ocw.sh` and `get-ocw.sh.minisig` (5.52.0: the one-line installer, below), paste the
+   CHANGELOG entry, then publish.
 2. Enable **immutable releases** in the repository settings (once): a published release's assets and tag can no longer change.
    Create the release tagged `revocation` now (marked *pre-release* so it is never "latest"); **do not** make that one immutable:
    its `revocation.json` asset is replaced when a revocation is published.
-3. Verify like a user would: download the three files from the published release and run
-   `python tools/release.py verify ocw-5.47.0.tar.gz ocw-5.47.0.tar.gz.minisig`.
+3. Verify like a user would: download the five files from the published release and run
+   `python tools/release.py verify ocw-5.47.0.tar.gz ocw-5.47.0.tar.gz.minisig --bootstrap get-ocw.sh --bootstrap-sig get-ocw.sh.minisig`, and
+   `minisign -Vm get-ocw.sh -P <the release key's minisign line> -H` (see the README). The first re-renders `get-ocw.sh` from the
+   tarball's own template, verifier and key list and compares it byte for byte, so a script that is not what the release produces is caught.
 4. Never reuse a version number. A bad release is superseded by the next patch (and its notes say so).
-5. **The offline bundle (5.49.0).** After signing, build the air-gapped bundle and attach it (and its `.sha256`) to the same release:
+5. **`get-ocw.sh`, the one-line installer (5.52.0).** `release.py build` renders it next to the tarball, from the **tagged**
+   `server/get-ocw.sh.in`, `server/updater/root/ocw_crypto.py`, `ocw_trust.py`, `ocw_bootstrap_verify.py` and `server/release_keys.json`
+   (the verifier and the key list are embedded byte for byte; a test compares them with the sources), and lists its sha256 in the manifest
+   as `bootstrap_sha256`. The render is deterministic, so anyone can rebuild it from the tag. `release.py sign` signs it with the release key
+   (trusted comment `file=get-ocw.sh version=<v> sha256=<hex>`), checks first that it is exactly what the tarball renders, and verifies
+   its own output. Users get it from `https://github.com/<repo>/releases/latest/download/get-ocw.sh`, which GitHub resolves to the newest
+   release that is not a pre-release: never mark a release you do not want installed by default as the latest. A bootstrap kept from an
+   older release refuses a release signed by a key it does not know and says to download the current `get-ocw.sh`.
+   **Go-live items** (owner actions, not code): create the release tagged `revocation` (step 2: today it does not exist, and without it
+   the installer's revocation check finds nothing to apply); publish the release key id `88DFB54FC6C0E819` and its minisign line on a page
+   GitHub's account does not control (the README says to compare the key id with it); immutable releases on; hardware-key 2FA on the
+   GitHub account.
+6. **The offline bundle (5.49.0).** After signing, build the air-gapped bundle and attach it (and its `.sha256`) to the same release:
    ```bash
    python tools/release.py build-offline release-out/ocw-5.47.0.tar.gz        # -> release-out/ocw-5.47.0-offline.tar.gz (+ .sha256)
    # narrow it while testing:  --python 3.12 --platform linux-x86_64
@@ -134,7 +149,7 @@ notifications before you publish. Then:
    fails the build and names the package. Needs `packaging` (`pip install packaging`) on the releasing computer. Test it: unpack on a machine
    without network and run `python launch.py upgrade --from-file …`. A new platform or Python version goes into `OFFLINE_PYTHONS` / `OFFLINE_PLATFORMS` in
    `tools/release.py`. Regenerating `requirements.lock` means building a new bundle; there is nothing to sign separately.
-6. **Prereleases.** Mark a release as a *pre-release* on GitHub to offer it only to installs on the prerelease channel (they use `GET /releases`; stable installs
+7. **Prereleases.** Mark a release as a *pre-release* on GitHub to offer it only to installs on the prerelease channel (they use `GET /releases`; stable installs
    keep using `/releases/latest`, which never returns a prerelease). It is built and signed exactly like any release; the tag is still `vX.Y.Z`.
 
 **First release only: the KMS interop test.** The byte format of KMS's Ed25519 `Sign` answer is not documented beyond "the signature";

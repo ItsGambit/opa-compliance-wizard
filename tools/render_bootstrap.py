@@ -12,6 +12,8 @@ The template (server/get-ocw.sh.in) has three placeholders:
 
 import json
 import re
+import sys
+from pathlib import Path
 
 TEMPLATE_PATH = "server/get-ocw.sh.in"
 # (published name inside the work directory, path in the repository), in the order they are written
@@ -89,3 +91,26 @@ def bootstrap_version(script):
     if not m:
         raise RenderError("the script does not carry OCW_BOOTSTRAP_VERSION")
     return m.group(1).decode()
+
+
+def main(argv=None):
+    """`python tools/render_bootstrap.py <version> <out file>`: renders get-ocw.sh from the working tree (CI uses it to check the
+    template with ShellCheck; releases are rendered from the tag by release.py)."""
+    argv = sys.argv[1:] if argv is None else argv
+    if len(argv) != 2:
+        print("usage: render_bootstrap.py <version> <out file>", file=sys.stderr)
+        return 2
+    repo = Path(__file__).resolve().parent.parent
+    files = {TEMPLATE_PATH: (repo / TEMPLATE_PATH).read_bytes()}
+    for _name, path in EMBEDDED:
+        files[path] = (repo / path).read_bytes()
+    try:
+        Path(argv[1]).write_bytes(render(argv[0], files))
+    except RenderError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
