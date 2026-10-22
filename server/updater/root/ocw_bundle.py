@@ -237,6 +237,7 @@ def build(dest_dir, stem, summary, texts, audit_entries, redactor, now=None, cap
     os.makedirs(dest_dir, exist_ok=True)
     path = os.path.join(dest_dir, name)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o640)
+    os.fchmod(fd, 0o640)   # not at the mercy of the umask
     with os.fdopen(fd, "wb") as fh:
         fh.write(blob)
         fh.flush()

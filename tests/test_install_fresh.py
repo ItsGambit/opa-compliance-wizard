@@ -741,7 +741,9 @@ def test_uninstall_leaves_an_nginx_site_that_is_not_this_applications(world):
 
 def test_uninstall_leaves_a_unit_that_runs_from_somewhere_else(world):
     (world.unit_dir / "opa-compliance-wizard.service").write_text(f"[Service]\nUser={world.user}\nWorkingDirectory=/home/someone/opa\n")
-    (world.opt).mkdir()
+    (world.opt / "releases" / "5.0.0").mkdir(parents=True)
+    (world.opt / "updater").mkdir()
+    (world.opt / "current").symlink_to("releases/5.0.0")
     p = world.run("--uninstall", "--keep-data", "--yes")
     assert p.returncode == 0 and "is not removed" in p.stdout and (world.unit_dir / "opa-compliance-wizard.service").exists()
 
@@ -827,3 +829,74 @@ def test_uninstall_leaves_an_enabled_link_that_points_to_another_site(world):
     assert p.returncode == 0, p.stderr + p.stdout
     assert link.is_symlink() and os.readlink(link) == str(other) and "it was left in place" in p.stdout
     assert not (world.sites / "opa-secrets-wizard").exists() and "Lingering stays on" in p.stdout
+
+
+# --- the last review round --------------------------------------------------------------------------------------------------------
+
+
+def _default_site(world):
+    default = world.sites / "default"
+    default.write_text("server { listen 80 default_server; }\n")
+    (world.enabled / "default").symlink_to(default)
+    return world.enabled / "default"
+
+
+def test_the_default_nginx_site_is_removed_only_when_this_run_installed_nginx(world):
+    link = _default_site(world)
+    p = world.fresh("--disable-default-site")
+    assert p.returncode == 0, p.stderr + p.stdout
+    assert not link.exists() and not link.is_symlink() and (world.sites / "default").exists()     # the link goes, the file stays
+    assert "removed the distribution's default site link" in p.stdout and calls(world).count("systemctl reload nginx") >= 2
+    assert "nginx's own 'default' site" not in p.stdout
+
+
+def test_an_existing_nginx_keeps_its_other_sites_and_the_done_text_mentions_the_default_one(world):
+    link = _default_site(world)
+    p = world.fresh()
+    assert p.returncode == 0, p.stderr + p.stdout
+    assert link.is_symlink()
+    assert "nginx's own 'default' site" in p.stdout and "sudo rm" in p.stdout
+
+
+def test_the_dry_run_says_the_default_site_link_would_go(world):
+    _default_site(world)
+    p = world.fresh("--dry-run", "--disable-default-site")
+    assert p.returncode == 0 and "remove the link" in p.stdout and (world.enabled / "default").is_symlink()
+
+
+@pytest.mark.parametrize("bad", ["/usr/local", "/usr/share", "/var/cache", "/etc/nginx", "/home/someone", "/var/lib", "/usr/lib"])
+def test_uninstall_refuses_system_directories_it_did_not_make(world, bad):
+    assert world.fresh().returncode == 0
+    before = calls(world)
+    p = world.run("--uninstall", "--keep-data", "--yes", extra_env={"OCW_OPT_DIR": bad})
+    assert p.returncode == 2 and "refusing to remove" in p.stderr
+    assert not any(w in calls(world)[len(before):] for w in ("stop", "disable", "daemon-reload")) and world.opt.exists()
+
+
+def test_uninstall_refuses_a_directory_that_does_not_look_like_an_install_of_ours(world):
+    assert world.fresh().returncode == 0
+    other = world.w / "somebody-elses-app"
+    (other / "releases").mkdir(parents=True)
+    (other / "important.txt").write_text("keep")
+    before = calls(world)
+    p = world.run("--uninstall", "--keep-data", "--yes", extra_env={"OCW_OPT_DIR": str(other)})
+    assert p.returncode == 2 and "does not look like an install made by this installer" in p.stderr
+    assert (other / "important.txt").read_text() == "keep" and not any(w in calls(world)[len(before):] for w in ("stop", "disable"))
+    # a `current` link that points outside releases/ is not ours either
+    (other / "updater").mkdir()
+    (other / "current").symlink_to("/etc")
+    assert world.run("--uninstall", "--keep-data", "--yes", extra_env={"OCW_OPT_DIR": str(other)}).returncode == 2
+    assert (other / "important.txt").exists()
+
+
+def test_uninstall_words_what_it_did_to_the_link_and_names_the_account(world):
+    assert world.fresh().returncode == 0
+    link = world.enabled / "opa-secrets-wizard"
+    link.unlink()
+    other = world.w / "other-site"
+    other.write_text("server { }\n")
+    link.symlink_to(other)
+    p = world.run("--uninstall", "--keep-data", "--yes")
+    assert p.returncode == 0, p.stderr + p.stdout
+    assert "was kept: it points elsewhere" in p.stdout and f"removed {world.sites}/opa-secrets-wizard and {link}" not in p.stdout
+    assert "Lingering stays on for ocw " in p.stdout and "for  (" not in p.stdout

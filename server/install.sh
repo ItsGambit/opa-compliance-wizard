@@ -63,6 +63,8 @@
 #   --revocation FILE          a verified key revocation to apply to root's trust list and hand to the application (repeatable)
 #   --release-base-url URL     the https mirror the updater should use (written to the updater's settings)
 #   --revocation-url URL       an owner-controlled https source for key revocations (written to the settings files)
+#   --disable-default-site     also remove the distribution's `default` nginx site link (get-ocw.sh passes it when it installed nginx
+#                              in this very run, so only this application's site answers; an nginx that was already there is left alone)
 #   --log FILE                 append everything this prints to FILE (created 0600)
 #   --uninstall --keep-data    remove the software (units, command, /opt tree, updater, its account, the nginx site) after you type
 #                              UNINSTALL; the data directory, environment file, session key, TLS files, application account and
@@ -124,6 +126,7 @@ REVOCATIONS=()
 LOG_FILE=""
 UNINSTALL=""
 KEEP_DATA=""
+DISABLE_DEFAULT_SITE=""
 RELEASE_BASE_URL_ARG=""
 REVOCATION_URL_ARG=""
 ORIG_ARGS=("$@")
@@ -162,6 +165,7 @@ while [ $# -gt 0 ]; do
     --log) [ $# -ge 2 ] || die "--log needs a file"; LOG_FILE="$2"; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
     --keep-data) KEEP_DATA=1; shift ;;
+    --disable-default-site) DISABLE_DEFAULT_SITE=1; shift ;;
     -h | --help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
@@ -221,8 +225,25 @@ check_removable() { # check_removable <dir>: never "/", never a shallow or syste
     /etc | /usr | /var | /var/lib | /var/log | /var/tmp | /opt | /home | /root | /bin | /sbin | /lib | /lib64 | /boot | /srv | /tmp | /run | /mnt | /media | /dev | /proc | /sys)
       die "refusing to remove '$_d'" ;;
   esac
+  case "${_d%/}" in
+    /usr/?* | /etc/?* | /home/?* | /var/?* | /root/?* | /boot/?* | /srv/?* | /run/?* | /lib/?* | /mnt/?* | /media/?*)
+      case "${_d%/}" in
+        /usr/?*/?* | /etc/?*/?* | /home/?*/?* | /var/?*/?* | /root/?*/?* | /srv/?*/?* | /mnt/?*/?* | /media/?*/?*) ;;   # two levels below a system directory: the layout's own paths and tests
+        *) die "refusing to remove '$_d': it is a system directory, not a directory this installer made" ;;
+      esac ;;
+  esac
   case "$_d" in */../* | */.. | */./* | */.) die "refusing to remove '$_d'" ;; esac
   case "$DATA_DIR/" in "$_d"/*) die "refusing to remove $_d: it holds the data directory $DATA_DIR (use different directories, or move the data first)" ;; esac
+}
+looks_like_our_tree() { # the opt directory must be one this installer made: releases/ and updater/, and a `current` link into
+  # releases/ (or the fresh-install marker), owned by root
+  [ -d "$OPT_DIR/releases" ] && [ -d "$OPT_DIR/updater" ] || return 1
+  if [ -L "$OPT_DIR/current" ]; then
+    case "$(readlink "$OPT_DIR/current")" in releases/* | "$OPT_DIR"/releases/*) ;; *) return 1 ;; esac
+  elif [ ! -e "$OPT_DIR/.fresh-install-incomplete" ]; then
+    return 1
+  fi
+  [ -n "$TESTING" ] || [ "$(stat -c %u "$OPT_DIR" 2>/dev/null)" = "0" ]
 }
 safe_remove_tree() { # safe_remove_tree <dir>
   local _d="$1"
@@ -233,7 +254,7 @@ safe_remove_tree() { # safe_remove_tree <dir>
 uninstall_keep_data() {
   [ -n "$KEEP_DATA" ] || die "--uninstall needs --keep-data: this release removes the software only; removing the data is a manual step (docs/hosting.md, Uninstalling)"
   local _plain_units="ocw-upgrade.path ocw-upgrade.service ocw-upgrade-due.timer ocw-upgrade-due.service ocw-stage@.service"
-  local _ours="" _u _f _wd _gates _site _enabled _kept_site="" _upd_home
+  local _ours="" _u _f _wd _gates _site _enabled _kept_site="" _upd_home _app_acct _removed_link=""
   for _u in opa-compliance-wizard opa-secrets-wizard opa-auth-gate; do
     _f="$UNIT_DIR/$_u.service"
     [ -f "$_f" ] || continue
@@ -248,6 +269,9 @@ uninstall_keep_data() {
   [ ! -f "$OPT_DIR/updater/config.json" ] || _site="$("$PY3" -I -c 'import json, sys; print(json.load(open(sys.argv[1])).get("nginx_site") or "")' "$OPT_DIR/updater/config.json" 2>/dev/null || true)"
   [ -n "$_site" ] || _site="$NGINX_SITES_DIR/opa-secrets-wizard"
   _enabled="$NGINX_ENABLED_DIR/$(basename -- "$_site")"
+  _app_acct=""
+  [ ! -f "$OPT_DIR/updater/config.json" ] || _app_acct="$("$PY3" -I -c 'import json, sys; print(json.load(open(sys.argv[1])).get("app_user") or "")' "$OPT_DIR/updater/config.json" 2>/dev/null || true)"
+  [ -n "$_app_acct" ] || _app_acct="the application account"
   note "OPA Compliance Wizard: uninstall, keeping the data"
   note ""
   note "Will remove:"
@@ -258,6 +282,9 @@ uninstall_keep_data() {
   _upd_home="$ARTIFACTS_DIR"
   [ "$(basename -- "$(dirname -- "$ARTIFACTS_DIR")")" != "$UPDATER_USER" ] || _upd_home="$(dirname -- "$ARTIFACTS_DIR")"
   check_removable "$OPT_DIR"      # refused here, before anything is stopped or removed
+  if [ -e "$OPT_DIR" ] && ! looks_like_our_tree; then
+    die "$OPT_DIR does not look like an install made by this installer (it needs releases/ and updater/, a 'current' link into releases/, and root as owner); nothing was removed"
+  fi
   check_removable "$_upd_home"
   plan "$_upd_home (the downloads of the staging account) and the account $UPDATER_USER"
   if [ -n "$_gates" ]; then
@@ -299,12 +326,12 @@ uninstall_keep_data() {
       _had_link="$(readlink "$_enabled")"
       if [ "$_had_link" != "$_site" ]; then note "NOTE: $_enabled points to $_had_link, not to this application's site: it was left in place"; _enabled_ours=""; fi
     fi
-    if [ -n "$_enabled_ours" ]; then rm -f -- "$_enabled"; fi
+    if [ -n "$_enabled_ours" ]; then rm -f -- "$_enabled"; _removed_link=1; fi
     rm -f -- "$_site"
     if ! command -v nginx >/dev/null 2>&1 || nginx -t >/dev/null 2>&1; then
       systemctl reload nginx >/dev/null 2>&1 || note "NOTE: nginx did not reload; run 'sudo systemctl reload nginx' yourself"
       rm -f -- "$_keep"
-      note "    removed $_site and $_enabled"
+      if [ -n "$_removed_link" ]; then note "    removed $_site and $_enabled"; else note "    removed $_site (the link $_enabled was kept: it points elsewhere)"; fi
     else
       [ ! -f "$_keep" ] || mv -- "$_keep" "$_site"
       [ -z "$_had_link" ] || [ -z "$_enabled_ours" ] || ln -sfn "$_had_link" "$_enabled"
@@ -319,7 +346,7 @@ uninstall_keep_data() {
   fi
   note ""
   note "Done. The software is removed. Kept: $DATA_DIR (data), $ENV_FILE, $SESSION_KEY_FILE, $NGINX_SSL_DIR, the account that ran the application, the packages."
-  note "Lingering stays on for $APP_USER (its account is kept); 'loginctl disable-linger $APP_USER' ends it when you remove the account."
+  note "Lingering stays on for $_app_acct (its account is kept); 'loginctl disable-linger <that account>' ends it when you remove the account."
   note "Installing again with get-ocw.sh finds the data and the settings and uses them. Removing the data too is a manual step (docs/hosting.md, Uninstalling):"
   note "it deletes the only copy of the archive and audit log, so be sure you have a backup."
 }
@@ -603,6 +630,7 @@ if [ "$MODE" = "fresh" ]; then
     else
       plan "make a temporary self-signed certificate for ${SERVER_NAME:-the server name you will give} in $NGINX_SSL_DIR (825 days; browsers will warn until you install a trusted one)"
     fi
+    [ -z "$DISABLE_DEFAULT_SITE" ] || plan "remove the link $NGINX_ENABLED_DIR/default (the distribution's default site) because this run installed nginx"
     plan "write the nginx site $CONF_NGINX_SITE for ${SERVER_NAME:-the server name you will give} (root:$APP_GROUP 0640, carries the proxy secret), link it into $NGINX_ENABLED_DIR, run nginx -t, reload nginx; the distribution's default site is left alone"
   fi
   _hz=""
@@ -798,6 +826,18 @@ fresh_nginx() { # the site, linked and loaded; put back if nginx refuses it
     die "nginx would not load the new site (is another service using port 80 or 443? journalctl -u nginx -n 50); the site was taken out again"
   fi
   note "    nginx serves $SERVER_NAME (site $_site, link $_link)"
+  local _def="$NGINX_ENABLED_DIR/default"
+  if [ -n "$DISABLE_DEFAULT_SITE" ] && [ -L "$_def" ]; then
+    local _def_target
+    _def_target="$(readlink "$_def")"
+    rm -f -- "$_def"
+    if systemctl reload nginx >/dev/null 2>&1; then
+      note "    removed the distribution's default site link $_def (nginx was installed by this run, so only this site answers); it was pointing to $_def_target"
+    else
+      ln -sfn "$_def_target" "$_def"
+      note "WARNING: nginx would not reload without the default site, so its link was put back"
+    fi
+  fi
 }
 
 install_app_unit() { # install_app_unit <file name>: rendered from the release's template; a different existing unit is kept in the backup
@@ -914,9 +954,14 @@ print_fresh_done() {
   fi
   note "  3. Put the client secret and the read-only admin-check token in the application's keyring (docs/hosting.md steps 3 and \"Admin access\"):"
   note "     sudo -u $APP_USER env XDG_RUNTIME_DIR=/run/user/$APP_UID DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$APP_UID/bus $OPT_DIR/current/.venv/bin/python -c \"import getpass, keyring; keyring.set_password('opa-compliance-wizard:default', 'okta_client_secret', getpass.getpass('client secret: '))\""
+  note "     Run it while the backend service is running (it is, right now): the service's session keeps the keyring unlocked and the command reaches it through that session."
   note "     (the same for 'okta_admin_check_token'; both prompts hide what you type and nothing is written to the shell history)"
   note "  4. sudo systemctl start opa-auth-gate && sudo systemctl status opa-auth-gate"
   note "  5. Open $_origin, sign in, add your first environment (the dashboard walks you through it)."
+  if [ -z "$NO_NGINX" ] && { [ -e "$NGINX_ENABLED_DIR/default" ] || [ -L "$NGINX_ENABLED_DIR/default" ]; }; then
+    note "  Note: nginx's own 'default' site ($NGINX_ENABLED_DIR/default) is still enabled; other sites on this server are none of this installer's business."
+    note "        If you want only this application's site to answer, remove that link ('sudo rm $NGINX_ENABLED_DIR/default && sudo systemctl reload nginx')."
+  fi
   note "  Later: upgrades from the Updates page or 'sudo ocw-updater apply <version>'; status: 'ocw-updater status'; uninstall: 'sudo bash get-ocw.sh --uninstall --keep-data'."
 }
 

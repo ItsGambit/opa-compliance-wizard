@@ -753,3 +753,13 @@ def test_the_same_revocation_from_two_sources_is_not_reported_as_a_replay_attack
     p = bw.run("--dry-run", "--server-name", "a.example.com", "--self-signed")
     assert p.returncode == 0, p.stderr + p.stdout
     assert "the same revocation was already applied from another source" in p.stdout and "replayed" not in p.stdout
+
+
+def test_the_default_nginx_site_flag_is_passed_only_when_this_run_installs_nginx(bw):
+    bw.publish()
+    p = bw.run("--dry-run", "--server-name", "a.example.com", "--self-signed")           # nginx is a stub on the PATH: already installed
+    assert p.returncode == 0 and "--disable-default-site" not in bw.install_args()[0]
+    (bw.stub / "bin" / "nginx").unlink()
+    (bw.stub / "install.args").unlink()
+    p = bw.run("--dry-run", "--server-name", "a.example.com", "--self-signed")
+    assert p.returncode == 0 and "--disable-default-site" in bw.install_args()[0]

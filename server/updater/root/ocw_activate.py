@@ -375,6 +375,7 @@ def safe_copy(src, dst, mode=0o600, uid=None, gid=None):
             pass
         dfd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, mode)
         with os.fdopen(dfd, "wb") as fout:
+            os.fchmod(fout.fileno(), mode)   # the open() above is subject to the caller's umask (077 on hardened servers); the mode is the intent
             if uid is not None and os.geteuid() == 0:
                 os.fchown(fout.fileno(), uid, gid)
             shutil.copyfileobj(fin, fout, 1 << 20)
@@ -1630,6 +1631,7 @@ class Updater:
         b = self.st.get("backup") or {}
         line["backup_size"], line["backup_integrity"] = b.get("size"), b.get("integrity")
         fd = os.open(self.cfg.history_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        os.fchmod(fd, 0o644)   # not at the mercy of the umask
         with os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(line) + "\n")
             fh.flush()
@@ -1824,6 +1826,7 @@ class Updater:
         tmp = os.path.join(lib, f".{new_id}.tmp")
         shutil.rmtree(tmp, ignore_errors=True)
         os.makedirs(tmp, mode=0o755)
+        os.chmod(tmp, 0o755)   # makedirs' mode is masked by the umask
         for name, path in files.items():
             safe_copy(path, os.path.join(tmp, name), 0o755 if name == "ocw_activate.py" else 0o644)
         rc, out = self.host.run([sys.executable, "-I", "-B", os.path.join(tmp, "ocw_activate.py"), "selftest"], 60)

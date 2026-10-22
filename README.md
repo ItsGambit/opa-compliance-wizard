@@ -171,7 +171,7 @@ performed.**
   follow [docs/hosting.md](docs/hosting.md) by hand. Debian 11 and older, Ubuntu 20.04 and older, Alpine, servers without systemd as
   PID 1 (most containers, WSL1) and macOS are refused too, each with its own reason. A Docker image is on the backlog.
 - It does not set up Okta. The four Okta settings (commented in the settings file) and the client secret and admin-check token (in the
-  application's keyring) are still entered by you; the last lines of the run print the exact steps. The login gate is installed
+  application's keyring, with the backend running) are still entered by you; the last lines of the run print the exact steps. The login gate is installed
   and enabled but **not started** until you have done that.
 - The offline bundle is not accepted by `--from-dir` yet (bring the release file, its signature and `--wheelhouse DIR` for the packages).
 - `--uninstall` keeps the data (the archive, audit log, settings file, session key, TLS files, the application account and the packages).

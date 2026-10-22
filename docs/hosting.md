@@ -157,7 +157,8 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
 3. Store the client secret in the OS keyring under this project's existing
    per-environment convention:
    `keyring.set_password(f"opa-compliance-wizard:{env_name}", "okta_client_secret", "<secret>")`
-   (`env_name` matches whatever `OKTA_ENV_NAME` you set in step 4). An
+   (`env_name` matches whatever `OKTA_ENV_NAME` you set in step 4). Run it as the app user **while the backend service is running**:
+   the service's session keeps the keyring unlocked and the command reaches it through that session. An
    install from before the 5.20.0 rename can leave existing credentials
    stored under the old `opa-secrets-wizard:{env_name}` prefix as-is —
    they're still read via a fallback and need no migration.

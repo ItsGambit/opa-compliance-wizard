@@ -489,6 +489,11 @@ installer_args() { # installer_args <mode flags...>: the flags every install.sh 
     [ -z "$CERT_FILE" ] || IA+=(--cert "$CERT_FILE" --key "$KEY_FILE")
     [ -z "$BACKEND_PORT" ] || IA+=(--backend-port "$BACKEND_PORT")
   fi
+  local _p
+  for _p in ${PACKAGES[@]+"${PACKAGES[@]}"}; do
+    # this run installs nginx: Debian's own default site is then only noise, so install.sh takes its link out
+    if [ "$_p" = "nginx" ] && { [ "$MODE" = "fresh" ] || [ "$MODE" = "fresh-resume" ]; }; then IA+=(--disable-default-site); fi
+  done
   [ -z "$REFRESH_UPDATER" ] || IA+=(--refresh-updater)
   [ -z "$APPLY_NGINX" ] || IA+=(--apply-nginx)
   [ -z "$REGEN_SECOND" ] || IA+=(--regenerate-second-sites)
