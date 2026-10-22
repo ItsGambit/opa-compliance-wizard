@@ -159,7 +159,10 @@ def cmd_status(a, cfg, host):
         return EXIT_OK
     since = f", since {s['installed_since']}" if s["installed_since"] else ""
     signed = f", signed by {s['installed_signed_by']}" if s["installed_signed_by"] else ""
-    print(f"installed      {s['installed'] or 'unknown'}   (releases/{s['installed']}{since}{signed})")
+    if s["installed"]:
+        print(f"installed      {s['installed']}   (releases/{s['installed']}{since}{signed})")
+    else:
+        print("installed      none (no current release; a migration was rolled back or never finished)")
     if s["latest"]:
         print(f"latest stable  {s['latest']}   (checked {s['latest_checked'] or 'never'}{_older_than_installed_note(s['latest'], s['installed'])})")
     last_target = (s.get("state") or {}).get("version_to")

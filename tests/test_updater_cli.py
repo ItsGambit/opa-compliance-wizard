@@ -30,6 +30,14 @@ def prepare_release(m, version="5.47.0", **kw):
     return m.releases_dir / f"ocw-{version}.tar.gz"
 
 
+def test_status_without_a_current_release_says_so_plainly(m, capsys):
+    os.unlink(m.cfg().current)       # what a rolled-back or unfinished migration leaves
+    assert cli(m, "status") == 0
+    out = capsys.readouterr().out
+    assert out.startswith("installed      none (no current release; a migration was rolled back or never finished)")
+    assert "releases/None" not in out and "unknown" not in out.split("\n")[0]
+
+
 def test_status_shows_the_picture_in_the_artboard_format(m, capsys):
     assert cli(m, "status") == 0
     out = capsys.readouterr().out

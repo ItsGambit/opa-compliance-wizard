@@ -696,7 +696,7 @@ if [ -n "$SECOND_GATES" ]; then
     plan "regenerate those nginx sites from the live main site ($CONF_NGINX_SITE) with nginx -t first and a restore on failure"
   else
     note "   Neither this installer nor the updater changes those sites. After this run, regenerate them with"
-    note "       sudo bash $SOURCE_DIR/server/install.sh --regenerate-second-sites"
+    note "       sudo bash $OPT_DIR/current/server/install.sh --regenerate-second-sites"
     note "   (add --apply-nginx in the same command to also apply the main site's maintenance page first)."
   fi
 fi
@@ -1351,7 +1351,7 @@ if [ -n "$SECOND_GATES" ]; then
     note ""
     note "!! ACTION NEEDED: the nginx site of these additional login gates does not deny every route in the current deny rules ($DENIED_PREFIXES):$_unfixed"
     note "!! Through that hostname an administrator of that org could reach the whole-backend admin routes among them (host upgrades, shared permissions, the Overview). Run"
-    note "!!     sudo bash $SOURCE_DIR/server/install.sh --regenerate-second-sites"
+    note "!!     sudo bash $OPT_DIR/current/server/install.sh --regenerate-second-sites"
     note "!! (it rebuilds each site from the live main site, runs nginx -t, and puts the old site back if it fails)."
   fi
 fi

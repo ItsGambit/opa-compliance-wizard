@@ -440,9 +440,11 @@ def test_second_gates_are_announced_loudly_in_the_dry_run_and_the_real_run(world
     d = world.run("--dry-run")
     assert d.returncode == 0, d.stdout + d.stderr
     assert "ADDITIONAL LOGIN GATES FOUND: second" in d.stdout and "does NOT deny every route in the current deny rules" in d.stdout and all(p in d.stdout for p in ("/api/access_control", "/api/shared_permissions", "/api/archives", "/api/upgrade", "/api/overview"))
-    assert f"server/install.sh --regenerate-second-sites" in d.stdout
+    # the remedy names the INSTALLED copy (the source directory may be a work directory that is gone when the run ends)
+    assert f"sudo bash {world.w}/opt/current/server/install.sh --regenerate-second-sites" in d.stdout and f"{world.src}/server/install.sh --regenerate" not in d.stdout
     p = world.run()
     assert p.returncode == 0, p.stdout + p.stderr
+    assert f"sudo bash {world.w}/opt/current/server/install.sh --regenerate-second-sites" in p.stdout and f"{world.src}/server/install.sh --regenerate" not in p.stdout
     assert "ACTION NEEDED" in p.stdout and "--regenerate-second-sites" in p.stdout and "second" in p.stdout.split("ACTION NEEDED")[1]
     assert "/api/upgrade" not in site.read_text()  # not touched without the flag
 

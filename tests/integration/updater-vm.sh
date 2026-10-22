@@ -647,7 +647,9 @@ check "trust apply of the test revocation succeeds" test "$RC" -eq 0
 "$UPDATER_CMD" stage "$REL/ocw-98.0.9.tar.gz" > "$WORK/stage9c.txt" 2>&1 && RC=0 || RC=$?
 check "a release signed by the revoked key (with an old timestamp) is refused (exit 2)" test "$RC" -eq 2
 check "the refusal says the key is revoked" bash -c "grep -qi 'revoked' $WORK/stage9c.txt"
-check "the applied revocation was not copied into the application's directory" test ! -e "$DATA/upgrade/revocations/1.json"
+# the application's own CLI (as the app account) keeps its raw copy there (keys._keep_raw_copy); root must have written nothing in it
+check "any copy of the revocation in the application's directory belongs to the application account, and root wrote nothing there" \
+  bash -c "[ ! -e '$DATA/upgrade/revocations/1.json' ] || [ \"\$(stat -c %U '$DATA/upgrade/revocations/1.json')\" = '$TEST_USER' ]; [ -z \"\$(find '$DATA/upgrade/revocations' -user root)\" ]"
 
 say "8. The root unit's sandbox (for tightening CapabilityBoundingSet)"
 systemctl show ocw-upgrade.service -p CapabilityBoundingSet -p ProtectSystem -p IPAddressDeny -p IPAddressAllow > "$WORK/sandbox.txt" || true
