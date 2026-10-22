@@ -41,11 +41,9 @@ describe('UsersTab', () => {
     expect(within(detail).getByText(/admin@example\.test · human · \d+ groups? → \d+ polic/)).toBeTruthy()
     expect(within(detail).getByRole('link', { name: 'Resource evidence (live + archive)' })).toBeTruthy()
     expect(within(detail).getAllByRole('columnheader').map(h => h.textContent)).toEqual(['Policy', 'Via group', 'Grants', 'Conditions'])  // no "Last accessed" column: no per-policy source
-    expect(within(rail).getByRole('button', { name: /2\s*servers/ })).toBeTruthy()
-    expect(within(rail).getByRole('button', { name: /3\s*managed saas app accounts/i })).toBeTruthy()
+    expect(within(detail).getByText(/→ 2 servers, 3 SaaS accounts/)).toBeTruthy()  // the counts are in the summary line
     expect(within(rail).getByRole('button', { name: /3\s*groups/ })).toBeTruthy()
     expect(screen.getByText('lab-linux-example-01')).toBeTruthy()
-    expect(screen.getByText('opa-user-admin@example.test', { exact: false })).toBeTruthy()
   })
 
   it('a row shows what they can do, how they get it and last used, and expands inline', () => {
@@ -111,17 +109,13 @@ describe('UsersTab', () => {
     expect(screen.queryByText("No policy grants access via this user's groups.")).toBeNull()
   })
 
-  it('M4: a user with nothing trackable has usage filters ready, not stuck disabled', () => {
-    // Only the Servers rule has resources without a lookup kind: use a model whose
-    // policies grant nothing trackable (a server selector row).
-    const model = {
-      ...exampleModel,
-      policies: [{ ...exampleModel.policies[0], rules: [{ ...exampleModel.policies[0].rules[0], resolutions: [{ kind: 'condition', description: 'Servers labeled env=prod' }] }] }],
-    } as unknown as AccessModel
-    open(model)
-    fireEvent.click(screen.getByRole('button', { name: /Filter/ }))
-    const box = screen.getByRole('checkbox', { name: /Used in the period read/ }) as HTMLInputElement
-    expect(box.disabled).toBe(false)
+  it('5.51.0: the rail has no count tiles, Filter menu or CSV/MD buttons, and the summary line carries the counts', () => {
+    open()
+    expect(screen.queryByRole('button', { name: /Filter/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: /^(CSV|MD)$/ })).toBeNull()
+    const card = screen.getByRole('region', { name: 'Selected user' })
+    expect(within(card).getByText(/\d+ groups? → \d+ polic(y|ies) → \d+ [a-z]/)).toBeTruthy()
+    expect(screen.getAllByText(/Policy grants come from the stored OPA scan/)).toHaveLength(1)
   })
 
   it('shows the coverage note, the count chip and the evidence in the opened row', () => {

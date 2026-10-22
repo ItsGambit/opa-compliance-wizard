@@ -195,7 +195,7 @@ def summary_line(parts):
     if len(requested) == 1:
         state = parts[requested[0]]["state"]
         return f"{PART_LABELS[requested[0]]} completed." if state == "ok" else f"{PART_LABELS[requested[0]]} {_state_words(state)}."
-    line = f"{len(done)} of {len(requested)} parts completed"
+    line = "all three parts completed" if len(done) == len(requested) == 3 else f"{len(done)} of {len(requested)} parts completed"
     others = [f"{PART_LABELS[p]} {_state_words(parts[p]['state'])}" for p in requested if parts[p]["state"] != "ok"]
     return line + ("; " + ", ".join(others) if others else "") + "."
 

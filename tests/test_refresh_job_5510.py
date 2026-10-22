@@ -136,7 +136,7 @@ def test_a_full_refresh_runs_three_parts_stores_the_scan_and_reports_each(rig, t
     job = rig.run()
     view = job.status_view()
     assert {p: view["parts"][p]["state"] for p in rj.PARTS} == {"opa": "ok", "okta": "ok", "log": "ok"}
-    assert view["summary"] == "3 of 3 parts completed."
+    assert view["summary"] == "all three parts completed."
     assert audit_store.opa_model_cache_info(rig.env)["built_at"]
     assert {k: v["state"] for k, v in view["parts"]["okta"]["sub"].items()} == {
         "admins": "ok", "principal_status": "ok", "inventory": "ok", "mfa_aggregates": "ok"}

@@ -161,7 +161,7 @@ export function AccessExplorer({ subTab, onOpenEnvironments, canAdmin }: Props) 
       )}
       {subTab === 'groups' && <GroupsTab model={displayedModel} />}
 
-      {builtAt && (
+      {builtAt && subTab !== 'users' && (  // the Users view says it in its detail card
         <p className="text-xs text-muted m-0">
           Policy grants come from the stored OPA scan ({formatDateTimeZone(builtAt)}). "Last accessed" and "Resource evidence" read the archive and the live System Log when you ask; they are not part of the scan.
         </p>

@@ -12,7 +12,7 @@ const H = 3_600_000
 
 describe('refresh wording', () => {
   it('counts parts the way the Overview and the toast say it', () => {
-    expect(completedText(3, 3)).toBe('all 3 parts completed')
+    expect(completedText(3, 3)).toBe('all three parts completed')
     expect(completedText(2, 3)).toBe('2 of 3 parts completed')
     expect(completedText(1, 1)).toBe('completed')
   })
@@ -20,7 +20,7 @@ describe('refresh wording', () => {
   it('the finish toast names the parts that did not complete, and says the rest is updated', () => {
     const all = job({ opa: 'ok', okta: 'ok', log: 'ok' })
     all.parts.okta.sub = { admins: { state: 'ok' }, principal_status: { state: 'ok' }, inventory: { state: 'ok' }, mfa_aggregates: { state: 'skipped' } }
-    expect(finishToast(all)).toEqual({ title: 'Refresh finished: all 3 parts completed', variant: 'success',
+    expect(finishToast(all)).toEqual({ title: 'Refresh finished: all three parts completed', variant: 'success',
       description: 'Audit Log: refresh.started, access_scan.completed, sync.manual_completed, okta_snapshot.captured ×3, refresh.completed.' })
     const partial = finishToast(job({ opa: 'ok', okta: 'refused', log: 'timed_out' }))
     expect(partial.variant).toBe('warning')

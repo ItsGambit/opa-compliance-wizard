@@ -3,20 +3,16 @@ import { useUserResourceAccess } from '../api/hooks'
 import { useRemoveUserFromGroup } from '../hooks/useRemoveUserFromGroup'
 import type { AccessModel, ResourceAccessInfo } from '../types'
 import { coverageNote } from '../utils/accessEvidence'
-import { aggregateResources, trackedRequests, type AccessLookup } from '../utils/accessResources'
-import type { ExportSection } from '../utils/export'
-import { visibleAccessSections } from '../utils/exportSections'
+import { aggregateResources, countLabel, sectionsByType, trackedRequests, type AccessLookup } from '../utils/accessResources'
 import { policiesUsingGroup, rulesGrantedToGroupIds } from '../utils/policy'
 import { ExplorerLayout } from './explorer/ExplorerLayout'
 import { GrantsMain } from './explorer/GrantsMain'
 import { GroupRemoveControl } from './explorer/GroupRemoveControl'
 import { RailGroupsExpander } from './explorer/RailGroupsExpander'
-import { CountList, FilterMenu } from './explorer/RailParts'
 import { ResourceAccessView } from './explorer/ResourceAccessView'
 import { UserDetail } from './explorer/UserDetail'
 import { UserRail } from './explorer/UserRail'
 import { useGrantsExplorer } from './explorer/useGrantsExplorer'
-import { ExportButtons } from './ExportButtons'
 
 /** Okta lifecycle flags per OPA user id (cross-check C1), from the newest lookup; absent when none has been run. */
 export interface OktaUserFlags {
@@ -32,6 +28,15 @@ interface Props {
    * Access Explorer otherwise only does on an explicit Refresh click --
    * we already know the outcome of a successful removal locally. */
   onUserGroupRemoved: (userId: string, groupId: string) => void
+}
+
+/** "38 servers, 2 secret folders, 1 SaaS account": what the user's policies reach, with counts, in the detail summary line. */
+function reachText(resources: ReturnType<typeof aggregateResources>): string {
+  return sectionsByType(resources).map(s => {
+    const label = countLabel(s.title, s.resources.length)
+    const named = /^managed saas app account/.test(label) ? label.replace(/^managed saas app account/, 'SaaS account') : label
+    return `${s.resources.length} ${named}`
+  }).join(', ')
 }
 
 export function UsersTab({ model, okta, onUserGroupRemoved }: Props) {
@@ -119,29 +124,11 @@ export function UsersTab({ model, okta, onUserGroupRemoved }: Props) {
     return ids
   }, [grants, groupIds])
 
-  const exportSectionsForUser: ExportSection[] = useMemo(() => {
-    if (!user) return []
-    return [
-      {
-        title: `User: ${user.details?.full_name || user.name}`,
-        rows: [
-          {
-            Email: user.details?.email ?? '',
-            Status: user.status ?? '',
-            Groups: user.groups.map(g => g.name).join(', '),
-          },
-        ],
-      },
-      ...visibleAccessSections(ex.visible, now),
-    ]
-  }, [user, ex.visible, now])
-
   const rail = (
     <>
       <UserRail users={model.users} flags={flags} selectedId={userId} onSelect={setUserId} />
       {user && (
         <>
-          <CountList items={ex.countItems} onSelect={ex.jump} />
           <RailGroupsExpander
             count={user.groups.length}
             label={`group${user.groups.length === 1 ? '' : 's'}`}
@@ -152,10 +139,6 @@ export function UsersTab({ model, okta, onUserGroupRemoved }: Props) {
               action: grantingGroupIds.has(g.id) ? removeControl(g, 'Remove') : undefined,
             }))}
           />
-          <FilterMenu items={ex.filterItems} active={ex.active} onToggle={ex.toggleFilter} />
-          <div className="xp-rail-actions">
-            <ExportButtons sections={exportSectionsForUser} filenameBase={`opa-user-${user.name}`} />
-          </div>
         </>
       )}
     </>
@@ -167,7 +150,7 @@ export function UsersTab({ model, okta, onUserGroupRemoved }: Props) {
         <p className="xp-note">Select a user to see everything they have access to through their groups.</p>
       ) : (
         <>
-        <UserDetail user={user} model={model} grants={grants} groupIds={groupIds} reach={ex.countItems.map(c => c.label).join(', ')} evidenceTarget="user-access-detail"
+        <UserDetail user={user} model={model} grants={grants} groupIds={groupIds} reach={reachText(resources)} evidenceTarget="user-access-detail"
           okta={okta ? { state: okta.users[user.id]?.okta_state ?? null, flag: oktaFlag, capturedAt: okta.capturedAt } : undefined} />
         <div id="user-access-detail" className="flex flex-col gap-4" role="region" aria-label="Access by resource, last accessed and evidence">
         <GrantsMain

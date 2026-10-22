@@ -69,10 +69,10 @@ export function tally(status: RefreshStatus) {
   return { total: parts.length, done: parts.length - failing.length, failing }
 }
 
-/** "all 3 parts completed" / "2 of 3 parts completed". */
+/** "all three parts completed" / "2 of 3 parts completed". */
 export function completedText(done: number, total: number): string {
   if (total === 1) return done === 1 ? 'completed' : 'did not complete'
-  return done === total ? `all ${total} parts completed` : `${done} of ${total} parts completed`
+  return done === total ? `all ${total === 3 ? 'three' : total} parts completed` : `${done} of ${total} parts completed`
 }
 
 /** The audit entries a refresh wrote, as the success toast lists them ("Audit Log: refresh.started, access_scan.completed, ..."). */
