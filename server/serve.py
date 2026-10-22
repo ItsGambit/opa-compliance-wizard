@@ -969,7 +969,8 @@ def _run_sync_job(env_id, env_name, okta_client, ingestion_scope, owner, trigger
                 if result.get("cancelled"):
                     _sync_jobs[storage_name]["cancelled"] = True
             engine.log_audit_event(
-                actor_email, actor_sub, f"{action_prefix}_failed", {"name": env_name, **result},
+                # a Stop is audited as cancelled, not as a failure (the saved position carries on)
+                actor_email, actor_sub, f"{action_prefix}_{'cancelled' if result.get('cancelled') else 'failed'}", {"name": env_name, **result},
                 client_ip=client_ip, user_agent=user_agent,
             )
             return

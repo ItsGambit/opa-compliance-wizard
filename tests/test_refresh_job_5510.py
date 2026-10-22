@@ -275,7 +275,7 @@ def test_a_stop_ends_the_scan_at_the_next_checkpoint_and_leaves_the_previous_sca
     assert "still shown and stored" in job.status_view()["parts"]["opa"]["message"]
 
 
-def test_a_stop_during_the_log_part_leaves_the_cursor_saved_and_the_run_partial(rig):
+def test_a_stop_during_the_log_part_leaves_the_cursor_saved_and_the_run_partial(rig, tmp_audit_log, monkeypatch):
     conn = audit_store._get_connection()
     cursor = "/api/v1/logs?after=c1&limit=1000&sortOrder=ASCENDING&since=x"
     audit_store._upsert_sync_state(conn, rig.env, last_synced_at=_ts(30), last_sync_completed_at=_ts(30), last_sync_status="success",
@@ -289,6 +289,19 @@ def test_a_stop_during_the_log_part_leaves_the_cursor_saved_and_the_run_partial(
     job = rig.run(["log"])
     data = job.status_view()["parts"]["log"]
     assert data["state"] == "cancelled" and "the next run continues from there" in data["message"]
+    # F1: a user's Stop is not a failure: audited as cancelled, status not "error" (so no back-off, no banner)
+    state = audit_store.get_sync_state(rig.env)
+    assert state["last_sync_status"] == "cancelled" and state["last_sync_error"] is None
+    actions = [r["action"] for r in rig.audit(tmp_audit_log)]
+    assert "sync.manual_cancelled" in actions and "sync.manual_failed" not in actions
+    started = []
+    monkeypatch.setattr(rig.serve, "_start_refresh_job", lambda *a, **k: started.append(a))
+    audit_store._upsert_sync_state(audit_store._get_connection(), rig.env, last_sync_completed_at=_ts(25 * 60))  # yesterday: a run is due
+    monkeypatch.setattr(engine, "get_sync_schedule_by_id", lambda env_id: {"enabled": True, "run_time": "00:00"})
+    rig.serve._scheduler_tick(datetime.now(timezone.utc))
+    assert len(started) == 1  # a stop does not arm the scheduler's retry back-off
+    banner = oa.build_overview(rig.env)["attention"]
+    assert not [a for a in banner if a["kind"] == "sync" and "failed" in a["text"]]
     stored = audit_store._get_connection().execute("SELECT poll_cursor FROM sync_state WHERE environment_id = ?", (rig.env,)).fetchone()[0]
     assert "after=c2" in stored  # progress saved
     assert audit_store._get_connection().execute("SELECT COUNT(*) FROM events WHERE environment_id = ?", (rig.env,)).fetchone()[0] == 1
@@ -441,6 +454,7 @@ def test_the_scheduler_does_not_retry_a_failed_log_part_inside_the_back_off(rig,
     assert state["last_sync_status"] == "error"
     started = []
     monkeypatch.setattr(rig.serve, "_start_refresh_job", lambda *a, **k: started.append(a))
+    audit_store._upsert_sync_state(audit_store._get_connection(), rig.env, last_sync_completed_at=_ts(25 * 60))  # yesterday: a run is due
     monkeypatch.setattr(engine, "get_sync_schedule_by_id", lambda env_id: {"enabled": True, "run_time": "00:00"})
     rig.serve._scheduler_tick(datetime.now(timezone.utc))
     assert started == []  # the last attempt is under SCHEDULER_RETRY_BACKOFF_SECS old

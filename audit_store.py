@@ -2743,7 +2743,12 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
 
     def _fail(error_message, until):
         try:
-            _upsert_sync_state(conn, environment_id, last_sync_status="error", last_sync_error=error_message)
+            if stopped["on_request"]:
+                # A Stop (or a part deadline) is not a failure of Okta: the saved position carries on, so the status is "cancelled", with no
+                # error text, and neither the scheduler's retry back-off nor the Overview's failing-sync banner is armed by it.
+                _upsert_sync_state(conn, environment_id, last_sync_status="cancelled", last_sync_error=None)
+            else:
+                _upsert_sync_state(conn, environment_id, last_sync_status="error", last_sync_error=error_message)
             if on_progress:
                 on_progress("ingest", "error", error_message)
         except Exception:
