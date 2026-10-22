@@ -721,3 +721,35 @@ def test_the_trigger_is_what_the_caller_says_not_a_guess_from_the_parts(matrix_s
         assert _call(base_url, "POST", "/api/environments/dev/refresh", body, _who(OWNER_A)).status_code == 200
         triggers.append(serve._refresh_jobs[env_id].trigger)
     assert triggers == ["manual", "explorer", "manual"]  # only the two the UI uses are accepted
+
+
+# -- review M2: the finish record is written before the job reads as done, and never for a deleted environment -------------------------
+def test_the_real_supervisor_leaves_no_sync_state_row_behind_when_the_environment_is_deleted_mid_refresh(matrix_server, monkeypatch):  # noqa: F811
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+
+    def part(job, ctx):  # a part that notices the stop at its next checkpoint, then takes a moment to wind down
+        job.begin("opa")
+        job.cancel_events["opa"].wait(20)
+        time.sleep(0.2)
+        job.finish("opa", "cancelled", rj.cancelled_message())
+    monkeypatch.setattr(serve, "_refresh_part_opa", part)
+    monkeypatch.setattr(serve, "REFRESH_SUPERVISE_POLL_SECS", 0.02)
+    out = serve._start_refresh_job(env_id, "dev", parts=["opa"], trigger="manual", owner=OWNER_A)
+    assert out["started"]
+    time.sleep(0.2)
+    resp = _call(base_url, "DELETE", f"/api/environments/dev?id={env_id}&purge_archive=1", headers=_who(ADMIN, admin=True))
+    assert resp.status_code == 200, resp.text
+    time.sleep(0.6)  # anything the supervisor still wanted to write would be written by now
+    assert audit_store.get_sync_state(env_id) is None
+    assert env_id not in serve._refresh_jobs
+    assert [a for a in audit_store.list_orphaned_archives() if a.get("environment_id") == env_id] == []
+
+
+def test_a_finished_job_has_its_record_stored_before_it_reads_as_done(rig):  # noqa: F811
+    seen = []
+    real = rig.serve._persist_last_refresh
+    rig.monkeypatch.setattr(rig.serve, "_persist_last_refresh", lambda job, *a, **k: (seen.append(job.status), real(job, *a, **k))[1])
+    rig.run(["log"])
+    assert seen == ["running"]  # persisted while the job still read as running: a delete waiting for "done" waits for the write
+    assert audit_store.get_sync_state(rig.env)["last_refresh"]["manual"]["finished_at"]

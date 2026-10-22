@@ -1512,6 +1512,14 @@ def _finish_cancelled(job, part):
 
 
 def _conclude_refresh(job, ctx):
+    # The finish record is stored BEFORE the job reads as done: an environment delete waits for "done", so it also waits for this write,
+    # and the write is skipped for a job that is no longer current or whose environment is gone (it would re-create a row for it).
+    finished_at = rj.utc_now_iso()
+    try:
+        if _refresh_current(job) and engine.environment_owner(job.environment_id)[0]:
+            _persist_last_refresh(job, finished_at)
+    except Exception as exc:
+        engine.log("WARN", f"The refresh outcome could not be recorded ({type(exc).__name__}).")
     job.conclude()
     outcome = job.outcome()
     seconds = round(time.monotonic() - job.started_mono, 1)
@@ -1521,18 +1529,14 @@ def _conclude_refresh(job, ctx):
                                client_ip=ctx.get("client_ip"), user_agent=ctx.get("user_agent"))
     except Exception as exc:
         engine.log("WARN", f"The refresh outcome could not be written to the audit log ({type(exc).__name__}).")
-    try:
-        _persist_last_refresh(job)
-    except Exception as exc:
-        engine.log("WARN", f"The refresh outcome could not be recorded ({type(exc).__name__}).")
 
 
-def _persist_last_refresh(job):
+def _persist_last_refresh(job, finished_at=None):
     """Remember what the last scheduled and the last other refresh did, per part (state and a short message, no names), so the
     Overview can still say a scheduled run did not read OPA after a restart."""
     import audit_store
     view = job.status_view()
-    record = {"job_id": job.job_id, "trigger": job.trigger, "finished_at": view["finished_at"],
+    record = {"job_id": job.job_id, "trigger": job.trigger, "finished_at": finished_at or view["finished_at"],
               "parts": {p: {"state": view["parts"][p]["state"], "message": (view["parts"][p].get("message") or "")[:300]} for p in job.parts}}
     state = audit_store.get_sync_state(job.environment_id) or {}
     stored = state.get("last_refresh") if isinstance(state.get("last_refresh"), dict) else {}
