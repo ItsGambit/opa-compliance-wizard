@@ -149,7 +149,13 @@ notifications before you publish. Then:
    fails the build and names the package. Needs `packaging` (`pip install packaging`) on the releasing computer. Test it: unpack on a machine
    without network and run `python launch.py upgrade --from-file …`. A new platform or Python version goes into `OFFLINE_PYTHONS` / `OFFLINE_PLATFORMS` in
    `tools/release.py`. Regenerating `requirements.lock` means building a new bundle; there is nothing to sign separately.
-7. **Prereleases.** Mark a release as a *pre-release* on GitHub to offer it only to installs on the prerelease channel (they use `GET /releases`; stable installs
+7. **When an existing install must re-run `install.sh` (5.52.0).** The manifest's `install_sh_min_version` is the newest of (a) the
+   `OCW_INSTALL_SH_REQUIRED_SINCE="X.Y.Z"` line near the top of `server/install.sh` and (b) the last release in which a systemd unit
+   (`server/ocw-*.service|path|timer`) or `server/ocw-updater.sh` changed. A change to `install.sh` alone (a fresh-install-only
+   addition, say) does **not** raise it, so existing installs are not asked to run `--refresh-updater` for nothing. **Bump the marker to
+   the release version when an existing install needs the new install.sh** (a new unit setting it writes, a changed layout, a fix to
+   what it does on a re-run). `release.py build` stops if the marker is missing, malformed or newer than the release being built.
+8. **Prereleases.** Mark a release as a *pre-release* on GitHub to offer it only to installs on the prerelease channel (they use `GET /releases`; stable installs
    keep using `/releases/latest`, which never returns a prerelease). It is built and signed exactly like any release; the tag is still `vX.Y.Z`.
 
 **First release only: the KMS interop test.** The byte format of KMS's Ed25519 `Sign` answer is not documented beyond "the signature";

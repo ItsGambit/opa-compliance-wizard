@@ -75,6 +75,14 @@
 # Exit status: 0 done; 2 refused, nothing was changed; 3 failed and everything was put back; 4 failed, an operator must act.
 set -euo pipefail
 
+# The release whose install.sh an EXISTING install needs (tools/release.py reads this line into the manifest's
+# install_sh_min_version; the updater asks for `install.sh --refresh-updater` only while the version it last recorded is older).
+# 5.50.0: the second-gate deny rules and --regenerate-second-sites, the newest change to what an existing install runs.
+# 5.52.0 added the fresh-install path, --uninstall and --log, which existing installs do not need. Bump it when an existing
+# install needs the new install.sh (docs/releasing.md).
+OCW_INSTALL_SH_REQUIRED_SINCE="5.50.0"
+: "$OCW_INSTALL_SH_REQUIRED_SINCE"
+
 OPT_DIR="${OCW_OPT_DIR:-/opt/opa-compliance-wizard}"
 DATA_DIR="${OCW_DATA_DIR:-/var/lib/opa-compliance-wizard}"
 UNIT_DIR="${OCW_UNIT_DIR:-/etc/systemd/system}"

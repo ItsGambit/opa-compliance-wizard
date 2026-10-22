@@ -206,7 +206,8 @@ def _nginx_template_changed(repo, files, version):
 
 UNIT_FILES = ("server/ocw-stage@.service", "server/ocw-upgrade.service", "server/ocw-upgrade.path", "server/ocw-upgrade-due.service",
               "server/ocw-upgrade-due.timer")
-INSTALL_SH_FILES = UNIT_FILES + ("server/ocw-updater.sh", "server/install.sh")
+UPDATER_FILES = UNIT_FILES + ("server/ocw-updater.sh",)   # what makes a stale install break an upgrade; install.sh uses a marker instead
+INSTALL_SH_FILES = UPDATER_FILES + ("server/install.sh",)
 
 
 def _file_at_tag(repo, tag, name):
@@ -235,21 +236,50 @@ def _requires_install_sh(repo, files, version):
     return _differs_from_tag(repo, files, prev, UNIT_FILES)
 
 
+_MARKER_RE = re.compile(rb'^OCW_INSTALL_SH_REQUIRED_SINCE="([^"]*)"$', re.M)
+
+
+def _install_sh_marker(files, version):
+    """The release in which server/install.sh last changed in a way an EXISTING install needs, read from the marker line
+    `OCW_INSTALL_SH_REQUIRED_SINCE="X.Y.Z"` in install.sh. None when the tree has no install.sh (a test fixture). A missing or
+    malformed marker, or one newer than the release being built, stops the build."""
+    entry = files.get("server/install.sh")
+    if entry is None:
+        return None
+    m = _MARKER_RE.search(entry[1] if isinstance(entry, tuple) else entry)
+    if not m or not VERSION_RE.match(m.group(1).decode()):
+        raise ReleaseError('server/install.sh must carry a line OCW_INSTALL_SH_REQUIRED_SINCE="X.Y.Z" (the release whose install.sh '
+                           "changes an existing install needs); it is missing or malformed")
+    marker = m.group(1).decode()
+    if tuple(map(int, marker.split("."))) > tuple(map(int, version.split("."))):
+        raise ReleaseError(f"OCW_INSTALL_SH_REQUIRED_SINCE is {marker}, newer than the release being built ({version})")
+    return marker
+
+
 def _install_sh_min_version(repo, files, version):
-    """The newest release version (this one or an earlier tag) in which the units, the ocw-updater wrapper or install.sh
-    changed, found by walking the tags back. The updater refuses a release only while the version install.sh last
-    recorded is older than this. The oldest tag counts as having introduced those files, and a release with no earlier
-    tag uses its own version."""
+    """The newest of: the marker in install.sh (the release whose install.sh changes existing installs need), and the newest
+    release (this one or an earlier tag) in which a unit or the ocw-updater wrapper changed, found by walking the tags back.
+    A byte change in install.sh alone (for example a fresh-install-only addition) does NOT raise it. The updater refuses a
+    release only while the version install.sh last recorded is older than this. The oldest tag counts as having introduced
+    those files, and a release with no earlier tag uses its own version."""
+    marker = _install_sh_marker(files, version)
+    walked = _walk_install_sh_version(repo, files, version)
+    if marker is None:
+        return walked
+    return max(marker, walked, key=lambda v: tuple(map(int, v.split("."))))
+
+
+def _walk_install_sh_version(repo, files, version):
     prev = _previous_tag(repo, version)
-    if prev is None or _differs_from_tag(repo, files, prev, INSTALL_SH_FILES):
+    if prev is None or _differs_from_tag(repo, files, prev, UPDATER_FILES):
         return version
     cur = prev
     while True:
         before = _previous_tag(repo, cur[1:])
         if before is None:
             return cur[1:]
-        mine = {n: (0, d) for n in INSTALL_SH_FILES if (d := _file_at_tag(repo, cur, n)) is not None}
-        if _differs_from_tag(repo, mine, before, INSTALL_SH_FILES):
+        mine = {n: (0, d) for n in UPDATER_FILES if (d := _file_at_tag(repo, cur, n)) is not None}
+        if _differs_from_tag(repo, mine, before, UPDATER_FILES):
             return cur[1:]
         cur = before
 

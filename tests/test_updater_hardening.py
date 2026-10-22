@@ -667,6 +667,7 @@ def _git_repo(tmp_path, tags):
     run("config", "user.email", "t@example.com")
     run("config", "user.name", "t")
     state = {n: "base\n" for n in tool.INSTALL_SH_FILES}
+    state["server/install.sh"] = 'OCW_INSTALL_SH_REQUIRED_SINCE="1.0.0"\n'
     for version, changes in tags.items():
         state.update(changes)
         for n, text in state.items():
@@ -692,9 +693,9 @@ def test_install_sh_min_version_walks_the_tags_back_to_the_newest_change(tmp_pat
     })
     # nothing changed in 1.6.0 against 1.5.0: the answer walks back through 1.5.0 and 1.4.0 to 1.3.0 (the unit)
     assert tool._install_sh_min_version(repo, _files(state), "1.6.0") == "1.3.0"
-    # a change in this release is its own minimum
-    changed = dict(state, **{"server/install.sh": "installer v2\n"})
-    assert tool._install_sh_min_version(repo, _files(changed), "1.6.0") == "1.6.0"
+    # a byte change in install.sh alone does not raise it (the marker says what existing installs need)
+    changed = dict(state, **{"server/install.sh": 'OCW_INSTALL_SH_REQUIRED_SINCE="1.0.0"\n# a fresh-install-only addition\n'})
+    assert tool._install_sh_min_version(repo, _files(changed), "1.6.0") == "1.3.0"
     # a wrapper-only change: the minimum moves but the 5.47.0-compatible boolean (units only) stays false
     wrapper = dict(state, **{"server/ocw-updater.sh": "wrapper v3\n"})
     assert tool._install_sh_min_version(repo, _files(wrapper), "1.6.0") == "1.6.0"
@@ -709,7 +710,7 @@ def test_install_sh_min_version_walks_the_tags_back_to_the_newest_change(tmp_pat
 
 def test_install_sh_min_version_of_a_first_release_is_its_own_version(tmp_path):
     tool, repo, state = _git_repo(tmp_path, {"1.0.0": {}})
-    assert tool._install_sh_min_version(repo, _files(state), "0.9.0") == "0.9.0"
+    assert tool._install_sh_min_version(repo, _files(dict(state, **{"server/install.sh": 'OCW_INSTALL_SH_REQUIRED_SINCE="0.9.0"\n'})), "0.9.0") == "0.9.0"
     # the oldest tag counts as having introduced the files
     assert tool._install_sh_min_version(repo, _files(state), "1.0.1") == "1.0.0"
 
@@ -747,3 +748,26 @@ def test_preflight_is_silent_when_every_second_gate_site_denies_the_upgrade_rout
     m.put_artifacts("5.47.0")
     assert m.updater().apply(m.request("5.47.0", correlation_id="upg-00000411")) == "completed"
     assert not [e for e in m.audit_actions() if e["details"].get("step") == "second_gate_site_unprotected"]
+
+
+def test_install_sh_marker_sets_the_floor_and_a_unit_change_still_raises_it(tmp_path):
+    tool, repo, state = _git_repo(tmp_path, {"5.49.0": {}, "5.50.0": {}, "5.51.0": {}})
+    # (a) marker 5.50.0 and only install.sh changed: 5.52.0 says 5.50.0 (the oldest tag's walk gives 5.49.0; the marker is newer)
+    only_sh = dict(state, **{"server/install.sh": 'OCW_INSTALL_SH_REQUIRED_SINCE="5.50.0"\n# new fresh-install code\n'})
+    assert tool._install_sh_min_version(repo, _files(only_sh), "5.52.0") == "5.50.0"
+    # (b) a unit change raises it to the release version
+    unit = dict(only_sh, **{"server/ocw-upgrade.service": "unit v2\n"})
+    assert tool._install_sh_min_version(repo, _files(unit), "5.52.0") == "5.52.0"
+    # the marker wins over an older walk, and a newer walk wins over the marker
+    assert tool._install_sh_min_version(repo, _files(dict(only_sh, **{"server/install.sh": 'OCW_INSTALL_SH_REQUIRED_SINCE="5.52.0"\n'})), "5.52.0") == "5.52.0"
+    # (c) a marker newer than the release, malformed, or missing stops the build
+    for text in ('OCW_INSTALL_SH_REQUIRED_SINCE="5.53.0"\n', 'OCW_INSTALL_SH_REQUIRED_SINCE="5.5"\n', 'OCW_INSTALL_SH_REQUIRED_SINCE=5.50.0\n', "no marker\n"):
+        with pytest.raises(tool.ReleaseError, match="OCW_INSTALL_SH_REQUIRED_SINCE"):
+            tool._install_sh_min_version(repo, _files(dict(state, **{"server/install.sh": text})), "5.52.0")
+
+
+def test_the_real_install_sh_carries_a_valid_marker_not_newer_than_its_version():
+    tool = _release_tool()
+    text = (Path(__file__).resolve().parent.parent / "server" / "install.sh").read_bytes()
+    marker = tool._install_sh_marker({"server/install.sh": (0o755, text)}, "5.52.0")
+    assert marker == "5.50.0"
