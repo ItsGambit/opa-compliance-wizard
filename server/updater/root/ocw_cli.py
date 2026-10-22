@@ -152,8 +152,11 @@ def cmd_status(a, cfg, host):
     print(f"installed      {s['installed'] or 'unknown'}   (releases/{s['installed']}{since}{signed})")
     if s["latest"]:
         print(f"latest stable  {s['latest']}   (checked {s['latest_checked'] or 'never'})")
+    last_target = (s.get("state") or {}).get("version_to")
     for r in s["staged"]:
-        print(f"staged         {r['version']}   verified ok, venv built, sha256 {str(r['sha256'])[:8]}…{str(r['sha256'])[-4:]}")
+        # A tree staged by an earlier attempt stays on disk until it is applied or pruned: say so when the last run was about another version.
+        earlier = f"   (staged earlier, not part of the last run: {last_target})" if last_target and last_target != r["version"] else ""
+        print(f"staged         {r['version']}   verified ok, venv built, sha256 {str(r['sha256'])[:8]}…{str(r['sha256'])[-4:]}{earlier}")
     for r in s["schedule"]:
         print(f"schedule       {r['not_before']} (entered as {r['entered'] or 'UTC'}) by {r['by']}, upgrade {r['correlation_id']}")
     u = s["updater"]

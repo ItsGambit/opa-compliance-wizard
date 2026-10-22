@@ -218,6 +218,23 @@ def test_status_prints_the_last_runs_words(m, capsys):
     assert "[release_files_mismatch]" in out and "Nothing was changed on the server." in out and "Next: Download the release again" in out
 
 
+def test_status_labels_a_staged_version_that_is_not_the_one_the_last_run_refused(m, capsys):
+    staged(m, "5.47.0")
+    staged(m, "5.47.1")
+    (m.opt / "staging" / "5.47.0" / "requirements.lock").write_text("# changed\n")
+    m.updater().apply(m.request("5.47.0", correlation_id="upg-00000506"))
+    ocw_cli.main(["status"], m.cfg(), m.host)
+    out = capsys.readouterr().out
+    line = next(l for l in out.splitlines() if l.startswith("staged") and "5.47.1" in l)
+    assert "staged earlier, not part of the last run" in line
+
+
+def test_the_release_files_next_step_does_not_send_the_reader_to_the_command_they_are_reading():
+    text, _changed, step = act.describe_reason("release_files_mismatch")
+    assert "ocw-updater status" not in step
+    assert step == "Download the release again. If it happens again, open an issue on the project's GitHub page."
+
+
 def test_a_rejected_request_carries_the_plain_words_too(m):
     up = m.updater()
     act.reject(up, "upg-00000505", "request_replayed", "this approval was already used")

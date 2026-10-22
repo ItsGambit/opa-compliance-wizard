@@ -131,7 +131,7 @@ REASON_TEXT = {
     "stage_failed": ("The release could not be prepared for installation.", "Try again. If it repeats: " + BUNDLE_STEP),
     "not_staged": ("The release could not be prepared for installation.", "Try again. If it repeats: " + BUNDLE_STEP),
     "release_files_mismatch": ("The prepared files do not match the signed release (a file differs, is missing, or is extra).",
-                               "Download the release again. If it repeats, the staging area may have been altered: run " + STATUS_STEP + " and " + ISSUE_STEP + "."),
+                               "Download the release again. If it happens again, " + ISSUE_STEP + "."),
     "environment_unexpected": ("The release's Python environment has something the updater does not expect (for example a link to a file "
                                "outside the release, or a file with group or world write permission).",
                                "This is usually a Python layout the updater has not seen. " + INSTALL_STEP + " If it repeats: " + BUNDLE_STEP),
