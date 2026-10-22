@@ -11,12 +11,14 @@ interface Props {
   reviewing: boolean
   reviewError: string | null
   onReview: () => void
+  /** The release the open 24 h rollback goes back to: an upgrade now replaces it (the updater allows that). */
+  rollbackEnds?: string | null
   onUpgradeNow: () => void
   onSchedule: () => void
   onSecondApproval: () => void
 }
 
-export function AvailableSection({ status, isLocal, reviewing, reviewError, onReview, onUpgradeNow, onSchedule, onSecondApproval }: Props) {
+export function AvailableSection({ status, isLocal, reviewing, reviewError, onReview, rollbackEnds, onUpgradeNow, onSchedule, onSecondApproval }: Props) {
   const latest = status.latest!
   const u = status.upgrade
   const preview = u?.preview ?? null
@@ -84,6 +86,9 @@ export function AvailableSection({ status, isLocal, reviewing, reviewError, onRe
         )}
         {hosted && reason && (
           <p id="upgrade-block" className="text-xs text-muted mt-3 mb-0" role="status">{reason}</p>
+        )}
+        {hosted && rollbackEnds && (
+          <p className="text-xs text-text-dim mt-3 mb-0" role="status">Upgrading now replaces the rollback to {rollbackEnds} from the last upgrade: afterwards you can roll back to {status.installed_version} instead.</p>
         )}
         {hosted && !reason && (
           <p className="text-xs text-muted mt-3 mb-0">Both continue to a confirmation screen that shows exactly what changes, then a step-up MFA approval. Nothing is installed before that.</p>

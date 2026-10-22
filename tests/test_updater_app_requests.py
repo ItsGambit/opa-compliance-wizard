@@ -94,6 +94,18 @@ def test_rollback_after_the_window_or_without_a_previous_release_is_refused(m):
     assert os.readlink(m.opt / "current") == "releases/5.47.0"
 
 
+def test_an_upgrade_inside_the_rollback_window_is_allowed_and_replaces_the_rollback_target(m):
+    """The Updates page tells the admin that upgrading now ends the rollback to the release before: the activator does not refuse it."""
+    applied(m)  # 5.46.0 -> 5.47.0: a rollback to 5.46.0 is open
+    assert os.readlink(m.opt / "previous") == "releases/5.46.0"
+    applied(m, "5.48.0", cid="upg-ccdd0002")  # a newer release is applied while that window is open
+    assert os.readlink(m.opt / "current") == "releases/5.48.0"
+    assert os.readlink(m.opt / "previous") == "releases/5.47.0"  # the 5.46.0 rollback is gone; a new window runs back to 5.47.0
+    assert m.read_state()["result"] == "completed"
+    send(m, "rollback", confirm="ROLLBACK")  # the rollback now goes to the version that was running before this upgrade
+    assert process(m) == ["rolled_back"] and os.readlink(m.opt / "current") == "releases/5.47.0"
+
+
 def test_restore_request_puts_the_pre_upgrade_archive_back(m):
     applied(m)
     conn = sqlite3.connect(m.db)

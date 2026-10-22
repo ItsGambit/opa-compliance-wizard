@@ -289,6 +289,24 @@ describe('08a progress', () => {
     } finally { vi.useRealTimers() }
   })
 
+  it('inside the 24 h rollback window the success cards stay on top, with Check now below them', async () => {
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({ installed_version: '5.48.0', upgrade: makeUpgrade({ run: makeRun(), rollback: { available: true, until: '2099-01-01T00:00:00Z', to: '5.46.0' } }) }))
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    const done = (await screen.findAllByText(/Upgraded to 5.48.0/))[0]
+    const check = screen.getByRole('button', { name: /Check now/ })
+    expect(done.compareDocumentPosition(check) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('inside the rollback window a newer release is offered, and says that upgrading ends the rollback', async () => {
+    vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({ ...NEWER, latest: { ...NEWER.latest, version: '5.49.0' }, installed_version: '5.48.0',
+      upgrade: makeUpgrade({ run: makeRun(), preview: makePreview({ version: '5.49.0' }), rollback: { available: true, until: '2099-01-01T00:00:00Z', to: '5.46.0' } }) }))
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    expect(await screen.findByText('5.49.0 is available')).toBeTruthy()
+    expect(screen.getAllByText(/Upgraded to 5.48.0/).length).toBeGreaterThan(0)
+    expect(screen.getByText('Upgrading now replaces the rollback to 5.46.0 from the last upgrade: afterwards you can roll back to 5.48.0 instead.')).toBeTruthy()
+    expect((screen.getByRole('button', { name: /Upgrade now/ }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
   it('reloads once when the new version answers, never again', async () => {
     const reload = vi.fn()
     Object.defineProperty(window, 'location', { configurable: true, value: { ...window.location, reload } })
@@ -649,7 +667,7 @@ describe('mockup fidelity (round 3)', () => {
     expect(screen.getByText(/The service was unavailable for 41 s\./)).toBeTruthy()
     expect(screen.getByText('Activator updated itself to 5.48.0 after re-verifying the release')).toBeTruthy()
     expect(screen.getByText('upgrade/backups/audit_store-pre-5.48.0-20261021T023005Z.db')).toBeTruthy()
-    expect(screen.queryByText('Installed version')).toBeNull()                          // the mockup's page is the result only
+    expect(screen.getByRole('button', { name: /Check now/ })).toBeTruthy()              // the result leads; the installed-version card (Check now) follows it
     fireEvent.click(await screen.findByRole('button', { name: /View the 3 audit entries for this upgrade/ }))
     expect(sessionStorage.getItem('opa.auditSearch')).toBe('upg-7f3a9c2e')
     expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Upgraded to 5.48.0', description: expect.stringContaining('The page reloaded on the new version') }))

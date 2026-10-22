@@ -508,16 +508,18 @@ export function UpdatesPage({ onOpenKeys, onHeader }: { onOpenKeys: () => void; 
         </div>
       )}
 
+      {/* Inside the 24 h rollback window the success cards stay above; the installed-version card (Check now) and any newer release follow. */}
       {/* Mockup 03: when an update is available, its card leads the page and replaces the installed-version card (owner, 2026-10-20). */}
-      {sched?.status !== 'scheduled' && !successShown && state === 'update_available' && status.latest
+      {sched?.status !== 'scheduled' && state === 'update_available' && status.latest
         ? (isLocal
           ? <LocalModeCard status={status} />
           : <AvailableSection status={status} isLocal={isLocal} reviewing={review.isPending} reviewError={reviewError}
               onReview={() => review.mutate()}
+              rollbackEnds={successShown ? u?.rollback?.to ?? 'the previous release' : null}
               onUpgradeNow={() => { setMode('apply'); setChoice(null); setView('confirm') }}
               onSchedule={() => openSchedule('schedule')}
               onSecondApproval={() => { setMode('second'); setView('confirm') }} />)
-        : sched?.status !== 'scheduled' && !successShown && <StatusCard status={status} onCheckNow={() => checkNow.mutate()} checking={checkNow.isPending} disabled={busy} />}
+        : sched?.status !== 'scheduled' && <StatusCard status={status} onCheckNow={() => checkNow.mutate()} checking={checkNow.isPending} disabled={busy} />}
       {isLocal && state !== 'update_available' && <LocalModeCard status={status} />}
       {pending && !pending.mine && state !== 'update_available' && (
         <section className="card p-4 border-accent/50">
