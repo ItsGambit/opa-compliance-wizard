@@ -3541,6 +3541,9 @@ class Handler(SimpleHTTPRequestHandler):
                 with _sync_jobs_lock:
                     job = dict(_sync_jobs.get(environment_id, {"status": "idle", "steps": [], "error": None}))
                 job["sync_state"] = audit_store.get_sync_state(environment_id)
+                if job["sync_state"] and not engine.shared_capability_allowed(environment_id, engine_owner, "live_read",
+                                                                              caller_issuer=_issuer_from_headers(self.headers)):
+                    job["sync_state"]["last_refresh"] = None  # the per-part outcomes need what /refresh/status needs (live_read)
                 job["is_first_sync"] = audit_store.is_first_sync(environment_id)
                 return self._send_json(200, job)
 

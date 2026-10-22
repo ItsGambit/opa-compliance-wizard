@@ -753,3 +753,20 @@ def test_a_finished_job_has_its_record_stored_before_it_reads_as_done(rig):  # n
     rig.run(["log"])
     assert seen == ["running"]  # persisted while the job still read as running: a delete waiting for "done" waits for the write
     assert audit_store.get_sync_state(rig.env)["last_refresh"]["manual"]["finished_at"]
+
+
+# -- review L2: the per-part outcomes are read with the same permission on both routes ------------------------------------------------
+def test_the_sync_status_route_shows_the_refresh_outcomes_only_to_callers_who_may_read_the_refresh_status(matrix_server):  # noqa: F811
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+    engine.set_environment_shared("dev", OWNER_A, True)
+    audit_store._upsert_sync_state(audit_store._get_connection(), env_id, last_refresh_json=json.dumps({"scheduled": {
+        "finished_at": "2026-10-21T02:20:00.000Z", "parts": {"opa": {"state": "refused", "message": "OPA refused the service key for projects (HTTP 403)."}}}}))
+    engine.set_shared_permissions({"view_archive": "allow", "live_read": "deny"}, environment_id=env_id)
+    get = lambda who: _call(base_url, "GET", "/api/environments/dev/sync/status", headers=who)  # noqa: E731
+    r = get(_who(OWNER_B))
+    assert r.status_code == 200 and r.json()["sync_state"]["last_refresh"] is None and "refused the service key" not in r.text
+    assert _call(base_url, "GET", "/api/environments/dev/refresh/status", headers=_who(OWNER_B)).status_code == 403
+    engine.set_shared_permissions({"live_read": "allow"}, environment_id=env_id)
+    assert get(_who(OWNER_B)).json()["sync_state"]["last_refresh"]["scheduled"]["parts"]["opa"]["state"] == "refused"
+    assert _call(base_url, "GET", "/api/environments/dev/refresh/status", headers=_who(OWNER_B)).status_code == 200
