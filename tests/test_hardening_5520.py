@@ -24,6 +24,16 @@ def test_a_stop_landing_just_before_the_deadline_is_cancelled_not_timed_out(rig)
     assert job.part_state("log") == "cancelled"
 
 
+def test_a_stop_is_honoured_over_a_deadline_only_for_the_kill_grace(rig, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(rj, "KILL_GRACE_SECS", 0)  # a part that did not stop within the grace is timed out as before
+    job = _StopLandsAtTheDeadline(rig.env, ["log"], "manual")
+    assert job.begin("log")
+    rig.serve._refresh_jobs[rig.env] = job
+    rig.serve._supervise(job, [])
+    job.conclude()
+    assert job.part_state("log") == "timed_out"
+
+
 def test_a_part_over_its_deadline_without_a_stop_is_still_timed_out(rig):  # noqa: F811
     class _Late(rj.RefreshJob):
         def overdue(self, deadlines=None):

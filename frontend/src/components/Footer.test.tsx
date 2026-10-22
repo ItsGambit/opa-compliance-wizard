@@ -6,6 +6,7 @@ import type { RefreshStatus } from '../types'
 import { renderWithClient } from '../test/renderWithClient'
 import type { Environment } from '../types'
 import { makeStatus, NEWER } from '../test/upgradeFixtures'
+import * as toasts from '../hooks/useToast'
 import { Footer } from './Footer'
 
 vi.mock('../api/client', () => ({
@@ -74,6 +75,21 @@ describe('Footer', () => {
     await waitFor(() => expect(startRefresh).toHaveBeenCalledTimes(1))
     expect(startRefresh).toHaveBeenCalledWith('team', undefined)  // no `parts`: the server runs every part
     expect(startSync).not.toHaveBeenCalled()
+  })
+
+  it('Sync now while a System Log sync runs: not an error, says what runs and when to retry', async () => {
+    const spy = vi.spyOn(toasts, 'toast')
+    vi.mocked(fetchEnvironments).mockResolvedValue({ environments: [env({ is_own: true, shared: false })], active: 'team', active_id: 'e1' })
+    const words = 'A refresh of System Log is running. The OPA scan and Okta scan can start when it finishes.'
+    vi.mocked(startRefresh).mockRejectedValue(Object.assign(new Error(words), { status: 409, body: { error: words, reason: 'busy_other_parts', running: ['log'], missing: ['opa', 'okta'] } }))
+    renderWithClient(<Footer />)
+    fireEvent.click(await screen.findByRole('button', { name: /Sync now/ }))
+    await waitFor(() => expect(spy).toHaveBeenCalled())
+    expect(spy).toHaveBeenCalledWith(expect.objectContaining({
+      title: 'Not started yet', variant: 'default',
+      description: 'A System Log sync is running. Sync now can start the full refresh when it finishes (usually within a few minutes).',
+    }))
+    expect(spy.mock.calls.some(c => c[0].variant === 'error')).toBe(false)
   })
 
   it('while a refresh runs the button attaches (no second job) and the footer says it is syncing', async () => {

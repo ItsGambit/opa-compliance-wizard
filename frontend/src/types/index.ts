@@ -735,6 +735,9 @@ export interface ApiErrorBody {
    * "already_consumed"; audit-log backfill "busy"; 5.42.0
    * "shared_permission_denied", "secrets_expired", "step_up_unavailable"). */
   reason?: string
+  /** 5.52.0: a "busy_other_parts" refusal (409): the parts the running refresh is still working on, and the parts that were asked for. */
+  running?: string[]
+  missing?: string[]
   /** 5.42.0: the capability a shared_permission_denied refusal names. */
   capability?: string
   /** 5.42.0: the Environments change a step-up save applied (or refused). */

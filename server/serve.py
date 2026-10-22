@@ -1488,10 +1488,15 @@ def _run_refresh_job(job, ctx):
 
 def _supervise(job, lanes):
     grace_until = {}
+    cancel_seen_at = None
     while _refresh_current(job):
         for part in job.overdue():
             if job.is_cancelled():
-                break  # a Stop that landed before the deadline is a Stop: the part ends at its checkpoint as "cancelled", not "timed_out"
+                # A Stop that landed before the deadline is a Stop: the part ends at its checkpoint as "cancelled", not "timed_out".
+                # Only for the kill grace, so a part stuck inside one call that never returns still ends the job (as timed_out).
+                cancel_seen_at = cancel_seen_at or time.monotonic()
+                if time.monotonic() - cancel_seen_at < rj.KILL_GRACE_SECS:
+                    break
             minutes = rj.PART_DEADLINES_SECS[part] // 60
             if job.finish(part, "timed_out", rj.timed_out_message(part, minutes)):
                 job.cancel_events[part].reason = "timed_out"  # so the sync can record a deadline, not a Stop

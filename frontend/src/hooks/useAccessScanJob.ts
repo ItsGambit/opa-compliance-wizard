@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError, fetchAccessModel, fetchRefreshStatus, startRefresh } from '../api/client'
 import type { BootstrapStepEvent } from '../api/client'
 import type { AccessModelResponse, RefreshStatus } from '../types'
+import { busyRefreshMessage } from '../utils/refresh'
 import { JOB_LOST_MESSAGE, startPollLoop } from './pollLoop'
 
 export type JobPhase = 'idle' | 'starting' | 'running' | 'done' | 'error'
@@ -72,7 +73,7 @@ export function useAccessScanJob() {
       .catch(err => {
         if (gen !== generation.current) return
         // A busy answer (another refresh is running without the OPA part) is not a failed scan: nothing was started, nothing was lost.
-        setState(s => ({ ...s, phase: 'error', error: errorText(err), failureState: err instanceof ApiError && err.status === 409 ? 'busy' : null }))
+        setState(s => ({ ...s, phase: 'error', error: busyRefreshMessage(err, ['opa']) ?? errorText(err), failureState: err instanceof ApiError && err.status === 409 ? 'busy' : null }))
       })
   }, [stopPolling])
 

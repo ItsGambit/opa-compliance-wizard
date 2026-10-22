@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { cancelRefresh, fetchRefreshStatus, startRefresh } from '../api/client'
 import { invalidateArchiveQueries } from '../api/queryClient'
 import type { RefreshPartName, RefreshStatus } from '../types'
-import { finishToast, OVERVIEW_PATH, REFRESH_TOAST_MS } from '../utils/refresh'
+import { busyRefreshMessage, finishToast, OVERVIEW_PATH, REFRESH_TOAST_MS } from '../utils/refresh'
 import { toast } from './useToast'
 
 // The combined Refresh (5.51.0), seen from the browser: one status query per environment that every screen shares
@@ -35,7 +35,8 @@ function onOverview(): boolean {
 export function useRefreshActions(environment: string | undefined) {
   const queryClient = useQueryClient()
 
-  const start = useCallback(async (parts?: RefreshPartName[]) => {
+  /** `label` names the control that asked (the footer's "Sync now"), so a refusal because another sync is running can say what will work later. */
+  const start = useCallback(async (parts?: RefreshPartName[], label?: string) => {
     if (!environment) return null
     try {
       const out = await startRefresh(environment, parts)
@@ -51,6 +52,11 @@ export function useRefreshActions(environment: string | undefined) {
       }
       return out
     } catch (err) {
+      const busy = busyRefreshMessage(err, parts, label)
+      if (busy) {  // nothing was started and nothing is wrong: another part is running; say what it is and when to try again
+        toast({ title: 'Not started yet', description: busy, variant: 'default', duration: REFRESH_TOAST_MS, action: { label: 'View progress', href: OVERVIEW_PATH } })
+        return null
+      }
       toast({ title: 'Could not start the refresh', description: (err as Error).message, variant: 'error', duration: REFRESH_TOAST_MS })
       return null
     }

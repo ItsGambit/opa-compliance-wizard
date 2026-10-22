@@ -196,3 +196,22 @@ export function staleBadgeText(builtAt: string, now: number): string | null {
   const days = Math.max(1, Math.floor((now - new Date(builtAt).getTime()) / 86_400_000))
   return `${f === 'stale' ? 'Stale' : 'Very stale'} · ${days} day${days === 1 ? '' : 's'}`
 }
+
+/** 5.52.0: the words for a refresh the server refused because the running one does not include what was asked ("busy_other_parts", 409):
+ * what is running, what was asked, and when to retry. Null for any other error (the caller shows the server's own message).
+ * `label` names the control that was used ("Sync now"); without it the sentence says "the full refresh". */
+export function busyRefreshMessage(err: unknown, requested: RefreshPartName[] | undefined, label?: string): string | null {
+  const e = err as { status?: number; body?: { reason?: string; running?: string[]; missing?: string[] } } | null
+  if (!e || e.status !== 409 || e.body?.reason !== 'busy_other_parts') return null
+  const known = (list: unknown): RefreshPartName[] => (Array.isArray(list) ? list : []).filter((p): p is RefreshPartName => p === 'opa' || p === 'log' || p === 'okta')
+  const running = known(e.body.running)
+  if (running.length === 0) return null  // the server did not say what runs: its own message is the honest one
+  const asked = requested ?? known(e.body.missing)
+  const running_text = running.length === 1 && running[0] === 'log' ? 'A System Log sync is running.'
+    : `A refresh of ${running.map(p => REFRESH_PART_LABELS[p].name).join(' and ')} is running.`
+  const full = !requested || requested.length === 3
+  const retry = ' when it finishes (usually within a few minutes).'
+  if (full) return `${running_text} ${label ? `${label} can start the full refresh` : 'The full refresh can start'}${retry}`
+  const names = asked.map(p => REFRESH_PART_LABELS[p].name).join(' and ')
+  return `${running_text} The ${names || 'part you asked for'} can start${retry}`
+}

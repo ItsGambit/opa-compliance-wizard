@@ -132,14 +132,14 @@ describe('AccessExplorer', () => {
     expect(toolbarRefresh().getAttribute('aria-disabled')).toBe('false')
   })
 
-  it('Refresh OPA scan while a job without the OPA part runs shows the server\'s busy message and keeps the old scan and label (not "done")', async () => {
+  it('Refresh OPA scan while a job without the OPA part runs says what is running and when to retry, and keeps the old scan and label (not "done")', async () => {
     const built = hoursAgo(30)
     vi.mocked(fetchAccessModel).mockResolvedValue(stored({ built_at: built }))
-    vi.mocked(startRefresh).mockRejectedValue(new ApiError('A refresh of System Log is running. The OPA scan can start when it finishes.', 409, { error: 'x', reason: 'busy_other_parts' }))
+    vi.mocked(startRefresh).mockRejectedValue(new ApiError('A refresh of System Log is running. The OPA scan can start when it finishes.', 409, { error: 'x', reason: 'busy_other_parts', running: ['log'], missing: ['opa'] }))
     renderShell()
     await screen.findByText('Stale · 1 day')
     await act(async () => { fireEvent.click(toolbarRefresh()) })
-    expect((await screen.findByTestId('failure-text')).textContent).toBe('A refresh of System Log is running. The OPA scan can start when it finishes.')
+    expect((await screen.findByTestId('failure-text')).textContent).toBe('A System Log sync is running. The OPA scan can start when it finishes (usually within a few minutes).')
     expect(screen.getByText('Refresh not started')).toBeTruthy()  // nothing was started and nothing was lost: not "Refresh failed"
     expect(screen.queryByText('Refresh failed')).toBeNull()
     expect(screen.queryByRole('button', { name: 'Open Environments' })).toBeNull()

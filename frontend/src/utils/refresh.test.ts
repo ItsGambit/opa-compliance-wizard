@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { RefreshStatus } from '../types'
 import { formatDateTimeZone } from './format'
-import { ageText, completedText, elapsedText, finishToast, latestRefresh, scanFreshness, staleBadgeText } from './refresh'
+import { ageText, busyRefreshMessage, completedText, elapsedText, finishToast, latestRefresh, scanFreshness, staleBadgeText } from './refresh'
 
 const job = (states: Record<string, string>): RefreshStatus => ({
   status: 'done', job_id: 'j', trigger: 'manual', started_at: null, finished_at: '2026-10-21T08:48:00.000Z', cancel_requested: false, summary: null,
@@ -77,5 +77,31 @@ describe('wording helpers (mockup fidelity)', () => {
     expect(completedWords(3, 3)).toBe('all three parts completed')
     expect(completedWords(2, 3)).toBe('2 of 3 parts completed')
     expect(formatTimeOnly('2026-10-21T08:48:00.000Z')).toMatch(/\d{2}:\d{2}/)
+  })
+})
+
+
+describe('a refresh refused because another part is running (5.52.0)', () => {
+  const busy = (running: string[], missing: string[]) => Object.assign(new Error('server words'), { status: 409, body: { error: 'server words', reason: 'busy_other_parts', running, missing } })
+
+  it('Sync now while only the System Log syncs says what runs, what will work, and when to retry', () => {
+    expect(busyRefreshMessage(busy(['log'], ['opa', 'okta']), undefined, 'Sync now'))
+      .toBe('A System Log sync is running. Sync now can start the full refresh when it finishes (usually within a few minutes).')
+  })
+
+  it('the Overview\'s Refresh (no label) says the full refresh', () => {
+    expect(busyRefreshMessage(busy(['log'], ['opa', 'okta']), undefined))
+      .toBe('A System Log sync is running. The full refresh can start when it finishes (usually within a few minutes).')
+  })
+
+  it('a single part from the Overview menu or the Access Explorer names that part', () => {
+    expect(busyRefreshMessage(busy(['log'], ['okta']), ['okta'])).toBe('A System Log sync is running. The Okta scan can start when it finishes (usually within a few minutes).')
+    expect(busyRefreshMessage(busy(['log'], ['opa']), ['opa'])).toBe('A System Log sync is running. The OPA scan can start when it finishes (usually within a few minutes).')
+  })
+
+  it('names the running parts when it is not only the log, and ignores every other error', () => {
+    expect(busyRefreshMessage(busy(['opa', 'okta'], ['log']), ['log'])).toBe('A refresh of OPA scan and Okta scan is running. The System Log can start when it finishes (usually within a few minutes).')
+    expect(busyRefreshMessage(new Error('boom'), undefined)).toBeNull()
+    expect(busyRefreshMessage(Object.assign(new Error('x'), { status: 409, body: { error: 'x', reason: 'other' } }), undefined)).toBeNull()
   })
 })
