@@ -618,3 +618,34 @@ def test_a_refresh_that_will_not_stop_blocks_the_delete_with_a_message_instead_o
     assert env_id in engine.list_all_environments()
     job.finish("opa", "cancelled", "x")
     job.conclude()
+
+
+def test_a_redact_and_continue_hit_is_audited_by_key_path_only_and_the_scan_is_stored(rig, tmp_audit_log):  # noqa: F811
+    secret = "opk_" + "Zq8vK2mXp9LrT4wYb7NcD1fH"
+
+    def build(client, okta_client=None, on_progress=None):
+        model = _default_builder(client, okta_client, on_progress)
+        model["servers"] = [{"id": "s1", "hostname": secret}]
+        return model
+    rig.builder = build
+    data = rig.run(["opa"]).status_view()["parts"]["opa"]
+    assert data["state"] == "ok" and data["warnings"] == 1
+    assert audit_store.opa_model_cache_info(rig.env)
+    assert secret not in json.dumps(audit_store.load_opa_model_cache(rig.env)["model"])
+    rows = rig.audit(tmp_audit_log)
+    redacted = [r for r in rows if r["action"] == "access_scan.redacted"]
+    assert redacted and redacted[0]["details"]["key_paths"] == ["servers[0].hostname"] and redacted[0]["details"]["count"] == 1
+    assert secret not in open(tmp_audit_log, encoding="utf-8").read()
+
+
+def test_a_scan_with_hyphenated_names_stores_and_seals(rig):  # noqa: F811
+    def build(client, okta_client=None, on_progress=None):
+        model = _default_builder(client, okta_client, on_progress)
+        model["servers"] = [{"id": "s1", "hostname": "sk-prod-db-01"}]
+        model["policies"] = [{"id": "p1", "name": "Prod-DB-Admins-ReadOnly-Policy-2026-Q4-Rev3", "active": True, "rules": []}]
+        return model
+    rig.builder = build
+    data = rig.run(["opa"]).status_view()["parts"]["opa"]
+    assert data["state"] == "ok" and data["warnings"] == 0
+    names = [p["name"] for p in audit_store.load_opa_model_cache(rig.env)["model"]["policies"]]
+    assert names == ["Prod-DB-Admins-ReadOnly-Policy-2026-Q4-Rev3"]

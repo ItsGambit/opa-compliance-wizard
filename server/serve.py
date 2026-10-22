@@ -646,7 +646,9 @@ def _run_access_job(storage_name, job_client, job_okta_client, correlation_id=No
         built_at = _utc_now_ms_iso()
         duration = round(time.monotonic() - started, 1)
         engine.checkpoint()  # a stop (or a deadline) that arrived while the last call ran: nothing is stored
-        redacted = engine.redact_model_for_storage(result)
+        redacted, redacted_paths = engine.redact_model_for_storage_report(result)
+        if redacted_paths:  # values under name fields that looked like credentials were replaced: say where (key paths only), never what
+            _audit_for(audit_ctx, "access_scan.redacted", {"count": len(redacted_paths), "key_paths": redacted_paths[:20]})
         del result
         stored, store_problem = "memory_only", None
         try:

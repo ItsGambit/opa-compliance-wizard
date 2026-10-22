@@ -6873,8 +6873,20 @@ DEVICE_ALLOWED_ENROLLMENT_FIELDS = ("id", "key", "name", "status")
 _MODEL_MAX_DEPTH = 40
 _JWT_SHAPE = re.compile(r"^eyJ[A-Za-z0-9_-]{10,}\.")
 _SSWS_SHAPE = re.compile(r"^00[A-Za-z0-9_-]{40,}$")
-_TOKEN_PREFIX_SHAPE = re.compile(r"^(?:opk_|sk-|ghp_|xox[abpr]-)[A-Za-z0-9_-]{8,}")
-_LONG_SECRET_SHAPE = re.compile(r"^[A-Za-z0-9+/_=-]{40,}$")
+# Heuristic shapes (5.51.0 review H1): these run over data that is almost entirely human-chosen names, so they are narrow.
+_STRONG_PREFIX_SHAPE = re.compile(r"^(?:ghp_|xox[abpr]-)[A-Za-z0-9_-]{8,}")  # never occur in a name
+_SOFT_PREFIX_SHAPE = re.compile(r"^(?:opk_|sk-)(?P<rest>[A-Za-z0-9]{24,})$")  # a name like sk-prod-db-01 is far shorter and has separators
+_BASE64_SHAPE = re.compile(r"^[A-Za-z0-9+/=]{40,}$")  # base64 has none of the separators names use
+_BASE64URL_SHAPE = re.compile(r"^[A-Za-z0-9_-]{40,}$")
+_HEURISTIC_ENTROPY_FLOOR = 4.5  # natural names sit at 4.2-4.5 bits per character; random base64 at 4.6 and up
+# Keys whose values are human-chosen text. The heuristic long-string rule is not applied under them; a prefix-shaped hit under one is
+# replaced and the scan continues (the exact JWT and SSWS shapes still refuse everywhere).
+NAME_LIKE_KEYS = frozenset((
+    "name", "displayname", "display_name", "hostname", "canonical_name", "description", "label", "title", "message", "path", "email",
+    "login", "serialnumber", "osversion", "model", "manufacturer",
+))
+NAME_LIKE_SUFFIXES = ("name", "label", "title", "description", "path", "email", "login", "hostname")  # project_name, resourceGroupName ...
+REDACTED_PLACEHOLDER = "[redacted]"
 
 
 class ModelRedactionError(ValueError):
@@ -6898,18 +6910,40 @@ def _entropy_bits_per_char(text):
     return -sum((n / total) * math.log2(n / total) for n in counts.values())
 
 
-def _credential_shaped(text):
-    """True for a JWT, an Okta SSWS token, a well-known token prefix, or a long single-token string with mixed case,
-    digits and high entropy (an API key secret). Ids (UUIDs are 36 characters; Okta ids 20), hex digests (entropy of at most
-    4 bits per character), names and URLs (spaces, dots) do not match."""
-    if _JWT_SHAPE.match(text) or _SSWS_SHAPE.match(text) or _TOKEN_PREFIX_SHAPE.match(text):
+def _mixed_and_entropic(text):
+    return (any(c.islower() for c in text) and any(c.isupper() for c in text) and any(c.isdigit() for c in text)
+            and _entropy_bits_per_char(text) >= _HEURISTIC_ENTROPY_FLOOR)
+
+
+def _exact_credential_shape(text):
+    """A JWT or an Okta SSWS token: refuses the scan wherever it appears."""
+    return bool(_JWT_SHAPE.match(text) or _SSWS_SHAPE.match(text))
+
+
+def _prefix_credential_shape(text):
+    """A well-known token prefix: ghp_ / xox?-, or opk_ / sk- followed by 24 or more high-entropy characters."""
+    if _STRONG_PREFIX_SHAPE.match(text):
         return True
-    if len(text) >= 40 and _LONG_SECRET_SHAPE.match(text):
-        has_lower = any(c.islower() for c in text)
-        has_upper = any(c.isupper() for c in text)
-        has_digit = any(c.isdigit() for c in text)
-        return has_lower and has_upper and has_digit and _entropy_bits_per_char(text) >= 4.3
+    m = _SOFT_PREFIX_SHAPE.match(text)
+    return bool(m and any(c.isdigit() for c in m.group("rest")) and _entropy_bits_per_char(m.group("rest")) >= 4.0)
+
+
+def _long_secret_shape(text):
+    """A long single-token string with mixed case, digits and high entropy (an API key secret). Ids (UUIDs 36 characters, Okta ids 20),
+    hex digests (entropy of at most 4 bits per character), names and URLs (spaces, dots, short hyphenated segments) do not match."""
+    if len(text) < 40:
+        return False
+    if _BASE64_SHAPE.match(text):
+        return _mixed_and_entropic(text)
+    if _BASE64URL_SHAPE.match(text):
+        segments = [x for x in re.split(r"[-_]", text) if x]
+        return min(len(x) for x in segments) >= 12 and _mixed_and_entropic(text)
     return False
+
+
+def _credential_shaped(text):
+    """True for any shape that looks like a credential (exact, prefix or long secret)."""
+    return _exact_credential_shape(text) or _prefix_credential_shape(text) or _long_secret_shape(text)
 
 
 def _path_segment(key):
@@ -6917,7 +6951,7 @@ def _path_segment(key):
     return text if len(text) <= 40 else text[:40] + "..."
 
 
-def _redact_value(value, path, depth):
+def _redact_value(value, path, depth, name_key=False, hits=None):
     if depth > _MODEL_MAX_DEPTH:
         raise ModelRedactionError(path, kind="unstorable")
     if isinstance(value, dict):
@@ -6931,12 +6965,21 @@ def _redact_value(value, path, depth):
                 # kept there (the canary below still reads it); dropped everywhere else.
                 if not (lowered == "value" and "account_name_format" in value):
                     continue
-            out[key] = _redact_value(item, f"{path}.{_path_segment(key)}" if path else _path_segment(key), depth + 1)
+            out[key] = _redact_value(item, f"{path}.{_path_segment(key)}" if path else _path_segment(key), depth + 1,
+                                     lowered in NAME_LIKE_KEYS or lowered.endswith(NAME_LIKE_SUFFIXES), hits)
         return out
     if isinstance(value, (list, tuple)):
-        return [_redact_value(item, f"{path}[{i}]", depth + 1) for i, item in enumerate(value)]
+        return [_redact_value(item, f"{path}[{i}]", depth + 1, name_key, hits) for i, item in enumerate(value)]
     if isinstance(value, str):
-        if _credential_shaped(value):
+        if _exact_credential_shape(value):
+            raise ModelRedactionError(path)
+        if name_key:
+            if _prefix_credential_shape(value):  # a name field is human text: drop the value, keep the scan, say where
+                if hits is not None:
+                    hits.append(path)
+                return REDACTED_PLACEHOLDER
+            return value
+        if _prefix_credential_shape(value) or _long_secret_shape(value):
             raise ModelRedactionError(path)
         return value
     if value is None or isinstance(value, (bool, int)):
@@ -6967,19 +7010,34 @@ def _allowed_device(device, path):
 
 
 def redact_model_for_storage(model):
-    """A copy of an Access Explorer model that is safe to keep on disk, or ModelRedactionError.
+    """redact_model_for_storage_report without the report: the safe copy only."""
+    return redact_model_for_storage_report(model)[0]
+
+
+def redact_model_for_storage_report(model):
+    """(a copy of an Access Explorer model that is safe to keep on disk, [key paths of values replaced]), or ModelRedactionError.
 
     * Every dict key on a deny-list (credentials, passwords, tokens, key secrets, cookies, ...) is dropped, at any depth.
     * Okta devices keep only the fields the Resources tab renders.
-    * Any string value shaped like a credential makes the whole scan fail: nothing is stored. A false positive costs one
-      refused scan; a stored secret costs far more. The error names the key path, never the value.
+    * A JWT or SSWS-shaped string anywhere, or a credential-shaped string under a key that is not a name field, makes the whole
+      scan fail: nothing is stored. A false positive costs one refused scan; a stored secret costs far more.
+    * A prefix-shaped string (ghp_, xox?-, or opk_/sk- plus 24 or more high-entropy characters) under a name field (name,
+      hostname, description ...) is replaced with "[redacted]" and the scan continues; the returned list holds the key paths and
+      the model gets a warning saying values were removed. Errors and reports name the key path, never the value.
     The input is not modified."""
     if not isinstance(model, dict):
         raise ModelRedactionError("", kind="unstorable")
     prepared = dict(model)
     if isinstance(prepared.get("devices"), list):
         prepared["devices"] = [_allowed_device(d, f"devices[{i}]") for i, d in enumerate(prepared["devices"])]
-    return _redact_value(prepared, "", 0)
+    hits = []
+    out = _redact_value(prepared, "", 0, False, hits)
+    if hits:
+        out["warnings"] = list(out.get("warnings") or []) + [{
+            "section": "redacted values", "status": "redacted",
+            "message": f"{len(hits)} value{'s' if len(hits) != 1 else ''} under name fields looked like credentials and {'were' if len(hits) != 1 else 'was'} removed from the stored scan.",
+        }]
+    return out, hits
 
 
 def canonical_model_json(model):

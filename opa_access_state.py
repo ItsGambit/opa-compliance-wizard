@@ -99,7 +99,7 @@ def build_items(model):
             item = _policy_item(p)
             truncated += 1 if item.get("truncated") else 0
             items.append((f"policy:{p['id']}", item))
-    unreadable = [w.get("section") for w in _dicts(model.get("warnings")) if isinstance(w.get("section"), str)]
+    unreadable = [w.get("section") for w in _dicts(model.get("warnings")) if isinstance(w.get("section"), str) and w.get("status") != "redacted"]
     items.append(("summary:counts", {"counts": inventory_counts.opa_counts(model), "unreadable_sections": sorted(unreadable)}))
     if not (users or groups or policies):
         raise ValueError("the OPA scan holds no users, groups or policies to record")

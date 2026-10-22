@@ -76,7 +76,11 @@ def test_the_input_is_not_modified():
     assert model == before
 
 
-@pytest.mark.parametrize("secret", [JWT, SSWS, LONG_SECRET, "opk_abcdefghijkl", "ghp_abcdefghijklmnop"])
+OPK_SECRET = "opk_" + "Zq8vK2mXp9LrT4wYb7NcD1fH"  # 24 high-entropy characters after the prefix
+SK_SECRET = "sk-" + "Xt5Pq2Lm9Rv7Nc3Wb8Kd4Fh6"
+
+
+@pytest.mark.parametrize("secret", [JWT, SSWS, LONG_SECRET, OPK_SECRET, SK_SECRET, "ghp_abcdefghijklmnop", "xoxb-1234567890abcdef"])
 def test_a_credential_shaped_value_refuses_the_scan_and_names_the_path_not_the_value(secret):
     model = _model(users=[{"id": "u1", "name": "alex"}, {"id": "u2", "details": {"notes": [{"free_text": secret}]}}])
     with pytest.raises(engine.ModelRedactionError) as caught:
@@ -324,3 +328,54 @@ def test_a_scan_row_does_not_disturb_deep_verification(db):
     audit_store.store_opa_model_cache(ENV, _model())
     audit_store.record_config_snapshot(ENV, "opa_access_state", [("user:u1", {"id": "u1"})])
     assert audit_store.verify_ingestion_chain(ENV, deep=True)["valid"]
+
+
+# -- 5.51.0 review H1: ordinary names must store; the shapes of real credentials still refuse ----------------------------------
+ORDINARY_NAMES = [
+    "sk-prod-db-01", "sk-web-server-1", "opk_gateway_eu1", "Prod-DB-Admins-ReadOnly-Policy-2026-Q4-Rev3",
+    "ProdDbAdminsReadOnlyPolicy2026Q4Rev3Backup01", "arn-aws-iam-123456789012-role-ProdAdminRole-Q4",
+    "Marketing-Team-Shared-Database-Readers-Group-2026", "SN-4F9K2X7M1Q8W3Z5T6V0B", "Platform-Engineering-Break-Glass-Access-Production-2026",
+]
+
+
+@pytest.mark.parametrize("name", ORDINARY_NAMES)
+def test_ordinary_names_are_stored_untouched_in_every_name_field(name):
+    model = _model(servers=[{"id": "s1", "hostname": name, "display_name": name}], groups=[{"id": "g1", "name": name, "roles": []}],
+                   users=[{"id": "u1", "name": name, "details": {"displayName": name}}],
+                   policies=[{"id": "p1", "name": name, "active": True, "rules": [], "description": name}],
+                   devices=[{"id": "d1", "profile": {"displayName": name, "serialNumber": name, "model": name, "manufacturer": name}}])
+    out, hits = engine.redact_model_for_storage_report(model)
+    assert hits == [] and out["servers"][0]["hostname"] == name and out["policies"][0]["name"] == name
+    assert out["groups"][0]["name"] == name and out["devices"][0]["profile"]["serialNumber"] == name
+    assert engine.redact_model_for_storage(model)["policies"][0]["name"] == name
+
+
+@pytest.mark.parametrize("name", [n for n in ORDINARY_NAMES if not n.startswith("ProdDbAdmins")])  # an unseparated 44-character mixed-case name is only safe under a name field
+def test_ordinary_names_under_other_keys_pass_too(name):
+    assert engine.redact_model_for_storage(_model(users=[{"id": "u1", "details": {"notes": [{"free_text": name}]}}]))["users"][0]["details"]["notes"][0]["free_text"] == name
+
+
+def test_a_prefix_shaped_value_under_a_name_field_is_replaced_and_the_scan_continues():
+    model = _model(servers=[{"id": "s1", "hostname": OPK_SECRET}, {"id": "s2", "hostname": "web-01"}], groups=[{"id": "g1", "name": "ghp_abcdefghijklmnop"}])
+    out, hits = engine.redact_model_for_storage_report(model)
+    assert out["servers"][0]["hostname"] == "[redacted]" and out["servers"][1]["hostname"] == "web-01" and out["groups"][0]["name"] == "[redacted]"
+    assert sorted(hits) == ["groups[0].name", "servers[0].hostname"]
+    assert any(w.get("status") == "redacted" and "removed" in w["message"] for w in out["warnings"])
+    assert OPK_SECRET not in json.dumps(out)
+
+
+def test_an_exact_shape_still_refuses_under_a_name_field_and_a_heuristic_hit_elsewhere_still_refuses():
+    for exact in (JWT, SSWS):
+        with pytest.raises(engine.ModelRedactionError) as caught:
+            engine.redact_model_for_storage(_model(servers=[{"id": "s1", "hostname": exact}]))
+        assert caught.value.key_path == "servers[0].hostname"
+    with pytest.raises(engine.ModelRedactionError):
+        engine.redact_model_for_storage(_model(servers=[{"id": "s1", "labels": {"owner_note": OPK_SECRET}}]))
+    with pytest.raises(engine.ModelRedactionError):
+        engine.redact_model_for_storage(_model(servers=[{"id": "s1", "labels": {"owner_note": LONG_SECRET}}]))
+
+
+@pytest.mark.parametrize("key", ["project_name", "resourceGroupName", "server_name", "owner_label", "canonical_name"])
+def test_name_like_keys_are_recognised_by_suffix(key):
+    out, hits = engine.redact_model_for_storage_report(_model(servers=[{"id": "s1", key: "ProdDbAdminsReadOnlyPolicy2026Q4Rev3Backup01"}]))
+    assert hits == [] and out["servers"][0][key] == "ProdDbAdminsReadOnlyPolicy2026Q4Rev3Backup01"
