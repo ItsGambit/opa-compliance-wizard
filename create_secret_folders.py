@@ -2310,6 +2310,11 @@ def cancel_requested():
     return flag is not None and flag.is_set()
 
 
+def cancel_reason():
+    """Why the running job was asked to stop: "cancelled" (a person's Stop) or "timed_out" (the part's deadline)."""
+    return getattr(CANCEL_FLAG.get(), "reason", None) or "cancelled"
+
+
 def checkpoint():
     if cancel_requested():
         raise JobCancelled("cancelled")

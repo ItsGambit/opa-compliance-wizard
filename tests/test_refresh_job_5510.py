@@ -298,8 +298,11 @@ def test_a_stop_during_the_log_part_leaves_the_cursor_saved_and_the_run_partial(
     monkeypatch.setattr(rig.serve, "_start_refresh_job", lambda *a, **k: started.append(a))
     audit_store._upsert_sync_state(audit_store._get_connection(), rig.env, last_sync_completed_at=_ts(25 * 60))  # yesterday: a run is due
     monkeypatch.setattr(engine, "get_sync_schedule_by_id", lambda env_id: {"enabled": True, "run_time": "00:00"})
+    # a Stop is not a failure of Okta, but a stopped scheduled run is not restarted at the next poll either: same back-off as a failure
     rig.serve._scheduler_tick(datetime.now(timezone.utc))
-    assert len(started) == 1  # a stop does not arm the scheduler's retry back-off
+    assert started == []
+    rig.serve._scheduler_tick(datetime.now(timezone.utc) + timedelta(seconds=rig.serve.SCHEDULER_RETRY_BACKOFF_SECS + 60))
+    assert len(started) == 1  # retried once the back-off has passed
     banner = oa.build_overview(rig.env)["attention"]
     assert not [a for a in banner if a["kind"] == "sync" and "failed" in a["text"]]
     stored = audit_store._get_connection().execute("SELECT poll_cursor FROM sync_state WHERE environment_id = ?", (rig.env,)).fetchone()[0]
@@ -858,3 +861,67 @@ def test_a_part_that_ran_out_of_time_says_what_it_kept():
     assert "The previous data is kept." in rj.timed_out_message("opa", 45)
     assert "Captures that finished are kept" in rj.timed_out_message("okta", 30)
     assert rj.timed_out_message("opa", 1).startswith("Stopped after 1 minute.")
+
+
+
+# -- F1 follow-up: a Stop or a deadline backs the scheduler off like a failure does ----------------------------------------------------
+class _SlowPages(SyncOkta):
+    """Polling that never ends by itself: each page brings a new event slowly, so a stop or a deadline is noticed between pages."""
+    n = 0
+
+    def get_system_log_page(self, path):
+        time.sleep(0.05)
+        _SlowPages.n += 1
+        return [_event(f"s{_SlowPages.n}", 5)], f"/api/v1/logs?after=c{_SlowPages.n + 10}&limit=1000&sortOrder=ASCENDING&since=x"
+
+
+def _slow_log(rig, monkeypatch):
+    conn = audit_store._get_connection()
+    cursor = "/api/v1/logs?after=c1&limit=1000&sortOrder=ASCENDING&since=x"
+    audit_store._upsert_sync_state(conn, rig.env, last_synced_at=_ts(30), last_sync_completed_at=_ts(25 * 60), last_sync_status="success", ingestion_scope="all", poll_cursor=cursor)
+    rig.okta = _SlowPages()
+    monkeypatch.setattr(engine, "get_sync_schedule_by_id", lambda env_id: {"enabled": True, "run_time": "00:00"})
+
+
+def test_a_part_deadline_is_recorded_as_timed_out_and_the_scheduler_backs_off(rig, monkeypatch, tmp_audit_log):  # noqa: F811
+    _slow_log(rig, monkeypatch)
+    monkeypatch.setitem(rj.PART_DEADLINES_SECS, "log", 0.3)
+    monkeypatch.setattr(rj, "KILL_GRACE_SECS", 3)
+    job = rig.run(["log"], trigger="scheduled")
+    assert job.part_state("log") == "timed_out"
+    state = audit_store.get_sync_state(rig.env)
+    assert state["last_sync_status"] == "timed_out" and state["last_sync_attempt_at"]
+    started = []
+    monkeypatch.setattr(rig.serve, "_start_refresh_job", lambda *a, **k: started.append(a))
+    rig.serve._scheduler_tick(datetime.now(timezone.utc))
+    assert started == []  # not restarted inside the back-off
+    rig.serve._scheduler_tick(datetime.now(timezone.utc) + timedelta(seconds=rig.serve.SCHEDULER_RETRY_BACKOFF_SECS + 60))
+    assert len(started) == 1
+
+
+def test_the_banner_says_the_sync_is_timing_out_only_after_two_runs_in_a_row(rig, monkeypatch):  # noqa: F811
+    _slow_log(rig, monkeypatch)
+    monkeypatch.setitem(rj.PART_DEADLINES_SECS, "log", 0.3)
+    monkeypatch.setattr(rj, "KILL_GRACE_SECS", 3)
+    rig.run(["log"], trigger="scheduled")
+    texts = lambda: [a["text"] for a in oa.build_overview(rig.env)["attention"]]  # noqa: E731
+    assert not [t for t in texts() if "timed out" in t]  # once is not yet a pattern
+    rig.run(["log"], trigger="scheduled")
+    assert [t for t in texts() if "timed out 2 runs in a row" in t]
+    rig.okta = SyncOkta()
+    rig.run(["log"], trigger="scheduled")  # a run that finishes ends the streak
+    assert not [t for t in texts() if "timed out" in t]
+
+
+def test_a_manual_refresh_straight_after_a_stop_is_allowed_the_back_off_is_the_schedulers(rig, monkeypatch):  # noqa: F811
+    _slow_log(rig, monkeypatch)
+    rig.start(["log"])
+    time.sleep(0.2)
+    rig.job().request_cancel()
+    rig.wait()
+    assert audit_store.get_sync_state(rig.env)["last_sync_status"] == "cancelled"
+    rig.okta = SyncOkta()
+    again = rig.start(["log"])
+    assert again["started"] is True  # nothing holds a person back
+    rig.wait()
+    assert audit_store.get_sync_state(rig.env)["last_sync_status"] == "success"

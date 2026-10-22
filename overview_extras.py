@@ -67,7 +67,8 @@ def _refresh_view(sync, schedule):
                 "parts": {p: {"state": (d or {}).get("state"), "message": (d or {}).get("message")} for p, d in (record.get("parts") or {}).items()}}
     schedule = schedule or {}
     return {"schedule": {"enabled": bool(schedule.get("enabled")), "run_time": schedule.get("run_time") or "02:00"},
-            "last_scheduled": one(stored.get("scheduled")), "last_manual": one(stored.get("manual"))}
+            "last_scheduled": one(stored.get("scheduled")), "last_manual": one(stored.get("manual")),
+            "log_timeouts": int(stored.get("log_timeouts") or 0)}
 
 
 def _opa_model_block(model_time, effective_principals, scan, refresh):
@@ -163,6 +164,10 @@ def attention(src, now=None):
         short = (f"Archive sync has not succeeded for {days} day(s)" + (f" ({a['last_sync_error']})" if a.get("last_sync_error") else "") + "."
                  if days is not None else "Archive sync has not completed yet.")  # the one-pager's wording: no button names
         out.append({"kind": "sync", "text": _sync_attention_text(a, now), "short": short})
+    timeouts = (src.get("refresh") or {}).get("log_timeouts") or 0
+    if timeouts >= 2:
+        out.append({"kind": "sync_timeout", "text": f"The archive sync timed out {timeouts} runs in a row. It keeps its place and the next run continues "
+                    "from there; if it keeps happening, check how much Okta is returning or contact support."})
     if o.get("newest_attempt_status") in ("refused", "error") and o.get("newest_attempt_at"):
         out.append({"kind": "snapshot", "text": "The newest Okta configuration capture " + ("was refused by Okta." if o["newest_attempt_status"] == "refused" else "failed.")})
     elif (o.get("days_old") or 0) >= 2:

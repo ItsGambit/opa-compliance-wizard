@@ -2744,9 +2744,11 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
     def _fail(error_message, until):
         try:
             if stopped["on_request"]:
-                # A Stop (or a part deadline) is not a failure of Okta: the saved position carries on, so the status is "cancelled", with no
-                # error text, and neither the scheduler's retry back-off nor the Overview's failing-sync banner is armed by it.
-                _upsert_sync_state(conn, environment_id, last_sync_status="cancelled", last_sync_error=None)
+                # A Stop or a part deadline is not a failure of Okta: the saved position carries on, so the status is "cancelled" (a person's
+                # Stop) or "timed_out" (the deadline), with no error text. The failing-sync banner is not armed by either; the scheduler
+                # backs off after both, like after a failure, so a stopped or slow run is not restarted at the next poll.
+                import create_secret_folders as _engine
+                _upsert_sync_state(conn, environment_id, last_sync_status=_engine.cancel_reason(), last_sync_error=None)
             else:
                 _upsert_sync_state(conn, environment_id, last_sync_status="error", last_sync_error=error_message)
             if on_progress:

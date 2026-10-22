@@ -1490,6 +1490,7 @@ def _supervise(job, lanes):
         for part in job.overdue():
             minutes = rj.PART_DEADLINES_SECS[part] // 60
             if job.finish(part, "timed_out", rj.timed_out_message(part, minutes)):
+                job.cancel_events[part].reason = "timed_out"  # so the sync can record a deadline, not a Stop
                 job.cancel_events[part].set()
                 grace_until[part] = time.monotonic() + rj.KILL_GRACE_SECS
         alive = [thread for thread, _p in lanes if thread.is_alive()]
@@ -1554,6 +1555,11 @@ def _persist_last_refresh(job, finished_at=None):
     state = audit_store.get_sync_state(job.environment_id) or {}
     stored = state.get("last_refresh") if isinstance(state.get("last_refresh"), dict) else {}
     stored["scheduled" if job.trigger == "scheduled" else "manual"] = record
+    log_state = view["parts"].get("log", {}).get("state") if "log" in job.parts else None
+    if log_state == "timed_out":  # consecutive runs whose log part hit its deadline (the Overview names a pattern, not one slow run)
+        stored["log_timeouts"] = int(stored.get("log_timeouts") or 0) + 1
+    elif log_state == "ok":
+        stored["log_timeouts"] = 0
     audit_store._upsert_sync_state(audit_store._get_connection(), job.environment_id, last_refresh_json=json.dumps(stored, sort_keys=True))
 
 
@@ -1983,7 +1989,7 @@ def _scheduler_tick(now_utc):
         # DATA-05: back off after a failed/unfinished attempt instead of
         # retrying on every poll (see SCHEDULER_RETRY_BACKOFF_SECS).
         last_attempt = state.get("last_sync_attempt_at") if state else None
-        if last_attempt and (state.get("last_sync_status") in ("error", "running")):
+        if last_attempt and (state.get("last_sync_status") in ("error", "running", "cancelled", "timed_out")):
             try:
                 attempt_dt = datetime.fromisoformat(last_attempt.replace("Z", "+00:00"))
                 if now_utc - attempt_dt < timedelta(seconds=SCHEDULER_RETRY_BACKOFF_SECS):
