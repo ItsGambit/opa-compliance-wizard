@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { useQueryClient } from '@tanstack/react-query'
-import { ChevronDown, Copy, FileText, List, RefreshCw } from 'lucide-react'
+import { Copy, FileText, List, RefreshCw } from 'lucide-react'
 import { startOktaCapture } from '../api/client'
 import { useEnvironments, useOverview, usePeopleList, useReportDefs, useWhoami } from '../api/hooks'
 import { useIntegrityCheck } from '../hooks/useIntegrityCheck'
@@ -20,6 +20,7 @@ import { oktaStateText } from '../utils/oktaAdmins'
 import { canAdminFrom } from '../utils/whoami'
 import { DialogCloseButton } from './DialogCloseButton'
 import { ActionMenu } from './ActionMenu'
+import { EnvironmentButton } from './EnvironmentButton'
 import { ExportButtons } from './ExportButtons'
 import { RefreshControl } from './RefreshControl'
 import { RefreshProgressCard } from './RefreshProgressCard'
@@ -193,7 +194,7 @@ function ScanRow({ o }: { o: OverviewData }) {
       {stale ? <StatusBadge label={stale} variant={freshness === 'very_stale' ? 'error' : 'warn'} /> : <StatusBadge label="Current" variant="active" />}
       {m.modified_at && <>{' '}<StatusBadge label="Edited since the scan" variant="neutral" /></>}
       {m.principals_effective != null ? ` · ${m.principals_effective} principals with effective access, resolved through policies` : ''}
-      {(m.warnings_count ?? 0) > 0 ? ` · ${m.warnings_count} section${m.warnings_count === 1 ? '' : 's'} the key cannot read` : ''} · stored in the local archive
+      {(m.warnings_count ?? 0) > 0 ? ` · ${m.warnings_count} section${m.warnings_count === 1 ? '' : 's'} the key cannot read` : ''}{(m.hidden_values ?? 0) > 0 ? ` · ${m.hidden_values} value${m.hidden_values === 1 ? '' : 's'} hidden before storing` : ''} · stored in the local archive
     </span>
   )
 }
@@ -628,10 +629,7 @@ export function OverviewPage({ onOpenReports, onOpenOktaAdmins, onOpenAccessUser
 
       {/* One row, as in the approved mockup: Environment, As of, Export…, PDF for leadership. */}
       <div className="flex flex-wrap items-center gap-3">
-        <button type="button" className="text-input inline-flex items-center gap-1.5 !py-1.5 !px-2.5 min-h-[2.125rem]" onClick={onOpenEnvironments} disabled={!onOpenEnvironments}
-          aria-label={`Environment: ${environment}. Open Environments`}>
-          <span className="text-muted text-xs">Environment</span> {environment}<ChevronDown size={13} aria-hidden="true" className="text-muted" />
-        </button>
+        <EnvironmentButton environment={environment} onOpen={onOpenEnvironments} />
         <label className="inline-flex items-center gap-1.5 text-xs text-muted">As of <Select ariaLabel="As of" value={asOf} onValueChange={setAsOf} placeholder="As of" options={asOfOptions} /></label>
         <ActionMenu label="Export…" menuLabel="Export" items={[
           { key: 'csv', label: 'Counts as CSV', disabled: exportBits.length === 0, onSelect: () => exportSections(exportBits, 'csv', 'opa-overview-counts') },

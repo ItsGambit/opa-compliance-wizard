@@ -117,4 +117,10 @@ describe('RefreshProgressCard', () => {
     expect(screen.getByText('Refresh of prod-example finished')).toBeTruthy()
     expect(screen.getByText(/by you · finished .* \(2 min 12 s\) · Audit Log: refresh\.completed/)).toBeTruthy()
   })
+
+  it('the collapsed line says what was read: new events and principals', () => {
+    const done = withParts(base(), { opa: { state: 'ok', counts: { users: 214 } }, log: { state: 'ok', events_new: 3412 }, okta: { state: 'ok' } }, { status: 'done', finished_at: '2026-10-21T08:41:30.000Z' })
+    render(<RefreshProgressCard status={done} environment="prod-example" now={NOW} {...noop} />)
+    expect(screen.getByText(/all completed · 3,412 new events · 214 principals/)).toBeTruthy()
+  })
 })

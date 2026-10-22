@@ -1676,7 +1676,7 @@ export interface Overview {
       loaded: boolean; refreshed_at: string | null; principals_effective: number | null
       /** 5.51.0 */
       built_at?: string | null; age_seconds?: number | null; source?: 'memory' | 'cache' | 'none'; stale?: boolean; very_stale?: boolean
-      counts?: Record<string, number>; warnings_count?: number; modified_at?: string | null; last_scan_outcome?: RefreshPartState | null
+      counts?: Record<string, number>; warnings_count?: number; hidden_values?: number; modified_at?: string | null; last_scan_outcome?: RefreshPartState | null
     }
     refresh?: { schedule: { enabled: boolean; run_time: string }; last_scheduled: RefreshRecord | null; last_manual: RefreshRecord | null }
     okta_org: { users: number | null; host?: string | null }

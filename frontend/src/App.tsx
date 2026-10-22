@@ -15,6 +15,7 @@ import { ComplianceReports } from './components/ComplianceReports'
 import { EnvironmentManagerDialog } from './components/EnvironmentManagerDialog'
 import { EnvironmentScope } from './components/EnvironmentScope'
 import { EnvironmentSetup } from './components/EnvironmentSetup'
+import { EnvironmentButton } from './components/EnvironmentButton'
 import { Footer } from './components/Footer'
 import { FolderBuilder } from './components/FolderBuilder'
 import { OrphanedArchivesDialog } from './components/OrphanedArchivesDialog'
@@ -324,7 +325,9 @@ export default function App() {
               </p>
             </div>
             <div className="flex items-center gap-3">
-              {activeTab !== 'overview' && (
+              {activeTab === 'access' && environments?.active ? (
+                <EnvironmentButton environment={environments.active} onOpen={() => setEnvironmentsOpen(true)} />
+              ) : activeTab !== 'overview' && (
                 <span className="text-xs text-text-faint">
                   Connected: <span className="text-text-dim font-medium">{environments?.active}</span>
                 </span>

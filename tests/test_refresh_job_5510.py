@@ -643,7 +643,11 @@ def test_a_redact_and_continue_hit_is_audited_by_key_path_only_and_the_scan_is_s
         return model
     rig.builder = build
     data = rig.run(["opa"]).status_view()["parts"]["opa"]
-    assert data["state"] == "ok" and data["warnings"] == 1
+    assert data["state"] == "ok" and data["warnings"] == 0  # a hidden value is not "a section the key cannot read"
+    assert "hidden before storing" in data["message"] and "1 value that looked like a credential was hidden before storing." in data["message"]
+    assert "cannot read" not in data["message"]
+    assert audit_store.opa_model_cache_info(rig.env)["warnings_count"] == 0
+    assert rig.serve._scan_overview_block(rig.env)["warnings_count"] == 0 and rig.serve._scan_overview_block(rig.env)["hidden_values"] == 1
     assert audit_store.opa_model_cache_info(rig.env)
     assert secret not in json.dumps(audit_store.load_opa_model_cache(rig.env)["model"])
     rows = rig.audit(tmp_audit_log)

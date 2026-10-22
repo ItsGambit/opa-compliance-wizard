@@ -87,4 +87,12 @@ describe('SideNav Okta Admins (P3)', () => {
     expect(screen.getByText('Compliance Reports').closest('button')!.getAttribute('aria-current')).toBeNull()
     unmount()
   })
+
+  it('shows Okta Admins by the same rule as 5.50.1 (no gate of its own: whoever could open Compliance Reports); only its position moved', () => {
+    for (const flags of [{ canAdmin: false, canViewOverview: false }, { canAdmin: false, canViewOverview: true }, { canAdmin: true }]) {
+      const { unmount } = renderNav(flags)
+      expect(screen.queryAllByText('Okta Admins')).toHaveLength(1)
+      unmount()
+    }
+  })
 })

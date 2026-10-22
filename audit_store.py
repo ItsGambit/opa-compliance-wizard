@@ -3257,7 +3257,7 @@ def store_opa_model_cache(environment_id, model, built_at=None, duration_seconds
     built_at = built_at or _iso_ms(datetime.now(timezone.utc))
     digest = hashlib.sha256(raw).hexdigest()
     blob = zlib.compress(raw, 6)
-    warnings = redacted.get("warnings") if isinstance(redacted.get("warnings"), list) else []
+    warnings = [w for w in (redacted.get("warnings") if isinstance(redacted.get("warnings"), list) else []) if not (isinstance(w, dict) and w.get("status") == "redacted")]  # sections the key cannot read; hidden values are counted apart
     conn = _get_connection()
     with _db_lock:
         conn.execute(

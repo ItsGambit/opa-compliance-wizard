@@ -87,6 +87,8 @@ export function AccessExplorer({ subTab, onOpenEnvironments, canAdmin }: Props) 
   const stale = builtAt ? staleBadgeText(builtAt, now) : null
   const freshness = builtAt ? scanFreshness(builtAt, now) : 'unknown'
 
+  const unreadable = (displayedModel.warnings ?? []).filter(w => (w as { status?: unknown }).status !== 'redacted')
+  const hiddenValues = (displayedModel.warnings ?? []).filter(w => (w as { status?: unknown }).status === 'redacted')
   const scheduledOpa = syncStatus?.sync_state?.last_refresh?.scheduled?.parts?.opa
   const scheduledAt = syncStatus?.sync_state?.last_refresh?.scheduled?.finished_at
   const scheduledNote = scheduledOpa && scheduledOpa.state !== 'ok'
@@ -129,13 +131,16 @@ export function AccessExplorer({ subTab, onOpenEnvironments, canAdmin }: Props) 
           </button>
         </div>
       </div>
-      {(displayedModel.warnings?.length ?? 0) > 0 && (
+      {unreadable.length > 0 && (
         <div className="card p-3 border-warn/40 text-xs text-warn flex flex-col gap-1" role="status">
           <div className="font-medium">Some sections are incomplete — the service key may not read them, so they are shown empty:</div>
-          {displayedModel.warnings!.map((w, i) => (
+          {unreadable.map((w, i) => (
             <div key={`${i}:${w.section}`}>{w.message}</div>
           ))}
         </div>
+      )}
+      {hiddenValues.length > 0 && (
+        <div className="card p-3 text-xs text-text-dim" role="status">{hiddenValues.map(w => w.message).join(' ')}</div>
       )}
 
       {subTab === 'resource_groups' && <ResourceGroupsTab model={displayedModel} />}

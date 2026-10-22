@@ -662,13 +662,14 @@ def _run_access_job(storage_name, job_client, job_okta_client, correlation_id=No
             store_problem = type(store_exc).__name__
             engine.log("WARN", f"The OPA scan could not be stored ({store_problem}); it stays in memory until the next scan.")
         counts = audit_store.opa_model_counts(redacted)
-        warnings = len(redacted.get("warnings") or [])
+        warnings = _unreadable_sections(redacted)  # sections the key cannot read; values hidden under name fields are counted apart (hidden)
+        hidden = len(redacted_paths)
         snapshot = _seal_access_state(storage_name, redacted, built_at, audit_ctx)
         with _access_jobs_lock:
             job = _access_jobs.setdefault(storage_name, {"status": "running", "steps": [], "error": None, "result": None})
             job.update(status="done", result=redacted, result_at=built_at, error=None, error_kind=None, source="scan",
                        stored=stored, store_problem=store_problem, duration_seconds=duration, warnings=warnings,
-                       counts=counts, previous=None, snapshot=snapshot)
+                       counts=counts, previous=None, snapshot=snapshot, hidden=hidden)
         _audit_for(audit_ctx, "access_scan.completed", {"seconds": duration, **counts, "warnings": warnings, "stored": stored,
                                                         **({"snapshot_id": snapshot["snapshot_id"]} if snapshot.get("snapshot_id") else {})})
     except engine.JobCancelled:
@@ -1185,8 +1186,18 @@ def _access_model_payload(view):
     age = _scan_age_seconds(view["built_at"])
     stale, very_stale = _scan_staleness(age)
     return {"model": model, "built_at": view["built_at"], "age_seconds": age, "source": view["source"], "stale": stale,
-            "very_stale": very_stale, "counts": audit_store.opa_model_counts(model), "warnings": len(model.get("warnings") or []),
+            "very_stale": very_stale, "counts": audit_store.opa_model_counts(model), "warnings": _unreadable_sections(model),
             "modified_at": view.get("modified_at")}
+
+
+def _unreadable_sections(model):
+    """How many sections the service key could not read (the model's warnings, without the one that says values were hidden)."""
+    return len([w for w in (model.get("warnings") or []) if not (isinstance(w, dict) and w.get("status") == "redacted")])
+
+
+def _hidden_values(model):
+    """How many values under name fields looked like credentials and were removed before the scan was stored."""
+    return sum(1 for w in (model.get("warnings") or []) if isinstance(w, dict) and w.get("status") == "redacted")
 
 
 def _scan_overview_block(environment_id):
@@ -1199,7 +1210,7 @@ def _scan_overview_block(environment_id):
     stale, very_stale = _scan_staleness(age)
     model = view["model"]
     return {"built_at": view["built_at"], "age_seconds": age, "source": view["source"], "stale": stale, "very_stale": very_stale,
-            "counts": audit_store.opa_model_counts(model), "warnings_count": len(model.get("warnings") or []), "modified_at": view.get("modified_at")}
+            "counts": audit_store.opa_model_counts(model), "warnings_count": _unreadable_sections(model), "hidden_values": _hidden_values(model), "modified_at": view.get("modified_at")}
 
 
 def _sync_schedule_or_none(environment_id):
@@ -1610,7 +1621,7 @@ def _refresh_part_opa(job, ctx):
     status = entry.get("status")
     if status == "done" and isinstance(entry.get("result"), dict):
         job.fresh_model = entry["result"]
-        job.finish(part, "ok", rj.opa_success_message(entry.get("counts") or {}, entry.get("warnings") or 0, entry.get("stored"), entry.get("snapshot")),
+        job.finish(part, "ok", rj.opa_success_message(entry.get("counts") or {}, entry.get("warnings") or 0, entry.get("stored"), entry.get("snapshot"), entry.get("hidden") or 0),
                    built_at=entry.get("result_at"), counts=entry.get("counts") or {}, warnings=entry.get("warnings") or 0,
                    stored=entry.get("stored"), steps=steps, snapshot=entry.get("snapshot"))
     elif status == "running":

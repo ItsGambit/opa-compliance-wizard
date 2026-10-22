@@ -309,4 +309,13 @@ describe('OverviewPage', () => {
     expect(screen.getByText('9 hold a privileged OPA role').tagName).toBe('STRONG')
     expect(screen.getByText('1 person holds both').tagName).toBe('STRONG')
   })
+
+  it('the stored-scan line counts unreadable sections and hidden values apart', async () => {
+    const base = overview()
+    vi.mocked(fetchOverview).mockResolvedValue({ ...base, sources: { ...base.sources, opa_model: { loaded: true, refreshed_at: new Date().toISOString(), principals_effective: 3, built_at: new Date().toISOString(), source: 'cache', warnings_count: 1, hidden_values: 2 } } })
+    renderWithClient(<OverviewPage onOpenReports={vi.fn()} />)
+    await screen.findByText(/14 people hold/)
+    const strip = screen.getByRole('region', { name: 'Where the figures come from' })
+    expect(within(strip).getByText(/1 section the key cannot read · 2 values hidden before storing/)).toBeTruthy()
+  })
 })

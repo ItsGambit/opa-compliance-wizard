@@ -80,8 +80,8 @@ export function BootstrapProgressPanel({ phase, stepDefs, events, error, onRetry
     const failed = phase === 'error'
     return (
       <div role="status" aria-live="polite"
-        className={`fixed bottom-4 right-4 left-4 sm:left-auto sm:w-[25rem] card p-3 shadow-xl z-40 flex flex-col gap-2 ${failed ? 'border-loss/45' : ''}`}>
-        <span className={`section-label ${failed ? '!text-loss' : ''}`}>{failed ? (failureState === 'refused' ? 'Refresh refused' : 'Refresh failed') : 'Refreshing the OPA scan…'}</span>
+        className={`fixed bottom-4 right-4 left-4 sm:left-auto sm:w-[25rem] card p-3 shadow-xl z-40 flex flex-col gap-2 ${failed && failureState !== 'busy' ? 'border-loss/45' : ''}`}>
+        <span className={`section-label ${failed && failureState !== 'busy' ? '!text-loss' : ''}`}>{failed ? (failureState === 'busy' ? 'Refresh not started' : failureState === 'refused' ? 'Refresh refused' : 'Refresh failed') : 'Refreshing the OPA scan…'}</span>
         <div className="flex flex-col gap-1">{stepList}</div>
         {failed ? (
           <>

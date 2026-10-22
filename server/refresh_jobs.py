@@ -237,12 +237,14 @@ def _previous(previous_built_at):
             else "no scan is stored yet, so nothing is shown yet")
 
 
-def opa_success_message(counts, warnings, stored, snapshot=None):
+def opa_success_message(counts, warnings, stored, snapshot=None, hidden=0):
     bits = [f"{counts[k]} {k}" for k in ("users", "groups", "policies", "projects", "servers") if k in counts]
     text = "Scanned " + ", ".join(bits) + "." if bits else "Scan finished."
     if warnings:
         text += (f" Completed with {warnings} section{'s' if warnings != 1 else ''} the key cannot read "
                  "(shown empty, listed on the Access Explorer).")
+    if hidden:
+        text += f" {hidden} value{'s' if hidden != 1 else ''} that looked like {'credentials' if hidden != 1 else 'a credential'} {'were' if hidden != 1 else 'was'} hidden before storing."
     if stored == "memory_only":
         text += " Kept in memory only: the scan is larger than 96 MB, so it was not stored and will be read again after a restart."
     state = (snapshot or {}).get("state")

@@ -140,6 +140,9 @@ describe('AccessExplorer', () => {
     await screen.findByText('Stale · 1 day')
     await act(async () => { fireEvent.click(toolbarRefresh()) })
     expect((await screen.findByTestId('failure-text')).textContent).toBe('A refresh of System Log is running. The OPA scan can start when it finishes.')
+    expect(screen.getByText('Refresh not started')).toBeTruthy()  // nothing was started and nothing was lost: not "Refresh failed"
+    expect(screen.queryByText('Refresh failed')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Open Environments' })).toBeNull()
     expect(screen.getByText('Stale · 1 day')).toBeTruthy()  // the label did not change
     expect(fetchAccessModel).toHaveBeenCalledTimes(1)  // nothing was fetched as if a scan had finished
   })
@@ -204,5 +207,18 @@ describe('AccessExplorer', () => {
     expect(screen.getByText('Users')).toBeTruthy()  // the whole list while it runs (the mockup's panel)
     fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
     await waitFor(() => expect(cancelRefresh).toHaveBeenCalledWith('dev'))
+  })
+
+  it('a value hidden before storing has its own line and is not reported as an unreadable section', async () => {
+    vi.mocked(fetchAccessModel).mockResolvedValue(stored({ model: { warnings: [
+      { section: 'gateways', status: 403, message: 'gateways: not available to this service key (HTTP 403); shown as empty.' },
+      { section: 'redacted values', status: 'redacted', message: '1 value under name fields looked like a credential and was removed from the stored scan.' },
+    ] } as unknown as AccessModel }))
+    renderShell()
+    await screen.findByText('resource groups view')
+    const incomplete = screen.getByText(/Some sections are incomplete/).parentElement!
+    expect(incomplete.textContent).toContain('gateways')
+    expect(incomplete.textContent).not.toContain('looked like a credential')
+    expect(screen.getByText('1 value under name fields looked like a credential and was removed from the stored scan.')).toBeTruthy()
   })
 })
