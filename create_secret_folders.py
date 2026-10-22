@@ -6876,8 +6876,10 @@ DEVICE_ALLOWED_PROFILE_FIELDS = (
 )
 DEVICE_ALLOWED_ENROLLMENT_FIELDS = ("id", "key", "name", "status")
 _MODEL_MAX_DEPTH = 40
-_JWT_SHAPE = re.compile(r"^eyJ[A-Za-z0-9_-]{10,}\.")
-_SSWS_SHAPE = re.compile(r"^00[A-Za-z0-9_-]{40,}$")
+# Searched for INSIDE a string (a header, a sentence), with boundaries: an Okta API token is exactly 42 characters, so a longer
+# run (a 64-character hex digest that starts with 00) is not one.
+_JWT_SHAPE = re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
+_SSWS_SHAPE = re.compile(r"(?<![A-Za-z0-9_-])00[A-Za-z0-9_-]{40}(?![A-Za-z0-9_-])")
 # Heuristic shapes (5.51.0 review H1): these run over data that is almost entirely human-chosen names, so they are narrow.
 _STRONG_PREFIX_SHAPE = re.compile(r"^(?:ghp_|github_pat_|xox[abpr]-)[A-Za-z0-9_-]{8,}")  # never occur in a name
 _SOFT_PREFIX_SHAPE = re.compile(r"^(?:opk_|sk-)(?:[a-z0-9]{1,8}-){0,3}(?P<rest>[A-Za-z0-9_-]{24,})$")  # sk-proj-..., sk-ant-api03-...  # a name like sk-prod-db-01 is far shorter and has separators
@@ -6922,8 +6924,8 @@ def _mixed_and_entropic(text):
 
 
 def _exact_credential_shape(text):
-    """A JWT or an Okta SSWS token: refuses the scan wherever it appears."""
-    return bool(_JWT_SHAPE.match(text) or _SSWS_SHAPE.match(text))
+    """A JWT or an Okta SSWS token, anywhere in the string: refuses the scan wherever it appears."""
+    return bool(_JWT_SHAPE.search(text) or _SSWS_SHAPE.search(text))
 
 
 def _prefix_credential_shape(text):

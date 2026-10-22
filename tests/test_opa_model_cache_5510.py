@@ -14,7 +14,7 @@ import create_secret_folders as engine
 ENV = "55555555-5555-5555-5555-555555555555"
 OTHER = "66666666-6666-6666-6666-666666666666"
 JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl"
-SSWS = "00" + "aB3_-" * 9  # 47 characters, starts with 00
+SSWS = "00" + "aB3_-" * 8  # 42 characters, starts with 00, like an Okta API token
 LONG_SECRET = "Zq8vK2mXp9LrT4wYb7NcD1fHj6GsA3eUi5OoV0xRn2Qk8MtB"  # 50 characters, mixed case and digits
 
 
@@ -423,3 +423,31 @@ def test_hyphen_segmented_provider_keys_are_redacted_under_a_name_field_and_refu
 def test_names_that_start_like_a_key_still_store(name):
     out, hits = engine.redact_model_for_storage_report(_model(servers=[{"id": "s1", "hostname": name, "details": {"owner_note": name}}]))
     assert hits == [] and out["servers"][0]["hostname"] == name and out["servers"][0]["details"]["owner_note"] == name
+
+
+# -- exact shapes are found INSIDE strings too (a header, a sentence), refusing everywhere -------------------------------------------
+@pytest.mark.parametrize("wrap", ["{t}", "SSWS {t}", "Authorization: SSWS {t}", "my token is {t} please keep it", "token={t};"])
+@pytest.mark.parametrize("token", [SSWS, JWT])
+@pytest.mark.parametrize("where", [("servers", "hostname"), ("servers", "details.owner_note")])
+def test_an_exact_token_shape_inside_a_string_refuses_under_a_name_key_and_elsewhere(wrap, token, where):
+    collection, key = where
+    record = {"id": "s1"}
+    if "." in key:
+        record["details"] = {"owner_note": wrap.format(t=token)}
+    else:
+        record[key] = wrap.format(t=token)
+    with pytest.raises(engine.ModelRedactionError) as caught:
+        engine.redact_model_for_storage(_model(**{collection: [record]}))
+    assert token not in str(caught.value)
+
+
+@pytest.mark.parametrize("fine", [
+    "00" + "a1b2c3d4" * 7 + "a1b2c3",  # a 64-hex digest that happens to start with 00
+    "0f" * 20,  # a 40-hex sha1
+    "sha1:" + "0f" * 20,
+    "Production Linux servers owned by the platform team",
+])
+def test_digests_and_ordinary_text_store(fine):
+    assert len(fine) != 42
+    out = engine.redact_model_for_storage(_model(servers=[{"id": "s1", "hostname": "web-01", "details": {"owner_note": fine}}]))
+    assert out["servers"][0]["details"]["owner_note"] == fine
