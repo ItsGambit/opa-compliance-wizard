@@ -370,12 +370,56 @@ def test_an_exact_shape_still_refuses_under_a_name_field_and_a_heuristic_hit_els
             engine.redact_model_for_storage(_model(servers=[{"id": "s1", "hostname": exact}]))
         assert caught.value.key_path == "servers[0].hostname"
     with pytest.raises(engine.ModelRedactionError):
-        engine.redact_model_for_storage(_model(servers=[{"id": "s1", "labels": {"owner_note": OPK_SECRET}}]))
+        engine.redact_model_for_storage(_model(servers=[{"id": "s1", "details": {"owner_note": OPK_SECRET}}]))
     with pytest.raises(engine.ModelRedactionError):
-        engine.redact_model_for_storage(_model(servers=[{"id": "s1", "labels": {"owner_note": LONG_SECRET}}]))
+        engine.redact_model_for_storage(_model(servers=[{"id": "s1", "details": {"owner_note": LONG_SECRET}}]))
 
 
 @pytest.mark.parametrize("key", ["project_name", "resourceGroupName", "server_name", "owner_label", "canonical_name"])
 def test_name_like_keys_are_recognised_by_suffix(key):
     out, hits = engine.redact_model_for_storage_report(_model(servers=[{"id": "s1", key: "ProdDbAdminsReadOnlyPolicy2026Q4Rev3Backup01"}]))
     assert hits == [] and out["servers"][0][key] == "ProdDbAdminsReadOnlyPolicy2026Q4Rev3Backup01"
+
+
+# -- re-check N1 and N2 ------------------------------------------------------------------------------------------------------------------
+LONG_NAME = "ProdDbAdminsReadOnlyPolicy2026Q4Rev3Backup01"
+
+
+def test_label_values_alternative_names_and_rule_candidates_are_names_too():
+    model = _model(servers=[{"id": "s1", "hostname": "web-01", "labels": {"env": LONG_NAME}, "alt_names": [LONG_NAME], "tags": [LONG_NAME], "aliases": [LONG_NAME]}],
+                   policies=[{"id": "p1", "name": "p", "active": True, "rules": [{"name": "r", "conditions": [{"candidates": [LONG_NAME]}], "resolutions": []}]}])
+    out, hits = engine.redact_model_for_storage_report(model)
+    assert hits == []
+    assert out["servers"][0]["labels"]["env"] == LONG_NAME and out["servers"][0]["alt_names"] == [LONG_NAME]
+    assert out["policies"][0]["rules"][0]["conditions"][0]["candidates"] == [LONG_NAME]
+
+
+def _random_alnum(n):
+    import secrets
+    return "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz0123456789") for _ in range(n - 1)) + "7"
+
+
+def _synthetic_keys():
+    # generated on the fly: shaped like real provider keys, never a real key
+    return {
+        "sk-proj": "sk-proj-" + _random_alnum(40) + "_" + _random_alnum(30),
+        "sk-ant": "sk-ant-api03-" + _random_alnum(48) + "-" + _random_alnum(40),
+        "sk-plain": "sk-" + _random_alnum(40),
+        "github_pat": "github_pat_" + _random_alnum(22) + "_" + _random_alnum(59),
+    }
+
+
+@pytest.mark.parametrize("kind", ["sk-proj", "sk-ant", "sk-plain", "github_pat"])
+def test_hyphen_segmented_provider_keys_are_redacted_under_a_name_field_and_refused_elsewhere(kind):
+    secret = _synthetic_keys()[kind]
+    out, hits = engine.redact_model_for_storage_report(_model(servers=[{"id": "s1", "hostname": secret}]))
+    assert out["servers"][0]["hostname"] == "[redacted]" and hits == ["servers[0].hostname"] and secret not in json.dumps(out)
+    with pytest.raises(engine.ModelRedactionError) as caught:
+        engine.redact_model_for_storage(_model(servers=[{"id": "s1", "details": {"owner_note": secret}}]))
+    assert caught.value.key_path == "servers[0].details.owner_note" and secret not in str(caught.value)
+
+
+@pytest.mark.parametrize("name", ["sk-prod-db-01", "sk-web-server-1", "sk-prod-eu-west-payments-db-01", "opk_gateway_eu1", "sk-proj-payments-team", "github-pat-rotation-runbook"])
+def test_names_that_start_like_a_key_still_store(name):
+    out, hits = engine.redact_model_for_storage_report(_model(servers=[{"id": "s1", "hostname": name, "details": {"owner_note": name}}]))
+    assert hits == [] and out["servers"][0]["hostname"] == name and out["servers"][0]["details"]["owner_note"] == name

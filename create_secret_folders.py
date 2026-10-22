@@ -6874,8 +6874,8 @@ _MODEL_MAX_DEPTH = 40
 _JWT_SHAPE = re.compile(r"^eyJ[A-Za-z0-9_-]{10,}\.")
 _SSWS_SHAPE = re.compile(r"^00[A-Za-z0-9_-]{40,}$")
 # Heuristic shapes (5.51.0 review H1): these run over data that is almost entirely human-chosen names, so they are narrow.
-_STRONG_PREFIX_SHAPE = re.compile(r"^(?:ghp_|xox[abpr]-)[A-Za-z0-9_-]{8,}")  # never occur in a name
-_SOFT_PREFIX_SHAPE = re.compile(r"^(?:opk_|sk-)(?P<rest>[A-Za-z0-9]{24,})$")  # a name like sk-prod-db-01 is far shorter and has separators
+_STRONG_PREFIX_SHAPE = re.compile(r"^(?:ghp_|github_pat_|xox[abpr]-)[A-Za-z0-9_-]{8,}")  # never occur in a name
+_SOFT_PREFIX_SHAPE = re.compile(r"^(?:opk_|sk-)(?:[a-z0-9]{1,8}-){0,3}(?P<rest>[A-Za-z0-9_-]{24,})$")  # sk-proj-..., sk-ant-api03-...  # a name like sk-prod-db-01 is far shorter and has separators
 _BASE64_SHAPE = re.compile(r"^[A-Za-z0-9+/=]{40,}$")  # base64 has none of the separators names use
 _BASE64URL_SHAPE = re.compile(r"^[A-Za-z0-9_-]{40,}$")
 _HEURISTIC_ENTROPY_FLOOR = 4.5  # natural names sit at 4.2-4.5 bits per character; random base64 at 4.6 and up
@@ -6884,8 +6884,9 @@ _HEURISTIC_ENTROPY_FLOOR = 4.5  # natural names sit at 4.2-4.5 bits per characte
 NAME_LIKE_KEYS = frozenset((
     "name", "displayname", "display_name", "hostname", "canonical_name", "description", "label", "title", "message", "path", "email",
     "login", "serialnumber", "osversion", "model", "manufacturer",
+    "labels", "alt_names", "candidates", "tags", "aliases",  # operator-chosen label values, alternative names, a rule's candidate hostnames and accounts
 ))
-NAME_LIKE_SUFFIXES = ("name", "label", "title", "description", "path", "email", "login", "hostname")  # project_name, resourceGroupName ...
+NAME_LIKE_SUFFIXES = ("name", "names", "label", "title", "description", "path", "email", "login", "hostname")  # project_name, resourceGroupName ...
 REDACTED_PLACEHOLDER = "[redacted]"
 
 
@@ -6966,7 +6967,7 @@ def _redact_value(value, path, depth, name_key=False, hits=None):
                 if not (lowered == "value" and "account_name_format" in value):
                     continue
             out[key] = _redact_value(item, f"{path}.{_path_segment(key)}" if path else _path_segment(key), depth + 1,
-                                     lowered in NAME_LIKE_KEYS or lowered.endswith(NAME_LIKE_SUFFIXES), hits)
+                                     name_key or lowered in NAME_LIKE_KEYS or lowered.endswith(NAME_LIKE_SUFFIXES), hits)
         return out
     if isinstance(value, (list, tuple)):
         return [_redact_value(item, f"{path}[{i}]", depth + 1, name_key, hits) for i, item in enumerate(value)]
