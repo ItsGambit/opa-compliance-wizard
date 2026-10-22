@@ -144,7 +144,7 @@ def test_template_declares_the_hardening_once_at_server_level():
     https = [b for b in nginx_second_site.server_blocks(text) if "listen 443" in b][0]
     for _path, block in nginx_second_site._location_blocks(https):
         structure = nginx_second_site._structure(block)
-        if _path == "/__ocw_maintenance":
+        if _path in ("/__ocw_maintenance", "/__ocw_gate_down"):
             # The internal maintenance-page location sets Retry-After/Cache-Control, so it must repeat every
             # server-level security header itself (a location with any add_header inherits none).
             for header in ("X-Content-Type-Options", "X-Frame-Options", "Content-Security-Policy", "Referrer-Policy"):
@@ -217,6 +217,7 @@ def served(tmp_path):
             self.wfile.write(body)
 
     gate, backend = _start(Gate), _start(Backend)
+    rec.gate = gate
     crt, key = _self_signed(tmp_path)
     http_port, https_port = _free_port(), _free_port()
     site = _template_with(tmp_path, crt, key, http_port=http_port, https_port=https_port,
@@ -508,3 +509,25 @@ def test_maintenance_page_is_served_with_503_while_the_flag_file_exists(served, 
     assert request("/__ocw_maintenance").status in (404, 503)  # internal only: a client cannot request it directly
     page.unlink()
     assert request("/", {"Cookie": "opa_wizard_session=good"}).status == 200
+
+
+def test_template_answers_503_with_a_page_when_nginx_itself_fails_the_auth_request_text_only():
+    """(Static check that always runs; the served test below needs nginx.) 5.52.0: the gate being down must not read as a crash."""
+    text = TEMPLATE.read_text()
+    assert "error_page 500 =503 /__ocw_gate_down;" in text and "location = /__ocw_gate_down {" in text
+    assert text.count("proxy_intercept_errors") == 0      # a 500 the backend itself sends is passed through unchanged
+
+
+def test_gate_down_gives_503_with_the_page_not_a_bare_500(served):
+    request, rec, _ = served
+    assert request("/", {"Cookie": "opa_wizard_session=good"}).status == 200
+    rec.gate.shutdown()
+    rec.gate.server_close()                 # the login gate is not running (not configured yet, or restarting)
+    before = len(rec.backend_requests)
+    for path in ("/", "/api/environments"):
+        resp = request(path, {"Cookie": "opa_wizard_session=good"})
+        assert resp.status == 503, (path, resp.status)
+        assert b"Sign-in is not available" in resp.body and resp.getheader("Retry-After") == "30"
+        assert resp.getheader("X-Frame-Options") == "DENY" and "no-store" in (resp.getheader("Cache-Control") or "")
+    assert len(rec.backend_requests) == before       # the application is not asked
+    assert request("/__ocw_gate_down").status in (404, 503)

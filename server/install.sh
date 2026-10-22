@@ -21,7 +21,7 @@
 # Three situations, detected automatically:
 #   fresh install     no layout and no running install: installs the release in this checkout AND makes the server work
 #                     (5.52.0): the application account (--create-app-user), lingering, the environment file with generated
-#                     secrets, the two application units (the login gate is enabled, not started: it needs your Okta
+#                     secrets, the two application units (the login gate is installed but neither enabled nor started: it needs your Okta
 #                     settings), the nginx site and a TLS certificate, the session key; starts the backend and checks it.
 #                     Resumable: a second run after a failure repairs what is missing and never overwrites a data or
 #                     settings file. Needs --server-name HOST (or --no-nginx) and a certificate choice (see below).
@@ -65,6 +65,7 @@
 #   --revocation-url URL       an owner-controlled https source for key revocations (written to the settings files)
 #   --disable-default-site     also remove the distribution's `default` nginx site link (get-ocw.sh passes it when it installed nginx
 #                              in this very run, so only this application's site answers; an nginx that was already there is left alone)
+#   --plan-shown               (get-ocw.sh) the plan was just printed by a dry run: do not print it again before doing it
 #   --log FILE                 append everything this prints to FILE (created 0600)
 #   --uninstall --keep-data    remove the software (units, command, /opt tree, updater, its account, the nginx site) after you type
 #                              UNINSTALL; the data directory, environment file, session key, TLS files, application account and
@@ -136,8 +137,9 @@ usage() { sed -n '2,/^set -euo pipefail/{/^set -euo pipefail/!p;}' "${BASH_SOURC
 # migration exits 3
 DIE_CODE=2
 die() { echo "ERROR: $*" >&2; exit "$DIE_CODE"; }
-note() { echo "$*"; }
-plan() { echo "  - $*"; }
+PLAN_QUIET=""   # --plan-shown: the plan was printed by the dry run just before; the real run does not print it a second time
+note() { [ -n "$PLAN_QUIET" ] || echo "$*"; }
+plan() { [ -n "$PLAN_QUIET" ] || echo "  - $*"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -165,6 +167,7 @@ while [ $# -gt 0 ]; do
     --log) [ $# -ge 2 ] || die "--log needs a file"; LOG_FILE="$2"; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
     --keep-data) KEEP_DATA=1; shift ;;
+    --plan-shown) PLAN_QUIET=1; shift ;;
     --disable-default-site) DISABLE_DEFAULT_SITE=1; shift ;;
     -h | --help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
@@ -459,11 +462,11 @@ else
   APP_GROUP="$APP_USER"
 fi
 MODE="fresh"
-if [ -n "$LAYOUT_PRESENT" ] && [ -z "$RESUME" ]; then
-  MODE="reinstall"
-elif [ -n "$LAYOUT_PRESENT" ]; then
+if [ -n "$LAYOUT_PRESENT" ] && [ -n "$RESUME" ]; then
   MODE="fresh"
-elif [ -n "$LEGACY_DIR" ]; then
+elif [ -z "$LEGACY_DIR" ] && [ -n "$LAYOUT_PRESENT" ]; then
+  MODE="reinstall"
+elif [ -n "$LEGACY_DIR" ]; then   # a unit that still runs from an in-home directory means the migration has not (successfully) happened
   MODE="migrate"
   [ -x "$LEGACY_DIR/.venv/bin/python" ] || note "NOTE: $LEGACY_DIR has no .venv/bin/python; migrating anyway (the new release gets its own)."
 fi
@@ -621,7 +624,7 @@ fi
 if [ "$MODE" = "fresh" ]; then
   plan "write $ENV_FILE (owner $APP_USER, mode 0600) with three generated secrets that are never shown, DEPLOYMENT_MODE=hosted${SERVER_NAME:+, the origin https://$SERVER_NAME} and the Okta settings as commented lines (an existing file is kept as it is)"
   plan "write the login gate's session key $SESSION_KEY_FILE (32 random bytes, root:$APP_GROUP 0640; an existing one is kept)"
-  plan "install $UNIT_DIR/opa-compliance-wizard.service and opa-auth-gate.service for $APP_USER (run directory /run/user/<its id>); enable both; the login gate is NOT started (it needs your Okta settings)"
+  plan "install $UNIT_DIR/opa-compliance-wizard.service and opa-auth-gate.service for $APP_USER (run directory /run/user/<its id>); enable the backend only: the login gate is neither enabled nor started (it needs your Okta settings, and an enabled unconfigured gate would crash-loop at every boot)"
   if [ -n "$NO_NGINX" ]; then
     plan "no nginx site (--no-nginx): the template stays at $OPT_DIR/current/server/nginx-opa-secrets-wizard.conf"
   else
@@ -689,6 +692,7 @@ if [ -z "$ASSUME_YES" ]; then
   case "$TTY_ANSWER" in y | Y | yes | YES) ;; *) die "not confirmed; nothing was changed" ;; esac
 fi
 
+PLAN_QUIET=""
 # --- doing it ---------------------------------------------------------------------------------------------------
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -911,7 +915,8 @@ fresh_finish() { # after the layout, the updater and its units are in place: set
   install_app_unit opa-compliance-wizard.service
   install_app_unit opa-auth-gate.service
   systemctl daemon-reload
-  systemctl enable opa-compliance-wizard opa-auth-gate >/dev/null 2>&1 || note "WARNING: could not enable opa-compliance-wizard / opa-auth-gate"
+  # the gate is installed DISABLED: without the Okta settings it refuses to start, and Restart=on-failure would loop at every boot
+  systemctl enable opa-compliance-wizard >/dev/null 2>&1 || note "WARNING: could not enable opa-compliance-wizard"
   fresh_wait_runtime
   app_can_run_release || die "the account $APP_USER cannot run the installed release at $OPT_DIR/current (it cannot execute .venv/bin/python or read the application's files), so the backend was not started. Something was changed: the account, directories, settings file and units exist. Fix the modes along the path ('namei -l $OPT_DIR/current/.venv/bin/python' shows them) and run the same command again; it resumes."
   note "==> Starting the backend"
@@ -935,7 +940,7 @@ print_fresh_done() {
   note "Done. OPA Compliance Wizard $VERSION is installed and the backend is running."
   note "  What changed: $OPT_DIR (code, root-owned), $DATA_DIR (data, owned by $APP_USER),"
   note "                $ENV_FILE (settings and generated secrets, 0600), $UNIT_DIR/opa-compliance-wizard.service,"
-  note "                opa-auth-gate.service (installed, not started), ocw-*.service, $BIN_DIR/ocw-updater,"
+  note "                opa-auth-gate.service (installed, not enabled, not started), ocw-*.service, $BIN_DIR/ocw-updater,"
   if [ -z "$NO_NGINX" ]; then
     if [ -n "$CERT_FILE" ]; then
       note "                $CONF_NGINX_SITE (your certificate),"
@@ -956,7 +961,8 @@ print_fresh_done() {
   note "     sudo -u $APP_USER env XDG_RUNTIME_DIR=/run/user/$APP_UID DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$APP_UID/bus $OPT_DIR/current/.venv/bin/python -c \"import getpass, keyring; keyring.set_password('opa-compliance-wizard:default', 'okta_client_secret', getpass.getpass('client secret: '))\""
   note "     Run it while the backend service is running (it is, right now): the service's session keeps the keyring unlocked and the command reaches it through that session."
   note "     (the same for 'okta_admin_check_token'; both prompts hide what you type and nothing is written to the shell history)"
-  note "  4. sudo systemctl start opa-auth-gate && sudo systemctl status opa-auth-gate"
+  note "  4. sudo systemctl enable --now opa-auth-gate && sudo systemctl status opa-auth-gate"
+  note "     (it was installed disabled on purpose: until step 2 is done it would crash-loop; this command starts it now and at every boot)"
   note "  5. Open $_origin, sign in, add your first environment (the dashboard walks you through it)."
   if [ -z "$NO_NGINX" ] && { [ -e "$NGINX_ENABLED_DIR/default" ] || [ -L "$NGINX_ENABLED_DIR/default" ]; }; then
     note "  Note: nginx's own 'default' site ($NGINX_ENABLED_DIR/default) is still enabled; other sites on this server are none of this installer's business."
@@ -1136,6 +1142,9 @@ if [ "$MODE" = "migrate" ]; then
     done
     systemctl daemon-reload || true
     for _i in $ALL_UNITS; do systemctl restart "$_i" || true; done
+    # the new layout was not switched to: take its `current` link away, so nothing treats this server as migrated and a later run
+    # offers the migration again (the release itself, the updater and the data copies' originals stay where they are)
+    rm -f -- "$OPT_DIR/current"
     DIE_CODE=3
     die "migration rolled back; the install is as it was. Nothing was lost. Send the output above to the maintainers."
   }

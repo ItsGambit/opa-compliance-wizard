@@ -268,6 +268,19 @@ def test_failed_health_check_puts_everything_back(world):
         assert not list(world.legacy.glob(f + ".migrated-*"))
 
 
+def test_after_a_rolled_back_migration_the_next_run_offers_the_migration_again(world):
+    Backend.version = "9.9.9"
+    p = world.run()
+    assert p.returncode == 3 and "migration rolled back" in p.stderr + p.stdout          # exit 3: everything put back
+    assert not (world.w / "opt" / "current").exists() and (world.w / "opt" / "releases").exists()   # the new layout is not switched to
+    d = world.run("--dry-run")
+    assert d.returncode == 0 and "(migrate)" in d.stdout and "reinstall" not in d.stdout.split("Plan:")[0]
+    Backend.version = "5.47.0"
+    p = world.run()
+    assert p.returncode == 0, p.stderr + p.stdout
+    assert (world.w / "opt" / "current").is_symlink() and f"WorkingDirectory={world.w}/opt/current" in world.unit.read_text()
+
+
 def test_units_that_do_not_start_roll_back_too(world):
     Backend.version = "5.47.0"
     (world.stub / "fail_start").write_text("")

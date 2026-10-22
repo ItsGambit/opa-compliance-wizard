@@ -62,7 +62,6 @@ OCW_MAX_MANIFEST=4194304
 
 LOG_FILE=""
 WORK_DIR=""
-HANDED_OVER=""
 DRY_RUN=""
 KEEP_WORK=""
 TESTING="${OCW_INSTALL_TEST:-}"
@@ -80,11 +79,11 @@ say_err() {
 refuse() { say_err "refused: $*"; exit 2; }
 fail() { say_err "failed: $*"; exit 3; }
 
-cleanup() { # the work directory goes unless asked to keep it; after a failed hand-over it stays (the verified release)
+cleanup() { # the work directory goes after every run (done, refused, failed or interrupted) unless --keep-work or --dry-run; the log stays
   local _rc=$?
   trap - EXIT
   if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ] && [ -z "$KEEP_WORK" ] && [ -z "$DRY_RUN" ]; then
-    if [ -z "$HANDED_OVER" ] || [ "$_rc" -eq 0 ]; then rm -rf -- "$WORK_DIR"; fi
+    rm -rf -- "$WORK_DIR"
   fi
   if [ -n "$LOG_FILE" ] && [ "$_rc" -ne 0 ]; then say_err "Log: $LOG_FILE"; fi
   exit "$_rc"
@@ -269,11 +268,8 @@ detect_existing() {
   MODE="fresh"
   LEGACY_FOUND=""
   local _s _wd
-  if [ -L "$OPT_DIR/current" ] && [ -e "$BIN_DIR/ocw-updater" ] && [ ! -e "$OPT_DIR/.fresh-install-incomplete" ]; then
-    MODE="already-installed"
-    [ -z "$REFRESH_UPDATER" ] || MODE="refresh-updater"
-    return 0
-  fi
+  # a unit that still runs from an in-home directory means the migration has not (successfully) happened, whatever else is
+  # in /opt (a rolled-back migration leaves the release and the updater behind): offer it again
   for _s in opa-secrets-wizard opa-compliance-wizard; do
     _wd="$(unit_working_dir "$UNIT_DIR/$_s.service")"
     case "$_wd" in
@@ -281,6 +277,11 @@ detect_existing() {
       *) if [ -f "$_wd/create_secret_folders.py" ]; then MODE="migrate"; LEGACY_FOUND="$_wd"; return 0; fi ;;
     esac
   done
+  if [ -L "$OPT_DIR/current" ] && [ -e "$BIN_DIR/ocw-updater" ] && [ ! -e "$OPT_DIR/.fresh-install-incomplete" ]; then
+    MODE="already-installed"
+    [ -z "$REFRESH_UPDATER" ] || MODE="refresh-updater"
+    return 0
+  fi
   if [ -d "$OPT_DIR" ] || [ -e "$OPT_DIR/.fresh-install-incomplete" ]; then MODE="fresh-resume"; fi
   return 0
 }
@@ -418,6 +419,7 @@ verify_release() {
          --info-out "$WORK_DIR/release-info.json" --revocation-out "$WORK_DIR/revocations")
   [ -z "$VERSION" ] || _args+=(--expect-version "$VERSION")
   [ -z "$ALLOW_OLDER" ] || _args+=(--allow-older)
+  [ "$REVOCATION_CHECKED" = "yes" ] || _args+=(--revocation-unchecked)
   for _f in ${REVOCATION_FILES[@]+"${REVOCATION_FILES[@]}"}; do _args+=(--revocation "$_f"); done
   local _out _rc=0
   _out="$(run_verifier "${_args[@]}" 2>"$WORK_DIR/verify.err")" || _rc=$?
@@ -494,6 +496,7 @@ installer_args() { # installer_args <mode flags...>: the flags every install.sh 
     # this run installs nginx: Debian's own default site is then only noise, so install.sh takes its link out
     if [ "$_p" = "nginx" ] && { [ "$MODE" = "fresh" ] || [ "$MODE" = "fresh-resume" ]; }; then IA+=(--disable-default-site); fi
   done
+  [ -z "$PLAN_SHOWN" ] || IA+=(--plan-shown)
   [ -z "$REFRESH_UPDATER" ] || IA+=(--refresh-updater)
   [ -z "$APPLY_NGINX" ] || IA+=(--apply-nginx)
   [ -z "$REGEN_SECOND" ] || IA+=(--regenerate-second-sites)
@@ -504,7 +507,6 @@ installer_args() { # installer_args <mode flags...>: the flags every install.sh 
 
 run_installer() { # run_installer [extra flags...]: the verified release's install.sh; its own log handling appends to the log
   local _rc=0
-  HANDED_OVER=1
   bash "$REL_DIR/server/install.sh" "${IA[@]}" "$@" || _rc=$?
   return "$_rc"
 }
@@ -561,7 +563,7 @@ main() {
   fi
   VERSION="" FROM_DIR="" WHEELHOUSE="" ASSUME_YES="" NO_REVOCATION_CHECK="" APP_USER="" SERVER_NAME="" CERT_FILE="" KEY_FILE=""
   SELF_SIGNED="" NO_NGINX="" BACKEND_PORT="" ALLOW_OLDER="" REFRESH_UPDATER="" APPLY_NGINX="" REGEN_SECOND="" REMOVE_SUDOERS=""
-  UNINSTALL="" KEEP_DATA="" note_placeholder=""
+  UNINSTALL="" KEEP_DATA="" note_placeholder="" PLAN_SHOWN=""
   local _show_version=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -718,7 +720,6 @@ main() {
   installer_args
   local _rc=0
   # the plan: always the release's own dry run (it validates every flag before anything is changed)
-  HANDED_OVER=""
   bash "$REL_DIR/server/install.sh" "${IA[@]}" --dry-run || _rc=$?
   if [ "$_rc" -ne 0 ]; then
     say_err "The installer refused the plan above (exit $_rc). Nothing was changed."
@@ -739,11 +740,12 @@ main() {
   fi
   install_packages
   _rc=0
+  PLAN_SHOWN=1
+  installer_args
   run_installer --yes || _rc=$?
   if [ "$_rc" -ne 0 ]; then
     case "$_rc" in 2 | 3 | 4) ;; *) _rc=4 ;; esac
     say_err "The installer stopped (exit $_rc); its messages above say what happened and what to do. Log: $LOG_FILE"
-    KEEP_WORK=1
     exit "$_rc"
   fi
   say "Log: $LOG_FILE"

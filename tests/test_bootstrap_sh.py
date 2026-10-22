@@ -340,6 +340,7 @@ def test_when_no_revocation_source_can_be_read_the_run_asks_and_yes_needs_the_na
     assert p.returncode == 2 and "--yes-no-revocation-check" in p.stderr
     p = bw.run("--yes", "--yes-no-revocation-check", "--server-name", "a.example.com", "--self-signed")
     assert p.returncode == 0 and "continuing without a revocation check" in p.stdout
+    assert "key revocation NOT checked" in p.stdout and "no key revocation published" not in p.stdout
 
 
 def test_downgrade_below_the_installers_own_release_needs_allow_older(bw):
@@ -524,7 +525,7 @@ def test_a_failing_install_script_exits_with_its_code_and_keeps_the_verified_rel
     (bw.stub / "install_rc").write_text("4")
     p = bw.run("--yes", "--server-name", "a.example.com", "--self-signed")
     assert p.returncode == 4 and "The installer stopped (exit 4)" in p.stderr and "Log:" in p.stderr
-    assert len(bw.work_dirs()) == 1
+    assert not bw.work_dirs() and bw.logs()                        # the work directory goes after a failed run; the log stays
     (bw.stub / "install_rc").write_text("1")
     assert bw.run("--yes", "--server-name", "a.example.com", "--self-signed").returncode == 4     # an unknown code means an operator must act
 
@@ -686,6 +687,7 @@ def test_end_to_end_with_the_real_installer_and_no_secret_in_the_output_or_the_l
         p = bw.run("--yes", "--server-name", "opa.example.com", "--self-signed", "--backend-port", str(port))
         assert p.returncode == 0, p.stderr + p.stdout
         assert "Done. OPA Compliance Wizard 5.52.0 is installed and the backend is running." in p.stdout
+        assert p.stdout.count("create the system account ocw-updater") == 1 and p.stdout.count("Plan:") == 2   # the plan is shown once (the bootstrap's own "Plan:" and install.sh's)
         env_file = bw.w / "etc" / "opa-compliance-wizard.env"
         values = dict(line.split("=", 1) for line in env_file.read_text().splitlines() if re.match(r"^[A-Z_]+=", line))
         secrets_ = [values[k] for k in ("NGINX_PROXY_SECRET", "KEYRING_UNLOCK_PASSWORD", "INTERNAL_API_SHARED_SECRET")]
@@ -763,3 +765,20 @@ def test_the_default_nginx_site_flag_is_passed_only_when_this_run_installs_nginx
     (bw.stub / "install.args").unlink()
     p = bw.run("--dry-run", "--server-name", "a.example.com", "--self-signed")
     assert p.returncode == 0 and "--disable-default-site" in bw.install_args()[0]
+
+
+def test_a_rolled_back_migration_is_offered_again_even_though_the_new_layout_is_still_on_disk(bw):
+    bw.publish()
+    legacy = bw.w / "home" / "opa"
+    legacy.mkdir(parents=True)
+    (legacy / "create_secret_folders.py").write_text('SCRIPT_VERSION = "5.45.1"\n')
+    (bw.w / "units" / "opa-compliance-wizard.service").write_text(f"[Service]\nUser=x\nWorkingDirectory={legacy}\n")
+    (bw.opt / "releases" / "5.52.0").mkdir(parents=True)          # what an older rollback left behind: the layout, the link and the command
+    (bw.opt / "current").symlink_to("releases/5.52.0")
+    cmd = bw.w / "bin" / "ocw-updater"
+    cmd.write_text("#!/bin/bash\n")
+    cmd.chmod(0o755)
+    p = bw.run(answers="y\ny\n")
+    assert p.returncode == 0, p.stderr + p.stdout
+    assert "an in-home install at" in p.stdout and "already runs the upgrade layout" not in p.stdout
+    assert "This is a migration" in p.stdout and bw.install_args()[-1].endswith("--yes")

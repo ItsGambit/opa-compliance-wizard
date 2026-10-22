@@ -357,7 +357,7 @@ def apply_revocations(trust, paths):
 
 
 def verify_and_extract(tar, sig, keys_raw, bootstrap_version, extract_dir, expect_version=None, allow_older=False,
-                       revocation_paths=()):
+                       revocation_paths=(), revocation_checked=True):
     """Everything this installer checks, then the unpack. Returns (info dict, ok lines, notes). Raises Refused."""
     ot = _trust()
     try:
@@ -399,7 +399,10 @@ def verify_and_extract(tar, sig, keys_raw, bootstrap_version, extract_dir, expec
     if applied:
         rev_text = "key revocation serial " + ", ".join(str(a["serial"]) for a in applied) + " applied"
     else:
-        rev_text = "no key revocation published" if not revocation_paths else "no valid key revocation applied"
+        if not revocation_checked:
+            rev_text = "key revocation NOT checked (a source could not be reached)"
+        else:
+            rev_text = "no key revocation published" if not revocation_paths else "no valid key revocation applied"
     signed = f", signed {checked['timestamp']}" if checked["timestamp"] else ""
     ok = [f"release {version}: signature valid (key {checked['key_id']}{signed}); sha256 {checked['sha256']}; "
           f"{len(checked['manifest']['files'])} files match the signed manifest; {rev_text}"]
@@ -455,7 +458,7 @@ def cmd_verify(a):
         return 3
     try:
         info, ok_lines, notes, applied = verify_and_extract(a.tar, a.sig, keys_raw, a.bootstrap_version, a.extract,
-                                                            a.expect_version, a.allow_older, a.revocation or [])
+                                                            a.expect_version, a.allow_older, a.revocation or [], not a.revocation_unchecked)
     except Refused as exc:
         print(f"ERROR: {exc.code}: {exc}. Nothing was changed. {hint_for(exc.code)}", file=sys.stderr)
         return 2
@@ -503,6 +506,7 @@ def build_parser():
     s.add_argument("--allow-older", action="store_true")
     s.add_argument("--revocation", action="append")
     s.add_argument("--revocation-out")
+    s.add_argument("--revocation-unchecked", action="store_true", help="a revocation source could not be reached: do not say none was published")
     s.set_defaults(fn=cmd_verify)
     return p
 

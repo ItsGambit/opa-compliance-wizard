@@ -85,7 +85,7 @@ it; writes `/etc/opa-compliance-wizard.env` (mode 0600) with `DEPLOYMENT_MODE=ho
 and the Okta lines commented out; writes the two application units with the account's real numeric id in `/run/user/<uid>` (the
 unit templates carry `__APP_UID__` and `__APP_USER_HOME__`; the installer fills them in); writes the login gate's session key;
 makes the nginx site from the release's template with your server name, the proxy secret and a certificate (yours, or a temporary
-self-signed one); starts the backend and checks it, also through nginx. The login gate is installed and enabled but **not started**:
+self-signed one); starts the backend and checks it, also through nginx. The login gate is installed but **neither enabled nor started** (`sudo systemctl enable --now opa-auth-gate` once the Okta settings are in):
 it refuses to start without the Okta settings, which you enter (steps 1-4 below; the last lines of the installer's output name the
 exact commands). Behind a proxy or with a mirror, pass the settings through sudo (`sudo https_proxy=... OCW_RELEASE_BASE_URL=... OCW_REVOCATION_URL=... bash get-ocw.sh --version X.Y.Z`); with a mirror also set `OCW_REVOCATION_URL` to a page you control, because a mirror answers for the revocation files too. Run it again after a failure and it resumes; it never overwrites a data or settings file.
 

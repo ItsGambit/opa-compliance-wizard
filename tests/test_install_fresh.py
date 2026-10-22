@@ -115,8 +115,11 @@ exit 0
 # from that directory with the test interpreter, as the application account would run it
 STUB_RUNUSER = r'''#!/bin/bash
 shift 3
-if [ -n "$FAKE_APP_DIR" ] && [ "$1" = env ]; then
-  envarg="$2"; shift 3; cd "$FAKE_APP_DIR" && exec env "$envarg" PYTHONPATH="$FAKE_APP_PYPATH" OPA_WIZARD_SKIP_DOTENV=1 "$FAKE_APP_PY" "$@"
+# the root updater runs the application's CLI as:  sh -c 'cd "$1" && shift && exec "$@"' sh <release dir> env OPA_DATA_DIR=.. PYTHONDONTWRITEBYTECODE=1 <venv python> -m ...
+# with FAKE_APP_PY set, only the interpreter is swapped (the test venv has no cryptography); the working directory is the script's own business
+if [ -n "$FAKE_APP_PY" ] && [ "$1" = sh ]; then
+  script="$3"; cur="$5"; e1="$7"; e2="$8"; shift 9
+  exec sh -c "$script" sh "$cur" env "$e1" "$e2" OPA_WIZARD_SKIP_DOTENV=1 "$FAKE_APP_PY" "$@"
 fi
 exec "$@"
 '''
@@ -162,8 +165,7 @@ def world(tmp_path):
         p.write_text(body)
         p.chmod(0o755)
     src = w / "src"
-    (src / "server" / "updater").mkdir(parents=True)
-    shutil.copytree(REPO / "server" / "updater" / "root", src / "server" / "updater" / "root")
+    shutil.copytree(REPO / "server" / "updater", src / "server" / "updater", ignore=shutil.ignore_patterns("__pycache__"))
     for f in ("nginx_bake.py", "release_keys.json", "ocw-stage@.service", "ocw-upgrade.path", "ocw-upgrade.service", "ocw-upgrade-due.service",
               "ocw-upgrade-due.timer", "ocw-updater.sh", "install.sh", "nginx_second_site.py", "opa-compliance-wizard.service",
               "opa-auth-gate.service", "start-headless.sh", "nginx-opa-secrets-wizard.conf", "install_helpers.py"):
@@ -194,13 +196,13 @@ def world(tmp_path):
                       ssl=ssl_dir, env_file=w / "etc" / "opa-compliance-wizard.env", opt=w / "opt", data=w / "var-lib",
                       key=w / "etc" / "session.key", home=w / "var-lib" / "home")
 
-    def run(*args, extra_env=None, answers=None, script=None, umask=None):
+    def run(*args, extra_env=None, answers=None, script=None, umask=None, cwd=None):
         if answers is not None:
             o.answers.write_text(answers)
         e = dict(env, **(extra_env or {}))
         pre = (lambda: os.umask(umask)) if umask is not None else None
         return subprocess.run(["bash", str(script or (src / "server" / "install.sh")), "--wheelhouse", str(w / "wheels"), *args],
-                              capture_output=True, text=True, env=e, timeout=300, stdin=subprocess.DEVNULL, start_new_session=True, preexec_fn=pre)
+                              capture_output=True, text=True, env=e, timeout=300, stdin=subprocess.DEVNULL, start_new_session=True, preexec_fn=pre, cwd=cwd)
 
     def fresh(*args, **kw):
         base = ["--yes", "--create-app-user", "--server-name", "opa.example.com", "--self-signed", "--backend-port", str(port)]
@@ -227,7 +229,7 @@ def test_a_fresh_install_makes_a_working_server_and_says_what_is_left(world):
     p = world.fresh()
     assert p.returncode == 0, p.stderr + p.stdout
     out = p.stdout
-    for needle in ("(fresh)", "Done. OPA Compliance Wizard 5.52.0 is installed and the backend is running.", "opa-auth-gate.service (installed, not started)",
+    for needle in ("(fresh)", "Done. OPA Compliance Wizard 5.52.0 is installed and the backend is running.", "opa-auth-gate.service (installed, not enabled, not started)", "sudo systemctl enable --now opa-auth-gate",
                    "self-signed certificate: your browser will warn", "1. Register the Okta OIDC web app", "DASHBOARD_ORIGIN is already set to https://opa.example.com",
                    "keyring.set_password('opa-compliance-wizard:default', 'okta_client_secret'", "XDG_RUNTIME_DIR=/run/user/4242"):
         assert needle in out, needle
@@ -245,8 +247,8 @@ def test_a_fresh_install_makes_a_working_server_and_says_what_is_left(world):
         assert mode(world.unit_dir / name) == 0o644
     assert (world.home / ".local" / "share" / "keyrings").is_dir() and mode(world.home / ".local" / "share" / "keyrings") == 0o700
     c = calls(world)
-    assert "systemctl enable opa-compliance-wizard opa-auth-gate" in c and "systemctl start opa-compliance-wizard" in c
-    assert "start opa-auth-gate" not in c.replace("start opa-compliance-wizard", "")      # the gate is enabled, not started
+    assert "systemctl enable opa-compliance-wizard\n" in c and "systemctl start opa-compliance-wizard" in c
+    assert "opa-auth-gate" not in c.replace("list-unit-files opa-auth-gate-*.service --no-legend", "")      # the gate is neither enabled nor started
     # the release is in place and linked; the completion marker is gone
     assert (world.opt / "current").is_symlink() and (world.opt / "releases" / "5.52.0" / ".installed-from-source").exists()
     assert not (world.opt / ".fresh-install-incomplete").exists()
@@ -407,7 +409,7 @@ def test_the_dry_run_prints_the_whole_fresh_plan_and_changes_nothing(world):
     p = world.fresh("--dry-run")
     assert p.returncode == 0, p.stderr + p.stdout
     for needle in ("(fresh)", "create the application account ocw", "write " + str(world.env_file), "three generated secrets that are never shown",
-                   "login gate is NOT started", "temporary self-signed certificate for opa.example.com", "write the nginx site", "Dry run: nothing was changed."):
+                   "neither enabled nor started", "temporary self-signed certificate for opa.example.com", "write the nginx site", "Dry run: nothing was changed."):
         assert needle in p.stdout, needle
     for path in (world.opt, world.data, world.env_file, world.key, world.ssl, world.stub / "useradd.args", world.stub / "openssl.calls"):
         assert not path.exists(), path
@@ -454,13 +456,15 @@ def _revocation_setup(world, tmp_path):
 
 def test_a_verified_revocation_is_applied_to_roots_trust_list_and_the_applications_key_state(world, tmp_path):
     key, rev = _revocation_setup(world, tmp_path)
-    # the application's own CLI, run as its account by `trust apply`, from a tree with the test key list
-    appdir = world.w / "appdir"
-    (appdir / "server").mkdir(parents=True)
-    shutil.copytree(REPO / "server" / "updater", appdir / "server" / "updater", ignore=shutil.ignore_patterns("__pycache__"))
-    shutil.copy(world.src / "server" / "release_keys.json", appdir / "server" / "release_keys.json")
-    p = world.fresh("--revocation", str(rev), extra_env={"FAKE_APP_DIR": str(appdir), "FAKE_APP_PY": sys.executable, "FAKE_APP_PYPATH": str(REPO),
-                                                                      "OPA_RELEASE_KEYS_LOCAL": str(world.data / "release_keys.local.json")})
+    # the application's own CLI is started by root's updater as it would be on a server: from a working directory that is NOT the
+    # repository (here: an unrelated directory), so `server` is importable only if the updater changes into the release directory
+    (world.src / "create_secret_folders.py").write_text(      # the part of the engine the key tools use
+        'SCRIPT_VERSION = "5.52.0"\nimport json, os\n\n\ndef _atomic_write_json(path, obj, mode=0o600):\n'
+        '    with open(path, "w") as fh:\n        json.dump(obj, fh)\n    os.chmod(path, mode)\n')
+    elsewhere = world.w / "unrelated-cwd"
+    elsewhere.mkdir()
+    p = world.fresh("--revocation", str(rev), cwd=str(elsewhere),
+                    extra_env={"FAKE_APP_PY": sys.executable, "OPA_RELEASE_KEYS_LOCAL": str(world.data / "release_keys.local.json")})
     assert p.returncode == 0, p.stderr + p.stdout
     trust = json.loads((world.opt / "updater" / "trust.json").read_text())
     assert trust["serial"] == 1 and [r["key_id"] for r in trust["revoked"]] == [key.key_id]
@@ -900,3 +904,9 @@ def test_uninstall_words_what_it_did_to_the_link_and_names_the_account(world):
     assert p.returncode == 0, p.stderr + p.stdout
     assert "was kept: it points elsewhere" in p.stdout and f"removed {world.sites}/opa-secrets-wizard and {link}" not in p.stdout
     assert "Lingering stays on for ocw " in p.stdout and "for  (" not in p.stdout
+
+
+def test_plan_shown_keeps_the_real_run_from_printing_the_plan_again(world):
+    p = world.fresh("--plan-shown")
+    assert p.returncode == 0, p.stderr + p.stdout
+    assert "Plan:" not in p.stdout and "  - create" not in p.stdout and "==> Accounts and directories" in p.stdout and "Done. OPA Compliance Wizard" in p.stdout

@@ -728,13 +728,16 @@ def _apply_to_application(cfg, host, path):
     """Keep the application's own key list (used by the update check and the Updates screen) in step with root's:
     run its CLI as the application account (never as root)."""
     if not cfg.app_user:
-        return "Note: run `ocw-updater keys apply-revocation FILE` too, so the application's own key list matches."
+        return f"Note: run `sudo ocw-updater keys apply-revocation {path}` too, so the application's own key list matches."
     py = os.path.join(cfg.current, ".venv", "bin", "python")
-    rc, out = host.run(["runuser", "-u", cfg.app_user, "--", "env", f"OPA_DATA_DIR={cfg.data}", py, "-m", "server.updater", "keys",
+    # from the release directory (`server` is importable only there; root's own working directory may be unreadable to the
+    # application account), exactly as the ocw-updater command does it
+    rc, out = host.run(["runuser", "-u", cfg.app_user, "--", "sh", "-c", 'cd "$1" && shift && exec "$@"', "sh", cfg.current,
+                        "env", f"OPA_DATA_DIR={cfg.data}", "PYTHONDONTWRITEBYTECODE=1", py, "-m", "server.updater", "keys",
                         "apply-revocation", path], timeout=120)
     return ("The application's own key list was updated too." if rc == 0 else
             "Root's list is updated, but the application's own key list was not (" + out.strip()[-120:] +
-            "); run `ocw-updater keys apply-revocation FILE`.")
+            "); run `sudo ocw-updater keys apply-revocation " + path + "`.")
 
 
 def cmd_nginx_sync(a, cfg, host):
