@@ -434,6 +434,12 @@ LAYOUT_PRESENT=""
 if [ -n "$SERVICE_NAME" ]; then
   _unit_user="$(unit_prop "$SERVICE_NAME" User)"
   _unit_wd="$(unit_prop "$SERVICE_NAME" WorkingDirectory)"
+  # the unit FILE is what counts (a loaded copy can be stale until the next daemon-reload)
+  _frag0="$(unit_prop "$SERVICE_NAME" FragmentPath)"
+  if [ -f "$_frag0" ]; then
+    _wd_file="$(sed -n -e 's/^[[:space:]]*WorkingDirectory=[[:space:]]*//p' "$_frag0" | head -n 1)"
+    [ -z "$_wd_file" ] || _unit_wd="$_wd_file"
+  fi
   [ -n "$APP_USER" ] || APP_USER="$_unit_user"
   if [ -z "$LEGACY_DIR" ] && [ -n "$_unit_wd" ] && [ "$_unit_wd" != "$OPT_DIR/current" ]; then
     case "$_unit_wd" in
@@ -501,6 +507,18 @@ if [ -n "$LEGACY_DIR" ] && [ -f "$LEGACY_DIR/.deploy.conf" ]; then
   done < "$LEGACY_DIR/.deploy.conf"
 fi
 case "$CONF_PORT" in "" | *[!0-9]*) die "OPA_BACKEND_PORT in .deploy.conf is not a number" ;; esac
+# a re-run on an installed layout (no legacy directory any more): the site and port the install recorded
+if [ -z "$LEGACY_DIR" ] && [ "$MODE" = "reinstall" ] && [ -f "$OPT_DIR/updater/config.json" ]; then
+  _recorded="$("$PY3" -I -c 'import json, re, sys
+c = json.load(open(sys.argv[1]))
+site, port = c.get("nginx_site"), c.get("backend_port")
+if isinstance(site, str) and re.fullmatch(r"/[A-Za-z0-9._/-]+", site) and isinstance(port, int) and 0 < port < 65536:
+    print(site, port)' "$OPT_DIR/updater/config.json" 2>/dev/null || true)"
+  if [ -n "$_recorded" ]; then
+    CONF_NGINX_SITE="${_recorded% *}"
+    CONF_PORT="${_recorded##* }"
+  fi
+fi
 URL_RE='^(https://|http://127\.0\.0\.1|http://localhost)[A-Za-z0-9._:/%~+-]+$'
 for _u in "$RELEASE_BASE_URL_ARG" "$REVOCATION_URL_ARG"; do
   [ -z "$_u" ] || [[ "$_u" =~ $URL_RE ]] || die "'$_u' is not a plain https address (no user name or password in it, no query, no spaces)"
