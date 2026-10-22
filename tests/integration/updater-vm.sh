@@ -88,16 +88,18 @@ ok() { PASS=$((PASS + 1)); printf '  ok    %s\n' "$*"; }
 bad() { FAIL=$((FAIL + 1)); FAILED_NAMES+=("$*"); printf '  FAIL  %s\n' "$*"; }
 DIAG_N=0
 diag() { # what to look at when a check failed (printed, and kept in $WORK/diag-N.txt): the updater's own view of the run
+  # Safe under set -e and pipefail, also before /usr/local/bin/ocw-updater exists (a failed early check must report, not abort the script).
   DIAG_N=$((DIAG_N + 1))
   [ "$DIAG_N" -le 8 ] || return 0
   {
     echo "---- diagnostics #$DIAG_N ----"
-    echo "-- ocw-updater status --json"; /usr/local/bin/ocw-updater status --json 2>&1 | tail -n 60
-    echo "-- state.json"; cat "$DATA/upgrade/state.json" 2>&1 | tail -n 60
-    echo "-- journal: ocw-upgrade.service (last 50)"; journalctl -u ocw-upgrade.service --no-pager -o cat -n 50 2>&1
-    echo "-- journal: opa-compliance-wizard (last 50)"; journalctl -u opa-compliance-wizard --no-pager -o cat -n 50 2>&1
-    echo "-- ls releases / staging"; ls -la "$OPT/releases" "$OPT/staging" 2>&1
-  } 2>&1 | tee "$WORK/diag-$DIAG_N.txt" | sed 's/^/        /'
+    echo "-- ocw-updater status --json"
+    if [ -x /usr/local/bin/ocw-updater ]; then /usr/local/bin/ocw-updater status --json 2>&1 | tail -n 60 || true; else echo "(ocw-updater is not installed yet)"; fi
+    echo "-- state.json"; { cat "$DATA/upgrade/state.json" 2>&1 | tail -n 60; } || true
+    echo "-- journal: ocw-upgrade.service (last 50)"; { journalctl -u ocw-upgrade.service --no-pager -o cat -n 50 2>&1; } || true
+    echo "-- journal: opa-compliance-wizard (last 50)"; { journalctl -u opa-compliance-wizard --no-pager -o cat -n 50 2>&1; } || true
+    echo "-- ls releases / staging"; { ls -la "$OPT/releases" "$OPT/staging" 2>&1; } || true
+  } 2>&1 | tee "$WORK/diag-$DIAG_N.txt" | sed 's/^/        /' || true
 }
 check() { # check "description" command...   (on failure: the exit status, the command's output tail, and the diagnostics above)
   local d="$1" out rc
@@ -329,7 +331,7 @@ UPDATER_CMD=/usr/local/bin/ocw-updater
 bash "$LEGACY/server/install.sh" --dry-run --app-user "$TEST_USER" > "$WORK/dryrun.txt"
 check "dry run printed a plan" grep -q "Dry run: nothing was changed" "$WORK/dryrun.txt"
 check "dry run created no layout" test ! -e "$OPT"
-check "dry run announces the additional login gate and names the command" bash -c "grep -q 'ADDITIONAL LOGIN GATES FOUND: vmsecond' $WORK/dryrun.txt && grep -q -- '--regenerate-second-sites' $WORK/dryrun.txt && grep -q 'does NOT deny /api/upgrade' $WORK/dryrun.txt"
+check "dry run announces the additional login gate and names the command" bash -c "grep -q 'ADDITIONAL LOGIN GATES FOUND: vmsecond' $WORK/dryrun.txt && grep -q -- '--regenerate-second-sites' $WORK/dryrun.txt && grep -q 'does NOT deny every route in the current deny rules' $WORK/dryrun.txt"
 bash "$LEGACY/server/install.sh" --yes --app-user "$TEST_USER" --apply-nginx > "$WORK/install.txt" 2>&1 || { cat "$WORK/install.txt"; bad "install.sh exited non-zero"; }
 check "current points at the migrated release" test "$(readlink "$OPT/current")" = "releases/98.0.1"
 check "the root-owned code is not writable by the application account" bash -c "! runuser -u $TEST_USER -- touch $OPT/current/x 2>/dev/null"
