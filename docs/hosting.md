@@ -58,7 +58,7 @@ hour after a failed attempt) follows the log part, as before. Each part has its 
 a part that runs out is stopped at its next checkpoint and its previous data is kept. The OPA scan is stored in the archive database (one
 replaceable row per environment), so a restart no longer loses it, and a sealed record of the day's OPA access state joins the evidence chain
 (once a day, from the scan just read). `ocw-updater` waits up to 10 minutes for a running refresh, OPA scan included, before it refuses with
-`sync_in_progress`. Where the data folder is matters for the stored scan: keep `OPA_DATA_DIR` on an encrypted disk, and on Windows
+`sync_in_progress`. Where the data folder is matters for the stored scan: keep the data directory (`OPA_DATA_DIR`) on an encrypted disk, and on Windows
 outside folders other users of the computer can read (the app warns at start if it is in one).
 
 **Why SQLite, not a "real" database server, for the audit archive:**
