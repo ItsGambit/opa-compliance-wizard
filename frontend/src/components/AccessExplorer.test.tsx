@@ -60,7 +60,7 @@ describe('AccessExplorer', () => {
     }))
     renderShell()
     expect(await screen.findByText(/No stored OPA scan for this environment yet\./)).toBeTruthy()
-    await waitFor(() => expect(startRefresh).toHaveBeenCalledWith('dev', ['opa']))
+    await waitFor(() => expect(startRefresh).toHaveBeenCalledWith('dev', ['opa'], 'explorer'))
     expect(await screen.findByText('Fetching users')).toBeTruthy()
   })
 
@@ -98,7 +98,7 @@ describe('AccessExplorer', () => {
     expect(screen.getByText('resource groups view')).toBeTruthy()  // the old data stays while refreshing
     expect(await screen.findByText('Current', undefined, { timeout: 4000 })).toBeTruthy()  // swapped in place
     expect(screen.queryByText('Stale · 1 day')).toBeNull()
-    expect(startRefresh).toHaveBeenCalledWith('dev', ['opa'])
+    expect(startRefresh).toHaveBeenCalledWith('dev', ['opa'], 'explorer')
   })
 
   it('a refused refresh keeps the previous scan, shows the server\'s message and names the scan that is still shown; the label does not change', async () => {
@@ -119,6 +119,19 @@ describe('AccessExplorer', () => {
     expect(within(label).getByText('Current')).toBeTruthy()
     const refresh = screen.getByRole('button', { name: /Refresh OPA scan/ })
     expect(refresh.getAttribute('aria-disabled')).toBe('false')
+  })
+
+  it('Refresh OPA scan while a job without the OPA part runs shows the server\'s busy message and keeps the old scan and label (not "done")', async () => {
+    const built = hoursAgo(30)
+    vi.mocked(fetchAccessModel).mockResolvedValue(stored({ built_at: built }))
+    vi.mocked(startRefresh).mockRejectedValue(new ApiError('A refresh of System Log is running. The OPA scan can start when it finishes.', 409, { error: 'x', reason: 'busy_other_parts' }))
+    renderShell()
+    await screen.findByText('Stale · 1 day')
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Refresh OPA scan/ })) })
+    expect(await screen.findByText(/A refresh of System Log is running\. The OPA scan can start when it finishes\./)).toBeTruthy()
+    expect(screen.getByText(/is still shown\./)).toBeTruthy()
+    expect(screen.getByText('Stale · 1 day')).toBeTruthy()  // the label did not change
+    expect(fetchAccessModel).toHaveBeenCalledTimes(1)  // nothing was fetched as if a scan had finished
   })
 
   it('the as-of explanation is attached to the label and the button (not only a title), and "Edited since the scan" shows after a local correction', async () => {

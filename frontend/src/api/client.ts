@@ -430,8 +430,8 @@ export function fetchAccessModel(): Promise<AccessModelResponse> {
 // ── The combined Refresh (5.51.0) ────────────────────────────────────────
 
 /** Starts one refresh (default: the OPA scan, the Okta scan and the System Log sync), or attaches to the one already running. */
-export function startRefresh(environment: string, parts?: RefreshPartName[]): Promise<RefreshStartResponse> {
-  return apiFetch(`/api/environments/${encodeURIComponent(environment)}/refresh`, { method: 'POST', body: JSON.stringify(parts ? { parts } : {}) })
+export function startRefresh(environment: string, parts?: RefreshPartName[], trigger?: 'explorer'): Promise<RefreshStartResponse> {
+  return apiFetch(`/api/environments/${encodeURIComponent(environment)}/refresh`, { method: 'POST', body: JSON.stringify({ ...(parts ? { parts } : {}), ...(trigger ? { trigger } : {}) }) })
 }
 
 export function fetchRefreshStatus(environment: string): Promise<RefreshStatus> {

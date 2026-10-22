@@ -1378,6 +1378,21 @@ def _start_refresh_job(env_id, env_name, parts=None, trigger="manual", owner=eng
     with _refresh_jobs_lock:
         current = _refresh_jobs.get(env_id)
         if current is not None and current.status == "running":
+            missing = [p for p in parts if p not in current.parts]
+            still_running = current.running_parts() + [p for p in current.parts if current.part_state(p) == rj.PENDING]
+            # Attaching is honest only when the running job will do (some of) what was asked: every part the job is still working on,
+            # or the whole refresh. A request for a part the job does not include, or only for parts that already ended, would be
+            # reported as "already running" while nothing runs for it.
+            busy = bool(missing) or not (set(parts) & set(still_running) or parts == list(rj.PARTS))
+            if busy:
+                running_labels = ", ".join(rj.PART_LABELS[p] for p in rj.PARTS if p in still_running)
+                asked = [p for p in parts if p in missing] or parts
+                if trigger == "scheduled":
+                    engine.log_audit_event(actor_email, actor_sub, "sync.scheduled_skipped",
+                                           {"name": env_name, "reason": f"a refresh of {running_labels} is running"}, client_ip=client_ip, user_agent=user_agent)
+                return {"started": False, "already_running": True, "upgrade_starting": False, "job_id": current.job_id, "busy_other_parts": True,
+                        "missing": asked, "running": [p for p in rj.PARTS if p in still_running],
+                        "message": f"A refresh of {running_labels} is running. The {' and '.join(rj.PART_LABELS[p] for p in asked)} can start when it finishes."}
             if trigger == "scheduled":
                 engine.log_audit_event(actor_email, actor_sub, "sync.scheduled_skipped", {"name": env_name, "reason": "already running"},
                                        client_ip=client_ip, user_agent=user_agent)
@@ -4482,7 +4497,7 @@ class Handler(SimpleHTTPRequestHandler):
                     if not isinstance(subs, list) or not subs or not all(isinstance(x, str) and x in rj.OKTA_SUBS for x in subs):
                         return self._send_json(400, {"error": f"okta_subs must be a non-empty list drawn from {list(rj.OKTA_SUBS)}"})
                     options["okta_subs"] = [x for x in rj.OKTA_SUBS if x in subs]
-                trigger = "explorer" if parts == ["opa"] else "manual"
+                trigger = "explorer" if payload.get("trigger") == "explorer" else "manual"  # the Access Explorer says so; "OPA scan only" on the Overview is manual
                 # The owner's saved sync settings (by id), as Sync now uses them: a shared user never chooses the scope.
                 schedule = engine.get_sync_schedule_by_id(meta["environment_id"])
                 outcome = _start_refresh_job(
@@ -4493,6 +4508,8 @@ class Handler(SimpleHTTPRequestHandler):
                 if outcome["upgrade_starting"]:
                     return self._send_json(409, {"error": "An upgrade is starting; refreshes are paused until it finishes (a few minutes).",
                                                  "reason": "upgrade_starting", **outcome})
+                if outcome.get("busy_other_parts"):
+                    return self._send_json(409, {"error": outcome["message"], "reason": "busy_other_parts", **{k: v for k, v in outcome.items() if k != "message"}})
                 return self._send_json(200, outcome)
 
             if path.startswith("/api/environments/") and path.endswith("/sync/start"):
@@ -4611,6 +4628,8 @@ class Handler(SimpleHTTPRequestHandler):
                 if outcome["upgrade_starting"]:
                     return self._send_json(409, {"error": "An upgrade is starting; refreshes are paused until it finishes (a few minutes).",
                                                  "reason": "upgrade_starting"})
+                if outcome.get("busy_other_parts"):
+                    return self._send_json(409, {"error": outcome["message"], "reason": "busy_other_parts", "missing": outcome["missing"], "running": outcome["running"]})
                 return self._send_json(200, {"started": outcome["started"], "already_running": outcome["already_running"],
                                              "job_id": outcome["job_id"], "steps": engine.ACCESS_MODEL_STEPS})
 

@@ -42,6 +42,15 @@ describe('refresh watcher and actions', () => {
     expect(spy).toHaveBeenCalledWith(expect.objectContaining({ title: 'A refresh is already running' }))
   })
 
+  it('a busy answer (the running job does not include the part) is the server\'s message, never "already running"', async () => {
+    const spy = vi.spyOn(toasts, 'toast')
+    vi.mocked(startRefresh).mockRejectedValue(Object.assign(new Error('A refresh of System Log is running. The Okta scan can start when it finishes.'), { status: 409 }))
+    const { result } = renderHookWithClient(() => useRefreshActions('dev'))
+    await act(async () => { await result.current.start(['okta']) })
+    expect(spy).toHaveBeenCalledTimes(1)
+    expect(spy).toHaveBeenCalledWith(expect.objectContaining({ title: 'Could not start the refresh', description: 'A refresh of System Log is running. The Okta scan can start when it finishes.', variant: 'error' }))
+  })
+
   it('a refused start is a toast with the server\'s message', async () => {
     const spy = vi.spyOn(toasts, 'toast')
     vi.mocked(startRefresh).mockRejectedValue(new Error('An upgrade is starting; refreshes are paused until it finishes (a few minutes).'))

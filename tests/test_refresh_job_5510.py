@@ -217,7 +217,7 @@ def test_a_scheduled_tick_during_a_refresh_is_skipped_and_audited(rig, tmp_audit
     release.set()
     rig.wait()
     skipped = [r for r in rig.audit(tmp_audit_log) if r["action"] == "sync.scheduled_skipped"]
-    assert skipped and skipped[0]["details"]["reason"] == "already running"
+    assert skipped and skipped[0]["details"]["reason"] == "a refresh of OPA scan is running"  # the schedule tries again at its next poll
 
 
 def test_the_log_part_records_the_day_as_done_once(rig):
@@ -649,3 +649,75 @@ def test_a_scan_with_hyphenated_names_stores_and_seals(rig):  # noqa: F811
     assert data["state"] == "ok" and data["warnings"] == 0
     names = [p["name"] for p in audit_store.load_opa_model_cache(rig.env)["model"]["policies"]]
     assert names == ["Prod-DB-Admins-ReadOnly-Policy-2026-Q4-Rev3"]
+
+
+# -- review M1: coalescing knows which parts the running job covers ------------------------------------------------------------
+def _running_job(serve, env_id, parts, states):
+    job = rj.RefreshJob(env_id, parts, "manual")
+    for part, state in states.items():
+        if state == "running":
+            job.begin(part)
+        elif state != "pending":
+            job.begin(part)
+            job.finish(part, state, "x")
+    with serve._refresh_jobs_lock:
+        serve._refresh_jobs[env_id] = job
+    return job
+
+
+def test_a_request_for_parts_the_running_job_does_not_include_is_busy_not_attached(matrix_server):  # noqa: F811
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+    _running_job(serve, env_id, ["log"], {"log": "running"})
+    r = _call(base_url, "POST", "/api/environments/dev/refresh", {"parts": ["opa"]}, _who(OWNER_A))
+    assert r.status_code == 409 and r.json()["reason"] == "busy_other_parts"
+    assert r.json()["missing"] == ["opa"] and r.json()["running"] == ["log"]
+    assert r.json()["error"] == "A refresh of System Log is running. The OPA scan can start when it finishes."
+    assert serve._refresh_jobs[env_id].parts == ["log"]  # no second job, nothing queued
+
+
+def test_a_retry_of_a_part_that_already_ended_while_another_lane_runs_is_busy(matrix_server):  # noqa: F811
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+    _running_job(serve, env_id, ["opa", "okta", "log"], {"opa": "error", "log": "running", "okta": "pending"})
+    r = _call(base_url, "POST", "/api/environments/dev/refresh", {"parts": ["opa"]}, _who(OWNER_A))
+    assert r.status_code == 409 and r.json()["reason"] == "busy_other_parts" and r.json()["running"] == ["okta", "log"]
+    assert "The OPA scan can start when it finishes" in r.json()["error"]
+
+
+def test_all_parts_while_a_full_refresh_runs_still_attaches_even_if_some_part_ended(matrix_server):  # noqa: F811
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+    job = _running_job(serve, env_id, ["opa", "okta", "log"], {"opa": "ok", "log": "running", "okta": "pending"})
+    r = _call(base_url, "POST", "/api/environments/dev/refresh", {}, _who(OWNER_A))
+    assert r.status_code == 200 and r.json() == {"started": False, "already_running": True, "upgrade_starting": False, "job_id": job.job_id}
+    covered = _call(base_url, "POST", "/api/environments/dev/refresh", {"parts": ["log"]}, _who(OWNER_A))
+    assert covered.status_code == 200 and covered.json()["already_running"] is True  # a part the job is still running attaches
+
+
+def test_the_legacy_bootstrap_start_is_busy_too_and_the_scheduler_logs_why(matrix_server, tmp_audit_log):  # noqa: F811
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+    with serve._access_jobs_lock:
+        serve._access_jobs[env_id]["status"] = "done"
+    _running_job(serve, env_id, ["log"], {"log": "running"})
+    r = _call(base_url, "POST", "/api/access/bootstrap/start", {}, _who(OWNER_A))
+    assert r.status_code == 409 and r.json()["reason"] == "busy_other_parts"
+    out = serve._start_refresh_job(env_id, "dev", parts=list(rj.PARTS), trigger="scheduled")
+    assert out["busy_other_parts"] is True and out["already_running"] is True
+    rows = [json.loads(line) for line in open(tmp_audit_log, encoding="utf-8") if line.strip()]
+    skipped = [x for x in rows if x["action"] == "sync.scheduled_skipped"]
+    assert skipped and skipped[-1]["details"]["reason"] == "a refresh of System Log is running"
+
+
+def test_the_trigger_is_what_the_caller_says_not_a_guess_from_the_parts(matrix_server, monkeypatch, tmp_audit_log):  # noqa: F811
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+    monkeypatch.setattr(serve, "_run_refresh_job", lambda job, ctx: None)
+    triggers = []
+    for body in ({"parts": ["opa"]}, {"parts": ["opa"], "trigger": "explorer"}, {"parts": ["opa"], "trigger": "scheduled"}):
+        with serve._refresh_jobs_lock:
+            serve._refresh_jobs.pop(env_id, None)
+        assert _call(base_url, "POST", "/api/environments/dev/refresh", body, _who(OWNER_A)).status_code == 200
+        triggers.append(serve._refresh_jobs[env_id].trigger)
+    assert triggers == ["manual", "explorer", "manual"]  # only the two the UI uses are accepted

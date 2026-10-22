@@ -39,7 +39,7 @@ export function useAccessScanJob() {
     generation.current += 1
     const gen = generation.current
     setState({ ...INITIAL_STATE, phase: 'starting' })
-    startRefresh(environment, ['opa'])
+    startRefresh(environment, ['opa'], 'explorer')
       .then(() => {
         if (gen !== generation.current) return
         setState(s => ({ ...s, phase: 'running' }))
