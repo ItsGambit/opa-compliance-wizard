@@ -21,7 +21,30 @@ export function formatBytes(n: number | null | undefined): string {
 }
 
 /** The state shown in the status badge of the Updates page. */
-export type UpdateState = 'not_enabled' | 'off' | 'update_available' | 'up_to_date' | 'failed' | 'waiting'
+export type UpdateState = 'not_enabled' | 'off' | 'update_available' | 'up_to_date' | 'failed' | 'waiting' | 'stale'
+
+/** MAJOR.MINOR.PATCH as numbers, or null when the text is not one (the server pins this shape for releases). */
+function versionParts(text: string | null | undefined): number[] | null {
+  const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(text ?? '')
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null
+}
+
+/** True when the stored "latest stable" is OLDER than the installed version (it was read before newer releases existed). */
+export function latestOlderThanInstalled(status: UpgradeStatus): boolean {
+  const latest = versionParts(status.latest?.version)
+  const installed = versionParts(status.installed_version)
+  if (!latest || !installed) return false
+  for (let i = 0; i < 3; i++) if (latest[i] !== installed[i]) return latest[i] < installed[i]
+  return false
+}
+
+/** True when that stored result is from a check made before this version was installed: it says nothing about releases since. */
+export function latestIsStale(status: UpgradeStatus): boolean {
+  if (!latestOlderThanInstalled(status)) return false
+  const { at } = status.last_check
+  if (!at || !status.installed_at) return !at
+  return Date.parse(at) < Date.parse(status.installed_at)
+}
 
 export function updateState(status: UpgradeStatus): UpdateState {
   const { check, last_check: last } = status
@@ -30,6 +53,7 @@ export function updateState(status: UpgradeStatus): UpdateState {
   if (status.update_available) return 'update_available'
   if (last.consecutive_failures > 0) return 'failed'
   if (!last.at) return 'waiting'
+  if (latestIsStale(status)) return 'stale'
   return 'up_to_date'
 }
 

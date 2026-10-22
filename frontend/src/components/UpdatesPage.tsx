@@ -8,7 +8,7 @@ import type { UpgradeStatus } from '../types'
 import { clearRequested, readRequested, type RequestedUpgrade } from '../utils/upgradeRequested'
 import { UPGRADE_STEPS, browserZone, describeReason, isFailureResult, isRunning, serverZoneOf } from '../utils/upgradeFlow'
 import { formatDateTime } from '../utils/format'
-import { describeCheckFailure, frequencyLabel, updateState } from '../utils/upgrade'
+import { describeCheckFailure, frequencyLabel, latestIsStale, latestOlderThanInstalled, updateState } from '../utils/upgrade'
 import { UpdateCheckForm } from './UpdateCheckForm'
 import { AvailableSection } from './upgrade/AvailableSection'
 import { BackupsCard } from './upgrade/BackupsCard'
@@ -44,6 +44,7 @@ function StatusCard({ status, onCheckNow, checking, disabled, compact }: { statu
             {!compact && (state === 'not_enabled') && <Badge tone="neu">Update check not enabled</Badge>}
             {!compact && state === 'off' && <Badge tone="neu">Update check off</Badge>}
             {!compact && state === 'waiting' && <Badge tone="neu">Waiting for the first check</Badge>}
+            {!compact && state === 'stale' && <Badge tone="neu">Not checked since upgrade</Badge>}
           </h2>
           <div className={KV}>
             <Row label="Installed">
@@ -51,13 +52,17 @@ function StatusCard({ status, onCheckNow, checking, disabled, compact }: { statu
               {status.installed_at && <> · installed {formatDateTime(status.installed_at)}</>}
             </Row>
             <Row label="Latest stable">
-              {latest
+              {latest && latestIsStale(status)
+                ? <>Not checked since this version was installed — Check now. The last check ({last.at ? formatDateTime(last.at) : 'earlier'}) saw {latest.version}, which is older than the installed version.</>
+                : latest && latestOlderThanInstalled(status)
+                ? <>Up to date as of the last check ({last.at ? formatDateTime(last.at) : 'earlier'}); the last check saw {latest.version}.</>
+                : latest
                 ? <>{latest.version}{latest.published_at && <> (released {formatDateTime(latest.published_at)})</>}{!status.update_available && ' · no newer release'}</>
                 : state === 'not_enabled' || !last.at ? 'Unknown — this server has never checked.' : 'No stable release is published.'}
             </Row>
             {last.at && (
               <Row label="Last check">
-                {formatDateTime(last.at)} · {compact ? (last.status === 'ok' ? (status.update_available ? 'a newer release was found' : 'up to date') : describeCheckFailure(last.code)) : <>result: {last.status === 'ok' ? (status.update_available ? 'newer release found' : 'up to date') : describeCheckFailure(last.code)}</>}
+                {formatDateTime(last.at)} · {compact ? (last.status === 'ok' ? (status.update_available ? 'a newer release was found' : 'up to date') : describeCheckFailure(last.code)) : <>result: {last.status === 'ok' ? (status.update_available ? 'newer release found' : state === 'stale' ? 'made before this version was installed' : 'up to date') : describeCheckFailure(last.code)}</>}
                 {!compact && last.by && <> · by {last.by.replace(/^admin:/, '')} (Check now)</>}
                 {!compact && last.next_at && check.frequency === 'daily' && <> · next automatic check {formatDateTime(last.next_at)}</>}
               </Row>

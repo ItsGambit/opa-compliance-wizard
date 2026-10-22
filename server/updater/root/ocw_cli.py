@@ -142,6 +142,16 @@ def collect_status(cfg):
             "state": st, "last_run": hist[-1] if hist else None, "failures": act.read_json(cfg.failures_path, {})}
 
 
+def _older_than_installed_note(latest, installed):
+    """5.52.0: a stored 'latest stable' made before newer releases existed can be OLDER than what is installed; say so."""
+    try:
+        if installed and ocw_trust.version_tuple(latest) < ocw_trust.version_tuple(installed):
+            return "; older than installed, check again"
+    except ocw_trust.TrustError:
+        pass
+    return ""
+
+
 def cmd_status(a, cfg, host):
     s = collect_status(cfg)
     if a.json:
@@ -151,7 +161,7 @@ def cmd_status(a, cfg, host):
     signed = f", signed by {s['installed_signed_by']}" if s["installed_signed_by"] else ""
     print(f"installed      {s['installed'] or 'unknown'}   (releases/{s['installed']}{since}{signed})")
     if s["latest"]:
-        print(f"latest stable  {s['latest']}   (checked {s['latest_checked'] or 'never'})")
+        print(f"latest stable  {s['latest']}   (checked {s['latest_checked'] or 'never'}{_older_than_installed_note(s['latest'], s['installed'])})")
     last_target = (s.get("state") or {}).get("version_to")
     for r in s["staged"]:
         # A tree staged by an earlier attempt stays on disk until it is applied or pruned: say so when the last run was about another version.

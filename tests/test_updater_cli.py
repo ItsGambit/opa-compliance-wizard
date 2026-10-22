@@ -312,3 +312,28 @@ def test_prune_backups_from_the_command_line_is_typed_and_keeps_the_newest(m, ca
     assert not old.exists() and len(list(d.glob("*.db"))) == 1
     assert any(e["action"] == "upgrade.backups_pruned" for e in m.audit_actions())
     assert cli(m, "prune-backups", "--name", old.name, "--confirm", "PRUNE") == 2         # already gone
+
+
+def _status_with_latest(monkeypatch, latest):
+    real = ocw_cli.collect_status
+
+    def fake(cfg):
+        out = real(cfg)
+        out.update(latest=latest, latest_checked="2026-10-19T09:00:00Z")
+        return out
+    monkeypatch.setattr(ocw_cli, "collect_status", fake)
+
+
+def test_status_flags_a_stored_latest_that_is_older_than_the_installed_version(m, monkeypatch, capsys):
+    _status_with_latest(monkeypatch, "5.45.0")
+    assert cli(m, "status") == 0
+    line = [x for x in capsys.readouterr().out.splitlines() if x.startswith("latest stable")][0]
+    assert line == "latest stable  5.45.0   (checked 2026-10-19T09:00:00Z; older than installed, check again)"
+
+
+@pytest.mark.parametrize("latest", ["5.46.0", "5.47.0"])
+def test_status_leaves_an_equal_or_newer_latest_unannotated(m, monkeypatch, capsys, latest):
+    _status_with_latest(monkeypatch, latest)
+    assert cli(m, "status") == 0
+    line = [x for x in capsys.readouterr().out.splitlines() if x.startswith("latest stable")][0]
+    assert line == f"latest stable  {latest}   (checked 2026-10-19T09:00:00Z)"
