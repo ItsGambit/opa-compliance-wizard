@@ -205,7 +205,9 @@ def fetch(url, out_path, allowed_hosts, max_bytes):
     allowed = frozenset(h.lower() for h in allowed_hosts)
     if not url_allowed(url, allowed):
         raise FetchError("failed", f"{url} is not an allowed address (https, on {', '.join(sorted(allowed)) or 'no host'})")
-    opener = urllib.request.build_opener(_CheckedRedirects(allowed))
+    ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    opener = urllib.request.build_opener(_CheckedRedirects(allowed), urllib.request.HTTPSHandler(context=ctx))
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     part = out_path + ".part"
     try:
@@ -329,7 +331,7 @@ def apply_revocations(trust, paths):
     that is unreadable, replayed, badly signed or malformed is reported and ignored: a garbage file at a public URL must
     never block an install, and it changes nothing."""
     ot = _trust()
-    found, notes, applied = [], [], []
+    found, notes, applied, applied_raw = [], [], [], set()
     for path in paths:
         name = os.path.basename(path)
         try:
@@ -343,8 +345,12 @@ def apply_revocations(trust, paths):
         try:
             trust, detail = ot.apply_revocation(trust, raw)
         except ot.TrustError as exc:
-            notes.append(f"revocation file {name} ignored ({exc.code}: {exc})")
+            if exc.code == "replayed" and hashlib.sha256(raw).hexdigest() in applied_raw:
+                notes.append(f"revocation file {name}: the same revocation was already applied from another source")
+            else:
+                notes.append(f"revocation file {name} ignored ({exc.code}: {exc})")
             continue
+        applied_raw.add(hashlib.sha256(raw).hexdigest())
         applied.append({"serial": detail["to_serial"], "path": path, "raw": raw, "revoked": detail["revoked"],
                         "added": detail["added"], "reason": detail["reason"]})
     return trust, applied, notes

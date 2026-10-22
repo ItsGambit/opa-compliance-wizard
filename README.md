@@ -117,8 +117,8 @@ process).
 
 ## Installing on a server
 
-One command installs a signed release on a clean **Debian 12 or 13, or Ubuntu 22.04, 24.04 or 26.04** server (x86-64 or ARM, with
-systemd, run as root): it checks the system, downloads the release and its signature, **verifies the signature against the
+One command installs a signed release on a clean **Debian 12 or newer, or Ubuntu 22.04 or newer** server (the LTS releases are the ones
+meant; x86-64 or ARM, with systemd, run as root): it checks the system, downloads the release and its signature, **verifies the signature against the
 project's release key before anything is installed**, applies any published key revocation, and runs the installer from the
 verified release. That installer creates the application account, the settings file with generated secrets, the services and the
 nginx site with a certificate, starts the backend and checks it. It installs `nginx`, the keyring packages and `python3-venv` from
@@ -164,6 +164,9 @@ performed.**
 
 **What it does not do (5.52.0).**
 
+- **Run end to end on a real Debian 13 x86-64 server only.** Ubuntu and ARM (aarch64) are covered by automated tests with stubbed system
+  commands, not yet by a real-machine install.
+
 - Red Hat family systems (RHEL, Rocky, Alma, Fedora, Amazon Linux) are recognised and refused, with the reason and nothing changed:
   follow [docs/hosting.md](docs/hosting.md) by hand. Debian 11 and older, Ubuntu 20.04 and older, Alpine, servers without systemd as
   PID 1 (most containers, WSL1) and macOS are refused too, each with its own reason. A Docker image is on the backlog.
@@ -173,6 +176,11 @@ performed.**
 - The offline bundle is not accepted by `--from-dir` yet (bring the release file, its signature and `--wheelhouse DIR` for the packages).
 - `--uninstall` keeps the data (the archive, audit log, settings file, session key, TLS files, the application account and the packages).
   Removing them is a manual step, listed in [docs/hosting.md](docs/hosting.md#uninstalling).
+
+Behind a proxy, or with a mirror, pass the settings through `sudo`, which resets the environment:
+`sudo https_proxy=https://proxy.example.com:3128 OCW_RELEASE_BASE_URL=https://mirror.example.com/releases/download OCW_REVOCATION_URL=https://example.com/revocation.json bash get-ocw.sh --version 5.52.0`.
+A mirror must name the version (it cannot choose what gets installed) and also answers for the key-revocation files, so when you use one
+set `OCW_REVOCATION_URL` to a page you control: a mirror that hides a revocation would otherwise go unnoticed.
 
 A server that already runs the upgrade layout is left alone (the command prints its status and exits; upgrade from the Updates page or
 `sudo ocw-updater apply <version>`; `sudo bash get-ocw.sh --refresh-updater` refreshes the updater, the units and the command from a

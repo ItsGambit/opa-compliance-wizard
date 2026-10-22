@@ -111,7 +111,21 @@ echo "nginx $*" >> "$STUB/calls"
 [ ! -e "$STUB/nginx_bad" ] || { echo "nginx: configuration file test failed (simulated)" >&2; exit 1; }
 exit 0
 '''
-STUBS = {"systemctl": STUB_SYSTEMCTL, "sleep": "#!/bin/bash\nexit 0\n", "runuser": '#!/bin/bash\nshift 3\nexec "$@"\n', "useradd": STUB_USERADD,
+# runuser: -u USER -- cmd...; with FAKE_APP_DIR set, the application's own CLI (`env OPA_DATA_DIR=.. <venv python> -m server.updater ...`) runs
+# from that directory with the test interpreter, as the application account would run it
+STUB_RUNUSER = r'''#!/bin/bash
+shift 3
+if [ -n "$FAKE_APP_DIR" ] && [ "$1" = env ]; then
+  envarg="$2"; shift 3; cd "$FAKE_APP_DIR" && exec env "$envarg" PYTHONPATH="$FAKE_APP_PYPATH" OPA_WIZARD_SKIP_DOTENV=1 "$FAKE_APP_PY" "$@"
+fi
+exec "$@"
+'''
+# sh: the real one, unless the test says the application account cannot run the release
+STUB_SH = r'''#!/bin/bash
+if [ -e "$STUB/app_cannot_run" ] && [ "$1" = "-c" ] && [[ "$2" == *"test -x"* ]]; then exit 1; fi
+exec /bin/sh "$@"
+'''
+STUBS = {"systemctl": STUB_SYSTEMCTL, "sleep": "#!/bin/bash\nexit 0\n", "runuser": STUB_RUNUSER, "sh": STUB_SH, "useradd": STUB_USERADD,
          "userdel": '#!/bin/bash\necho "$*" >> "$STUB/userdel.args"\nexit 0\n', "loginctl": '#!/bin/bash\necho "loginctl $*" >> "$STUB/calls"\nexit 0\n',
          "id": STUB_ID, "getent": STUB_GETENT, "openssl": STUB_OPENSSL, "nginx": STUB_NGINX,
          "chown": '#!/bin/bash\necho "$@" >> "$STUB/chowns"\nexit 0\n'}
@@ -154,6 +168,7 @@ def world(tmp_path):
               "ocw-upgrade-due.timer", "ocw-updater.sh", "install.sh", "nginx_second_site.py", "opa-compliance-wizard.service",
               "opa-auth-gate.service", "start-headless.sh", "nginx-opa-secrets-wizard.conf", "install_helpers.py"):
         shutil.copy(REPO / "server" / f, src / "server" / f)
+    (src / "server" / "serve.py").write_text("# the application\n")
     (src / "create_secret_folders.py").write_text('SCRIPT_VERSION = "5.52.0"\n')
     (src / "requirements.lock").write_text("# empty on purpose\n")
     (src / "frontend" / "dist").mkdir(parents=True)
@@ -179,12 +194,13 @@ def world(tmp_path):
                       ssl=ssl_dir, env_file=w / "etc" / "opa-compliance-wizard.env", opt=w / "opt", data=w / "var-lib",
                       key=w / "etc" / "session.key", home=w / "var-lib" / "home")
 
-    def run(*args, extra_env=None, answers=None, script=None):
+    def run(*args, extra_env=None, answers=None, script=None, umask=None):
         if answers is not None:
             o.answers.write_text(answers)
         e = dict(env, **(extra_env or {}))
+        pre = (lambda: os.umask(umask)) if umask is not None else None
         return subprocess.run(["bash", str(script or (src / "server" / "install.sh")), "--wheelhouse", str(w / "wheels"), *args],
-                              capture_output=True, text=True, env=e, timeout=300, stdin=subprocess.DEVNULL, start_new_session=True)
+                              capture_output=True, text=True, env=e, timeout=300, stdin=subprocess.DEVNULL, start_new_session=True, preexec_fn=pre)
 
     def fresh(*args, **kw):
         base = ["--yes", "--create-app-user", "--server-name", "opa.example.com", "--self-signed", "--backend-port", str(port)]
@@ -426,20 +442,102 @@ def test_a_malformed_release_info_stops_the_install_with_a_reason(world):
     assert p.returncode == 4 and "could not record the provenance" in p.stderr
 
 
-def test_a_verified_revocation_is_applied_to_roots_trust_list_and_kept_for_the_application(world, tmp_path):
+def _revocation_setup(world, tmp_path):
     sys.path.insert(0, str(REPO / "tests"))
     from release_helpers import TestKey, TestStandby, key_list, make_revocation, revocation_payload
     key, standby, new = TestKey(), TestStandby(), TestKey()
     (world.src / "server" / "release_keys.json").write_text(json.dumps(key_list([key, standby])))
     rev = tmp_path / "revocation-0000000001.json"
     make_revocation(rev, [standby], revocation_payload(1, revoke=[key.key_id], add_keys=[new]))
-    p = world.fresh("--revocation", str(rev))
+    return key, rev
+
+
+def test_a_verified_revocation_is_applied_to_roots_trust_list_and_the_applications_key_state(world, tmp_path):
+    key, rev = _revocation_setup(world, tmp_path)
+    # the application's own CLI, run as its account by `trust apply`, from a tree with the test key list
+    appdir = world.w / "appdir"
+    (appdir / "server").mkdir(parents=True)
+    shutil.copytree(REPO / "server" / "updater", appdir / "server" / "updater", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copy(world.src / "server" / "release_keys.json", appdir / "server" / "release_keys.json")
+    p = world.fresh("--revocation", str(rev), extra_env={"FAKE_APP_DIR": str(appdir), "FAKE_APP_PY": sys.executable, "FAKE_APP_PYPATH": str(REPO),
+                                                                      "OPA_RELEASE_KEYS_LOCAL": str(world.data / "release_keys.local.json")})
     assert p.returncode == 0, p.stderr + p.stdout
     trust = json.loads((world.opt / "updater" / "trust.json").read_text())
     assert trust["serial"] == 1 and [r["key_id"] for r in trust["revoked"]] == [key.key_id]
-    kept = world.data / "upgrade" / "revocations" / rev.name
-    assert kept.read_bytes() == rev.read_bytes() and mode(kept) == 0o644
-    assert "Key revocations" in p.stdout
+    assert "The application's own key list was updated too." in p.stdout, p.stdout[p.stdout.index("Key revocations"):][:900]
+    local = json.loads((world.data / "release_keys.local.json").read_text())
+    assert [r["key_id"] for r in local["revoked"]] == [key.key_id]
+    # the copy lives in a root-owned, world-readable place, never in the application's upgrade/ directories
+    kept = world.opt / "updater" / "revocations" / rev.name
+    assert kept.read_bytes() == rev.read_bytes() and mode(kept) == 0o644 and mode(kept.parent) == 0o755
+    assert not (world.data / "upgrade" / "revocations" / rev.name).exists()
+    assert "Key revocations" in p.stdout and "keep them for the application" not in p.stdout
+
+
+def test_a_link_planted_where_the_revocation_copy_goes_is_refused_and_nothing_is_written(world, tmp_path):
+    _key, rev = _revocation_setup(world, tmp_path)
+    victim = world.w / "victim"
+    victim.write_text("keep me")
+    dest = world.opt / "updater" / "revocations"
+    dest.mkdir(parents=True)
+    (dest / rev.name).symlink_to(victim)
+    p = world.fresh("--revocation", str(rev))
+    assert p.returncode == 4 and "could not keep a copy" in p.stderr
+    assert victim.read_text() == "keep me"
+    # and a link in place of the directory itself
+    for f in dest.iterdir():
+        f.unlink()
+    dest.rmdir()
+    elsewhere = world.w / "elsewhere"
+    elsewhere.mkdir()
+    dest.symlink_to(elsewhere)
+    p = world.fresh("--revocation", str(rev))
+    assert p.returncode == 4 and not list(elsewhere.iterdir())
+
+
+def test_a_planted_link_below_the_application_home_is_refused_and_nothing_is_created_through_it(world):
+    home = world.w / "apphome"
+    (home / ".local").mkdir(parents=True)
+    target = world.w / "target"
+    target.mkdir()
+    (home / ".local" / "share").symlink_to(target)
+    (world.stub / "users").mkdir()
+    (world.stub / "users" / "ocw").write_text(str(home))        # the account exists, with this home
+    p = world.run("--yes", "--app-user", "ocw", "--server-name", "opa.example.com", "--self-signed", "--backend-port", str(world.port))
+    assert p.returncode == 4 and "is a link" in p.stderr
+    assert not list(target.iterdir())
+
+
+def test_the_release_tree_is_readable_by_the_application_whatever_umask_the_caller_has(world):
+    p = world.fresh(umask=0o077)       # get-ocw.sh runs with 077
+    assert p.returncode == 0, p.stderr + p.stdout
+    rel = world.opt / "releases" / "5.52.0"
+    bad = []
+    for path in [rel, *rel.rglob("*")]:
+        if path.is_symlink():
+            continue
+        m = path.stat().st_mode
+        if path.is_dir() and not (m & 0o005 == 0o005):
+            bad.append(("dir", str(path.relative_to(world.opt)), oct(m & 0o777)))
+        if path.is_file() and not (m & 0o004):
+            bad.append(("file", str(path.relative_to(world.opt)), oct(m & 0o777)))
+        if m & 0o022:
+            bad.append(("writable", str(path.relative_to(world.opt)), oct(m & 0o777)))
+    assert not bad, bad[:10]
+    assert os.access(rel / ".venv" / "bin" / "python", os.X_OK) and mode(world.opt) == 0o755 and mode(world.opt / "updater") == 0o755
+    # the secret-bearing files keep their own modes under the same umask
+    assert mode(world.env_file) == 0o600 and mode(world.key) == 0o640 and mode(world.sites / "opa-secrets-wizard") == 0o640
+    assert mode(world.ssl) == 0o700 and mode(world.ssl / "opa-secrets-wizard.key") == 0o600
+    assert mode(world.data) == 0o1770 and mode(world.data / "upgrade" / "backups") == 0o700
+
+
+def test_the_backend_is_not_started_when_the_application_account_cannot_run_the_release(world):
+    (world.stub / "app_cannot_run").write_text("")
+    p = world.fresh()
+    assert p.returncode == 4 and "cannot run the installed release" in p.stderr and "Something was changed" in p.stderr and "run the same command again" in p.stderr
+    assert "systemctl start opa-compliance-wizard" not in calls(world) and (world.opt / ".fresh-install-incomplete").exists()
+    (world.stub / "app_cannot_run").unlink()
+    assert world.fresh().returncode == 0
 
 
 def test_a_revocation_that_does_not_apply_stops_the_install(world, tmp_path):
@@ -716,3 +814,16 @@ def test_check_cert_accepts_a_pair_and_refuses_a_stranger(tmp_path):
     assert helpers("check-cert", "--cert", str(tmp_path / "a.crt"), "--key", str(tmp_path / "b.key")).returncode == 2
     (tmp_path / "junk").write_text("not pem")
     assert helpers("check-cert", "--cert", str(tmp_path / "junk"), "--key", str(tmp_path / "a.key")).returncode == 2
+
+
+def test_uninstall_leaves_an_enabled_link_that_points_to_another_site(world):
+    assert world.fresh().returncode == 0
+    link = world.enabled / "opa-secrets-wizard"
+    link.unlink()
+    other = world.w / "someone-elses-site"
+    other.write_text("server { }\n")
+    link.symlink_to(other)
+    p = world.run("--uninstall", "--keep-data", "--yes")
+    assert p.returncode == 0, p.stderr + p.stdout
+    assert link.is_symlink() and os.readlink(link) == str(other) and "it was left in place" in p.stdout
+    assert not (world.sites / "opa-secrets-wizard").exists() and "Lingering stays on" in p.stdout

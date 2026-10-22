@@ -75,7 +75,7 @@ workload that doesn't need it — the honest tradeoff isn't "SQLite vs.
 a faster database," it's "one file vs. a whole extra service," and for
 this tool's single-server-process design, the file wins.
 
-**What the installer does for you (5.52.0).** On a clean Debian 12/13 or Ubuntu 22.04/24.04/26.04 server one command does everything
+**What the installer does for you (5.52.0).** On a clean Debian 12 or newer or Ubuntu 22.04 or newer server (run end to end on a real Debian 13 x86-64 server only) one command does everything
 in the list below that needs root, in the right order, and starts the backend:
 `curl -fsSLO https://github.com/ItsGambit/opa-compliance-wizard/releases/latest/download/get-ocw.sh && sudo bash get-ocw.sh`
 (see the README's [Installing on a server](../README.md#installing-on-a-server) for what is checked and what you trust). It installs
@@ -87,7 +87,7 @@ unit templates carry `__APP_UID__` and `__APP_USER_HOME__`; the installer fills 
 makes the nginx site from the release's template with your server name, the proxy secret and a certificate (yours, or a temporary
 self-signed one); starts the backend and checks it, also through nginx. The login gate is installed and enabled but **not started**:
 it refuses to start without the Okta settings, which you enter (steps 1-4 below; the last lines of the installer's output name the
-exact commands). Run it again after a failure and it resumes; it never overwrites a data or settings file.
+exact commands). Behind a proxy or with a mirror, pass the settings through sudo (`sudo https_proxy=... OCW_RELEASE_BASE_URL=... OCW_REVOCATION_URL=... bash get-ocw.sh --version X.Y.Z`); with a mirror also set `OCW_REVOCATION_URL` to a page you control, because a mirror answers for the revocation files too. Run it again after a failure and it resumes; it never overwrites a data or settings file.
 
 **By hand (other distributions, or to see what the installer does).** **First install: what the server needs** (Debian/Ubuntu commands; adapt
 for your distro). The hosted services can't start without these, and an

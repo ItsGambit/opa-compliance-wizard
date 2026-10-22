@@ -327,6 +327,7 @@ echo "{\"timestamp\":\"$NOW\",\"actor_email\":\"vm-test-admin@example.com\",\"ac
 chown "$TEST_USER:$TEST_USER" "$LEGACY/audit_log.jsonl"
 
 say "2. install.sh: dry run, then migration"
+umask 077   # as under `sudo bash get-ocw.sh`, which runs install.sh with this umask: install.sh must set the one it needs (5.52.0 blocker)
 UPDATER_CMD=/usr/local/bin/ocw-updater
 bash "$LEGACY/server/install.sh" --dry-run --app-user "$TEST_USER" > "$WORK/dryrun.txt"
 check "dry run printed a plan" grep -q "Dry run: nothing was changed" "$WORK/dryrun.txt"

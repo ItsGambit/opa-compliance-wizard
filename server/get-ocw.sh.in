@@ -6,7 +6,7 @@
 # This file is GENERATED for each release from server/get-ocw.sh.in (tools/release.py) and published, signed, next to the
 # release. Read it before you run it: it is meant to be short and plain. What it does, in order:
 #
-#   1. checks the system (Debian 12/13, Ubuntu 22.04/24.04/26.04, x86-64 or ARM, systemd, Python 3.9+, SQLite 3.35+, disk);
+#   1. checks the system (Debian 12 or newer, Ubuntu 22.04 or newer, x86-64 or ARM, systemd, Python 3.9+, SQLite 3.35+, disk);
 #   2. looks for an existing install and chooses what to do (a server that already has the upgrade layout is left alone);
 #   3. downloads the release and its signature into a root-only work directory, checks for a published key revocation,
 #      and VERIFIES the signature with the verifier embedded below (Python standard library; no minisign, no packages)
@@ -43,7 +43,9 @@
 #   --keep-work              keep the work directory (the verified release) after the run
 #   --log FILE               log file (default /var/log/ocw-install/<UTC time>.log, mode 0600)
 # Environment: OCW_RELEASE_BASE_URL (https mirror of .../releases/download; needs --version), OCW_REVOCATION_URL (an extra
-# https source for key revocations). https_proxy / no_proxy are honoured.
+# https source for key revocations; set it to the owner's page when you use a mirror, because a mirror also answers for the
+# revocation files). https_proxy / no_proxy are honoured. sudo resets the environment, so pass them through it:
+#   sudo https_proxy=https://proxy.example.com:3128 OCW_RELEASE_BASE_URL=https://mirror.example.com/x bash get-ocw.sh --version X.Y.Z
 #
 # Exit status: 0 done; 2 refused, nothing was changed; 3 failed, nothing was changed or everything was put back;
 # 4 failed, you must act (the message says what).
@@ -155,7 +157,7 @@ detect_system() {
     _systemd="${OCW_SYSTEMD_DIR:-$_systemd}"
     _need_free="${OCW_MIN_FREE_KB_TEST:-$_need_free}"
   fi
-  [ -r "$OS_RELEASE_FILE" ] || refuse "this system has no $OS_RELEASE_FILE, so it cannot be identified. Nothing was changed. This installer supports Debian 12/13 and Ubuntu 22.04/24.04/26.04; see docs/hosting.md for a manual install on another system."
+  [ -r "$OS_RELEASE_FILE" ] || refuse "this system has no $OS_RELEASE_FILE, so it cannot be identified. Nothing was changed. This installer supports Debian 12 or newer and Ubuntu 22.04 or newer; see docs/hosting.md for a manual install on another system."
   OS_ID="$(os_field ID | tr 'A-Z' 'a-z')"
   OS_VERSION_ID="$(os_field VERSION_ID)"
   OS_LIKE="$(os_field ID_LIKE | tr 'A-Z' 'a-z')"
@@ -185,7 +187,7 @@ detect_system() {
         *" rhel "* | *" fedora "* | *" centos "* | *" rocky "* | *" almalinux "* | *" amzn "*)
           refuse "this system is $OS_NAME. The Red Hat family is not supported by this installer yet (nginx configuration layout, SELinux). Nothing was changed. Follow docs/hosting.md by hand, or ask the project (open an issue and name the ID '$OS_ID'). The Docker image for servers without systemd is on the project's backlog." ;;
         *)
-          refuse "this system is $OS_NAME (ID '$OS_ID'), which this installer does not support (it supports Debian 12/13 and Ubuntu 22.04/24.04/26.04). Nothing was changed. See docs/hosting.md for a manual install; the Docker image for servers without systemd is on the project's backlog, and a laptop install uses 'python launch.py' (README)." ;;
+          refuse "this system is $OS_NAME (ID '$OS_ID'), which this installer does not support (it supports Debian 12 or newer and Ubuntu 22.04 or newer). Nothing was changed. See docs/hosting.md for a manual install; the Docker image for servers without systemd is on the project's backlog, and a laptop install uses 'python launch.py' (README)." ;;
       esac ;;
   esac
   case "$_arch" in
@@ -239,6 +241,11 @@ EOF
   for _cmd in tar sed awk find id useradd runuser loginctl systemctl cmp diff df grep mktemp; do
     command -v "$_cmd" >/dev/null 2>&1 || { [ -n "$TESTING" ] && [ "$_cmd" = "runuser" ]; } || refuse "the command '$_cmd' is missing. Nothing was changed. Install it (it is part of the base system on Debian and Ubuntu) and run this again."
   done
+  if [ -n "$UNINSTALL" ]; then
+    # removing the software needs neither packages nor free space (it frees some)
+    say "ok  system: $OS_NAME ($_arch), systemd, Python $PY_VERSION (uninstall: disk space and packages are not checked)"
+    return 0
+  fi
   command -v apt-get >/dev/null 2>&1 || refuse "apt-get was not found, so the packages this needs cannot be installed. Nothing was changed. See docs/hosting.md."
   local _free_opt _free_data
   _free_opt="$(free_kb "$OPT_DIR")"
@@ -308,6 +315,11 @@ fetch_to() { # fetch_to <url> <out> <max bytes> [extra allowed host]: 0 ok, 20 n
   run_verifier fetch "$1" "$2" --max-bytes "$3" "${_hosts[@]}"
 }
 
+check_version_format() { # a release version is three numbers: nothing else reaches a file name, a URL or a message
+  local _re='^[0-9]+\.[0-9]+\.[0-9]+$'
+  [[ "$1" =~ $_re ]] || refuse "'$1' is not a version like 5.52.0. Nothing was changed."
+}
+
 resolve_and_download() {
   local _v _rc=0 _tar _sig _src
   mkdir -m 0700 "$WORK_DIR/dl"
@@ -330,6 +342,7 @@ resolve_and_download() {
     _v="$(basename -- "$_src")"
     _v="${_v#ocw-}"
     _v="${_v%.tar.gz}"
+    check_version_format "$_v"
     if [ -n "$VERSION" ] && [ "$VERSION" != "$_v" ]; then refuse "--version $VERSION does not match the file in --from-dir ($_v). Nothing was changed."; fi
     VERSION="$_v"
     TAR_FILE="$WORK_DIR/dl/ocw-$VERSION.tar.gz"
@@ -352,16 +365,12 @@ resolve_and_download() {
     if [ "$_rc" -ne 0 ]; then
       _src="$(head -c 400 "$WORK_DIR/dl/err" 2>/dev/null || true)"
       say_err "failed: could not find out which release is the latest: $_src"
-      say_err "Nothing was changed. Check that this server can reach github.com (https_proxy if you use a proxy), or name the release with --version X.Y.Z."
+      say_err "Nothing was changed. Check that this server can reach github.com (behind a proxy: sudo https_proxy=https://proxy.example.com:3128 bash get-ocw.sh ..., because sudo resets the environment), or name the release with --version X.Y.Z."
       exit 3
     fi
     VERSION="$(run_verifier manifest-version "$WORK_DIR/dl/latest-manifest.json")" || refuse "the release server's manifest.json did not name a version. Nothing was changed. Name the release with --version X.Y.Z."
   fi
-  case "$VERSION" in
-    [0-9]*.[0-9]*.[0-9]*) ;;
-    *) refuse "'$VERSION' is not a version like 5.52.0. Nothing was changed." ;;
-  esac
-  case "$VERSION" in *[!0-9.]* | *..* | .* | *.) refuse "'$VERSION' is not a version like 5.52.0. Nothing was changed." ;; esac
+  check_version_format "$VERSION"
   TAR_FILE="$WORK_DIR/dl/ocw-$VERSION.tar.gz"
   SIG_FILE="$TAR_FILE.minisig"
   say "     downloading release $VERSION and its signature"
@@ -373,7 +382,7 @@ resolve_and_download() {
     _src="$(head -c 400 "$WORK_DIR/dl/err" 2>/dev/null || true)"
     [ "$_rc" -ne 20 ] || _src="release $VERSION was not found ($_src)"
     say_err "failed: could not download the release: $_src"
-    say_err "Nothing was changed. Check the version exists and that this server can reach the release host (https_proxy if you use a proxy), or bring the files and use --from-dir."
+    say_err "Nothing was changed. Check the version exists and that this server can reach the release host (behind a proxy: sudo https_proxy=https://proxy.example.com:3128 bash get-ocw.sh ..., because sudo resets the environment), or bring the files and use --from-dir."
     exit 3
   fi
   _rc=0
@@ -656,7 +665,12 @@ main() {
   esac
   case "$MODE" in
     migrate) say "ok  existing install: an in-home install at $LEGACY_FOUND (it will be migrated; its data is copied and checked, nothing is deleted)" ;;
-    fresh-resume) say "ok  existing install: an unfinished earlier install in $OPT_DIR (it will be resumed; nothing under $DATA_DIR is overwritten)" ;;
+    fresh-resume)
+      if [ -L "$OPT_DIR/current" ] && [ ! -e "$OPT_DIR/.fresh-install-incomplete" ]; then
+        say "ok  existing install: a layout in $OPT_DIR without its ocw-updater command (it will be repaired; nothing under $DATA_DIR is overwritten)"
+      else
+        say "ok  existing install: an unfinished earlier install in $OPT_DIR (it will be resumed; nothing under $DATA_DIR is overwritten)"
+      fi ;;
     fresh) say "ok  existing install: none found (a fresh install)" ;;
     *) ;;
   esac

@@ -296,6 +296,32 @@ def cmd_record_release(a):
     return 0
 
 
+def cmd_keep_revocation(a):
+    """Copy a verified revocation into a root-owned, world-readable directory (default <opt>/updater/revocations) so the
+    application account can read it (`ocw-updater trust apply` hands it to the application's own CLI). Written with
+    O_NOFOLLOW|O_EXCL: a link planted at the destination is refused and nothing is written."""
+    name = os.path.basename(a.src)
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.json$", name):
+        raise Refuse(f"'{name}' is not a usable revocation file name")
+    with open(a.src, "rb") as fh:
+        data = fh.read(70000)
+    if os.path.islink(a.dest_dir):
+        raise Refuse(f"{a.dest_dir} is a link")
+    os.makedirs(a.dest_dir, mode=0o755, exist_ok=True)
+    os.chmod(a.dest_dir, 0o755)
+    dest = os.path.join(a.dest_dir, name)
+    try:
+        create_private_file(dest, data, 0o644, 0 if not TESTING else None, 0 if not TESTING else None)
+    except FileExistsError:
+        if os.path.islink(dest) or not os.path.isfile(dest):
+            raise Refuse(f"{dest} exists and is not a regular file (a link?)")
+        with open(dest, "rb") as fh:
+            if fh.read(70001) != data:
+                raise Refuse(f"{dest} exists with different content")
+    print(dest)
+    return 0
+
+
 def _openssl(args, data=None):
     return subprocess.run(["openssl", *args], input=data, capture_output=True, timeout=60)
 
@@ -372,6 +398,10 @@ def build_parser():
     s.add_argument("--info", required=True)
     s.add_argument("--stamp", required=True)
     s.set_defaults(fn=cmd_record_release)
+    s = sub.add_parser("keep-revocation")
+    s.add_argument("--src", required=True)
+    s.add_argument("--dest-dir", required=True)
+    s.set_defaults(fn=cmd_keep_revocation)
     s = sub.add_parser("check-cert")
     s.add_argument("--cert", required=True)
     s.add_argument("--key", required=True)

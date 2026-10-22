@@ -74,6 +74,10 @@
 #
 # Exit status: 0 done; 2 refused, nothing was changed; 3 failed and everything was put back; 4 failed, an operator must act.
 set -euo pipefail
+# The release tree, the virtualenv and every directory this makes must be readable by the application account whatever umask the
+# caller has (get-ocw.sh runs with 077): 022 here, and every secret-bearing write below sets its own mode explicitly (0600/0640
+# from the first byte, or inside a `umask 077` subshell).
+umask 022
 
 # The release whose install.sh an EXISTING install needs (tools/release.py reads this line into the manifest's
 # install_sh_min_version; the updater asks for `install.sh --refresh-updater` only while the version it last recorded is older).
@@ -289,17 +293,21 @@ uninstall_keep_data() {
   rm -f -- "$BIN_DIR/ocw-updater" "$UPDATER_ENV"
   if [ -z "$_kept_site" ] && { [ -e "$_site" ] || [ -L "$_enabled" ]; }; then
     note "==> nginx"
-    local _keep="$_site.uninstall-keep.$$" _had_link=""
+    local _keep="$_site.uninstall-keep.$$" _had_link="" _enabled_ours=1
     [ ! -f "$_site" ] || cp -p "$_site" "$_keep"
-    [ ! -L "$_enabled" ] || _had_link="$(readlink "$_enabled")"
-    rm -f -- "$_enabled" "$_site"
+    if [ -L "$_enabled" ]; then
+      _had_link="$(readlink "$_enabled")"
+      if [ "$_had_link" != "$_site" ]; then note "NOTE: $_enabled points to $_had_link, not to this application's site: it was left in place"; _enabled_ours=""; fi
+    fi
+    if [ -n "$_enabled_ours" ]; then rm -f -- "$_enabled"; fi
+    rm -f -- "$_site"
     if ! command -v nginx >/dev/null 2>&1 || nginx -t >/dev/null 2>&1; then
       systemctl reload nginx >/dev/null 2>&1 || note "NOTE: nginx did not reload; run 'sudo systemctl reload nginx' yourself"
       rm -f -- "$_keep"
       note "    removed $_site and $_enabled"
     else
       [ ! -f "$_keep" ] || mv -- "$_keep" "$_site"
-      [ -z "$_had_link" ] || ln -sfn "$_had_link" "$_enabled"
+      [ -z "$_had_link" ] || [ -z "$_enabled_ours" ] || ln -sfn "$_had_link" "$_enabled"
       note "WARNING: 'nginx -t' failed without the site, so it was put back. Fix nginx's configuration and remove the site by hand."
     fi
   fi
@@ -311,6 +319,7 @@ uninstall_keep_data() {
   fi
   note ""
   note "Done. The software is removed. Kept: $DATA_DIR (data), $ENV_FILE, $SESSION_KEY_FILE, $NGINX_SSL_DIR, the account that ran the application, the packages."
+  note "Lingering stays on for $APP_USER (its account is kept); 'loginctl disable-linger $APP_USER' ends it when you remove the account."
   note "Installing again with get-ocw.sh finds the data and the settings and uses them. Removing the data too is a manual step (docs/hosting.md, Uninstalling):"
   note "it deletes the only copy of the archive and audit log, so be sure you have a backup."
 }
@@ -607,7 +616,7 @@ if [ -n "$REMOVE_SUDOERS" ]; then
 else
   plan "leave any old deploy sudoers lines alone (add --remove-legacy-sudoers to remove them)"
 fi
-[ "${#REVOCATIONS[@]}" -eq 0 ] || plan "apply ${#REVOCATIONS[@]} verified key revocation(s) to root's trust list and keep them for the application (upgrade/revocations)"
+[ "${#REVOCATIONS[@]}" -eq 0 ] || plan "apply ${#REVOCATIONS[@]} verified key revocation(s) to root's trust list and to the application's key list (a root-owned copy in $OPT_DIR/updater/revocations)"
 plan "enable ocw-upgrade.path and ocw-upgrade.service (boot-time resume)"
 # every unit that would be rewritten must have the lines the rewrite works from: checked now, on a scratch copy, so a
 # surprising unit stops the run (the dry run too) before anything has been changed
@@ -716,8 +725,12 @@ fresh_account() { # the application account, its lingering user manager, and the
 
 fresh_home() { # the directory the keyring daemon writes (the units' ReadWritePaths= names it, so it must exist)
   local _d
-  for _d in "$APP_HOME" "$APP_HOME/.local" "$APP_HOME/.local/share" "$APP_HOME/.local/share/keyrings"; do
-    [ -d "$_d" ] || mkd "$APP_USER:$APP_GROUP" 0700 "$_d"
+  [ -d "$APP_HOME" ] || mkd "$APP_USER:$APP_GROUP" 0700 "$APP_HOME"
+  # below the home, which the application account owns, root creates nothing: each level is made BY that account, one at a
+  # time, and a link anywhere on the way is refused (root following a planted link would write somewhere it must not)
+  for _d in "$APP_HOME/.local" "$APP_HOME/.local/share" "$APP_HOME/.local/share/keyrings"; do
+    [ ! -L "$_d" ] || die "$_d is a link; move it aside and run the same command again (the installer will not create directories through it)"
+    [ -d "$_d" ] || run_as "$APP_USER" mkdir -m 0700 "$_d" || die "could not create $_d as $APP_USER"
   done
 }
 
@@ -807,6 +820,10 @@ install_app_unit() { # install_app_unit <file name>: rendered from the release's
   note "    installed $_dst"
 }
 
+app_can_run_release() { # the application account must be able to exec the interpreter and read the application
+  run_as "$APP_USER" sh -c 'test -x "$1" && test -r "$2" && test -x "$3"' sh "$OPT_DIR/current/.venv/bin/python" "$OPT_DIR/current/server/serve.py" "$OPT_DIR/current/server/start-headless.sh"
+}
+
 fresh_health() { # true when the backend is active with no restarts and answers (and nginx answers /healthz)
   local _try _bad _hargs
   _hargs=(health --port "$CONF_PORT" --version "$VERSION")
@@ -824,14 +841,16 @@ fresh_health() { # true when the backend is active with no restarts and answers 
 }
 
 apply_revocations() { # verified key revocations: root's trust list now, the application's key state through its own CLI
-  local _r
+  local _r _kept
   [ "${#REVOCATIONS[@]}" -gt 0 ] || return 0
+  HELPERS_RUN="$SOURCE_DIR/server/install_helpers.py"
   note "==> Key revocations"
   for _r in "${REVOCATIONS[@]}"; do
     [ -f "$_r" ] || die "the revocation file $_r does not exist"
-    "$PY3" -I "$OPT_DIR/updater/ocw_activate.py" cli trust apply "$_r" || die "could not apply the verified key revocation $_r to root's trust list (above)"
-    cp -- "$_r" "$DATA_DIR/upgrade/revocations/$(basename -- "$_r")"
-    own root:root 0644 "$DATA_DIR/upgrade/revocations/$(basename -- "$_r")"
+    # a root-owned, world-readable copy (never inside the application's directories): the application's own CLI, run as its
+    # account by `trust apply`, must be able to open it
+    _kept="$("$PY3" -I "$HELPERS_RUN" keep-revocation --src "$_r" --dest-dir "$OPT_DIR/updater/revocations")" || die "could not keep a copy of the verified key revocation $_r (above)"
+    "$PY3" -I "$OPT_DIR/updater/ocw_activate.py" cli trust apply "$_kept" || die "could not apply the verified key revocation $_r to root's trust list (above)"
   done
 }
 
@@ -854,6 +873,7 @@ fresh_finish() { # after the layout, the updater and its units are in place: set
   systemctl daemon-reload
   systemctl enable opa-compliance-wizard opa-auth-gate >/dev/null 2>&1 || note "WARNING: could not enable opa-compliance-wizard / opa-auth-gate"
   fresh_wait_runtime
+  app_can_run_release || die "the account $APP_USER cannot run the installed release at $OPT_DIR/current (it cannot execute .venv/bin/python or read the application's files), so the backend was not started. Something was changed: the account, directories, settings file and units exist. Fix the modes along the path ('namei -l $OPT_DIR/current/.venv/bin/python' shows them) and run the same command again; it resumes."
   note "==> Starting the backend"
   systemctl start opa-compliance-wizard || note "WARNING: systemctl start opa-compliance-wizard reported a failure (the check below says whether it came up)"
   if ! fresh_health; then

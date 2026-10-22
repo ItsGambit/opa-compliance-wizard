@@ -68,6 +68,7 @@ def full_tree_files():
                  "ocw-updater.sh", "install.sh", "nginx_second_site.py", "opa-compliance-wizard.service", "opa-auth-gate.service", "start-headless.sh",
                  "nginx-opa-secrets-wizard.conf", "install_helpers.py"):
         files[f"server/{name}"] = (REPO / "server" / name).read_bytes()
+    files["server/serve.py"] = b"# the application\n"
     files["requirements.lock"] = b"# empty on purpose\n"
     return files
 
@@ -711,3 +712,44 @@ def test_end_to_end_with_the_real_installer_and_no_secret_in_the_output_or_the_l
     finally:
         srv.shutdown()
         del socket
+
+
+# --- review round: small honesty and robustness points ----------------------------------------------------------------------------
+
+
+def test_uninstall_is_not_refused_by_the_disk_or_package_checks(bw):
+    rel = bw.opt / "releases" / "5.52.0" / "server"
+    rel.mkdir(parents=True)
+    (rel / "install.sh").write_text(STUB_INSTALL)
+    (bw.opt / "current").symlink_to("releases/5.52.0")
+    (bw.stub / "bin" / "apt-get").unlink()
+    p = bw.run("--uninstall", "--keep-data", "--yes", extra_env={"OCW_MIN_FREE_KB_TEST": "999999999999"})
+    assert p.returncode == 0, p.stderr + p.stdout
+    assert "disk space and packages are not checked" in p.stdout
+
+
+def test_from_dir_checks_the_version_in_the_file_name(bw):
+    tar, sig = bw.publish()
+    d = bw.w / "usb"
+    d.mkdir()
+    shutil.copy(tar, d / "ocw-1.2.3-x;y.tar.gz")
+    p = bw.run("--from-dir", str(d), "--yes", "--server-name", "a.example.com", "--self-signed")
+    assert p.returncode == 2 and "is not a version like 5.52.0" in p.stderr
+
+
+def test_a_layout_without_its_command_is_called_a_repair_not_a_resume(bw):
+    bw.publish()
+    (bw.opt / "releases" / "5.51.0").mkdir(parents=True)
+    (bw.opt / "current").symlink_to("releases/5.51.0")
+    p = bw.run("--dry-run", "--server-name", "a.example.com", "--self-signed")
+    assert p.returncode == 0 and "without its ocw-updater command (it will be repaired" in p.stdout and "unfinished earlier install" not in p.stdout
+
+
+def test_the_same_revocation_from_two_sources_is_not_reported_as_a_replay_attack(bw):
+    bw.publish()
+    bw.revocation(1, revoke=bw.key.key_id, add=TestKey(), known_good={"5.52.0": hashlib.sha256(Path(bw.releases["5.52.0"][0]).read_bytes()).hexdigest()})
+    shutil.copy(bw.w / "rev-1" / "revocation.json", bw.w / "same.json")
+    bw.server.respond("/gh/download/revocation-1/revocation.json", body=(bw.w / "same.json").read_bytes())
+    p = bw.run("--dry-run", "--server-name", "a.example.com", "--self-signed")
+    assert p.returncode == 0, p.stderr + p.stdout
+    assert "the same revocation was already applied from another source" in p.stdout and "replayed" not in p.stdout
