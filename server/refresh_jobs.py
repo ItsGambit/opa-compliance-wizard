@@ -214,6 +214,23 @@ OPA_STEP_NOUNS = {
 }
 
 
+def plain_error(error_class):
+    """What a person reads for an upstream failure: "HTTP 500", "a network error" or "an unexpected error", never a Python class name.
+    `error_class` is the audit summary ("OpaApiError: 500"); the audit log keeps that form, the screens do not."""
+    tail = str(error_class or "").rpartition(": ")[2].strip()
+    if tail.isdigit():
+        return f"HTTP {tail}"
+    if tail == "network":
+        return "a network error"
+    return "an unexpected error"
+
+
+def audit_line(kind, error_class):
+    """The Explorer panel's "Audit Log: access_scan.failed (HTTP 403)" line."""
+    what = {"redaction": "a value shaped like a credential", "cancelled": "stopped"}.get(kind) or plain_error(error_class)
+    return f"access_scan.failed ({what})"
+
+
 def _previous(previous_built_at):
     """What is still true after a failed scan, for the sentence 'Nothing was changed: <this>.'"""
     return (f"the scan from {format_time(previous_built_at)} is still shown and stored" if previous_built_at
@@ -250,7 +267,7 @@ def opa_failure(kind, status, failed_step, previous_built_at, error_class, key_p
                          "To fix: report this to the maintainers with the key path.")
     if kind == "cancelled":
         return "cancelled", f"Stopped before the scan finished. Nothing was changed: {keep}."
-    return "error", (f"OPA did not answer as expected ({error_class}). Nothing was changed: {keep}. "
+    return "error", (f"OPA did not answer as expected ({plain_error(error_class)}). Nothing was changed: {keep}. "
                      "To fix: try again; if it keeps failing, check the OPA host and the server's network.")
 
 

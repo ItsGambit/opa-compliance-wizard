@@ -810,6 +810,39 @@ def test_a_refused_scan_message_leads_with_what_happened_then_nothing_changed_th
     rig.builder = lambda client, okta_client=None, on_progress=None: (
         on_progress("users", "start", None), (_ for _ in ()).throw(engine.OpaApiError(403, "https://x.example.com/u", "denied")))[1]
     data = rig.run(["opa"]).status_view()["parts"]["opa"]
-    assert data["state"] == "refused" and data["audit_line"] == "access_scan.failed (OpaApiError: 403)"
+    assert data["state"] == "refused" and data["audit_line"] == "access_scan.failed (HTTP 403)"
     assert data["message"].startswith("OPA refused the service key when listing users (HTTP 403). Nothing was changed: no scan is stored yet")
     assert "To fix: open Environments and check the service key" in data["message"] and data["message"].endswith("Then retry.")
+
+
+
+# -- F2: no exception class names in what a person reads -------------------------------------------------------------------------------
+def test_an_opa_5xx_says_http_500_not_a_class_name(rig):  # noqa: F811
+    rig.builder = lambda *a, **k: (_ for _ in ()).throw(engine.OpaApiError(500, "https://x.example.com/p", "boom"))
+    data = rig.run(["opa"]).status_view()["parts"]["opa"]
+    assert data["state"] == "error" and data["message"].startswith("OPA did not answer as expected (HTTP 500).")
+    assert data["audit_line"] == "access_scan.failed (HTTP 500)"
+    assert "OpaApiError" not in json.dumps(data)
+
+
+def test_a_network_failure_and_an_unexpected_error_are_described_in_words(rig):  # noqa: F811
+    rig.builder = lambda *a, **k: (_ for _ in ()).throw(engine.OpaApiError(engine.API_STATUS_NETWORK, "u", "x"))
+    assert "(a network error)" in rig.run(["opa"]).status_view()["parts"]["opa"]["message"]
+    rig.builder = lambda *a, **k: (_ for _ in ()).throw(KeyError("odd"))
+    data = rig.run(["opa"]).status_view()["parts"]["opa"]
+    assert "KeyError" not in json.dumps(data) and "an unexpected error" in data["message"] or data["message"].startswith("Internal error")
+
+
+def test_no_part_or_sub_message_of_a_failed_refresh_names_an_exception_class(rig):  # noqa: F811
+    import re
+    class Boom(SyncOkta):
+        def get_system_log(self, **k):
+            raise engine.OktaApiError(500, "https://example.okta.com/x", "boom")
+
+        def count_okta_objects(self, *a, **k):
+            raise RuntimeError("counting broke")
+    rig.okta = Boom()
+    rig.builder = lambda *a, **k: (_ for _ in ()).throw(engine.OpaApiError(502, "u", "x"))
+    view = rig.run().status_view()
+    texts = [view["parts"][p].get("message", "") for p in rj.PARTS] + [v.get("message", "") for v in view["parts"]["okta"]["sub"].values()] + [view["parts"]["opa"].get("audit_line", "")]
+    assert not [t for t in texts if re.search(r"\b[A-Za-z]+(Error|Exception)\b", t)], texts

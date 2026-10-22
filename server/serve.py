@@ -1619,7 +1619,7 @@ def _refresh_part_opa(job, ctx):
         state, message = rj.opa_failure(entry.get("error_kind") or "error", entry.get("error_status"), entry.get("failed_step"),
                                         previous_at, entry.get("error_class") or "an error", entry.get("key_path"))
         job.finish(part, state, message, steps=steps, previous_built_at=previous_at,
-                   audit_line=f"access_scan.failed ({entry.get('error_class') or 'cancelled'})")
+                   audit_line=rj.audit_line(entry.get("error_kind") or "error", entry.get("error_class")))
 
 
 # -- the log part ------------------------------------------------------------------------------------------------------
@@ -1675,7 +1675,7 @@ def _refresh_part_log(job, ctx):
         elif error_status in (401, 403):
             state, message = rj.log_failure("refused", error_status)
         else:
-            safe = entry.get("error") if (entry.get("error_deliberate") or "error_class" not in entry) else entry.get("error_class")
+            safe = entry.get("error") if (entry.get("error_deliberate") or "error_class" not in entry) else rj.plain_error(entry.get("error_class"))
             state, message = rj.log_failure("error", error_status, safe)
         job.finish(part, state, message, steps=steps)
 
@@ -1749,7 +1749,7 @@ def _refresh_part_okta(job, ctx):
             job.set_sub(sub, "cancelled", rj.cancelled_message())
             raise
         except Exception as exc:
-            message_out = _job_error_message(exc) if isinstance(exc, ValueError) else f"{rj.OKTA_SUB_LABELS[sub]} failed ({_failure_summary(exc)}). Nothing was changed."
+            message_out = _job_error_message(exc) if isinstance(exc, ValueError) else f"{rj.OKTA_SUB_LABELS[sub]} failed ({rj.plain_error(_failure_summary(exc))}). Nothing was changed."
             _release_capture(env_id, kind, message_out)
             engine.log("WARN", f"Okta {sub} capture for '{ctx['env_name']}' failed: {type(exc).__name__}")
             _audit_for(audit, "okta_snapshot.failed", {"kind": kind, "error": _failure_summary(exc)})
