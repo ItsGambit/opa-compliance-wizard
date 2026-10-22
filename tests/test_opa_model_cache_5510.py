@@ -206,9 +206,9 @@ def test_environments_never_share_a_scan(db):
 
 
 def test_a_scan_built_by_another_model_shape_is_treated_as_absent(db):
-    audit_store.store_opa_model_cache(ENV, _model(), source_version="5.52.0")
+    audit_store.store_opa_model_cache(ENV, _model(), source_version="5.53.0")
     assert audit_store.load_opa_model_cache(ENV) is None and audit_store.opa_model_cache_info(ENV) is None
-    audit_store.store_opa_model_cache(ENV, _model(), source_version="5.51.7")  # a patch release shares the shape
+    audit_store.store_opa_model_cache(ENV, _model(), source_version="5.52.7")  # a patch release shares the shape
     assert audit_store.load_opa_model_cache(ENV) is not None
 
 
@@ -451,3 +451,52 @@ def test_digests_and_ordinary_text_store(fine):
     assert len(fine) != 42
     out = engine.redact_model_for_storage(_model(servers=[{"id": "s1", "hostname": "web-01", "details": {"owner_note": fine}}]))
     assert out["servers"][0]["details"]["owner_note"] == fine
+
+
+# -- 5.52.0 hardening (H1-H3) -----------------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("key", ["api_key", "apikey", "secret_key", "access_key", "passwd", "API_KEY"])
+def test_more_credential_keys_are_dropped_at_any_depth(key):
+    model = _model(servers=[{"id": "s1", "hostname": "web-01", key: "x", "details": {"deep": {key: "x", "keep": "ok"}},
+                             "labels": {"inner": {key: "x", "other": "fine"}}}])
+    out = engine.redact_model_for_storage(model)
+    server = out["servers"][0]
+    assert key not in server and key not in server["details"]["deep"] and key not in server["labels"]["inner"]
+    assert server["details"]["deep"]["keep"] == "ok" and server["labels"]["inner"]["other"] == "fine"
+
+
+def test_a_name_like_key_still_covers_a_string_or_a_list_of_strings_directly_under_it():
+    out, hits = engine.redact_model_for_storage_report(_model(servers=[{"id": "s1", "labels": {"env": LONG_NAME, "more": [LONG_NAME]}, "tags": [LONG_NAME]}]))
+    assert hits == [] and out["servers"][0]["labels"]["env"] == LONG_NAME and out["servers"][0]["labels"]["more"] == [LONG_NAME]
+
+
+def test_a_nested_object_under_a_name_like_key_does_not_inherit_name_status():
+    with pytest.raises(engine.ModelRedactionError) as caught:
+        engine.redact_model_for_storage(_model(servers=[{"id": "s1", "labels": {"inner": {"blob": LONG_SECRET}}}]))
+    assert caught.value.key_path == "servers[0].labels.inner.blob" and LONG_SECRET not in str(caught.value)
+
+
+def test_a_list_of_objects_under_a_name_like_key_does_not_inherit_name_status():
+    with pytest.raises(engine.ModelRedactionError):
+        engine.redact_model_for_storage(_model(servers=[{"id": "s1", "tags": [{"blob": LONG_SECRET}]}]))
+
+
+def test_an_api_key_nested_under_a_name_like_key_is_dropped_not_refused():
+    out = engine.redact_model_for_storage(_model(servers=[{"id": "s1", "labels": {"inner": {"api_key": LONG_SECRET}}}]))
+    assert out["servers"][0]["labels"]["inner"] == {} and LONG_SECRET not in json.dumps(out)
+
+
+@pytest.mark.parametrize("after_prefix,refused", [(40, True), (42, True), (44, True), (45, False)])
+def test_an_okta_token_shape_is_40_to_44_characters_after_00(after_prefix, refused):
+    token = "00" + ("aB3_-" * 10)[:after_prefix]
+    record = {"id": "s1", "details": {"owner_note": f"token {token} end"}}
+    if refused:
+        with pytest.raises(engine.ModelRedactionError):
+            engine.redact_model_for_storage(_model(servers=[record]))
+    else:
+        assert engine.redact_model_for_storage(_model(servers=[record]))["servers"][0]["details"]["owner_note"].find(token) > 0
+
+
+@pytest.mark.parametrize("digest", ["00" + "a1b2c3d4" * 7 + "a1b2c3", "0f" * 20, "00" + "9f" * 19])
+def test_a_sha1_and_a_64_hex_digest_still_store_with_the_wider_token_shape(digest):
+    out = engine.redact_model_for_storage(_model(servers=[{"id": "s1", "details": {"owner_note": digest}}]))
+    assert out["servers"][0]["details"]["owner_note"] == digest

@@ -1488,6 +1488,8 @@ def _supervise(job, lanes):
     grace_until = {}
     while _refresh_current(job):
         for part in job.overdue():
+            if job.is_cancelled():
+                break  # a Stop that landed before the deadline is a Stop: the part ends at its checkpoint as "cancelled", not "timed_out"
             minutes = rj.PART_DEADLINES_SECS[part] // 60
             if job.finish(part, "timed_out", rj.timed_out_message(part, minutes)):
                 job.cancel_events[part].reason = "timed_out"  # so the sync can record a deadline, not a Stop
@@ -1558,7 +1560,7 @@ def _persist_last_refresh(job, finished_at=None):
     log_state = view["parts"].get("log", {}).get("state") if "log" in job.parts else None
     if log_state == "timed_out":  # consecutive runs whose log part hit its deadline (the Overview names a pattern, not one slow run)
         stored["log_timeouts"] = int(stored.get("log_timeouts") or 0) + 1
-    elif log_state == "ok":
+    elif log_state:  # any other outcome of the log part (ok, error, cancelled, skipped) ends the streak: it counts runs IN A ROW
         stored["log_timeouts"] = 0
     audit_store._upsert_sync_state(audit_store._get_connection(), job.environment_id, last_refresh_json=json.dumps(stored, sort_keys=True))
 
