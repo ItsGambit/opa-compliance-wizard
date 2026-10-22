@@ -19,7 +19,12 @@
 #   /usr/local/bin/ocw-updater             the operator's command
 #
 # Three situations, detected automatically:
-#   fresh install     no layout and no running install: installs the release in this checkout.
+#   fresh install     no layout and no running install: installs the release in this checkout AND makes the server work
+#                     (5.52.0): the application account (--create-app-user), lingering, the environment file with generated
+#                     secrets, the two application units (the login gate is enabled, not started: it needs your Okta
+#                     settings), the nginx site and a TLS certificate, the session key; starts the backend and checks it.
+#                     Resumable: a second run after a failure repairs what is missing and never overwrites a data or
+#                     settings file. Needs --server-name HOST (or --no-nginx) and a certificate choice (see below).
 #   migration         an existing in-home install (the usual one, from docs/hosting.md): moves its data files, rewrites the
 #                     units' WorkingDirectory / ReadWritePaths (the keyring and /run/user carve-outs are kept exactly:
 #                     see the ProtectHome incident in the unit's comments), restarts, checks health and puts everything
@@ -43,10 +48,31 @@
 #                              Touches no data. This is the command a refused upgrade asks for ("needs_install_sh").
 #   --regenerate-second-sites  regenerate the nginx site of every additional login gate (opa-auth-gate-*) from the live main site
 #                              with this release's deny rules (every denied route), with `nginx -t` first and a restore on failure
-#   --yes                      do not ask for confirmation
+#   --yes                      do not ask for confirmation (a fresh install must then name its certificate choice)
+#
+# Fresh install (5.52.0):
+#   --create-app-user          create the application account if it does not exist (default name ocw; a regular account with
+#                              its home under the data directory, shell nologin, lingering on); refuses root
+#   --server-name HOST         the public DNS name or IP address (nginx server_name, DASHBOARD_ORIGIN, certificate name)
+#   --no-nginx                 do not set up nginx (another proxy or a tunnel fronts the application); the site template path
+#                              is printed
+#   --cert FILE --key FILE     use this TLS certificate and key (copied to /etc/nginx/ssl, mode 0600)
+#   --self-signed              make a temporary self-signed certificate (825 days; browsers warn until a trusted one is installed)
+#   --backend-port N           the application's port on 127.0.0.1 (default 8766)
+#   --release-info FILE        the verification result of get-ocw.sh: recorded as the release's provenance
+#   --revocation FILE          a verified key revocation to apply to root's trust list and hand to the application (repeatable)
+#   --release-base-url URL     the https mirror the updater should use (written to the updater's settings)
+#   --revocation-url URL       an owner-controlled https source for key revocations (written to the settings files)
+#   --log FILE                 append everything this prints to FILE (created 0600)
+#   --uninstall --keep-data    remove the software (units, command, /opt tree, updater, its account, the nginx site) after you type
+#                              UNINSTALL; the data directory, environment file, session key, TLS files, application account and
+#                              packages stay. Removing the data is a manual step (docs/hosting.md).
 #
 # Everything below that is a path can be redirected for testing (OCW_OPT_DIR, OCW_DATA_DIR, OCW_UNIT_DIR, OCW_BIN_DIR,
-# OCW_ENV_FILE, OCW_SUDOERS_DIR, OCW_ARTIFACTS_DIR); a test run also sets OCW_INSTALL_TEST=1 to skip root-only steps.
+# OCW_ENV_FILE, OCW_SUDOERS_DIR, OCW_ARTIFACTS_DIR, OCW_NGINX_SITES_DIR, OCW_NGINX_ENABLED_DIR, OCW_NGINX_SSL_DIR,
+# OCW_SESSION_KEY_FILE); a test run also sets OCW_INSTALL_TEST=1 to skip root-only steps.
+#
+# Exit status: 0 done; 2 refused, nothing was changed; 3 failed and everything was put back; 4 failed, an operator must act.
 set -euo pipefail
 
 OPT_DIR="${OCW_OPT_DIR:-/opt/opa-compliance-wizard}"
@@ -57,6 +83,9 @@ ENV_FILE="${OCW_ENV_FILE:-/etc/opa-compliance-wizard.env}"
 NGINX_SITES_DIR="${OCW_NGINX_SITES_DIR:-/etc/nginx/sites-available}"
 SUDOERS_DIR="${OCW_SUDOERS_DIR:-/etc/sudoers.d}"
 ARTIFACTS_DIR="${OCW_ARTIFACTS_DIR:-/var/lib/ocw-updater/artifacts}"
+NGINX_ENABLED_DIR="${OCW_NGINX_ENABLED_DIR:-/etc/nginx/sites-enabled}"
+NGINX_SSL_DIR="${OCW_NGINX_SSL_DIR:-/etc/nginx/ssl}"
+SESSION_KEY_FILE="${OCW_SESSION_KEY_FILE:-/etc/opa-secrets-wizard-session.key}"
 UPDATER_ENV="${OCW_UPDATER_ENV:-/etc/ocw-updater.env}"
 UPDATER_USER="ocw-updater"
 TESTING="${OCW_INSTALL_TEST:-}"
@@ -71,9 +100,27 @@ REMOVE_SUDOERS=""
 APPLY_NGINX=""
 REFRESH_UPDATER=""
 REGEN_SECOND=""
+CREATE_APP_USER=""
+SERVER_NAME=""
+BACKEND_PORT_ARG=""
+NO_NGINX=""
+CERT_FILE=""
+KEY_FILE=""
+SELF_SIGNED=""
+RELEASE_INFO=""
+REVOCATIONS=()
+LOG_FILE=""
+UNINSTALL=""
+KEEP_DATA=""
+RELEASE_BASE_URL_ARG=""
+REVOCATION_URL_ARG=""
+ORIG_ARGS=("$@")
 
-usage() { sed -n '2,50p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
-die() { echo "ERROR: $*" >&2; exit 1; }
+usage() { sed -n '2,/^set -euo pipefail/{/^set -euo pipefail/!p;}' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+# 2 = refused before anything was changed; the "doing it" part raises it to 4 (an operator must act); a rolled-back
+# migration exits 3
+DIE_CODE=2
+die() { echo "ERROR: $*" >&2; exit "$DIE_CODE"; }
 note() { echo "$*"; }
 plan() { echo "  - $*"; }
 
@@ -89,12 +136,39 @@ while [ $# -gt 0 ]; do
     --apply-nginx) APPLY_NGINX=1; shift ;;
     --refresh-updater) REFRESH_UPDATER=1; shift ;;
     --regenerate-second-sites) REGEN_SECOND=1; shift ;;
+    --create-app-user) CREATE_APP_USER=1; shift ;;
+    --server-name) [ $# -ge 2 ] || die "--server-name needs a name or address"; SERVER_NAME="$2"; shift 2 ;;
+    --backend-port) [ $# -ge 2 ] || die "--backend-port needs a number"; BACKEND_PORT_ARG="$2"; shift 2 ;;
+    --no-nginx) NO_NGINX=1; shift ;;
+    --cert) [ $# -ge 2 ] || die "--cert needs a file"; CERT_FILE="$2"; shift 2 ;;
+    --key) [ $# -ge 2 ] || die "--key needs a file"; KEY_FILE="$2"; shift 2 ;;
+    --self-signed) SELF_SIGNED=1; shift ;;
+    --release-info) [ $# -ge 2 ] || die "--release-info needs a file"; RELEASE_INFO="$2"; shift 2 ;;
+    --revocation) [ $# -ge 2 ] || die "--revocation needs a file"; REVOCATIONS+=("$2"); shift 2 ;;
+    --release-base-url) [ $# -ge 2 ] || die "--release-base-url needs an https address"; RELEASE_BASE_URL_ARG="$2"; shift 2 ;;
+    --revocation-url) [ $# -ge 2 ] || die "--revocation-url needs an https address"; REVOCATION_URL_ARG="$2"; shift 2 ;;
+    --log) [ $# -ge 2 ] || die "--log needs a file"; LOG_FILE="$2"; shift 2 ;;
+    --uninstall) UNINSTALL=1; shift ;;
+    --keep-data) KEEP_DATA=1; shift ;;
     -h | --help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
 done
 
-for _p in "$OPT_DIR" "$DATA_DIR" "$UNIT_DIR" "$BIN_DIR" "$ENV_FILE" "$SUDOERS_DIR" "$ARTIFACTS_DIR" "$NGINX_SITES_DIR"; do
+# --log: run this script again with everything it prints also appended to the log (created 0600), and pass its exit status on
+if [ -n "$LOG_FILE" ] && [ -z "${OCW_INSTALL_LOGGING:-}" ]; then
+  _ld="$(dirname -- "$LOG_FILE")"
+  if [ ! -d "$_ld" ]; then { mkdir -p "$_ld" && chmod 0700 "$_ld"; } || die "cannot create the log directory $_ld"; fi
+  ( umask 077; : >>"$LOG_FILE" ) || die "cannot write the log file $LOG_FILE"
+  chmod 0600 "$LOG_FILE"
+  export OCW_INSTALL_LOGGING=1
+  set +e
+  bash "${BASH_SOURCE[0]}" "${ORIG_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
+  _rc="${PIPESTATUS[0]}"
+  exit "$_rc"
+fi
+
+for _p in "$OPT_DIR" "$DATA_DIR" "$UNIT_DIR" "$BIN_DIR" "$ENV_FILE" "$SUDOERS_DIR" "$ARTIFACTS_DIR" "$NGINX_SITES_DIR" "$NGINX_ENABLED_DIR" "$NGINX_SSL_DIR" "$SESSION_KEY_FILE"; do
   case "$_p" in
     /*) ;;
     *) die "paths must be absolute (got '$_p')" ;;
@@ -111,6 +185,118 @@ for _cmd in systemctl python3 tar sed awk cmp seq find date grep wc cp mv rm chm
   command -v "$_cmd" >/dev/null 2>&1 || die "required command not found: $_cmd"
 done
 [ -n "$TESTING" ] || command -v runuser >/dev/null 2>&1 || die "required command not found: runuser (util-linux)"
+PY3="$(command -v python3)"
+
+# prompts go to the terminal, never to stdin (which may be a pipe); a test run can supply the answers in a file (OCW_TTY)
+TTY_OPEN=""
+tty_line() { # tty_line <prompt>: one line from the terminal in TTY_ANSWER; refuses when there is no terminal
+  TTY_ANSWER=""
+  local _in="/dev/tty"
+  if [ -n "$TESTING" ] && [ -n "${OCW_TTY:-}" ]; then _in="$OCW_TTY"; fi
+  if [ -z "$TTY_OPEN" ]; then
+    if { exec 9<"$_in"; } 2>/dev/null; then TTY_OPEN=1; else die "no terminal to ask you on; nothing was changed. Add --yes (and the options it needs) to run without questions."; fi
+  fi
+  if [ -n "$TESTING" ] && [ -n "${OCW_TTY:-}" ]; then printf '%s' "$1" >&2; elif ! { printf '%s' "$1" >/dev/tty; } 2>/dev/null; then printf '%s' "$1" >&2; fi
+  IFS= read -r TTY_ANSWER <&9 || TTY_ANSWER=""
+}
+
+# --- uninstall (--uninstall --keep-data) -------------------------------------------------------------------------
+# Removes the software and keeps every data file. It reads only the layout's own paths and never touches DATA_DIR.
+safe_remove_tree() { # safe_remove_tree <dir>: never "/", never a shallow path, never something that holds the data directory
+  local _d="$1"
+  case "$_d" in /?*/?*) ;; *) die "refusing to remove '$_d'" ;; esac
+  case "$_d" in */../* | */.. | */./* | */.) die "refusing to remove '$_d'" ;; esac
+  case "$DATA_DIR/" in "$_d"/*) die "refusing to remove $_d: it holds the data directory $DATA_DIR (use different directories, or move the data first)" ;; esac
+  if [ -L "$_d" ]; then rm -f -- "$_d"; elif [ -e "$_d" ]; then rm -rf -- "$_d"; fi
+}
+
+uninstall_keep_data() {
+  [ -n "$KEEP_DATA" ] || die "--uninstall needs --keep-data: this release removes the software only; removing the data is a manual step (docs/hosting.md, Uninstalling)"
+  local _plain_units="ocw-upgrade.path ocw-upgrade.service ocw-upgrade-due.timer ocw-upgrade-due.service ocw-stage@.service"
+  local _ours="" _u _f _wd _gates _site _enabled _kept_site=""
+  for _u in opa-compliance-wizard opa-secrets-wizard opa-auth-gate; do
+    _f="$UNIT_DIR/$_u.service"
+    [ -f "$_f" ] || continue
+    _wd="$(sed -n -e 's/^[[:space:]]*WorkingDirectory=[[:space:]]*//p' "$_f" | head -n 1)"
+    case "$_wd" in
+      "$OPT_DIR" | "$OPT_DIR"/*) _ours="$_ours $_u" ;;
+      *) note "NOTE: $_f runs the application from '$_wd', not from $OPT_DIR: it is not removed" ;;
+    esac
+  done
+  _gates="$(systemctl list-unit-files 'opa-auth-gate-*.service' --no-legend 2>/dev/null | awk '{print $1}' | sed -e 's/\.service$//' -e 's/^opa-auth-gate-//' | tr '\n' ' ' || true)"
+  _site="$NGINX_SITES_DIR/opa-secrets-wizard"
+  [ ! -f "$OPT_DIR/updater/config.json" ] || _site="$("$PY3" -I -c 'import json, sys; print(json.load(open(sys.argv[1])).get("nginx_site") or "")' "$OPT_DIR/updater/config.json" 2>/dev/null || true)"
+  [ -n "$_site" ] || _site="$NGINX_SITES_DIR/opa-secrets-wizard"
+  _enabled="$NGINX_ENABLED_DIR/$(basename -- "$_site")"
+  note "OPA Compliance Wizard: uninstall, keeping the data"
+  note ""
+  note "Will remove:"
+  plan "stop and disable the services:${_ours:- (no unit of the application found)} $_plain_units (those that exist)"
+  plan "the unit files in $UNIT_DIR for them"
+  plan "$BIN_DIR/ocw-updater and $UPDATER_ENV"
+  plan "$OPT_DIR (the installed releases, the updater, staging, the maintenance page, install backups)"
+  plan "$(dirname -- "$ARTIFACTS_DIR") (the downloads of the staging account) and the account $UPDATER_USER"
+  if [ -n "$_gates" ]; then
+    plan "NOT the nginx site $_site: additional login gates ($_gates) reuse its rate-limit zone; remove them first (setup-second-gate.sh)"
+    _kept_site=1
+  elif [ -e "$_site" ] || [ -L "$_enabled" ]; then
+    plan "the nginx site $_site and its link $_enabled (nginx is reloaded only if 'nginx -t' passes)"
+  fi
+  note ""
+  note "Will keep:"
+  plan "$DATA_DIR (the archive, audit log, access control, environments, upgrade backups, and the application account's home with its keyring)"
+  plan "$ENV_FILE, $SESSION_KEY_FILE, the TLS files in $NGINX_SSL_DIR, the application account, the distribution packages"
+  plan "every *.migrated-* file and the directory of a legacy install (they are not ours)"
+  [ -z "$_gates" ] || plan "the additional login gates and everything of theirs"
+  note ""
+  if [ -n "$DRY_RUN" ]; then note "Dry run: nothing was changed."; return 0; fi
+  if [ -z "$ASSUME_YES" ]; then
+    tty_line "Type UNINSTALL to remove the software and keep the data: "
+    [ "$TTY_ANSWER" = "UNINSTALL" ] || die "not confirmed; nothing was changed"
+  fi
+  DIE_CODE=4
+  note "==> Stopping and removing the services"
+  for _u in $_ours ocw-upgrade-due.timer ocw-upgrade.path ocw-upgrade.service ocw-upgrade-due.service; do
+    systemctl stop "$_u" >/dev/null 2>&1 || true
+    systemctl disable "$_u" >/dev/null 2>&1 || true
+  done
+  for _u in $_ours; do rm -f -- "$UNIT_DIR/$_u.service"; done
+  for _u in $_plain_units; do rm -f -- "$UNIT_DIR/$_u"; done
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  rm -f -- "$BIN_DIR/ocw-updater" "$UPDATER_ENV"
+  if [ -z "$_kept_site" ] && { [ -e "$_site" ] || [ -L "$_enabled" ]; }; then
+    note "==> nginx"
+    local _keep="$_site.uninstall-keep.$$" _had_link=""
+    [ ! -f "$_site" ] || cp -p "$_site" "$_keep"
+    [ ! -L "$_enabled" ] || _had_link="$(readlink "$_enabled")"
+    rm -f -- "$_enabled" "$_site"
+    if ! command -v nginx >/dev/null 2>&1 || nginx -t >/dev/null 2>&1; then
+      systemctl reload nginx >/dev/null 2>&1 || note "NOTE: nginx did not reload; run 'sudo systemctl reload nginx' yourself"
+      rm -f -- "$_keep"
+      note "    removed $_site and $_enabled"
+    else
+      [ ! -f "$_keep" ] || mv -- "$_keep" "$_site"
+      [ -z "$_had_link" ] || ln -sfn "$_had_link" "$_enabled"
+      note "WARNING: 'nginx -t' failed without the site, so it was put back. Fix nginx's configuration and remove the site by hand."
+    fi
+  fi
+  note "==> Removing the installed software"
+  safe_remove_tree "$OPT_DIR"
+  safe_remove_tree "$(dirname -- "$ARTIFACTS_DIR")"
+  if id "$UPDATER_USER" >/dev/null 2>&1 && command -v userdel >/dev/null 2>&1; then
+    userdel "$UPDATER_USER" >/dev/null 2>&1 || note "NOTE: could not remove the account $UPDATER_USER; remove it with 'userdel $UPDATER_USER'"
+  fi
+  note ""
+  note "Done. The software is removed. Kept: $DATA_DIR (data), $ENV_FILE, $SESSION_KEY_FILE, $NGINX_SSL_DIR, the account that ran the application, the packages."
+  note "Installing again with get-ocw.sh finds the data and the settings and uses them. Removing the data too is a manual step (docs/hosting.md, Uninstalling):"
+  note "it deletes the only copy of the archive and audit log, so be sure you have a backup."
+}
+
+if [ -n "$UNINSTALL" ]; then
+  uninstall_keep_data
+  exit 0
+fi
+[ -z "$KEEP_DATA" ] || die "--keep-data only goes with --uninstall"
 
 _here="$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 SOURCE_DIR="$(cd "${SOURCE_DIR:-$_here}" && pwd -P)"
@@ -123,7 +309,6 @@ case "$VERSION" in
   [0-9]*.[0-9]*.[0-9]*) ;;
   *) die "cannot read SCRIPT_VERSION from $SOURCE_DIR/create_secret_folders.py" ;;
 esac
-PY3="$(command -v python3)"
 case "$PY3" in
   /usr/bin/* | /usr/local/bin/* | /bin/* | /opt/*) ;;
   *) [ -n "$TESTING" ] || die "python3 resolves to $PY3, which is not a system location; root runs the updater with it" ;;
@@ -195,13 +380,30 @@ if [ -n "$SERVICE_NAME" ]; then
     esac
   fi
 fi
+RESUME=""
+[ ! -e "$OPT_DIR/.fresh-install-incomplete" ] || RESUME=1   # an earlier fresh install did not finish: run it to the end
+if [ -z "$APP_USER" ] && [ -n "$CREATE_APP_USER" ]; then APP_USER="ocw"; fi
 [ -n "$APP_USER" ] || APP_USER="$(stat -c %U "$SOURCE_DIR" 2>/dev/null || stat -f %Su "$SOURCE_DIR")"
-id "$APP_USER" >/dev/null 2>&1 || die "the application account '$APP_USER' does not exist (--app-user)"
 [ "$APP_USER" != "root" ] || die "the web application must not run as root; use its own account (--app-user)"
-APP_GROUP="$(id -gn "$APP_USER")"
+APP_WILL_CREATE=""
+if id "$APP_USER" >/dev/null 2>&1; then
+  APP_GROUP="$(id -gn "$APP_USER")"
+else
+  [ -n "$CREATE_APP_USER" ] || die "the application account '$APP_USER' does not exist (--app-user, or --create-app-user to create it)"
+  case "$APP_USER" in
+    [a-z_]*) ;;
+    *) die "'$APP_USER' is not a usable account name (lower-case letters, digits, - and _, starting with a letter)" ;;
+  esac
+  case "$APP_USER" in *[!a-z0-9_-]*) die "'$APP_USER' is not a usable account name (lower-case letters, digits, - and _, starting with a letter)" ;; esac
+  [ "${#APP_USER}" -le 32 ] || die "'$APP_USER' is too long for an account name (32 characters at most)"
+  APP_WILL_CREATE=1
+  APP_GROUP="$APP_USER"
+fi
 MODE="fresh"
-if [ -n "$LAYOUT_PRESENT" ]; then
+if [ -n "$LAYOUT_PRESENT" ] && [ -z "$RESUME" ]; then
   MODE="reinstall"
+elif [ -n "$LAYOUT_PRESENT" ]; then
+  MODE="fresh"
 elif [ -n "$LEGACY_DIR" ]; then
   MODE="migrate"
   [ -x "$LEGACY_DIR/.venv/bin/python" ] || note "NOTE: $LEGACY_DIR has no .venv/bin/python; migrating anyway (the new release gets its own)."
@@ -212,6 +414,9 @@ for _p in "$LEGACY_DIR" "$SOURCE_DIR"; do
     *[[:space:]]* | *\|* | *\&* | *\\*) die "paths must not contain spaces or | & \\ (got '$_p')" ;;
   esac
 done
+if [ -n "$APP_WILL_CREATE" ] && [ "$MODE" != "fresh" ]; then
+  die "--create-app-user is only for a fresh install; the account of an existing install is the User= of its unit (--app-user)"
+fi
 
 # the settings deploy.sh read from <install dir>/.deploy.conf (parsed, never sourced)
 CONF_NGINX_SITE="/etc/nginx/sites-available/opa-secrets-wizard"
@@ -234,6 +439,72 @@ if [ -n "$LEGACY_DIR" ] && [ -f "$LEGACY_DIR/.deploy.conf" ]; then
   done < "$LEGACY_DIR/.deploy.conf"
 fi
 case "$CONF_PORT" in "" | *[!0-9]*) die "OPA_BACKEND_PORT in .deploy.conf is not a number" ;; esac
+URL_RE='^(https://|http://127\.0\.0\.1|http://localhost)[A-Za-z0-9._:/%~+-]+$'
+for _u in "$RELEASE_BASE_URL_ARG" "$REVOCATION_URL_ARG"; do
+  [ -z "$_u" ] || [[ "$_u" =~ $URL_RE ]] || die "'$_u' is not a plain https address (no user name or password in it, no query, no spaces)"
+done
+[ -z "$RELEASE_BASE_URL_ARG" ] || CONF_RELEASE_BASE="$RELEASE_BASE_URL_ARG"
+if [ -n "$BACKEND_PORT_ARG" ] && [ "$MODE" != "fresh" ]; then note "NOTE: --backend-port is ignored: an existing install keeps its port ($CONF_PORT)"; fi
+if [ "$MODE" = "fresh" ]; then
+  if [ -n "$BACKEND_PORT_ARG" ]; then
+    case "$BACKEND_PORT_ARG" in "" | *[!0-9]*) die "--backend-port must be a number between 1024 and 65535" ;; esac
+    { [ "$BACKEND_PORT_ARG" -ge 1024 ] && [ "$BACKEND_PORT_ARG" -le 65535 ]; } || die "--backend-port must be between 1024 and 65535"
+    case "$BACKEND_PORT_ARG" in 8767 | 8768) die "--backend-port $BACKEND_PORT_ARG is used by the login gate or the host-status helper" ;; esac
+    CONF_PORT="$BACKEND_PORT_ARG"
+  fi
+  CONF_NGINX_SITE="$NGINX_SITES_DIR/opa-secrets-wizard"
+fi
+
+# --- fresh install: the choices (validated before the plan, so a dry run catches every bad one) ---------------------------
+
+HELPERS="$SOURCE_DIR/server/install_helpers.py"
+SERVER_KIND=""
+if [ "$MODE" = "fresh" ]; then
+  for _f in server/opa-compliance-wizard.service server/opa-auth-gate.service server/nginx-opa-secrets-wizard.conf server/install_helpers.py server/start-headless.sh; do
+    [ -f "$SOURCE_DIR/$_f" ] || die "$SOURCE_DIR/$_f is missing: a fresh install needs a 5.52.0 or newer release"
+  done
+  [ -z "$NO_NGINX" ] || [ -z "$SELF_SIGNED$CERT_FILE$KEY_FILE" ] || die "--no-nginx and a certificate option (--cert/--key/--self-signed) are alternatives"
+  [ -z "$CERT_FILE$KEY_FILE" ] || { [ -n "$CERT_FILE" ] && [ -n "$KEY_FILE" ]; } || die "--cert and --key go together"
+  [ -z "$SELF_SIGNED" ] || [ -z "$CERT_FILE" ] || die "--self-signed and --cert/--key are alternatives"
+  if [ -n "$CERT_FILE" ]; then
+    [ -f "$CERT_FILE" ] && [ -r "$CERT_FILE" ] || die "the certificate file '$CERT_FILE' does not exist or cannot be read"
+    [ -f "$KEY_FILE" ] && [ -r "$KEY_FILE" ] || die "the key file '$KEY_FILE' does not exist or cannot be read"
+    "$PY3" -I "$HELPERS" check-cert --cert "$CERT_FILE" --key "$KEY_FILE" || exit "$DIE_CODE"
+  fi
+  if [ -z "$SERVER_NAME" ] && [ -z "$NO_NGINX" ]; then
+    if [ -n "$ASSUME_YES" ]; then die "a fresh install needs --server-name HOST (the public DNS name or IP address), or --no-nginx"; fi
+    if [ -z "$DRY_RUN" ]; then
+      tty_line "Public name or IP address of this server (for the web address and the certificate): "
+      SERVER_NAME="$TTY_ANSWER"
+      [ -n "$SERVER_NAME" ] || die "no server name given; nothing was changed"
+    fi
+  fi
+  if [ -n "$SERVER_NAME" ]; then
+    SERVER_KIND="$("$PY3" -I "$HELPERS" validate-server-name "--name=$SERVER_NAME")" || exit "$DIE_CODE"
+  fi
+  if [ -z "$NO_NGINX" ] && [ -z "$SELF_SIGNED$CERT_FILE" ]; then
+    if [ -n "$ASSUME_YES" ]; then die "a fresh install with --yes must choose its certificate: --cert FILE --key FILE, --self-signed, or --no-nginx"; fi
+    if [ -z "$DRY_RUN" ]; then
+      note "TLS certificate for the web site:"
+      note "  1) I have a certificate and key"
+      note "  2) make a temporary self-signed one for now (browsers warn until you install a trusted one)"
+      note "  3) no nginx here (another proxy or a tunnel fronts the application)"
+      tty_line "Choose [2]: "
+      case "$TTY_ANSWER" in
+        1)
+          tty_line "Path of the certificate file (PEM, with any chain): "
+          CERT_FILE="$TTY_ANSWER"
+          tty_line "Path of the private key file (PEM): "
+          KEY_FILE="$TTY_ANSWER"
+          [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ] || die "the certificate or key file does not exist; nothing was changed"
+          "$PY3" -I "$HELPERS" check-cert --cert "$CERT_FILE" --key "$KEY_FILE" || exit "$DIE_CODE" ;;
+        3) NO_NGINX=1 ;;
+        "" | 2) SELF_SIGNED=1 ;;
+        *) die "'$TTY_ANSWER' is not a choice; nothing was changed" ;;
+      esac
+    fi
+  fi
+fi
 
 # --- the plan ------------------------------------------------------------------------------------------------
 
@@ -255,6 +526,13 @@ note "  app account   $APP_USER:$APP_GROUP    updater account: $UPDATER_USER (cr
 note ""
 note "Plan:"
 id "$UPDATER_USER" >/dev/null 2>&1 && plan "account $UPDATER_USER exists" || plan "create the system account $UPDATER_USER (no login, no home)"
+if [ "$MODE" = "fresh" ]; then
+  if [ -n "$APP_WILL_CREATE" ]; then
+    plan "create the application account $APP_USER (a regular account, home $DATA_DIR/home, shell nologin) and enable lingering for it (loginctl enable-linger), so its user manager and keyring run without a login"
+  else
+    plan "use the existing application account $APP_USER and enable lingering for it (loginctl enable-linger)"
+  fi
+fi
 plan "create $OPT_DIR/{releases,updater,maintenance}, $DATA_DIR/upgrade/{inbox/requests,bundles,backups,schedule,rejections,requests-done,work,revocations,verified}, $ARTIFACTS_DIR with the right owners and modes"
 if [ -z "$REFRESH_UPDATER" ] && [ -n "$LAYOUT_PRESENT" ]; then
   plan "keep the existing root-owned updater code (add --refresh-updater to replace it)"
@@ -281,7 +559,26 @@ if [ "$MODE" = "migrate" ]; then
   done
   plan "systemctl daemon-reload; start the units; check each is healthy; if not, put the old units, env file and data files back"
 fi
-[ -n "$APPLY_NGINX" ] && plan "bake and apply this release's nginx template (nginx -t first; rolled back on failure)"
+if [ "$MODE" = "fresh" ]; then
+  plan "write $ENV_FILE (owner $APP_USER, mode 0600) with three generated secrets that are never shown, DEPLOYMENT_MODE=hosted${SERVER_NAME:+, the origin https://$SERVER_NAME} and the Okta settings as commented lines (an existing file is kept as it is)"
+  plan "write the login gate's session key $SESSION_KEY_FILE (32 random bytes, root:$APP_GROUP 0640; an existing one is kept)"
+  plan "install $UNIT_DIR/opa-compliance-wizard.service and opa-auth-gate.service for $APP_USER (run directory /run/user/<its id>); enable both; the login gate is NOT started (it needs your Okta settings)"
+  if [ -n "$NO_NGINX" ]; then
+    plan "no nginx site (--no-nginx): the template stays at $OPT_DIR/current/server/nginx-opa-secrets-wizard.conf"
+  else
+    if [ -n "$CERT_FILE" ]; then
+      plan "copy your certificate and key to $NGINX_SSL_DIR/opa-secrets-wizard.crt and .key (mode 0600)"
+    else
+      plan "make a temporary self-signed certificate for ${SERVER_NAME:-the server name you will give} in $NGINX_SSL_DIR (825 days; browsers will warn until you install a trusted one)"
+    fi
+    plan "write the nginx site $CONF_NGINX_SITE for ${SERVER_NAME:-the server name you will give} (root:$APP_GROUP 0640, carries the proxy secret), link it into $NGINX_ENABLED_DIR, run nginx -t, reload nginx; the distribution's default site is left alone"
+  fi
+  _hz=""
+  [ -n "$NO_NGINX" ] || _hz=", and /healthz through nginx"
+  plan "start the backend and check it: active with 0 restarts, /api/version = $VERSION on 127.0.0.1:$CONF_PORT$_hz"
+  plan "on a failed check: stop and disable the backend, keep everything for inspection, exit 4 (running the same command again repairs)"
+fi
+[ -z "$APPLY_NGINX" ] || plan "bake and apply this release's nginx template (nginx -t first; rolled back on failure)"
 if [ -n "$REMOVE_SUDOERS" ]; then
   plan "check $SUDOERS_DIR/opa-compliance-wizard-deploy only grants the old deploy commands, then move it aside"
 else
@@ -327,9 +624,8 @@ if [ -n "$DRY_RUN" ]; then
   exit 0
 fi
 if [ -z "$ASSUME_YES" ]; then
-  printf 'Proceed? [y/N] '
-  read -r _ans || _ans=""
-  case "$_ans" in y | Y | yes | YES) ;; *) die "not confirmed; nothing was changed" ;; esac
+  tty_line "Proceed? [y/N] "
+  case "$TTY_ANSWER" in y | Y | yes | YES) ;; *) die "not confirmed; nothing was changed" ;; esac
 fi
 
 # --- doing it ---------------------------------------------------------------------------------------------------
@@ -343,13 +639,243 @@ own() { # own <owner:group> <mode> <path>
 }
 mkd() { mkdir -p "$3"; own "$1" "$2" "$3"; }
 render() { # render <template> <output>: fill in the __NAME__ words
-  sed -e "s|__OPT_DIR__|$OPT_DIR|g" -e "s|__DATA_DIR__|$DATA_DIR|g" -e "s|__APP_USER__|$APP_USER|g" -e "s|__PYTHON3__|$PY3|g" -e "s|__ARTIFACTS_DIR__|$ARTIFACTS_DIR|g" -e "s|__ENV_FILE__|$ENV_FILE|g" "$1" > "$2"
+  sed -e "s|__OPT_DIR__|$OPT_DIR|g" -e "s|__DATA_DIR__|$DATA_DIR|g" -e "s|__APP_USER__|$APP_USER|g" -e "s|__PYTHON3__|$PY3|g" -e "s|__ARTIFACTS_DIR__|$ARTIFACTS_DIR|g" -e "s|__ENV_FILE__|$ENV_FILE|g" \
+      -e "s|__APP_DIR__|$OPT_DIR/current|g" -e "s|__APP_UID__|${APP_UID:-0}|g" -e "s|__APP_USER_HOME__|${APP_HOME:-}|g" \
+      -e "s|^EnvironmentFile=/etc/opa-compliance-wizard.env\$|EnvironmentFile=$ENV_FILE|" "$1" > "$2"
 }
 run_as() { # run_as <user> <cmd...>
   local _u="$1"; shift
   if [ -n "$TESTING" ]; then "$@"; else runuser -u "$_u" -- "$@"; fi
 }
 
+# --- fresh install: the pieces (5.52.0) -------------------------------------------------------------------------------
+
+fresh_prerequisites() { # what a fresh install needs from the system, checked before anything is changed
+  local _missing=""
+  if [ -z "$NO_NGINX" ]; then
+    command -v nginx >/dev/null 2>&1 || _missing="$_missing nginx"
+    { [ -d "$NGINX_SITES_DIR" ] && [ -d "$NGINX_ENABLED_DIR" ]; } || _missing="$_missing nginx-site-directories($NGINX_SITES_DIR,$NGINX_ENABLED_DIR)"
+  fi
+  if [ -n "$SELF_SIGNED" ]; then command -v openssl >/dev/null 2>&1 || _missing="$_missing openssl"; fi
+  command -v getent >/dev/null 2>&1 || _missing="$_missing getent"
+  command -v loginctl >/dev/null 2>&1 || _missing="$_missing loginctl"
+  if [ -z "$TESTING" ]; then
+    [ -x /usr/bin/gnome-keyring-daemon ] || _missing="$_missing gnome-keyring"
+    if command -v dpkg-query >/dev/null 2>&1 && ! dpkg-query -W -f='${Status}' dbus-user-session 2>/dev/null | grep -q 'install ok installed'; then _missing="$_missing dbus-user-session"; fi
+  fi
+  [ -z "$_missing" ] || die "this server lacks:$_missing. The get-ocw.sh installer installs the packages; by hand: apt-get install nginx gnome-keyring dbus-user-session openssl. Nothing was changed."
+}
+
+fresh_account() { # the application account, its lingering user manager, and the facts the units need
+  if [ -n "$APP_WILL_CREATE" ]; then
+    note "    creating the account $APP_USER (home $DATA_DIR/home, shell nologin)"
+    mkdir -p "$DATA_DIR"
+    local _grp=(--user-group)
+    if getent group "$APP_USER" >/dev/null 2>&1; then _grp=(--gid "$APP_USER"); fi
+    useradd "${_grp[@]}" --create-home --home-dir "$DATA_DIR/home" --shell /usr/sbin/nologin "$APP_USER" || die "could not create the account $APP_USER"
+  else
+    note "    using the existing account $APP_USER"
+  fi
+  id "$APP_USER" >/dev/null 2>&1 || die "the account $APP_USER does not exist after it was created"
+  APP_GROUP="$(id -gn "$APP_USER")"
+  APP_UID="$(id -u "$APP_USER")"
+  APP_HOME="$(getent passwd "$APP_USER" | cut -d: -f6)"
+  case "$APP_UID" in "" | *[!0-9]* | 0) die "the account $APP_USER has no usable numeric id ('$APP_UID')" ;; esac
+  case "$APP_HOME" in
+    /?*) ;;
+    *) die "the account $APP_USER has no usable home directory ('$APP_HOME')" ;;
+  esac
+  case "$APP_HOME" in *[[:space:]]* | *\|* | *\&* | *\\*) die "the home directory of $APP_USER contains spaces or | & \\ ('$APP_HOME')" ;; esac
+  loginctl enable-linger "$APP_USER" || die "could not enable lingering for $APP_USER (loginctl enable-linger)"
+}
+
+fresh_home() { # the directory the keyring daemon writes (the units' ReadWritePaths= names it, so it must exist)
+  local _d
+  for _d in "$APP_HOME" "$APP_HOME/.local" "$APP_HOME/.local/share" "$APP_HOME/.local/share/keyrings"; do
+    [ -d "$_d" ] || mkd "$APP_USER:$APP_GROUP" 0700 "$_d"
+  done
+}
+
+fresh_wait_runtime() { # lingering starts the user manager asynchronously; the units need /run/user/<uid> and its bus
+  [ -z "$TESTING" ] || return 0
+  local _i
+  for _i in $(seq 1 30); do [ -d "/run/user/$APP_UID" ] && break; sleep 1; done
+  [ -d "/run/user/$APP_UID" ] || note "WARNING: /run/user/$APP_UID does not exist yet (the user manager of $APP_USER has not started: systemctl status user@$APP_UID); the backend may fail to start"
+  for _i in $(seq 1 15); do [ -S "/run/user/$APP_UID/bus" ] && break; sleep 1; done
+  [ -S "/run/user/$APP_UID/bus" ] || note "WARNING: there is no user D-Bus at /run/user/$APP_UID/bus (is dbus-user-session installed?); the keyring may not start"
+}
+
+fresh_tls() { # the certificate and key the nginx site names
+  local _crt="$NGINX_SSL_DIR/opa-secrets-wizard.crt" _key="$NGINX_SSL_DIR/opa-secrets-wizard.key" _san _out _f
+  mkd root:root 0700 "$NGINX_SSL_DIR"
+  if [ -n "$CERT_FILE" ]; then
+    mkdir -p "$BACKUP_DIR"
+    chmod 0700 "$BACKUP_DIR"
+    for _f in "$_crt" "$_key"; do [ ! -f "$_f" ] || cp -p "$_f" "$BACKUP_DIR/$(basename -- "$_f")"; done
+    ( umask 077; cat -- "$KEY_FILE" >"$_key.new" && cat -- "$CERT_FILE" >"$_crt.new" ) || die "could not copy the certificate and key into $NGINX_SSL_DIR"
+    own root:root 0600 "$_key.new"
+    own root:root 0600 "$_crt.new"
+    mv -- "$_key.new" "$_key"
+    mv -- "$_crt.new" "$_crt"
+    note "    installed your certificate and key in $NGINX_SSL_DIR"
+  elif [ -f "$_crt" ] && [ -f "$_key" ]; then
+    own root:root 0600 "$_key"
+    note "    kept the certificate and key already in $NGINX_SSL_DIR (delete both to have a new self-signed pair made)"
+  else
+    case "$SERVER_KIND" in ip4 | ip6) _san="IP:$SERVER_NAME" ;; *) _san="DNS:$SERVER_NAME" ;; esac
+    command -v openssl >/dev/null 2>&1 || die "openssl is needed to make the self-signed certificate (apt-get install openssl)"
+    if ! _out="$( umask 077; openssl req -x509 -newkey rsa:2048 -nodes -days 825 -subj "/CN=$SERVER_NAME" -addext "subjectAltName=$_san" -keyout "$_key" -out "$_crt" 2>&1 )"; then
+      rm -f -- "$_key" "$_crt"
+      die "openssl could not make the self-signed certificate: $_out"
+    fi
+    own root:root 0600 "$_key"
+    own root:root 0600 "$_crt"
+    note "    made a self-signed certificate for $SERVER_NAME (825 days): your browser will warn until you install a trusted one; HSTS stays off"
+  fi
+}
+
+fresh_nginx() { # the site, linked and loaded; put back if nginx refuses it
+  local _site="$CONF_NGINX_SITE" _link _had_site="" _had_link="" _out
+  _link="$NGINX_ENABLED_DIR/$(basename -- "$_site")"
+  mkdir -p "$BACKUP_DIR"
+  chmod 0700 "$BACKUP_DIR"
+  if [ -e "$_site" ]; then _had_site=1; cp -p "$_site" "$BACKUP_DIR/opa-secrets-wizard.site.before"; fi
+  [ ! -L "$_link" ] || _had_link=1
+  "$PY3" -I "$HELPERS" render-site --template "$SOURCE_DIR/server/nginx-opa-secrets-wizard.conf" --out "$_site" --server-name "$SERVER_NAME" \
+    --env-file "$ENV_FILE" --group "$APP_GROUP" --port "$CONF_PORT" || die "could not write the nginx site (above)"
+  ln -sfn "$_site" "$_link"
+  undo_nginx() {
+    if [ -n "$_had_site" ]; then cp -p "$BACKUP_DIR/opa-secrets-wizard.site.before" "$_site"; else rm -f -- "$_site"; fi
+    [ -n "$_had_link" ] || rm -f -- "$_link"
+  }
+  if ! _out="$(nginx -t 2>&1)"; then
+    undo_nginx
+    die "nginx -t rejected the new site, which was taken out again: $_out"
+  fi
+  systemctl enable nginx >/dev/null 2>&1 || true
+  if ! systemctl reload nginx >/dev/null 2>&1 && ! systemctl restart nginx; then
+    undo_nginx
+    systemctl reload nginx >/dev/null 2>&1 || true
+    die "nginx would not load the new site (is another service using port 80 or 443? journalctl -u nginx -n 50); the site was taken out again"
+  fi
+  note "    nginx serves $SERVER_NAME (site $_site, link $_link)"
+}
+
+install_app_unit() { # install_app_unit <file name>: rendered from the release's template; a different existing unit is kept in the backup
+  local _dst="$UNIT_DIR/$1"
+  render "$SOURCE_DIR/server/$1" "$_dst.new"
+  own root:root 0644 "$_dst.new"
+  if [ -f "$_dst" ] && cmp -s "$_dst" "$_dst.new"; then
+    rm -f -- "$_dst.new"
+    note "    $1 is already current"
+    return 0
+  fi
+  if [ -f "$_dst" ]; then
+    mkdir -p "$BACKUP_DIR"
+    chmod 0700 "$BACKUP_DIR"
+    cp -p "$_dst" "$BACKUP_DIR/$1"
+    echo "--- $_dst (changes; the old unit is in $BACKUP_DIR)"
+    diff -u "$_dst" "$_dst.new" || true
+  fi
+  mv -- "$_dst.new" "$_dst"
+  note "    installed $_dst"
+}
+
+fresh_health() { # true when the backend is active with no restarts and answers (and nginx answers /healthz)
+  local _try _bad _hargs
+  _hargs=(health --port "$CONF_PORT" --version "$VERSION")
+  if [ -z "$NO_NGINX" ] && { [ -z "$TESTING" ] || [ -n "${OCW_TEST_NGINX_PORT:-}" ]; }; then
+    _hargs+=(--nginx-host "$SERVER_NAME" --nginx-port "${OCW_TEST_NGINX_PORT:-443}")
+  fi
+  for _try in $(seq 1 45); do
+    sleep 2
+    _bad=""
+    [ "$(unit_prop opa-compliance-wizard ActiveState)" = "active" ] || _bad=1
+    [ "$(unit_prop opa-compliance-wizard NRestarts)" = "0" ] || _bad=1
+    if [ -z "$_bad" ] && "$PY3" -I "$HELPERS" "${_hargs[@]}"; then return 0; fi
+  done
+  return 1
+}
+
+fresh_apply_revocations() { # verified key revocations: root's trust list now, the application's key state through its own CLI
+  local _r
+  [ "${#REVOCATIONS[@]}" -gt 0 ] || return 0
+  note "==> Key revocations"
+  for _r in "${REVOCATIONS[@]}"; do
+    [ -f "$_r" ] || die "the revocation file $_r does not exist"
+    "$PY3" -I "$OPT_DIR/updater/ocw_activate.py" cli trust apply "$_r" || die "could not apply the verified key revocation $_r to root's trust list (above)"
+    cp -- "$_r" "$DATA_DIR/upgrade/revocations/$(basename -- "$_r")"
+    own root:root 0644 "$DATA_DIR/upgrade/revocations/$(basename -- "$_r")"
+  done
+}
+
+fresh_finish() { # after the layout, the updater and its units are in place: settings, certificate, site, units, start, check
+  note "==> Settings, certificate and web site"
+  local _env=(write-env --path "$ENV_FILE" --owner "$APP_USER" --data-dir "$DATA_DIR" --port "$CONF_PORT")
+  [ -z "$SERVER_NAME" ] || _env+=(--server-name "$SERVER_NAME")
+  [ -z "$REVOCATION_URL_ARG" ] || _env+=(--revocation-url "$REVOCATION_URL_ARG")
+  "$PY3" -I "$HELPERS" "${_env[@]}" || die "could not write the settings file $ENV_FILE (above)"
+  "$PY3" -I "$HELPERS" write-session-key --path "$SESSION_KEY_FILE" --group "$APP_GROUP" || die "could not write the session key (above)"
+  if [ -n "$NO_NGINX" ]; then
+    note "skipped: nginx not set up here (--no-nginx). The site template is at $OPT_DIR/current/server/nginx-opa-secrets-wizard.conf; the proxy secret it must carry is NGINX_PROXY_SECRET in $ENV_FILE."
+  else
+    fresh_tls
+    fresh_nginx
+  fi
+  note "==> The application units"
+  install_app_unit opa-compliance-wizard.service
+  install_app_unit opa-auth-gate.service
+  systemctl daemon-reload
+  systemctl enable opa-compliance-wizard opa-auth-gate >/dev/null 2>&1 || note "WARNING: could not enable opa-compliance-wizard / opa-auth-gate"
+  fresh_wait_runtime
+  note "==> Starting the backend"
+  systemctl start opa-compliance-wizard || note "WARNING: systemctl start opa-compliance-wizard reported a failure (the check below says whether it came up)"
+  if ! fresh_health; then
+    systemctl stop opa-compliance-wizard >/dev/null 2>&1 || true
+    systemctl disable opa-compliance-wizard >/dev/null 2>&1 || true
+    note "!! The backend did not come up healthy; it was stopped and disabled. Everything this run made is still in place for inspection:"
+    note "!!   $OPT_DIR, $DATA_DIR, $ENV_FILE, $UNIT_DIR/opa-compliance-wizard.service, the account $APP_USER"
+    note "!! See: journalctl -u opa-compliance-wizard -n 100 --no-pager"
+    note "!! Run the same command again to repair, or remove the software with: sudo bash get-ocw.sh --uninstall --keep-data"
+    die "the backend did not pass its health check; nothing was rolled back (a fresh install has no earlier version to go back to)"
+  fi
+  note "    the backend is active and answers /api/version as $VERSION"
+  rm -f -- "$OPT_DIR/.fresh-install-incomplete"
+}
+
+print_fresh_done() {
+  local _origin="https://${SERVER_NAME:-<your server name>}"
+  note ""
+  note "Done. OPA Compliance Wizard $VERSION is installed and the backend is running."
+  note "  What changed: $OPT_DIR (code, root-owned), $DATA_DIR (data, owned by $APP_USER),"
+  note "                $ENV_FILE (settings and generated secrets, 0600), $UNIT_DIR/opa-compliance-wizard.service,"
+  note "                opa-auth-gate.service (installed, not started), ocw-*.service, $BIN_DIR/ocw-updater,"
+  if [ -z "$NO_NGINX" ]; then
+    if [ -n "$CERT_FILE" ]; then
+      note "                $CONF_NGINX_SITE (your certificate),"
+    else
+      note "                $CONF_NGINX_SITE (self-signed certificate: your browser will warn until you install a trusted one),"
+    fi
+  fi
+  note "                accounts $APP_USER and $UPDATER_USER.${LOG_FILE:+ Log: $LOG_FILE}"
+  note "  Not done yet (nothing works in a browser until this is):"
+  note "  1. Register the Okta OIDC web app (docs/hosting.md, step 1): redirect $_origin/authorization-code/callback"
+  note "  2. As root: sudoedit $ENV_FILE and fill OKTA_ORG_URL, OKTA_OIDC_CLIENT_ID, OKTA_ADMIN_GROUP_ID"
+  if [ -n "$SERVER_NAME" ]; then
+    note "     (DASHBOARD_ORIGIN is already set to $_origin)"
+  else
+    note "     and DASHBOARD_ORIGIN (the public https origin of this server; it is not set because --no-nginx came without --server-name)"
+  fi
+  note "  3. Put the client secret and the read-only admin-check token in the application's keyring (docs/hosting.md steps 3 and \"Admin access\"):"
+  note "     sudo -u $APP_USER env XDG_RUNTIME_DIR=/run/user/$APP_UID DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$APP_UID/bus $OPT_DIR/current/.venv/bin/python -c \"import getpass, keyring; keyring.set_password('opa-compliance-wizard:default', 'okta_client_secret', getpass.getpass('client secret: '))\""
+  note "     (the same for 'okta_admin_check_token'; both prompts hide what you type and nothing is written to the shell history)"
+  note "  4. sudo systemctl start opa-auth-gate && sudo systemctl status opa-auth-gate"
+  note "  5. Open $_origin, sign in, add your first environment (the dashboard walks you through it)."
+  note "  Later: upgrades from the Updates page or 'sudo ocw-updater apply <version>'; status: 'ocw-updater status'; uninstall: 'sudo bash get-ocw.sh --uninstall --keep-data'."
+}
+
+[ "$MODE" != "fresh" ] || fresh_prerequisites
+DIE_CODE=4   # from here on something has been changed: a failure needs an operator
 note "==> Accounts and directories"
 if ! id "$UPDATER_USER" >/dev/null 2>&1; then
   if [ -n "$TESTING" ]; then note "    (test run: not creating $UPDATER_USER)"; else
@@ -358,7 +884,10 @@ if ! id "$UPDATER_USER" >/dev/null 2>&1; then
 fi
 UPD_OWNER="$UPDATER_USER:$UPDATER_USER"
 id "$UPDATER_USER" >/dev/null 2>&1 || UPD_OWNER="root:root"
+APP_UID="" APP_HOME=""
+[ "$MODE" != "fresh" ] || fresh_account
 mkd root:root 0755 "$OPT_DIR"
+[ "$MODE" != "fresh" ] || : >"$OPT_DIR/.fresh-install-incomplete"   # removed when the install has passed its health check
 # releases/ is ROOT-owned: only root can rename, replace or remove a release. The staging account builds in staging/<version>
 # and root moves the tree into releases/ before it takes ownership of it and checks it.
 mkd root:root 0755 "$OPT_DIR/releases"
@@ -371,6 +900,7 @@ mkd root:root 0755 "$OPT_DIR/maintenance"
 # here (the archive, the audit log) but cannot rename or remove the root-owned upgrade/ directory, so root never
 # works inside a directory the application controls.
 mkd "root:$APP_GROUP" 1770 "$DATA_DIR"
+[ "$MODE" != "fresh" ] || fresh_home
 mkd root:root 0755 "$DATA_DIR/upgrade"
 mkd "$APP_USER:$APP_GROUP" 0700 "$DATA_DIR/upgrade/inbox"
 mkd "$APP_USER:$APP_GROUP" 0700 "$DATA_DIR/upgrade/inbox/requests"
@@ -446,7 +976,7 @@ fi
 if [ "$MODE" != "reinstall" ]; then
   note "==> Release $VERSION"
   REL="$OPT_DIR/releases/$VERSION"
-  if [ ! -f "$REL/.installed-from-source" ]; then
+  if [ ! -f "$REL/.installed-from-source" ] && [ ! -f "$REL/.installed-from-release" ]; then
     rm -rf "$REL"
     mkd "$UPD_OWNER" 0755 "$REL"
     tar -C "$SOURCE_DIR" \
@@ -465,7 +995,11 @@ if [ "$MODE" != "reinstall" ]; then
     run_as "$UPDATER_USER" env HOME=/var/lib/ocw-updater PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1 "$REL/.venv/bin/pip" install -q "${_pip[@]}" \
       || die "pip install --require-hashes failed in $REL (the old install is untouched)"
     find "$REL" -path "$REL/.venv" -prune -o -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
-    printf '{"version": "%s", "source": "install.sh", "installed_at": "%s", "signed": false}\n' "$VERSION" "$STAMP" > "$REL/.installed-from-source"
+    if [ -n "$RELEASE_INFO" ]; then
+      "$PY3" -I "$SOURCE_DIR/server/install_helpers.py" record-release --release-dir "$REL" --info "$RELEASE_INFO" --stamp "$STAMP" || die "could not record the provenance of release $VERSION (above)"
+    else
+      printf '{"version": "%s", "source": "install.sh", "installed_at": "%s", "signed": false}\n' "$VERSION" "$STAMP" > "$REL/.installed-from-source"
+    fi
     if [ -z "$TESTING" ]; then chown -Rh root:root "$REL"; fi
     chmod -R go-w "$REL"
   else
@@ -485,6 +1019,7 @@ if [ ! -f "$UPDATER_ENV" ]; then
     echo "# no_proxy=localhost,127.0.0.1"
     [ -z "$CONF_RELEASE_BASE" ] || echo "OPA_RELEASE_BASE_URL=$CONF_RELEASE_BASE"
     [ -z "$CONF_REVOCATION_BASE" ] || echo "OPA_REVOCATION_URL_BASE=$CONF_REVOCATION_BASE"
+    [ -z "$REVOCATION_URL_ARG" ] || echo "OPA_REVOCATION_URL=$REVOCATION_URL_ARG"
   } > "$UPDATER_ENV"
   own root:root 0644 "$UPDATER_ENV"
 fi
@@ -510,6 +1045,7 @@ if [ "$MODE" = "migrate" ]; then
     done
     systemctl daemon-reload || true
     for _i in $ALL_UNITS; do systemctl restart "$_i" || true; done
+    DIE_CODE=3
     die "migration rolled back; the install is as it was. Nothing was lost. Send the output above to the maintainers."
   }
   for _u in $ALL_UNITS; do systemctl stop "$_u" || true; done
@@ -583,8 +1119,7 @@ PY
   note "    delete it yourself when you are satisfied. Unit/env backups are in $BACKUP_DIR."
 elif [ "$MODE" = "fresh" ]; then
   ln -sfn "releases/$VERSION" "$OPT_DIR/current"
-  note "    Fresh install: create the environment file ($ENV_FILE) and the units per docs/hosting.md, using"
-  note "    WorkingDirectory=$OPT_DIR/current and OPA_DATA_DIR=$DATA_DIR (server/opa-compliance-wizard.service has both)."
+  fresh_apply_revocations
 fi
 
 if [ -n "$APPLY_NGINX" ]; then
@@ -681,11 +1216,16 @@ note "    recorded install_sh_version=$VERSION in $OPT_DIR/updater/config.json"
 systemctl daemon-reload
 systemctl enable ocw-upgrade.path ocw-upgrade.service >/dev/null 2>&1 || note "WARNING: could not enable ocw-upgrade.path / ocw-upgrade.service"
 systemctl start ocw-upgrade.path || note "WARNING: could not start ocw-upgrade.path"
-note ""
-note "Done. Next:"
-note "  ocw-updater status                      what is installed and ready"
-note "  sudo ocw-updater apply <version>        upgrade (staging, backup, switch, health checks, automatic rollback)"
-note "  sudo server/install.sh --apply-nginx    (if you did not pass it) once, so other users see a maintenance page while it switches"
+if [ "$MODE" = "fresh" ]; then
+  fresh_finish
+  print_fresh_done
+else
+  note ""
+  note "Done. Next:"
+  note "  ocw-updater status                      what is installed and ready"
+  note "  sudo ocw-updater apply <version>        upgrade (staging, backup, switch, health checks, automatic rollback)"
+  note "  sudo server/install.sh --apply-nginx    (if you did not pass it) once, so other users see a maintenance page while it switches"
+fi
 if [ -n "$SECOND_GATES" ]; then
   _unfixed=""
   for _g in $SECOND_GATES; do [ "$(second_site_status "$_g")" = "ok" ] || _unfixed="$_unfixed $_g"; done

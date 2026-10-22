@@ -9,12 +9,16 @@ WorkingDirectory=__APP_DIR__
 Environment=OPA_DATA_DIR=__DATA_DIR__
 Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=/etc/opa-compliance-wizard.env
-Environment=XDG_RUNTIME_DIR=/run/user/1000
-Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+Environment=XDG_RUNTIME_DIR=/run/user/__APP_UID__
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/__APP_UID__/bus
 ExecStart=__APP_DIR__/server/start-headless.sh
 Restart=on-failure
 RestartSec=3
 
+# 5.52.0: __APP_UID__ is the application account's numeric id (server/install.sh fills it from `id -u`; it used to be
+# a hardcoded 1000 that hosting.md asked you to change by hand). The text below says 1000 where it tells the 2026-10-02
+# incident, which happened on an account with that id.
+#
 # 5.47.0 layout (server/install.sh writes this unit): __APP_DIR__ is
 # /opt/opa-compliance-wizard/current (a symlink to the active release; the
 # application user cannot write it), __DATA_DIR__ is
@@ -43,7 +47,7 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=__DATA_DIR__
 ReadWritePaths=__APP_USER_HOME__/.local/share/keyrings
-ReadWritePaths=/run/user/1000
+ReadWritePaths=/run/user/__APP_UID__
 ProtectKernelTunables=true
 ProtectControlGroups=true
 UMask=0077

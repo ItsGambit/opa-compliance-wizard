@@ -33,4 +33,4 @@ pkill -u "$(id -u)" -f 'gnome-keyring-daemon' 2>/dev/null || true
 printf '%s' "$KEYRING_UNLOCK_PASSWORD" | /usr/bin/gnome-keyring-daemon --unlock --login --components=secrets
 
 cd "$(dirname "$0")/.."
-exec .venv/bin/python server/serve.py --no-browser
+exec .venv/bin/python server/serve.py --no-browser --port "${OPA_BACKEND_PORT:-8766}"

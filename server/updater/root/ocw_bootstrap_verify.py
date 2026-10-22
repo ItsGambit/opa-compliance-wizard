@@ -462,7 +462,7 @@ def cmd_verify(a):
         if a.revocation_out:
             os.makedirs(a.revocation_out, mode=0o700, exist_ok=True)
             for item in applied:
-                _write_private(os.path.join(a.revocation_out, f"revocation-{item['serial']}.json"), item["raw"])
+                _write_private(os.path.join(a.revocation_out, f"revocation-{item['serial']:010d}.json"), item["raw"])
     except OSError as exc:
         print(f"ERROR: could not write the verification result: {exc.strerror or exc}. Nothing was installed.", file=sys.stderr)
         return 3

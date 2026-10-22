@@ -297,7 +297,7 @@ def test_cli_verify_writes_the_release_info_and_the_applied_revocations(w):
     info = json.loads((w.tmp / "info.json").read_text())
     assert info["version"] == "5.52.0" and info["revocation_serial_applied"] == 1 and info["bootstrap_version"] == "5.52.0"
     assert oct((w.tmp / "info.json").stat().st_mode & 0o777) == "0o600"
-    assert (w.tmp / "revs" / "revocation-1.json").read_bytes() == Path(rev).read_bytes()
+    assert (w.tmp / "revs" / "revocation-0000000001.json").read_bytes() == Path(rev).read_bytes()
 
 
 def test_cli_refusal_exits_2_with_the_house_message(w):

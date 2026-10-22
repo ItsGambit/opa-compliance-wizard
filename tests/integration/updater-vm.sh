@@ -245,7 +245,7 @@ KEYRING_UNLOCK_PASSWORD=$KEYRING_PW
 EOF
 umask 022
 # the unit the way docs/hosting.md installed it before 5.47.0: code, data and the three ReadWritePaths in the home directory
-sed -e "s|__APP_DIR__|$LEGACY|g" -e "s|__APP_USER_HOME__|$TEST_HOME|g" -e "s|__APP_USER__|$TEST_USER|g" -e "s|/run/user/1000|/run/user/$TEST_UID|g" \
+sed -e "s|__APP_DIR__|$LEGACY|g" -e "s|__APP_USER_HOME__|$TEST_HOME|g" -e "s|__APP_USER__|$TEST_USER|g" -e "s|__APP_UID__|$TEST_UID|g" \
   -e "s|__DATA_DIR__|$LEGACY|g" -e '/^Environment=OPA_DATA_DIR=/d' -e '/^Environment=PYTHONDONTWRITEBYTECODE=/d' -e '/^ProtectSystem=/d' \
   "$CHECKOUT/server/opa-compliance-wizard.service" > /etc/systemd/system/opa-compliance-wizard.service
 # indent every setting line by two spaces, as many hand-installed units are (systemd accepts it); install.sh must still edit them

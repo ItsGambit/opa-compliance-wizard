@@ -453,8 +453,11 @@ install_packages() {
   [ "${#PACKAGES[@]}" -gt 0 ] || { say "ok  packages: nothing to install"; return 0; }
   say "==> Installing packages from your distribution: ${PACKAGES[*]}"
   export DEBIAN_FRONTEND=noninteractive
-  { apt-get update -q && apt-get install -y -q --no-install-recommends "${PACKAGES[@]}"; } 2>&1 | tee -a "$LOG_FILE" || true
-  local _rc="${PIPESTATUS[0]}"
+  local _rc=0
+  set +e
+  { apt-get update -q && apt-get install -y -q --no-install-recommends "${PACKAGES[@]}"; } 2>&1 | tee -a "$LOG_FILE"
+  _rc="${PIPESTATUS[0]}"
+  set -e
   if [ "$_rc" -ne 0 ]; then
     say_err "failed: the package installation failed (messages above). Nothing of the application was installed yet. Fix the package problem (a mirror that does not answer, a locked dpkg) and run the same command again."
     exit 3
