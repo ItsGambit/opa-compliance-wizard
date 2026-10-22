@@ -1,6 +1,7 @@
 """5.51.0 Overview additions: the stored-scan block of the sources strip, the schedule and last-refresh view, and the banner
 sentences (a failing sync by how long ago the last success was, a scheduled refresh that did not read OPA)."""
 import json
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -117,3 +118,61 @@ def test_an_environment_the_caller_cannot_see_is_not_found_not_forbidden(matrix_
     base_url, serve = matrix_server
     _seed_owner_a_with_session(serve)  # private to A
     assert _call(base_url, "GET", "/api/overview?environment=dev", headers=_who(OWNER_B)).status_code == 404
+
+
+SENTINELS = ["Zelda Sentinel", "zelda.sentinel@example.com", "Quentin Probe", "quentin.probe@example.com", "Ursula Actor", "ursula.actor@example.com",
+             "Ivan Capture", "ivan.capture@example.com", "Mira Listed", "mira.listed@example.com", "svc-sentinel-account", "sentinel-host.example.com"]
+
+
+def test_the_archive_viewer_body_holds_no_name_or_e_mail_from_any_source_the_overview_reads(matrix_server, tmp_audit_log):  # noqa: F811
+    """Names and e-mails are seeded through every source the Overview reads, then the whole body (and the admin one, for contrast) is searched."""
+    import server.refresh_jobs as rj
+    import signin_mfa
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+    engine.set_environment_shared("dev", OWNER_A, True)
+    engine.set_shared_permissions({"view_archive": "allow", "live_read": "allow"}, environment_id=env_id)
+    # 1. Okta admin-role holders (the snapshot items hold login, e-mail, first and last name)
+    fake = FakeOkta(users=["00uS1"], roles={"00uS1": [{"id": "r1", "label": "Super administrator", "type": "SUPER_ADMIN", "status": "ACTIVE", "assignmentType": "USER"}]},
+                    profiles={"00uS1": {"id": "00uS1", "status": "ACTIVE", "profile": {"login": SENTINELS[1], "email": SENTINELS[1], "firstName": "Zelda", "lastName": "Sentinel"}}})
+    oa.capture_and_store(env_id, fake)
+    # 2. grant / revoke event actors and targets, sign-in events (the weekly counts are derived from them)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    events = [{"uuid": f"ev{i}", "eventType": et, "published": now, "displayMessage": SENTINELS[2],
+               "actor": {"id": "00uA", "alternateId": SENTINELS[3], "displayName": SENTINELS[2]}, "outcome": {"result": "SUCCESS"},
+               "target": [{"id": "00uT", "alternateId": SENTINELS[5], "displayName": SENTINELS[4], "type": "User"}],
+               "authenticationContext": {"credentialType": "OTP"}, "debugContext": {"debugData": {"factor": "SIGNED_NONCE"}}}
+              for i, et in enumerate(("user.account.privilege.grant", "user.account.privilege.revoke", "user.session.start", "user.authentication.auth_via_mfa"))]
+    conn = audit_store._get_connection()
+    audit_store._insert_rows(conn, env_id, [audit_store._normalize_live_event(e) for e in events], "all")
+    signin_mfa.refresh(env_id)
+    # 3. the OPA scan: users (names, e-mails), service accounts, servers, the people lists' source
+    model = _model()
+    model["users"][0].update(name=SENTINELS[8], details={"email": SENTINELS[9]})
+    model["okta_accounts"] = [{"id": "acct1", "okta_user_id": "00uSVC", "name": SENTINELS[10], "project_name": "P"}]
+    model["servers"] = [{"id": "s1", "hostname": SENTINELS[11]}]
+    _put_model(serve, env_id, model)
+    # 4. the Okta status of principals (login, e-mail, name per row), the capture actor and the refresh's starting actor
+    snap = audit_store.record_config_snapshot(env_id, "opa_principal_status", [("opa_user:1", {"name": SENTINELS[8], "email": SENTINELS[9], "okta_login": SENTINELS[7], "okta_state": "ACTIVE"})])
+    assert snap["item_count"] == 1
+    out = serve._start_refresh_job(env_id, "dev", parts=["log"], trigger="manual", owner=OWNER_A, actor_email=SENTINELS[5], actor_sub="00uACTOR",
+                                   client_ip="203.0.113.9", user_agent="agent")
+    assert out["started"]
+    for _ in range(100):
+        if not serve._refresh_running(env_id):
+            break
+        time.sleep(0.05)
+    serve._audit_for({"name": "dev", "trigger": "manual", "actor_email": SENTINELS[7], "actor_sub": "00uCAPTURE"}, "okta_snapshot.captured", {"kind": "okta_admins"})
+    audit_store._upsert_sync_state(conn, env_id, last_sync_error="rate limited (HTTP 429)", last_sync_status="error", last_sync_completed_at=now)
+    # the archive viewer's body: counts and wording only
+    viewer = _call(base_url, "GET", "/api/overview?environment=dev", headers=_who(OWNER_B))
+    assert viewer.status_code == 200
+    body = viewer.json()
+    assert body["okta_admins"]["count"] == 1  # the seeded sources really fed the figures
+    assert [s for s in SENTINELS if s in viewer.text] == []
+    admin = _call(base_url, "GET", "/api/overview?environment=dev", headers=_who(ADMIN, admin=True))
+    assert admin.status_code == 200 and [s for s in SENTINELS if s in admin.text] == []  # the counts body is the same for an administrator
+    # the lists stay behind the admin check
+    for lists in ("/api/overview/people?environment=dev&list=c5", "/api/overview/privileged?environment=dev"):
+        r = _call(base_url, "GET", lists, headers=_who(OWNER_B))
+        assert r.status_code == 403 and not any(s in r.text for s in SENTINELS)
