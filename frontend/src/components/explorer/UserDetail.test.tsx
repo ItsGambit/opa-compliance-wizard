@@ -1,7 +1,8 @@
 import { render, screen, within } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import { layoutForWidth, WIDE_MIN_WIDTH } from './layout'
-import { grantsText, UserDetail } from './UserDetail'
+import { UserDetail } from './UserDetail'
+import { grantsText } from '../../utils/userGrants'
 import { exampleModel } from '../../test/accessFixtures'
 import { rulesGrantedToGroupIds } from '../../utils/policy'
 
