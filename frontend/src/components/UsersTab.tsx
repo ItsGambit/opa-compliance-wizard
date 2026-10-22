@@ -6,7 +6,6 @@ import { coverageNote } from '../utils/accessEvidence'
 import { aggregateResources, trackedRequests, type AccessLookup } from '../utils/accessResources'
 import type { ExportSection } from '../utils/export'
 import { visibleAccessSections } from '../utils/exportSections'
-import { formatDateTime } from '../utils/format'
 import { policiesUsingGroup, rulesGrantedToGroupIds } from '../utils/policy'
 import { ExplorerLayout } from './explorer/ExplorerLayout'
 import { GrantsMain } from './explorer/GrantsMain'
@@ -14,6 +13,7 @@ import { GroupRemoveControl } from './explorer/GroupRemoveControl'
 import { RailGroupsExpander } from './explorer/RailGroupsExpander'
 import { CountList, FilterMenu } from './explorer/RailParts'
 import { ResourceAccessView } from './explorer/ResourceAccessView'
+import { UserDetail } from './explorer/UserDetail'
 import { UserRail } from './explorer/UserRail'
 import { useGrantsExplorer } from './explorer/useGrantsExplorer'
 import { ExportButtons } from './ExportButtons'
@@ -141,27 +141,6 @@ export function UsersTab({ model, okta, onUserGroupRemoved }: Props) {
       <UserRail users={model.users} flags={flags} selectedId={userId} onSelect={setUserId} />
       {user && (
         <>
-          <div className="flex flex-col gap-1">
-            <span className={`xp-rail-title ${isServiceAccount ? '!text-warn' : ''}`}>{user.details?.full_name || user.name}</span>
-            <span className="xp-rail-sub">
-              {[user.status, user.details?.email].filter(Boolean).join(' · ')}
-              {isServiceAccount && <> {user.status || user.details?.email ? '· ' : ''}<span className="text-warn font-medium">Service account</span></>}
-            </span>
-            {isServiceAccount && (
-              <span className="xp-rail-sub">No Okta identity — API-key-only, so "last used" (System Log) doesn't apply to it.</span>
-            )}
-            {oktaFlag && (
-              <span className={`xp-rail-sub ${oktaFlag === 'unknown' ? '' : 'text-warn'}`} role="status">
-                {oktaFlag === 'inactive' && <>Okta: this person's Okta user is deprovisioned or suspended, yet they are still an OPA principal. A candidate for review.</>}
-                {oktaFlag === 'absent' && <>Okta: no Okta user was found for this person, yet they are still an OPA principal. A candidate for review.</>}
-                {oktaFlag === 'unknown' && <>Okta: the status could not be read in the last lookup.</>}
-                {okta?.capturedAt && <> Looked up {formatDateTime(okta.capturedAt)}.</>}
-              </span>
-            )}
-            {user.groups_error && (
-              <span className="xp-rail-sub text-warn">Groups could not be read for this user, so their access is unknown (not "none").</span>
-            )}
-          </div>
           <CountList items={ex.countItems} onSelect={ex.jump} />
           <RailGroupsExpander
             count={user.groups.length}
@@ -183,10 +162,14 @@ export function UsersTab({ model, okta, onUserGroupRemoved }: Props) {
   )
 
   return (
-    <ExplorerLayout rail={rail} railLabel="User, quick view and filters">
+    <ExplorerLayout rail={rail} railLabel="User, quick view and filters" wideMin={900} railWidth="300px">
       {!user ? (
         <p className="xp-note">Select a user to see everything they have access to through their groups.</p>
       ) : (
+        <>
+        <UserDetail user={user} model={model} grants={grants} groupIds={groupIds} reach={ex.countItems.map(c => c.label).join(', ')} evidenceTarget="user-access-detail"
+          okta={okta ? { state: okta.users[user.id]?.okta_state ?? null, flag: oktaFlag, capturedAt: okta.capturedAt } : undefined} />
+        <div id="user-access-detail" className="flex flex-col gap-4" role="region" aria-label="Access by resource, last accessed and evidence">
         <GrantsMain
           ex={ex}
           now={now}
@@ -202,6 +185,8 @@ export function UsersTab({ model, okta, onUserGroupRemoved }: Props) {
             />
           )}
         />
+        </div>
+        </>
       )}
     </ExplorerLayout>
   )

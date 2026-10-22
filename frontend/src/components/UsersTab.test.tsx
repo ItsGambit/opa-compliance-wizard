@@ -33,11 +33,14 @@ describe('UsersTab', () => {
     expect(screen.getByText(/Select a user to see everything/)).toBeTruthy()
   })
 
-  it('shows the identity, per-type counts, groups and the sections', () => {
+  it('shows the identity beside the rail, the policy table, per-type counts, groups and the sections', () => {
     open()
     const rail = screen.getByRole('complementary')
-    expect(within(rail).getAllByText('Example Admin').length).toBeGreaterThan(0)
-    expect(within(rail).getByText(/ACTIVE · admin@example.test/)).toBeTruthy()
+    const detail = screen.getByRole('region', { name: 'Selected user' })  // beside the rail, as in the approved design
+    expect(within(detail).getAllByText('Example Admin').length).toBeGreaterThan(0)
+    expect(within(detail).getByText(/admin@example\.test · human · \d+ groups? → \d+ polic/)).toBeTruthy()
+    expect(within(detail).getByRole('link', { name: 'Resource evidence (live + archive)' })).toBeTruthy()
+    expect(within(detail).getAllByRole('columnheader').map(h => h.textContent)).toEqual(['Policy', 'Via group', 'Grants', 'Conditions'])  // no "Last accessed" column: no per-policy source
     expect(within(rail).getByRole('button', { name: /2\s*servers/ })).toBeTruthy()
     expect(within(rail).getByRole('button', { name: /3\s*managed saas app accounts/i })).toBeTruthy()
     expect(within(rail).getByRole('button', { name: /3\s*groups/ })).toBeTruthy()

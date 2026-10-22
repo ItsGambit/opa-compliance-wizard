@@ -24,9 +24,10 @@ function open(okta?: OktaUserFlags) {
 describe('UsersTab Okta lifecycle flag', () => {
   it('says so, as a candidate for review, for an inactive Okta user', () => {
     open({ capturedAt: '2026-10-02T00:00:00.000Z', users: { u1: { okta_state: 'DEPROVISIONED', flag: 'inactive' } } })
-    const rail = screen.getByRole('complementary')
-    expect(within(rail).getByRole('status').textContent).toMatch(/deprovisioned or suspended.*still an OPA principal.*candidate for review/)
-    expect(within(rail).getByRole('status').textContent).toMatch(/Looked up/)
+    const detail = screen.getByRole('region', { name: 'Selected user' })
+    expect(within(detail).getByRole('status').textContent).toMatch(/deprovisioned or suspended.*still an OPA principal.*candidate for review/)
+    expect(within(detail).getByRole('status').textContent).toMatch(/Looked up/)
+    expect(within(detail).getByText(/Okta: deprovisioned, read /)).toBeTruthy()
     expect(screen.getByRole('option', { name: /Okta: inactive/ })).toBeTruthy()  // the list says it too, not by colour alone
   })
 
@@ -37,7 +38,8 @@ describe('UsersTab Okta lifecycle flag', () => {
 
   it('stays quiet for an active user and when no lookup has run', () => {
     open({ capturedAt: '2026-10-02T00:00:00.000Z', users: { u1: { okta_state: 'ACTIVE', flag: null } } })
-    expect(screen.queryByText(/Okta:/)).toBeNull()
+    expect(screen.getByText(/^Okta: active, read /)).toBeTruthy()  // the design's badge; no warning text
+    expect(screen.queryByText(/candidate for review/)).toBeNull()
   })
 
   it('works without any Okta data', () => {

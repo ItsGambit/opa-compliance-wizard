@@ -7,9 +7,9 @@ export type ExplorerLayoutMode = 'wide' | 'narrow' | 'compact'
 /** The layout for the real width of the content container (NOT the window:
  * the SideNav takes width away). An unmeasurable width (0, e.g. before the
  * first layout or under jsdom) reads as the middle, stacked layout. */
-export function layoutForWidth(width: number): ExplorerLayoutMode {
+export function layoutForWidth(width: number, wideMin: number = WIDE_MIN_WIDTH): ExplorerLayoutMode {
   if (!width || !Number.isFinite(width)) return 'narrow'
-  if (width >= WIDE_MIN_WIDTH) return 'wide'
+  if (width >= wideMin) return 'wide'
   if (width < COMPACT_MAX_WIDTH) return 'compact'
   return 'narrow'
 }
