@@ -32,7 +32,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import sys
 import tarfile
 from collections import namedtuple
@@ -40,14 +39,13 @@ from pathlib import Path
 
 from . import keys as keylib
 from . import minisign
+from .root import ocw_bootstrap_verify as _bootstrap
 
-MAX_TARBALL_BYTES = 300 * 1024 * 1024
-MAX_MEMBER_BYTES = 200 * 1024 * 1024
-MAX_UNPACKED_BYTES = 1024 * 1024 * 1024
-MAX_MEMBERS = 20000
+MAX_TARBALL_BYTES = _bootstrap.MAX_TARBALL_BYTES
 MANIFEST_NAME = "manifest.json"
 KEYS_MEMBER = "server/release_keys.json"
 ENGINE_MEMBER = "create_secret_folders.py"
+_safe_relpath = _bootstrap._safe_relpath  # kept under its old name for the tests that call it
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 _FILE_RE = re.compile(r"^ocw-(\d+\.\d+\.\d+)\.tar\.gz$")
 _SCRIPT_VERSION_RE = re.compile(r'^SCRIPT_VERSION = "([^"]+)"', re.MULTILINE)
@@ -171,91 +169,14 @@ def verify_release(tar_path, sig_path, key_list, installed_version=None, allow_s
     return Release(version, sha256, sig.key_id, fields.get("timestamp"), manifest, action, candidate)
 
 
-# Names Windows treats specially (devices, alternate data streams, trailing dots/spaces are silently dropped): a
-# release that carries one would unpack differently there. Refused everywhere so the check is the same on every OS.
-_WINDOWS_UNSAFE_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
-_WINDOWS_DEVICE = re.compile(r"^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$", re.IGNORECASE)
-
-
-def _safe_relpath(name):
-    if not name or "\x00" in name or "\\" in name or name.startswith("/") or re.match(r"^[A-Za-z]:", name):
-        return None
-    clean = name.rstrip("/").split("/")
-    if any(p in ("", ".", "..") for p in clean):
-        return None
-    if any(_WINDOWS_UNSAFE_CHARS.search(p) or p.endswith((".", " ")) or _WINDOWS_DEVICE.match(p) for p in clean):
-        return None
-    return "/".join(clean)
-
-
 def safe_extract(tar_path, dest, manifest):
-    """Unpack `tar_path` into the (empty or new) directory `dest`. Only
-    regular files and directories; each file is hashed while it is written and
-    must equal the manifest; files the manifest lacks, or that are missing,
-    refuse the release. Nothing is made executable except what the tar marks
-    executable by its owner."""
-    import hashlib
-    expected = dict(manifest["files"])
-    dest = Path(dest)
-    dest.mkdir(parents=True, exist_ok=True)
-    root = dest.resolve()
-    total = count = 0
-    seen = set()
-    seen_folded = set()
+    """Unpack `tar_path` into `dest` with the rules in ocw_bootstrap_verify.safe_extract (regular files and directories
+    only, every file hashed against the signed manifest, nothing missing or extra). That module is the one copy: it is
+    also what get-ocw.sh embeds, so the installer and the updater unpack by the same code."""
     try:
-        with tarfile.open(tar_path, "r:gz") as tar:
-            for member in tar:
-                count += 1
-                if count > MAX_MEMBERS:
-                    raise VerifyError("bad_archive", "the release has too many files")
-                rel = _safe_relpath(member.name)
-                if rel is None:
-                    raise VerifyError("unsafe_path", f"the release contains an unsafe path ({member.name!r}); do not install it")
-                if member.isdir():
-                    (root / rel).mkdir(parents=True, exist_ok=True)
-                    continue
-                if not member.isreg():
-                    raise VerifyError("unsafe_member", f"the release contains a link or special file ({rel}); do not install it")
-                if rel in seen or rel.lower() in seen_folded:
-                    raise VerifyError("bad_archive", f"{rel} appears twice in the release (or differs from another file only by "
-                                      "upper/lower case, which Windows and macOS cannot hold apart)")
-                seen.add(rel)
-                seen_folded.add(rel.lower())
-                total += member.size
-                if member.size > MAX_MEMBER_BYTES or total > MAX_UNPACKED_BYTES:
-                    raise VerifyError("bad_archive", "the release unpacks to an unreasonable size")
-                target = (root / rel)
-                if root not in target.resolve().parents:
-                    raise VerifyError("unsafe_path", f"{rel} would be written outside the target directory")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                digest = hashlib.sha256()
-                with tar.extractfile(member) as src, open(target, "wb") as out:
-                    shutil.copyfileobj(_HashingReader(src, digest), out, 1 << 20)
-                os.chmod(target, 0o755 if member.mode & 0o100 else 0o644)
-                if rel == MANIFEST_NAME:
-                    continue
-                if expected.get(rel) != digest.hexdigest():
-                    raise VerifyError("file_mismatch", f"{rel} does not match the signed manifest "
-                                      f"({'not listed' if rel not in expected else 'different content'}); do not install it")
-    except (tarfile.TarError, OSError, EOFError) as exc:
-        if isinstance(exc, VerifyError):
-            raise
-        raise VerifyError("bad_archive", f"the release file cannot be unpacked ({exc})")
-    missing = sorted(set(expected) - seen)
-    if missing:
-        raise VerifyError("file_mismatch", f"the release is missing {len(missing)} file(s) the manifest lists "
-                          f"(first: {missing[0]})")
-    return count
-
-
-class _HashingReader:
-    def __init__(self, src, digest):
-        self._src, self._digest = src, digest
-
-    def read(self, n=-1):
-        data = self._src.read(n)
-        self._digest.update(data)
-        return data
+        return _bootstrap.safe_extract(tar_path, dest, manifest)
+    except _bootstrap.ExtractError as exc:
+        raise VerifyError(exc.code, str(exc))
 
 
 def _default_key_list(keys_path):

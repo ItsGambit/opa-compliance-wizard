@@ -1,0 +1,731 @@
+#!/bin/bash
+# get-ocw.sh -- the one-line installer for OPA Compliance Wizard @@VERSION@@. Run it ON THE SERVER, AS ROOT.
+#
+#   curl -fsSLO https://github.com/ItsGambit/opa-compliance-wizard/releases/latest/download/get-ocw.sh && sudo bash get-ocw.sh
+#
+# This file is GENERATED for each release from server/get-ocw.sh.in (tools/release.py) and published, signed, next to the
+# release. Read it before you run it: it is meant to be short and plain. What it does, in order:
+#
+#   1. checks the system (Debian 12/13, Ubuntu 22.04/24.04/26.04, x86-64 or ARM, systemd, Python 3.9+, SQLite 3.35+, disk);
+#   2. looks for an existing install and chooses what to do (a server that already has the upgrade layout is left alone);
+#   3. downloads the release and its signature into a root-only work directory, checks for a published key revocation,
+#      and VERIFIES the signature with the verifier embedded below (Python standard library; no minisign, no packages)
+#      before anything is unpacked or installed; then unpacks it with every file checked against the signed manifest;
+#   4. shows the plan (the release's own installer, in dry-run mode) and asks once;
+#   5. installs the few distribution packages it needs, then runs the VERIFIED release's server/install.sh.
+#
+# It never pipes anything into a shell, never runs a downloaded file before it is verified, never asks for or prints a
+# secret, and changes nothing outside its work directory and the log until you have confirmed the plan. The whole body is
+# inside functions and the last line is `main "$@"`: a truncated copy does nothing.
+#
+#   sudo bash get-ocw.sh --dry-run             the whole plan after a real download and verification; nothing is changed
+#   sudo bash get-ocw.sh --version 5.52.0      a specific release (default: the latest stable one)
+#   sudo bash get-ocw.sh --from-dir DIR        no internet: DIR holds ocw-X.Y.Z.tar.gz, .minisig and (optional) revocation.json
+#   sudo bash get-ocw.sh --uninstall --keep-data   remove the software, keep every data file
+#
+# Options (no option ever takes a secret):
+#   --version X.Y.Z          release to install (required with a mirror, OCW_RELEASE_BASE_URL)
+#   --version                (alone) print this installer's version and the keys it knows
+#   --from-dir DIR           install from files brought over by hand (no download)
+#   --wheelhouse DIR         Python packages from DIR only (pip --no-index), for a server without internet access
+#   --dry-run                show the plan; change nothing; keep the verified release in the work directory
+#   --yes                    do not ask (fresh install: also needs --server-name and --cert/--key, --self-signed or --no-nginx)
+#   --yes-no-revocation-check  with --yes: continue although the key-revocation check could not be made
+#   --app-user NAME          the application's account (default ocw; created on a fresh install)
+#   --server-name HOST       the public DNS name or IP address of this server (nginx site and allowed origin)
+#   --cert FILE --key FILE   a TLS certificate and key for the nginx site     --self-signed   make a temporary self-signed one
+#   --no-nginx               do not set up nginx (another proxy or a tunnel fronts the application)
+#   --backend-port N         port of the application on 127.0.0.1 (default 8766)
+#   --allow-older            permit a --version older than this installer's release
+#   --refresh-updater        server already has the upgrade layout: refresh the updater, units and command from a release
+#   --apply-nginx | --regenerate-second-sites | --remove-legacy-sudoers   passed to install.sh (see its --help)
+#   --uninstall --keep-data  remove the software; data, environment file, keys and the application account stay
+#   --keep-work              keep the work directory (the verified release) after the run
+#   --log FILE               log file (default /var/log/ocw-install/<UTC time>.log, mode 0600)
+# Environment: OCW_RELEASE_BASE_URL (https mirror of .../releases/download; needs --version), OCW_REVOCATION_URL (an extra
+# https source for key revocations). https_proxy / no_proxy are honoured.
+#
+# Exit status: 0 done; 2 refused, nothing was changed; 3 failed, nothing was changed or everything was put back;
+# 4 failed, you must act (the message says what).
+set -euo pipefail
+
+OCW_BOOTSTRAP_VERSION="@@VERSION@@"
+OCW_REPO="ItsGambit/opa-compliance-wizard"
+OCW_GITHUB_HOSTS="github.com objects.githubusercontent.com release-assets.githubusercontent.com"
+OCW_MIN_FREE_KB=2097152
+OCW_MAX_TARBALL=314572800
+OCW_MAX_SIG=16384
+OCW_MAX_JSON=65536
+OCW_MAX_MANIFEST=4194304
+
+LOG_FILE=""
+WORK_DIR=""
+HANDED_OVER=""
+DRY_RUN=""
+KEEP_WORK=""
+TESTING="${OCW_INSTALL_TEST:-}"
+
+# --- output: every line goes to the screen and the log; a refusal says what happened, that nothing changed, what to do --
+
+say() {
+  printf '%s\n' "$*"
+  if [ -n "$LOG_FILE" ]; then printf '%s\n' "$*" >>"$LOG_FILE" 2>/dev/null || true; fi
+}
+say_err() {
+  printf '%s\n' "$*" >&2
+  if [ -n "$LOG_FILE" ]; then printf '%s\n' "$*" >>"$LOG_FILE" 2>/dev/null || true; fi
+}
+refuse() { say_err "refused: $*"; exit 2; }
+fail() { say_err "failed: $*"; exit 3; }
+
+cleanup() { # the work directory goes unless asked to keep it; after a failed hand-over it stays (the verified release)
+  local _rc=$?
+  trap - EXIT
+  if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ] && [ -z "$KEEP_WORK" ] && [ -z "$DRY_RUN" ]; then
+    if [ -z "$HANDED_OVER" ] || [ "$_rc" -eq 0 ]; then rm -rf -- "$WORK_DIR"; fi
+  fi
+  if [ -n "$LOG_FILE" ] && [ "$_rc" -ne 0 ]; then say_err "Log: $LOG_FILE"; fi
+  exit "$_rc"
+}
+
+# --- the embedded verifier (generated: byte-for-byte copies of the repository files) ---------------------------------
+
+write_verifier() { # write_verifier <dir>
+  local _d="$1"
+@@EMBEDDED_FILES@@
+}
+
+# --- prompts: always through the terminal, never through stdin (which may be a pipe) ---------------------------------
+
+TTY_READY=""
+open_tty() {
+  [ -z "$TTY_READY" ] || return 0
+  local _in="/dev/tty"
+  if [ -n "$TESTING" ] && [ -n "${OCW_TTY:-}" ]; then _in="$OCW_TTY"; fi
+  if { exec 3<"$_in"; } 2>/dev/null; then TTY_READY=1; return 0; fi
+  return 1
+}
+ask() { # ask <question>: the answer is left in ANSWER
+  ANSWER=""
+  open_tty || refuse "no terminal to ask you on. Nothing was changed. Run it from a terminal, or add --yes after reading the plan from --dry-run."
+  if [ -n "$TESTING" ] && [ -n "${OCW_TTY:-}" ]; then printf '%s' "$1" >&2; elif ! { printf '%s' "$1" >/dev/tty; } 2>/dev/null; then printf '%s' "$1" >&2; fi
+  IFS= read -r ANSWER <&3 || ANSWER=""
+}
+confirm() { # confirm <question>: true only for y / yes
+  ask "$1 [y/N] "
+  case "$ANSWER" in y | Y | yes | YES | Yes) return 0 ;; *) return 1 ;; esac
+}
+
+# --- small helpers ---------------------------------------------------------------------------------------------------
+
+valid_url() { # https://host[:port][/path] from a plain character set: no user info, query, spaces or quotes
+  local _re='^(https://|http://127\.0\.0\.1|http://localhost)[A-Za-z0-9._:/%~+-]+$'
+  [[ "$1" =~ $_re ]]
+}
+url_host() { # the host name of an URL, lower case (no user info, no IPv6 literals)
+  local _h="${1#*://}"
+  _h="${_h%%/*}"
+  _h="${_h%%:*}"
+  printf '%s' "$_h" | tr 'A-Z' 'a-z'
+}
+free_kb() { # free kilobytes on the filesystem a path will live on (its nearest existing parent)
+  local _p="$1"
+  while [ ! -e "$_p" ] && [ "$_p" != "/" ]; do _p="$(dirname -- "$_p")"; done
+  df -Pk "$_p" 2>/dev/null | awk 'NR == 2 { print $4 }'
+}
+run_verifier() { # run_verifier <args...>: the embedded verifier, isolated (-I) and without site packages (-S)
+  "$PY3" -I -S "$WORK_DIR/verifier/ocw_bootstrap_verify.py" "$@"
+}
+
+# --- 1. the system ---------------------------------------------------------------------------------------------------
+
+os_field() { # os_field <NAME>: a value from the os-release file (read as text, never sourced)
+  sed -n -e "s/^$1=//p" "$OS_RELEASE_FILE" 2>/dev/null | head -n 1 | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//"
+}
+
+detect_system() {
+  OS_RELEASE_FILE="/etc/os-release"
+  local _arch _systemd _need_free
+  _arch="$(uname -m)"
+  _systemd="/run/systemd/system"
+  _need_free="$OCW_MIN_FREE_KB"
+  if [ -n "$TESTING" ]; then
+    OS_RELEASE_FILE="${OCW_OS_RELEASE:-$OS_RELEASE_FILE}"
+    _arch="${OCW_UNAME_M:-$_arch}"
+    _systemd="${OCW_SYSTEMD_DIR:-$_systemd}"
+    _need_free="${OCW_MIN_FREE_KB_TEST:-$_need_free}"
+  fi
+  [ -r "$OS_RELEASE_FILE" ] || refuse "this system has no $OS_RELEASE_FILE, so it cannot be identified. Nothing was changed. This installer supports Debian 12/13 and Ubuntu 22.04/24.04/26.04; see docs/hosting.md for a manual install on another system."
+  OS_ID="$(os_field ID | tr 'A-Z' 'a-z')"
+  OS_VERSION_ID="$(os_field VERSION_ID)"
+  OS_LIKE="$(os_field ID_LIKE | tr 'A-Z' 'a-z')"
+  OS_NAME="$(os_field PRETTY_NAME)"
+  [ -n "$OS_NAME" ] || OS_NAME="$OS_ID $OS_VERSION_ID"
+  case "$OS_ID" in
+    debian)
+      case "${OS_VERSION_ID%%.*}" in
+        "" | *[!0-9]*) OS_MAJOR=0 ;;
+        *) OS_MAJOR="${OS_VERSION_ID%%.*}" ;;
+      esac
+      case "$OS_MAJOR" in
+        1[2-9] | [2-9][0-9]) ;;
+        *) refuse "this system is $OS_NAME. This installer needs Debian 12 or newer (Debian 11 has SQLite 3.34, and the application needs 3.35). Nothing was changed. See docs/hosting.md for a manual install on another system." ;;
+      esac ;;
+    ubuntu)
+      case "${OS_VERSION_ID%%.*}" in
+        "" | *[!0-9]*) OS_MAJOR=0 ;;
+        *) OS_MAJOR="${OS_VERSION_ID%%.*}" ;;
+      esac
+      case "$OS_MAJOR" in
+        2[2-9] | [3-9][0-9]) ;;
+        *) refuse "this system is $OS_NAME. This installer needs Ubuntu 22.04 LTS or newer (older releases have Python 3.8). Nothing was changed. See docs/hosting.md for a manual install on another system." ;;
+      esac ;;
+    *)
+      case " $OS_ID $OS_LIKE " in
+        *" rhel "* | *" fedora "* | *" centos "* | *" rocky "* | *" almalinux "* | *" amzn "*)
+          refuse "this system is $OS_NAME. The Red Hat family is not supported by this installer yet (nginx configuration layout, SELinux). Nothing was changed. Follow docs/hosting.md by hand, or ask the project (open an issue and name the ID '$OS_ID'). The Docker image for servers without systemd is on the project's backlog." ;;
+        *)
+          refuse "this system is $OS_NAME (ID '$OS_ID'), which this installer does not support (it supports Debian 12/13 and Ubuntu 22.04/24.04/26.04). Nothing was changed. See docs/hosting.md for a manual install; the Docker image for servers without systemd is on the project's backlog, and a laptop install uses 'python launch.py' (README)." ;;
+      esac ;;
+  esac
+  case "$_arch" in
+    x86_64 | aarch64) ;;
+    *) refuse "this machine is $_arch; the release's packages exist for x86_64 and aarch64 only. Nothing was changed. See docs/hosting.md." ;;
+  esac
+  [ -d "$_systemd" ] || refuse "systemd is not running as PID 1 here ($_systemd is missing; a container or WSL1?). The application runs as systemd services. Nothing was changed. See docs/hosting.md; the Docker image is on the project's backlog."
+  PY3="$(command -v python3 || true)"
+  [ -n "$PY3" ] || refuse "python3 was not found. Nothing was changed. Install it (apt-get install python3) and run this again."
+  case "$PY3" in
+    /usr/bin/* | /usr/local/bin/* | /bin/* | /opt/*) ;;
+    *) [ -n "$TESTING" ] || refuse "python3 resolves to $PY3, which is not a system location, and root runs the updater with it. Nothing was changed. Install the distribution's python3." ;;
+  esac
+  local _facts _line PY_VERSION="" SQLITE_VERSION="" VENV_OK=""
+  _facts="$("$PY3" -I -c '
+import sys
+try:
+    import sqlite3
+    sq = sqlite3.sqlite_version
+except Exception:
+    sq = "none"
+try:
+    import venv, ensurepip
+    ve = "yes"
+except Exception:
+    ve = "no"
+print("py=%d.%d.%d" % sys.version_info[:3])
+print("sqlite=" + sq)
+print("venv=" + ve)
+print("sqlok=" + ("yes" if sq != "none" and tuple(int(p) for p in sq.split(".")[:3]) >= (3, 35, 0) else "no"))
+print("pyok=" + ("yes" if sys.version_info >= (3, 9) else "no"))
+' 2>/dev/null)" || refuse "python3 ($PY3) could not be run. Nothing was changed."
+  PY_OK="" SQL_OK=""
+  while IFS= read -r _line; do
+    case "$_line" in
+      py=*) PY_VERSION="${_line#py=}" ;;
+      sqlite=*) SQLITE_VERSION="${_line#sqlite=}" ;;
+      venv=yes) VENV_OK=1 ;;
+      pyok=yes) PY_OK=1 ;;
+      sqlok=yes) SQL_OK=1 ;;
+      *) ;;
+    esac
+  done <<EOF
+$_facts
+EOF
+  [ -n "$PY_OK" ] || refuse "this system is $OS_NAME (Python $PY_VERSION). This installer needs Python 3.9 or newer and SQLite 3.35 or newer, which Ubuntu 22.04 and Debian 12 and newer have. Nothing was changed. See docs/hosting.md for a manual install on another system."
+  [ -n "$SQL_OK" ] || refuse "this system is $OS_NAME (SQLite $SQLITE_VERSION). The application needs SQLite 3.35 or newer, which is the distribution's libsqlite3 and cannot be upgraded safely by this installer. Nothing was changed. Use Debian 12+ or Ubuntu 22.04+, or see docs/hosting.md."
+  NEED_VENV_PACKAGE=""
+  [ -n "$VENV_OK" ] || NEED_VENV_PACKAGE=1
+  local _cmd
+  for _cmd in tar sed awk find id useradd runuser loginctl systemctl cmp diff df grep mktemp; do
+    command -v "$_cmd" >/dev/null 2>&1 || { [ -n "$TESTING" ] && [ "$_cmd" = "runuser" ]; } || refuse "the command '$_cmd' is missing. Nothing was changed. Install it (it is part of the base system on Debian and Ubuntu) and run this again."
+  done
+  command -v apt-get >/dev/null 2>&1 || refuse "apt-get was not found, so the packages this needs cannot be installed. Nothing was changed. See docs/hosting.md."
+  local _free_opt _free_data
+  _free_opt="$(free_kb "$OPT_DIR")"
+  _free_data="$(free_kb "$DATA_DIR")"
+  case "${_free_opt:-0}" in *[!0-9]*) _free_opt=0 ;; esac
+  case "${_free_data:-0}" in *[!0-9]*) _free_data=0 ;; esac
+  if [ "${_free_opt:-0}" -lt "$_need_free" ] || [ "${_free_data:-0}" -lt "$_need_free" ]; then
+    refuse "not enough free disk space: $((${_free_opt:-0} / 1024)) MB free for $OPT_DIR and $((${_free_data:-0} / 1024)) MB for $DATA_DIR; 2048 MB are needed on each. Nothing was changed. Free some space and run this again."
+  fi
+  FREE_GB=$((${_free_opt:-0} / 1024 / 1024))
+  say "ok  system: $OS_NAME ($_arch), systemd, Python $PY_VERSION, SQLite $SQLITE_VERSION, ${FREE_GB} GB free"
+}
+
+# --- 2. an existing install -----------------------------------------------------------------------------------------
+
+unit_working_dir() { # the WorkingDirectory= of a unit file, or nothing
+  [ -f "$1" ] && sed -n -e 's/^[[:space:]]*WorkingDirectory=[[:space:]]*//p' "$1" | head -n 1 || true
+}
+
+detect_existing() {
+  MODE="fresh"
+  LEGACY_FOUND=""
+  local _s _wd
+  if [ -L "$OPT_DIR/current" ] && [ -e "$BIN_DIR/ocw-updater" ] && [ ! -e "$OPT_DIR/.fresh-install-incomplete" ]; then
+    MODE="already-installed"
+    [ -z "$REFRESH_UPDATER" ] || MODE="refresh-updater"
+    return 0
+  fi
+  for _s in opa-secrets-wizard opa-compliance-wizard; do
+    _wd="$(unit_working_dir "$UNIT_DIR/$_s.service")"
+    case "$_wd" in
+      "" | "$OPT_DIR" | "$OPT_DIR"/*) ;;
+      *) if [ -f "$_wd/create_secret_folders.py" ]; then MODE="migrate"; LEGACY_FOUND="$_wd"; return 0; fi ;;
+    esac
+  done
+  if [ -d "$OPT_DIR" ] || [ -e "$OPT_DIR/.fresh-install-incomplete" ]; then MODE="fresh-resume"; fi
+  return 0
+}
+
+# --- 3. which release, download, verify -------------------------------------------------------------------------------
+
+github_base() {
+  if [ -n "$TESTING" ] && [ -n "${OCW_GITHUB_BASE:-}" ]; then printf '%s' "${OCW_GITHUB_BASE%/}"; else printf '%s' "https://github.com/$OCW_REPO/releases"; fi
+}
+
+setup_sources() {
+  # RELEASE_BASE: where ocw-<v>.tar.gz lives, as <base>/v<v>/<name>; FETCH_HOSTS: the only hosts a download may come from
+  FETCH_HOSTS=""
+  if [ -n "${OCW_RELEASE_BASE_URL:-}" ]; then
+    valid_url "$OCW_RELEASE_BASE_URL" || refuse "OCW_RELEASE_BASE_URL is not a plain https address (no user name or password in it, no spaces). Nothing was changed. Set it to the https mirror of .../releases/download."
+    RELEASE_BASE="${OCW_RELEASE_BASE_URL%/}"
+    [ -n "$VERSION" ] || [ -n "$FROM_DIR" ] || refuse "a mirror (OCW_RELEASE_BASE_URL) needs --version X.Y.Z: a mirror must not be able to choose what gets installed. Nothing was changed. Add --version."
+    FETCH_HOSTS="$(url_host "$RELEASE_BASE")"
+  else
+    RELEASE_BASE="$(github_base)/download"
+    FETCH_HOSTS="$OCW_GITHUB_HOSTS"
+    if [ -n "$TESTING" ] && [ -n "${OCW_GITHUB_BASE:-}" ]; then FETCH_HOSTS="$(url_host "$OCW_GITHUB_BASE")"; fi
+  fi
+  if [ -n "${OCW_REVOCATION_URL:-}" ]; then
+    valid_url "$OCW_REVOCATION_URL" || refuse "OCW_REVOCATION_URL is not a plain https address (no user name or password in it, no spaces). Nothing was changed."
+  fi
+}
+
+fetch_to() { # fetch_to <url> <out> <max bytes> [extra allowed host]: 0 ok, 20 not found, 21 failed
+  local _hosts=() _h
+  for _h in $FETCH_HOSTS ${4:-}; do _hosts+=(--allow-host "$_h"); done
+  run_verifier fetch "$1" "$2" --max-bytes "$3" "${_hosts[@]}"
+}
+
+resolve_and_download() {
+  local _v _rc=0 _tar _sig _src
+  mkdir -m 0700 "$WORK_DIR/dl"
+  REVOCATION_FILES=()
+  REVOCATION_CHECKED="yes"
+  if [ -n "$FROM_DIR" ]; then
+    [ -d "$FROM_DIR" ] || refuse "--from-dir $FROM_DIR is not a directory. Nothing was changed."
+    local _found=0 _f
+    for _f in "$FROM_DIR"/ocw-*.tar.gz; do
+      [ -e "$_f" ] || continue
+      case "$(basename -- "$_f")" in
+        ocw-[0-9]*.[0-9]*.[0-9]*.tar.gz) ;;
+        *) continue ;;
+      esac
+      case "$(basename -- "$_f")" in *-offline.tar.gz) continue ;; esac
+      _found=$((_found + 1))
+      _src="$_f"
+    done
+    [ "$_found" -eq 1 ] || refuse "--from-dir needs exactly one ocw-X.Y.Z.tar.gz in $FROM_DIR (found $_found). Nothing was changed. The offline bundle is not accepted here yet: bring the three release files."
+    _v="$(basename -- "$_src")"
+    _v="${_v#ocw-}"
+    _v="${_v%.tar.gz}"
+    if [ -n "$VERSION" ] && [ "$VERSION" != "$_v" ]; then refuse "--version $VERSION does not match the file in --from-dir ($_v). Nothing was changed."; fi
+    VERSION="$_v"
+    TAR_FILE="$WORK_DIR/dl/ocw-$VERSION.tar.gz"
+    SIG_FILE="$TAR_FILE.minisig"
+    say "     reading the release files from $FROM_DIR"
+    run_verifier copy "$_src" "$TAR_FILE" --max-bytes "$OCW_MAX_TARBALL" || fail "could not read $_src. Nothing was changed."
+    run_verifier copy "$_src.minisig" "$SIG_FILE" --max-bytes "$OCW_MAX_SIG" || fail "could not read $_src.minisig (the signature file must sit next to the tarball). Nothing was changed."
+    if run_verifier copy "$FROM_DIR/revocation.json" "$WORK_DIR/dl/revocation-dir.json" --max-bytes "$OCW_MAX_JSON" 2>/dev/null; then
+      REVOCATION_FILES+=("$WORK_DIR/dl/revocation-dir.json")
+    else
+      REVOCATION_CHECKED="no"
+      REVOCATION_WHY="no revocation.json was brought with the release files (offline)"
+    fi
+    return 0
+  fi
+  if [ -z "$VERSION" ]; then
+    say "     asking the release server which release is the latest"
+    _rc=0
+    fetch_to "$(github_base)/latest/download/manifest.json" "$WORK_DIR/dl/latest-manifest.json" "$OCW_MAX_MANIFEST" 2>"$WORK_DIR/dl/err" || _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+      _src="$(head -c 400 "$WORK_DIR/dl/err" 2>/dev/null || true)"
+      say_err "failed: could not find out which release is the latest: $_src"
+      say_err "Nothing was changed. Check that this server can reach github.com (https_proxy if you use a proxy), or name the release with --version X.Y.Z."
+      exit 3
+    fi
+    VERSION="$(run_verifier manifest-version "$WORK_DIR/dl/latest-manifest.json")" || refuse "the release server's manifest.json did not name a version. Nothing was changed. Name the release with --version X.Y.Z."
+  fi
+  case "$VERSION" in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) refuse "'$VERSION' is not a version like 5.52.0. Nothing was changed." ;;
+  esac
+  case "$VERSION" in *[!0-9.]* | *..* | .* | *.) refuse "'$VERSION' is not a version like 5.52.0. Nothing was changed." ;; esac
+  TAR_FILE="$WORK_DIR/dl/ocw-$VERSION.tar.gz"
+  SIG_FILE="$TAR_FILE.minisig"
+  say "     downloading release $VERSION and its signature"
+  _tar="$RELEASE_BASE/v$VERSION/ocw-$VERSION.tar.gz"
+  _sig="$_tar.minisig"
+  _rc=0
+  fetch_to "$_tar" "$TAR_FILE" "$OCW_MAX_TARBALL" 2>"$WORK_DIR/dl/err" || _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    _src="$(head -c 400 "$WORK_DIR/dl/err" 2>/dev/null || true)"
+    [ "$_rc" -ne 20 ] || _src="release $VERSION was not found ($_src)"
+    say_err "failed: could not download the release: $_src"
+    say_err "Nothing was changed. Check the version exists and that this server can reach the release host (https_proxy if you use a proxy), or bring the files and use --from-dir."
+    exit 3
+  fi
+  _rc=0
+  fetch_to "$_sig" "$SIG_FILE" "$OCW_MAX_SIG" 2>"$WORK_DIR/dl/err" || _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    _src="$(head -c 400 "$WORK_DIR/dl/err" 2>/dev/null || true)"
+    say_err "failed: could not download the release's signature: $_src"
+    say_err "Nothing was changed. Download again; without the signature nothing can be installed."
+    exit 3
+  fi
+  # published key revocations: the project's `revocation` and `revocation-1` releases, and the owner's static URL
+  local _i=0 _url _extra
+  for _url in "$RELEASE_BASE/revocation/revocation.json" "$RELEASE_BASE/revocation-1/revocation.json" "${OCW_REVOCATION_URL:-}"; do
+    [ -n "$_url" ] || continue
+    _i=$((_i + 1))
+    _extra=""
+    [ "$_url" != "${OCW_REVOCATION_URL:-}" ] || _extra="$(url_host "$_url")"
+    _rc=0
+    fetch_to "$_url" "$WORK_DIR/dl/revocation-$_i.json" "$OCW_MAX_JSON" "$_extra" 2>"$WORK_DIR/dl/err" || _rc=$?
+    case "$_rc" in
+      0) REVOCATION_FILES+=("$WORK_DIR/dl/revocation-$_i.json") ;;
+      20) ;;
+      *) REVOCATION_CHECKED="no"; REVOCATION_WHY="$(head -c 300 "$WORK_DIR/dl/err" 2>/dev/null || true)" ;;
+    esac
+  done
+}
+
+verify_release() {
+  local _args=() _f
+  mkdir -m 0700 "$WORK_DIR/release-parent"
+  _args=(verify --tar "$TAR_FILE" --sig "$SIG_FILE" --keys "$WORK_DIR/verifier/release_keys.json"
+         --bootstrap-version "$OCW_BOOTSTRAP_VERSION" --extract "$WORK_DIR/release-parent/release"
+         --info-out "$WORK_DIR/release-info.json" --revocation-out "$WORK_DIR/revocations")
+  [ -z "$VERSION" ] || _args+=(--expect-version "$VERSION")
+  [ -z "$ALLOW_OLDER" ] || _args+=(--allow-older)
+  for _f in ${REVOCATION_FILES[@]+"${REVOCATION_FILES[@]}"}; do _args+=(--revocation "$_f"); done
+  local _out _rc=0
+  _out="$(run_verifier "${_args[@]}" 2>"$WORK_DIR/verify.err")" || _rc=$?
+  if [ -n "$_out" ]; then say "$_out"; fi
+  if [ "$_rc" -ne 0 ]; then
+    say_err "$(sed -e 's/^ERROR: /refused: /' "$WORK_DIR/verify.err" 2>/dev/null)"
+    if [ "$_rc" -eq 2 ]; then exit 2; fi
+    exit 3
+  fi
+  REL_DIR="$WORK_DIR/release-parent/release"
+  chmod -R go-w "$REL_DIR"
+  [ -f "$REL_DIR/server/install.sh" ] || refuse "the verified release does not contain server/install.sh. Nothing was changed. Contact the project."
+}
+
+revocation_gate() {
+  [ "$REVOCATION_CHECKED" = "yes" ] && return 0
+  say "note: could not check for a published key revocation (${REVOCATION_WHY:-the release server did not answer}). If the project announced a key compromise, stop here and bring revocation.json with --from-dir."
+  if [ -n "$ASSUME_YES" ]; then
+    [ -n "$NO_REVOCATION_CHECK" ] || refuse "the key-revocation check could not be made, and --yes was given without --yes-no-revocation-check. Nothing was changed. Fix the network, or add --yes-no-revocation-check to accept that."
+    say "     continuing without a revocation check (--yes-no-revocation-check)"
+    return 0
+  fi
+  [ -n "$DRY_RUN" ] && return 0
+  confirm "Continue without the revocation check?" || refuse "not confirmed. Nothing was changed."
+}
+
+# --- 4./5. plan, packages, hand-over ---------------------------------------------------------------------------------
+
+package_list() { # the distribution packages this install needs and does not have
+  PACKAGES=()
+  pkg_present() { command -v dpkg-query >/dev/null 2>&1 && dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; }
+  [ -z "$NEED_VENV_PACKAGE" ] || PACKAGES+=(python3-venv)
+  if [ "$MODE" = "fresh" ] || [ "$MODE" = "fresh-resume" ]; then
+    if [ -z "$NO_NGINX" ]; then command -v nginx >/dev/null 2>&1 || PACKAGES+=(nginx); fi
+    command -v gnome-keyring-daemon >/dev/null 2>&1 || PACKAGES+=(gnome-keyring)
+    pkg_present dbus-user-session || PACKAGES+=(dbus-user-session)
+    command -v openssl >/dev/null 2>&1 || PACKAGES+=(openssl)
+  fi
+}
+
+install_packages() {
+  [ "${#PACKAGES[@]}" -gt 0 ] || { say "ok  packages: nothing to install"; return 0; }
+  say "==> Installing packages from your distribution: ${PACKAGES[*]}"
+  export DEBIAN_FRONTEND=noninteractive
+  { apt-get update -q && apt-get install -y -q --no-install-recommends "${PACKAGES[@]}"; } 2>&1 | tee -a "$LOG_FILE" || true
+  local _rc="${PIPESTATUS[0]}"
+  if [ "$_rc" -ne 0 ]; then
+    say_err "failed: the package installation failed (messages above). Nothing of the application was installed yet. Fix the package problem (a mirror that does not answer, a locked dpkg) and run the same command again."
+    exit 3
+  fi
+}
+
+installer_args() { # installer_args <mode flags...>: the flags every install.sh call gets (the bootstrap's answers, never secrets)
+  IA=(--source "$REL_DIR" --release-info "$WORK_DIR/release-info.json" --log "$LOG_FILE")
+  local _r
+  if [ -d "$WORK_DIR/revocations" ]; then
+    for _r in "$WORK_DIR"/revocations/*.json; do [ -f "$_r" ] && IA+=(--revocation "$_r"); done
+  fi
+  [ -z "$WHEELHOUSE" ] || IA+=(--wheelhouse "$WHEELHOUSE")
+  [ -z "$APP_USER" ] || IA+=(--app-user "$APP_USER")
+  if [ "$MODE" = "fresh" ] || [ "$MODE" = "fresh-resume" ]; then
+    IA+=(--create-app-user)
+    [ -z "$SERVER_NAME" ] || IA+=(--server-name "$SERVER_NAME")
+    [ -z "$NO_NGINX" ] || IA+=(--no-nginx)
+    [ -z "$SELF_SIGNED" ] || IA+=(--self-signed)
+    [ -z "$CERT_FILE" ] || IA+=(--cert "$CERT_FILE" --key "$KEY_FILE")
+    [ -z "$BACKEND_PORT" ] || IA+=(--backend-port "$BACKEND_PORT")
+  fi
+  [ -z "$REFRESH_UPDATER" ] || IA+=(--refresh-updater)
+  [ -z "$APPLY_NGINX" ] || IA+=(--apply-nginx)
+  [ -z "$REGEN_SECOND" ] || IA+=(--regenerate-second-sites)
+  [ -z "$REMOVE_SUDOERS" ] || IA+=(--remove-legacy-sudoers)
+  [ -z "${OCW_RELEASE_BASE_URL:-}" ] || IA+=(--release-base-url "${OCW_RELEASE_BASE_URL%/}")
+  [ -z "${OCW_REVOCATION_URL:-}" ] || IA+=(--revocation-url "$OCW_REVOCATION_URL")
+}
+
+run_installer() { # run_installer [extra flags...]: the verified release's install.sh; its own log handling appends to the log
+  local _rc=0
+  HANDED_OVER=1
+  bash "$REL_DIR/server/install.sh" "${IA[@]}" "$@" || _rc=$?
+  return "$_rc"
+}
+
+choose_tls() { # fresh install: the server name and the TLS choice, asked only when not given
+  [ -z "$NO_NGINX" ] || return 0
+  if [ -z "$SERVER_NAME" ]; then
+    if [ -n "$DRY_RUN" ] && ! open_tty; then
+      SERVER_NAME="server.example.com"
+      note_placeholder=1
+    else
+      ask "Public name or IP address of this server (for the web address and the certificate): "
+      SERVER_NAME="$ANSWER"
+      [ -n "$SERVER_NAME" ] || refuse "no server name given. Nothing was changed. Run again and enter one, or use --no-nginx."
+    fi
+  fi
+  if [ -z "$SELF_SIGNED" ] && [ -z "$CERT_FILE" ]; then
+    if [ -n "$DRY_RUN" ] && ! open_tty; then
+      SELF_SIGNED=1
+    else
+      say "TLS certificate for the web site:"
+      say "  1) I have a certificate and key"
+      say "  2) make a temporary self-signed one for now (the browser will warn until you install a trusted one)"
+      say "  3) no nginx here (another proxy or a tunnel fronts the application)"
+      ask "Choose [2]: "
+      case "$ANSWER" in
+        1)
+          ask "Path of the certificate file (PEM, with any chain): "
+          CERT_FILE="$ANSWER"
+          ask "Path of the private key file (PEM): "
+          KEY_FILE="$ANSWER"
+          [ -n "$CERT_FILE" ] && [ -n "$KEY_FILE" ] || refuse "a certificate and a key path are both needed. Nothing was changed." ;;
+        3) NO_NGINX=1 ;;
+        "" | 2) SELF_SIGNED=1 ;;
+        *) refuse "'$ANSWER' is not a choice. Nothing was changed." ;;
+      esac
+    fi
+  fi
+}
+
+# --- main ------------------------------------------------------------------------------------------------------------
+
+usage() { sed -n '2,/^set -euo pipefail/p' "$0" | sed -n -e '/^# /s/^# \{0,1\}//p' -e '/^#$/s/^#//p'; }
+
+main() {
+  # a clean, predictable environment for everything below; never traced (a trace could print a value that matters)
+  set +x
+  unset BASH_XTRACEFD LD_PRELOAD LD_LIBRARY_PATH BASH_ENV ENV PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT
+  umask 077
+  export LC_ALL=C
+  if [ -z "$TESTING" ]; then
+    PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+    export PATH
+  fi
+  VERSION="" FROM_DIR="" WHEELHOUSE="" ASSUME_YES="" NO_REVOCATION_CHECK="" APP_USER="" SERVER_NAME="" CERT_FILE="" KEY_FILE=""
+  SELF_SIGNED="" NO_NGINX="" BACKEND_PORT="" ALLOW_OLDER="" REFRESH_UPDATER="" APPLY_NGINX="" REGEN_SECOND="" REMOVE_SUDOERS=""
+  UNINSTALL="" KEEP_DATA="" note_placeholder=""
+  local _show_version=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --version)
+        if [ $# -ge 2 ] && [ "${2#-}" = "$2" ]; then VERSION="$2"; shift 2; else _show_version=1; shift; fi ;;
+      --from-dir) [ $# -ge 2 ] || refuse "--from-dir needs a directory. Nothing was changed."; FROM_DIR="$2"; shift 2 ;;
+      --wheelhouse) [ $# -ge 2 ] || refuse "--wheelhouse needs a directory. Nothing was changed."; WHEELHOUSE="$2"; shift 2 ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      --yes | -y) ASSUME_YES=1; shift ;;
+      --yes-no-revocation-check) NO_REVOCATION_CHECK=1; shift ;;
+      --app-user) [ $# -ge 2 ] || refuse "--app-user needs a name. Nothing was changed."; APP_USER="$2"; shift 2 ;;
+      --server-name) [ $# -ge 2 ] || refuse "--server-name needs a name or address. Nothing was changed."; SERVER_NAME="$2"; shift 2 ;;
+      --cert) [ $# -ge 2 ] || refuse "--cert needs a file. Nothing was changed."; CERT_FILE="$2"; shift 2 ;;
+      --key) [ $# -ge 2 ] || refuse "--key needs a file. Nothing was changed."; KEY_FILE="$2"; shift 2 ;;
+      --self-signed) SELF_SIGNED=1; shift ;;
+      --no-nginx) NO_NGINX=1; shift ;;
+      --backend-port) [ $# -ge 2 ] || refuse "--backend-port needs a number. Nothing was changed."; BACKEND_PORT="$2"; shift 2 ;;
+      --allow-older) ALLOW_OLDER=1; shift ;;
+      --refresh-updater) REFRESH_UPDATER=1; shift ;;
+      --apply-nginx) APPLY_NGINX=1; shift ;;
+      --regenerate-second-sites) REGEN_SECOND=1; shift ;;
+      --remove-legacy-sudoers) REMOVE_SUDOERS=1; shift ;;
+      --uninstall) UNINSTALL=1; shift ;;
+      --keep-data) KEEP_DATA=1; shift ;;
+      --keep-work) KEEP_WORK=1; shift ;;
+      --log) [ $# -ge 2 ] || refuse "--log needs a file. Nothing was changed."; LOG_FILE="$2"; shift 2 ;;
+      -h | --help) usage; exit 0 ;;
+      *) refuse "unknown argument: $1. Nothing was changed. See --help." ;;
+    esac
+  done
+  if [ -n "$_show_version" ]; then
+    echo "get-ocw.sh from release $OCW_BOOTSTRAP_VERSION; knows release keys: @@KEY_SUMMARY@@"
+    exit 0
+  fi
+  [ -z "$KEEP_DATA" ] || [ -n "$UNINSTALL" ] || refuse "--keep-data only goes with --uninstall. Nothing was changed."
+  if [ -n "$UNINSTALL" ] && [ -z "$KEEP_DATA" ]; then
+    refuse "this release can only uninstall with --keep-data (the software goes, every data file stays). Nothing was changed. Removing the data is a manual step: see 'Uninstalling' in docs/hosting.md."
+  fi
+  OPT_DIR="/opt/opa-compliance-wizard" DATA_DIR="/var/lib/opa-compliance-wizard" UNIT_DIR="/etc/systemd/system" BIN_DIR="/usr/local/bin"
+  local _log_dir="/var/log/ocw-install" _work_base="/var/tmp" _ld
+  if [ -n "$TESTING" ]; then
+    OPT_DIR="${OCW_OPT_DIR:-$OPT_DIR}" DATA_DIR="${OCW_DATA_DIR:-$DATA_DIR}" UNIT_DIR="${OCW_UNIT_DIR:-$UNIT_DIR}" BIN_DIR="${OCW_BIN_DIR:-$BIN_DIR}"
+    _log_dir="${OCW_LOG_DIR:-$_log_dir}"
+    _work_base="${OCW_WORK_BASE:-$_work_base}"
+  fi
+  if [ -z "$TESTING" ]; then
+    [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || refuse "this installer needs bash 4 or newer (this is bash ${BASH_VERSION:-unknown}). Nothing was changed."
+    [ "$(id -u)" -eq 0 ] || refuse "run it as root: sudo bash get-ocw.sh (--dry-run needs root too: it only reads the system). Nothing was changed."
+  fi
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if [ -z "$LOG_FILE" ]; then
+    LOG_FILE="$_log_dir/$(date -u +%Y%m%dT%H%M%SZ).log"
+  fi
+  _ld="$(dirname -- "$LOG_FILE")"
+  if [ ! -d "$_ld" ]; then
+    { mkdir -p "$_ld" && chmod 0700 "$_ld"; } 2>/dev/null || { LOG_FILE=""; refuse "cannot create the log directory $_ld. Nothing was changed."; }
+  fi
+  ( umask 077; : >>"$LOG_FILE" ) 2>/dev/null || { LOG_FILE=""; refuse "cannot write the log file. Nothing was changed."; }
+  chmod 0600 "$LOG_FILE" 2>/dev/null || true
+  say "get-ocw.sh $OCW_BOOTSTRAP_VERSION  (log: $LOG_FILE)"
+  if [ -z "$ASSUME_YES" ] && [ -z "$DRY_RUN" ]; then
+    open_tty || refuse "no terminal to ask you on. Nothing was changed. Run it from a terminal, or add --yes after reading the plan from --dry-run."
+  fi
+  if [ -n "$SERVER_NAME" ]; then
+    case "$SERVER_NAME" in
+      *[!A-Za-z0-9.:-]* | "" | -* | .*) refuse "'$SERVER_NAME' is not a DNS name or an IP address (no scheme, path, spaces or symbols). Nothing was changed." ;;
+    esac
+  fi
+  if [ -n "$BACKEND_PORT" ]; then
+    case "$BACKEND_PORT" in *[!0-9]* | "") refuse "--backend-port must be a number. Nothing was changed." ;; esac
+  fi
+  if [ -n "$CERT_FILE" ] || [ -n "$KEY_FILE" ]; then
+    [ -n "$CERT_FILE" ] && [ -n "$KEY_FILE" ] || refuse "--cert and --key go together. Nothing was changed."
+    [ -z "$SELF_SIGNED" ] || refuse "--self-signed and --cert/--key are alternatives. Nothing was changed."
+    [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ] || refuse "the certificate or key file does not exist ($CERT_FILE, $KEY_FILE). Nothing was changed."
+  fi
+  [ -z "$NO_NGINX" ] || [ -z "$SELF_SIGNED$CERT_FILE" ] || refuse "--no-nginx and a certificate option are alternatives. Nothing was changed."
+  if [ -n "$WHEELHOUSE" ]; then [ -d "$WHEELHOUSE" ] || refuse "--wheelhouse $WHEELHOUSE is not a directory. Nothing was changed."; fi
+
+  detect_system
+  detect_existing
+  if [ -n "$UNINSTALL" ]; then
+    # the installed release's own installer (verified when it was installed); a damaged layout falls back to a download
+    if [ -f "$OPT_DIR/current/server/install.sh" ]; then
+      REL_DIR="$OPT_DIR/current"
+      IA=(--uninstall --keep-data --log "$LOG_FILE")
+      [ -z "$ASSUME_YES" ] || IA+=(--yes)
+      [ -z "$DRY_RUN" ] || IA+=(--dry-run)
+      run_installer || exit "$?"
+      exit 0
+    fi
+    say "note: no installed release was found at $OPT_DIR/current; downloading one to run its uninstaller"
+  fi
+  case "$MODE" in
+    already-installed)
+      local _cur
+      _cur="$(readlink "$OPT_DIR/current" 2>/dev/null || true)"
+      say "ok  existing install: the upgrade layout is in place ($OPT_DIR/current -> ${_cur:-?})"
+      if [ -x "$BIN_DIR/ocw-updater" ]; then "$BIN_DIR/ocw-updater" status 2>&1 | while IFS= read -r _l; do say "     $_l"; done || true; fi
+      say "This server already runs the upgrade layout. Upgrade from the Updates page or 'sudo ocw-updater apply <version>'."
+      say "To refresh the units, the command and the updater from a release: sudo bash get-ocw.sh --refresh-updater [--version X.Y.Z]"
+      say "Nothing was changed."
+      exit 0 ;;
+  esac
+  case "$MODE" in
+    migrate) say "ok  existing install: an in-home install at $LEGACY_FOUND (it will be migrated; its data is copied and checked, nothing is deleted)" ;;
+    fresh-resume) say "ok  existing install: an unfinished earlier install in $OPT_DIR (it will be resumed; nothing under $DATA_DIR is overwritten)" ;;
+    fresh) say "ok  existing install: none found (a fresh install)" ;;
+    *) ;;
+  esac
+  if [ -f "$DATA_DIR/audit_store.db" ] && { [ "$MODE" = "fresh" ] || [ "$MODE" = "fresh-resume" ]; }; then
+    say "ok  existing archive found in $DATA_DIR: kept; the application will open it"
+  fi
+  if { [ "$MODE" = "fresh" ] || [ "$MODE" = "fresh-resume" ]; } && [ -n "$ASSUME_YES" ] && [ -z "$UNINSTALL" ]; then
+    [ -n "$SERVER_NAME" ] || [ -n "$NO_NGINX" ] || refuse "--yes on a fresh install needs --server-name HOST (or --no-nginx). Nothing was changed."
+    [ -n "$NO_NGINX" ] || [ -n "$SELF_SIGNED" ] || [ -n "$CERT_FILE" ] || refuse "--yes on a fresh install must choose the certificate: --cert FILE --key FILE, --self-signed, or --no-nginx. Nothing was changed."
+  fi
+
+  setup_sources
+  # a work directory only root can enter; a stale one from a dry run is removed after a day
+  find "$_work_base" -maxdepth 1 -type d -name 'ocw-install.*' -user "$(id -un)" -mtime +0 -exec rm -rf {} + 2>/dev/null || true
+  WORK_DIR="$(mktemp -d "$_work_base/ocw-install.XXXXXXXX")" || fail "could not create a work directory in $_work_base. Nothing was changed."
+  chmod 0700 "$WORK_DIR"
+  mkdir -m 0700 "$WORK_DIR/verifier"
+  write_verifier "$WORK_DIR/verifier"
+  resolve_and_download
+  verify_release
+  revocation_gate
+  if [ -n "$UNINSTALL" ]; then
+    IA=(--uninstall --keep-data --log "$LOG_FILE" --source "$REL_DIR")
+    [ -z "$ASSUME_YES" ] || IA+=(--yes)
+    [ -z "$DRY_RUN" ] || IA+=(--dry-run)
+    run_installer || exit "$?"
+    exit 0
+  fi
+
+  if [ "$MODE" = "fresh" ] || [ "$MODE" = "fresh-resume" ]; then
+    choose_tls
+    [ -n "$APP_USER" ] || APP_USER="ocw"
+  fi
+  package_list
+  say ""
+  say "Plan: $MODE, release $VERSION"
+  if [ "${#PACKAGES[@]}" -gt 0 ]; then say "  packages from your distribution (apt-get install --no-install-recommends): ${PACKAGES[*]}"; else say "  packages: none needed"; fi
+  say "  then the verified release's own installer, whose plan follows"
+  say ""
+  installer_args
+  local _rc=0
+  # the plan: always the release's own dry run (it validates every flag before anything is changed)
+  HANDED_OVER=""
+  bash "$REL_DIR/server/install.sh" "${IA[@]}" --dry-run || _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    say_err "The installer refused the plan above (exit $_rc). Nothing was changed."
+    exit 2
+  fi
+  if [ -n "$DRY_RUN" ]; then
+    say ""
+    say "Dry run: nothing was changed. The downloaded and verified release is in $WORK_DIR (delete it with: rm -rf $WORK_DIR; a dry-run directory older than a day is removed by the next run)."
+    [ -z "$note_placeholder" ] || say "(the server name above is a placeholder: the real run asks, or use --server-name)"
+    exit 0
+  fi
+  if [ -z "$ASSUME_YES" ]; then
+    confirm "Proceed?" || refuse "not confirmed. Nothing was changed."
+    if [ "$MODE" = "migrate" ]; then
+      say "This is a migration: your data files are copied and checked, the units are rewritten, the service restarts."
+      confirm "Migrate this install now (the old files are kept and put back automatically if the new layout does not come up)?" || refuse "not confirmed. Nothing was changed."
+    fi
+  fi
+  install_packages
+  _rc=0
+  run_installer --yes || _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    case "$_rc" in 2 | 3 | 4) ;; *) _rc=4 ;; esac
+    say_err "The installer stopped (exit $_rc); its messages above say what happened and what to do. Log: $LOG_FILE"
+    KEEP_WORK=1
+    exit "$_rc"
+  fi
+  say "Log: $LOG_FILE"
+  exit 0
+}
+
+main "$@"

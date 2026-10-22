@@ -6,17 +6,18 @@ and Node 20.19+/22.12+). It is never run on a server and nothing in the app
 calls it.
 
     release.py build <version> [--out DIR] [--repo DIR]
-    release.py sign <ocw-version.tar.gz> --signer kms --kms-key K [--aws-profile P]
+    release.py sign <ocw-version.tar.gz> --signer kms --kms-key K [--aws-profile P]   (also signs get-ocw.sh next to it)
     release.py build-offline <ocw-version.tar.gz> [--out DIR] [--python 3.12 ...] [--platform linux-x86_64 ...]
-    release.py verify <ocw-version.tar.gz> <ocw-version.tar.gz.minisig> [...]
+    release.py verify <ocw-version.tar.gz> <ocw-version.tar.gz.minisig> [--bootstrap get-ocw.sh [--bootstrap-sig get-ocw.sh.minisig]]
     release.py pubkey --aws-kms <key id|arn|alias> | --azure <key id URL> [--out entry.json]
     release.py rotate [--add-key entry.json] [--retire <key id>]
 
 Where the keys live (decision, 5.46.0). No key is ever a file on this computer.
 The release (primary) key is an AWS KMS Ed25519 key; `sign --signer kms` calls
 KMS Sign with ED25519_SHA_512 and MessageType RAW (pure Ed25519) twice per
-release: once over the file's BLAKE2b-512 digest, once over signature + trusted
-comment. With `--aws-profile` the tool first makes sure there is a valid MFA-
+signed file: once over the file's BLAKE2b-512 digest, once over signature + trusted
+comment. A release signs two files (the tarball and its get-ocw.sh), so it is
+exactly FOUR Sign calls. With `--aws-profile` the tool first makes sure there is a valid MFA-
 backed IAM Identity Center session (it runs `aws sso login` if not), so nothing
 secret is stored here. The standby key (Azure Key Vault, ES256) signs
 revocations only and is used by tools/revoke.py, never from here.
@@ -54,6 +55,7 @@ from server.updater import keys as keylib  # noqa: E402
 from server.updater import minisign  # noqa: E402
 from server.updater import verify as verifylib  # noqa: E402
 from server.updater import offline as offlinelib  # noqa: E402
+import render_bootstrap  # noqa: E402
 
 DEFAULT_MIN_UPGRADE_FROM = "5.41.0"  # first release with deploy.sh handoff protocol 2
 DEFAULT_DOWNTIME_SECONDS = 60
@@ -283,6 +285,7 @@ def build_release(version, repo=REPO, out_dir=None, frontend_dist=None, min_upgr
     lock = files.get("frontend/package-lock.json")
     migrations, expected_schema = _migrations_from(files)
     activator_version = _activator_version(files)
+    bootstrap = _bootstrap_for(version, files)
     manifest = {
         "schema": 1,
         "version": version,
@@ -310,6 +313,9 @@ def build_release(version, repo=REPO, out_dir=None, frontend_dist=None, min_upgr
         "requires_reboot": False,
         "activator_version": activator_version,
         "frontend_lock_sha256": hashlib.sha256(lock[1]).hexdigest() if lock else None,
+        # sha256 of this release's get-ocw.sh (the one-line installer, rendered from the tagged template, verifier and key
+        # list; `verify --bootstrap` re-renders it from the tarball and compares). None for a tree without the template.
+        "bootstrap_sha256": hashlib.sha256(bootstrap).hexdigest() if bootstrap is not None else None,
         "changelog_excerpt": excerpt,
         "files": {name: hashlib.sha256(data).hexdigest() for name, (_m, data) in sorted(files.items())},
     }
@@ -327,13 +333,32 @@ def build_release(version, repo=REPO, out_dir=None, frontend_dist=None, min_upgr
             info.uname = info.gname = ""
             tar.addfile(info, io.BytesIO(data))
     (out_dir / "manifest.json").write_bytes(manifest_bytes)
+    if bootstrap is not None:
+        (out_dir / BOOTSTRAP_NAME).write_bytes(bootstrap)
     return tar_path, manifest
+
+
+BOOTSTRAP_NAME = "get-ocw.sh"
+
+
+def _bootstrap_for(version, files):
+    """The rendered get-ocw.sh bytes for this tree, or None for a tree that has no template (an old tag, a test fixture).
+    `files` is {path: (mode, bytes)} or {path: bytes}."""
+    flat = {n: (v[1] if isinstance(v, tuple) else v) for n, v in files.items()}
+    if render_bootstrap.TEMPLATE_PATH not in flat:
+        return None
+    try:
+        return render_bootstrap.render(version, flat)
+    except render_bootstrap.RenderError as exc:
+        raise ReleaseError(f"cannot render {BOOTSTRAP_NAME}: {exc}")
 
 
 def cmd_build(a):
     tar_path, manifest = build_release(a.version, Path(a.repo), a.out, a.frontend_dist, a.min_upgrade_from, a.downtime_seconds)
     print(f"Built {tar_path} ({len(manifest['files'])} files, commit {manifest['commit'][:12]})")
-    print(f"Next: release.py sign {tar_path} --key <primary.key>")
+    if manifest.get("bootstrap_sha256"):
+        print(f"Rendered {tar_path.parent / BOOTSTRAP_NAME} (sha256 {manifest['bootstrap_sha256'][:12]}...)")
+    print(f"Next: release.py sign {tar_path} --signer kms --kms-key <key>")
 
 
 # --- sign / verify ---------------------------------------------------------------
@@ -390,17 +415,104 @@ def sign_release_file(tar_path, signer, keys_path, mini=None, require_minisign=F
     return sig_path, info
 
 
+def _tar_files(tar_path):
+    """{path: bytes} of every regular file in a release tarball (the renderer's inputs live in it)."""
+    out = {}
+    with tarfile.open(tar_path, "r:gz") as tar:
+        for m in tar:
+            if m.isreg():
+                out[m.name] = tar.extractfile(m).read()
+    return out
+
+
+def verify_bootstrap_signature(script_path, sig_path, key_list):
+    """The signature on get-ocw.sh checked by the application's own verifier code: a release key (not retired or revoked),
+    the trusted comment `file=get-ocw.sh version=<v> sha256=<hex>`, and the version the script itself carries."""
+    script_path = Path(script_path)
+    prehash, sha256, _ = minisign.hash_file(script_path, 8 * 1024 * 1024)
+    sig = minisign.parse_signature(Path(sig_path).read_text(encoding="utf-8"))
+    fields = minisign.parse_trusted_comment(sig.trusted_comment, optional=("timestamp",))
+    pub = keylib.pick_signer(key_list, sig.key_id, "release", fields.get("timestamp"), fields["version"], sha256)
+    minisign.verify(prehash, sig, pub)
+    if fields["file"] != BOOTSTRAP_NAME or script_path.name != BOOTSTRAP_NAME:
+        raise ReleaseError(f"the signature is for '{fields['file']}', not for {BOOTSTRAP_NAME}")
+    if fields["sha256"] != sha256:
+        raise ReleaseError(f"the sha256 of {BOOTSTRAP_NAME} differs from the signed one")
+    try:
+        carried = render_bootstrap.bootstrap_version(script_path.read_bytes())
+    except render_bootstrap.RenderError as exc:
+        raise ReleaseError(str(exc))
+    if carried != fields["version"]:
+        raise ReleaseError(f"{BOOTSTRAP_NAME} carries version {carried} but the signature says {fields['version']}")
+    return fields, sig
+
+
+def check_bootstrap_against_release(tar_path, script_path):
+    """Re-render get-ocw.sh from the tarball's own files and compare it, byte for byte, with `script_path` and with the
+    manifest's bootstrap_sha256. Returns the version."""
+    files = _tar_files(tar_path)
+    manifest = json.loads(files["manifest.json"])
+    version = manifest["version"]
+    expected = _bootstrap_for(version, files)
+    if expected is None:
+        raise ReleaseError(f"the release has no {render_bootstrap.TEMPLATE_PATH}, so it has no get-ocw.sh to compare")
+    actual = Path(script_path).read_bytes()
+    if actual != expected:
+        raise ReleaseError(f"{BOOTSTRAP_NAME} is not what this release renders: it differs from the template, verifier and key "
+                           "list inside the tarball. Do not publish it; run `release.py build` again.")
+    if manifest.get("bootstrap_sha256") != hashlib.sha256(actual).hexdigest():
+        raise ReleaseError(f"the manifest's bootstrap_sha256 does not match {BOOTSTRAP_NAME}")
+    return version
+
+
+def sign_bootstrap_file(script_path, tar_path, signer, keys_path, mini=None, require_minisign=False):
+    """Signs get-ocw.sh with the release key: trusted comment `file=get-ocw.sh version=<v> sha256=<hex>` (two more KMS Sign
+    calls). Refuses to sign a script that is not exactly what the tarball's template, verifier and keys render."""
+    script_path = Path(script_path)
+    version = check_bootstrap_against_release(tar_path, script_path)
+    _prehash, sha256, _ = minisign.hash_file(script_path, 8 * 1024 * 1024)
+    comment = f"file={BOOTSTRAP_NAME} version={version} sha256={sha256}"
+    sig_path = Path(str(script_path) + ".minisig")
+    signer.sign_file(script_path, comment, sig_path)
+    eff = keylib.effective_from(keylib.load_key_list(keys_path))
+    try:
+        fields, sig = verify_bootstrap_signature(script_path, sig_path, eff)
+    except (ReleaseError, minisign.SignatureError, keylib.KeyListError) as exc:
+        sig_path.unlink(missing_ok=True)
+        raise ReleaseError(f"the {BOOTSTRAP_NAME} signature was made but does NOT verify against {keys_path}: {exc}\n"
+                           "The bad signature file was removed; do not upload anything.")
+    entry = next(k for k in eff["keys"] if k["key_id"] == sig.key_id)
+    interop_check(script_path, sig_path, entry, mini, require_minisign)
+    return sig_path, version
+
+
 def cmd_sign(a):
     tar_path = Path(a.tarball)
     signer = make_signer(a)
     keys_path = Path(a.keys or REPO / "server" / "release_keys.json")
+    script_path = tar_path.parent / BOOTSTRAP_NAME
+    with tarfile.open(tar_path, "r:gz") as tar:
+        has_template = render_bootstrap.TEMPLATE_PATH in tar.getnames()
+    if has_template and not script_path.is_file():
+        raise ReleaseError(f"{script_path} is missing: `release.py build` writes it next to the tarball, and a release publishes it. "
+                           "Nothing was signed.")
+    if has_template:
+        check_bootstrap_against_release(tar_path, script_path)  # before any KMS call: a stale script must not cost a signature
     sig_path, info = sign_release_file(tar_path, signer, keys_path, a.minisign, a.require_minisign)
     print(f"Signed and self-verified with key {info.key_id}.")
+    uploads = [tar_path, sig_path, tar_path.parent / "manifest.json"]
+    if has_template:
+        boot_sig, _v = sign_bootstrap_file(script_path, tar_path, signer, keys_path, a.minisign, a.require_minisign)
+        print(f"Signed and self-verified {BOOTSTRAP_NAME} with the same key.")
+        uploads += [script_path, boot_sig]
+    else:
+        print(f"NOTE: this tarball has no {render_bootstrap.TEMPLATE_PATH}, so there is no {BOOTSTRAP_NAME} to sign (an old release).")
     ids = [i for i in getattr(signer, "request_ids", []) if i]
+    expected = 4 if has_template else 2
     if ids:
-        print("KMS Sign request ids (expect exactly two; keep them in the release log): " + ", ".join(ids))
-    print("Upload these three files to the GitHub release for tag v" + info.version + ":")
-    for p in (tar_path, sig_path, tar_path.parent / "manifest.json"):
+        print(f"KMS Sign request ids (expect exactly {expected}; keep them in the release log): " + ", ".join(ids))
+    print(f"Upload these {len(uploads)} files to the GitHub release for tag v" + info.version + ":")
+    for p in uploads:
         print(f"  {p}")
 
 
@@ -410,7 +522,16 @@ def cmd_verify(a):
         argv += ["--keys", a.keys]
     if a.installed_version:
         argv += ["--installed-version", a.installed_version]
-    return verifylib.main(argv)
+    rc = verifylib.main(argv)
+    if rc != 0 or not a.bootstrap:
+        return rc
+    version = check_bootstrap_against_release(a.tarball, a.bootstrap)
+    print(f"OK  {Path(a.bootstrap).name} is exactly what release {version} renders (template, verifier and key list from the tarball)")
+    if a.bootstrap_sig:
+        keys = keylib.effective_from(keylib.load_key_list(a.keys or REPO / "server" / "release_keys.json"))
+        fields, sig = verify_bootstrap_signature(a.bootstrap, a.bootstrap_sig, keys)
+        print(f"OK  {Path(a.bootstrap).name} signature valid: key {sig.key_id}, version {fields['version']}")
+    return 0
 
 
 # --- offline bundle (5.49.0) ------------------------------------------------------------
@@ -705,6 +826,8 @@ def build_parser():
     s.add_argument("minisig")
     s.add_argument("--keys")
     s.add_argument("--installed-version")
+    s.add_argument("--bootstrap", help="also check this get-ocw.sh against the release (re-rendered from the tarball)")
+    s.add_argument("--bootstrap-sig", help="and its signature (default: no signature check)")
     s.set_defaults(fn=cmd_verify)
     s = sub.add_parser("pubkey")
     s.add_argument("--aws-kms", metavar="KEY", help="AWS KMS key id, ARN or alias (the release key)")
