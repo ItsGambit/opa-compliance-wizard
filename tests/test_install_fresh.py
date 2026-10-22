@@ -167,7 +167,7 @@ def world(tmp_path):
     env = dict(os.environ, PATH=f"{stub / 'bin'}:{os.environ['PATH']}", STUB=str(stub), OCW_INSTALL_TEST="1", OCW_TEST_MODE="1", OCW_FAST="1",
                OCW_OPT_DIR=str(w / "opt"), OCW_DATA_DIR=str(w / "var-lib"), OCW_UNIT_DIR=str(unit_dir), OCW_BIN_DIR=str(w / "bin"),
                OCW_ENV_FILE=str(w / "etc" / "opa-compliance-wizard.env"), OCW_SUDOERS_DIR=str(w / "sudoers"),
-               OCW_ARTIFACTS_DIR=str(w / "var-ocw" / "artifacts"), OCW_UPDATER_ENV=str(w / "etc" / "ocw-updater.env"),
+               OCW_ARTIFACTS_DIR=str(w / "var" / "ocw-updater" / "artifacts"), OCW_UPDATER_ENV=str(w / "etc" / "ocw-updater.env"),
                OCW_NGINX_SITES_DIR=str(sites), OCW_NGINX_ENABLED_DIR=str(enabled), OCW_NGINX_SSL_DIR=str(ssl_dir),
                OCW_SESSION_KEY_FILE=str(w / "etc" / "session.key"), OCW_TTY=str(answers))
     env.pop("OCW_INSTALL_LOGGING", None)
@@ -569,7 +569,7 @@ def test_uninstall_keep_data_removes_the_software_and_keeps_the_data(world):
     (world.stub / "users" / "ocw-updater").write_text("")        # pretend the staging account exists, so its removal is exercised
     p = world.run("--uninstall", "--keep-data", answers="UNINSTALL\n")
     assert p.returncode == 0, p.stderr + p.stdout
-    assert not world.opt.exists() and not (world.w / "var-ocw").exists() and not (world.w / "bin" / "ocw-updater").exists()
+    assert not world.opt.exists() and not (world.w / "var" / "ocw-updater").exists() and not (world.w / "bin" / "ocw-updater").exists()
     assert not (world.w / "etc" / "ocw-updater.env").exists() and not list(world.unit_dir.iterdir())
     assert not (world.sites / "opa-secrets-wizard").exists() and not (world.enabled / "opa-secrets-wizard").is_symlink()
     assert (world.data / "audit_store.db").read_text() == "ARCHIVE" and (world.data / "audit_log.jsonl").read_text() == '{"a":1}\n'
@@ -617,7 +617,28 @@ def test_uninstall_keeps_the_nginx_site_while_a_second_gate_uses_its_zone(world)
 def test_uninstall_refuses_a_data_directory_inside_the_tree_it_would_remove(world):
     assert world.fresh().returncode == 0
     p = world.run("--uninstall", "--keep-data", "--yes", extra_env={"OCW_DATA_DIR": str(world.opt / "data-inside")})
-    assert p.returncode in (2, 4) and "holds the data directory" in p.stderr and (world.data / "home").exists()
+    assert p.returncode == 2 and "holds the data directory" in p.stderr and (world.data / "home").exists()
+    assert (world.unit_dir / "opa-compliance-wizard.service").exists() and "stop opa-compliance-wizard" not in calls(world).split("systemctl start")[-1]   # nothing was stopped
+
+
+@pytest.mark.parametrize("bad", ["/opt", "/usr/..", "/var/lib", "/etc/", "/"])
+def test_uninstall_refuses_system_directories_before_it_stops_or_removes_anything(world, bad):
+    assert world.fresh().returncode == 0
+    before = calls(world)
+    p = world.run("--uninstall", "--keep-data", "--yes", extra_env={"OCW_OPT_DIR": bad})
+    assert p.returncode == 2 and "refusing to remove" in p.stderr
+    new = calls(world)[len(before):]
+    assert not any(w in new for w in ("stop", "disable", "daemon-reload", "reload nginx"))      # only read-only queries ran
+    assert (world.unit_dir / "opa-compliance-wizard.service").exists() and world.opt.exists()
+
+
+def test_uninstall_leaves_an_nginx_site_that_is_not_this_applications(world):
+    assert world.fresh().returncode == 0
+    site = world.sites / "opa-secrets-wizard"
+    site.write_text("server { listen 443; }\n")        # an operator's own site under the same name: no proxy secret in it
+    p = world.run("--uninstall", "--keep-data", "--yes")
+    assert p.returncode == 0, p.stderr + p.stdout
+    assert "it is not this application's site" in p.stdout and site.exists() and not world.opt.exists()
 
 
 def test_uninstall_leaves_a_unit_that_runs_from_somewhere_else(world):

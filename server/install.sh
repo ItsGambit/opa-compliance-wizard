@@ -202,18 +202,26 @@ tty_line() { # tty_line <prompt>: one line from the terminal in TTY_ANSWER; refu
 
 # --- uninstall (--uninstall --keep-data) -------------------------------------------------------------------------
 # Removes the software and keeps every data file. It reads only the layout's own paths and never touches DATA_DIR.
-safe_remove_tree() { # safe_remove_tree <dir>: never "/", never a shallow path, never something that holds the data directory
+check_removable() { # check_removable <dir>: never "/", never a shallow or system path, never something that holds the data directory
   local _d="$1"
   case "$_d" in /?*/?*) ;; *) die "refusing to remove '$_d'" ;; esac
+  case "${_d%/}" in
+    /etc | /usr | /var | /var/lib | /var/log | /var/tmp | /opt | /home | /root | /bin | /sbin | /lib | /lib64 | /boot | /srv | /tmp | /run | /mnt | /media | /dev | /proc | /sys)
+      die "refusing to remove '$_d'" ;;
+  esac
   case "$_d" in */../* | */.. | */./* | */.) die "refusing to remove '$_d'" ;; esac
   case "$DATA_DIR/" in "$_d"/*) die "refusing to remove $_d: it holds the data directory $DATA_DIR (use different directories, or move the data first)" ;; esac
+}
+safe_remove_tree() { # safe_remove_tree <dir>
+  local _d="$1"
+  check_removable "$_d"
   if [ -L "$_d" ]; then rm -f -- "$_d"; elif [ -e "$_d" ]; then rm -rf -- "$_d"; fi
 }
 
 uninstall_keep_data() {
   [ -n "$KEEP_DATA" ] || die "--uninstall needs --keep-data: this release removes the software only; removing the data is a manual step (docs/hosting.md, Uninstalling)"
   local _plain_units="ocw-upgrade.path ocw-upgrade.service ocw-upgrade-due.timer ocw-upgrade-due.service ocw-stage@.service"
-  local _ours="" _u _f _wd _gates _site _enabled _kept_site=""
+  local _ours="" _u _f _wd _gates _site _enabled _kept_site="" _upd_home
   for _u in opa-compliance-wizard opa-secrets-wizard opa-auth-gate; do
     _f="$UNIT_DIR/$_u.service"
     [ -f "$_f" ] || continue
@@ -235,9 +243,16 @@ uninstall_keep_data() {
   plan "the unit files in $UNIT_DIR for them"
   plan "$BIN_DIR/ocw-updater and $UPDATER_ENV"
   plan "$OPT_DIR (the installed releases, the updater, staging, the maintenance page, install backups)"
-  plan "$(dirname -- "$ARTIFACTS_DIR") (the downloads of the staging account) and the account $UPDATER_USER"
+  _upd_home="$ARTIFACTS_DIR"
+  [ "$(basename -- "$(dirname -- "$ARTIFACTS_DIR")")" != "$UPDATER_USER" ] || _upd_home="$(dirname -- "$ARTIFACTS_DIR")"
+  check_removable "$OPT_DIR"      # refused here, before anything is stopped or removed
+  check_removable "$_upd_home"
+  plan "$_upd_home (the downloads of the staging account) and the account $UPDATER_USER"
   if [ -n "$_gates" ]; then
     plan "NOT the nginx site $_site: additional login gates ($_gates) reuse its rate-limit zone; remove them first (setup-second-gate.sh)"
+    _kept_site=1
+  elif [ -e "$_site" ] && ! grep -q 'nginx_proxy_secret' "$_site" 2>/dev/null; then
+    plan "NOT the nginx site $_site: it is not this application's site (no proxy secret in it)"
     _kept_site=1
   elif [ -e "$_site" ] || [ -L "$_enabled" ]; then
     plan "the nginx site $_site and its link $_enabled (nginx is reloaded only if 'nginx -t' passes)"
@@ -282,7 +297,7 @@ uninstall_keep_data() {
   fi
   note "==> Removing the installed software"
   safe_remove_tree "$OPT_DIR"
-  safe_remove_tree "$(dirname -- "$ARTIFACTS_DIR")"
+  safe_remove_tree "$_upd_home"
   if id "$UPDATER_USER" >/dev/null 2>&1 && command -v userdel >/dev/null 2>&1; then
     userdel "$UPDATER_USER" >/dev/null 2>&1 || note "NOTE: could not remove the account $UPDATER_USER; remove it with 'userdel $UPDATER_USER'"
   fi

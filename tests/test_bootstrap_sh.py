@@ -99,7 +99,7 @@ class BW:
                         OCW_OS_RELEASE=str(self.os_release), OCW_UNAME_M="x86_64", OCW_SYSTEMD_DIR=str(tmp_path / "systemd"), OCW_MIN_FREE_KB_TEST="1024",
                         OCW_OPT_DIR=str(self.opt), OCW_DATA_DIR=str(self.data), OCW_UNIT_DIR=str(tmp_path / "units"), OCW_BIN_DIR=str(tmp_path / "bin"),
                         OCW_ENV_FILE=str(tmp_path / "etc" / "opa-compliance-wizard.env"), OCW_SUDOERS_DIR=str(tmp_path / "sudoers"),
-                        OCW_ARTIFACTS_DIR=str(tmp_path / "var-ocw" / "artifacts"), OCW_UPDATER_ENV=str(tmp_path / "etc" / "ocw-updater.env"),
+                        OCW_ARTIFACTS_DIR=str(tmp_path / "var" / "ocw-updater" / "artifacts"), OCW_UPDATER_ENV=str(tmp_path / "etc" / "ocw-updater.env"),
                         OCW_NGINX_SITES_DIR=str(tmp_path / "nginx-sites"), OCW_NGINX_ENABLED_DIR=str(tmp_path / "nginx-enabled"),
                         OCW_NGINX_SSL_DIR=str(tmp_path / "nginx-ssl"), OCW_SESSION_KEY_FILE=str(tmp_path / "etc" / "session.key"),
                         OCW_LOG_DIR=str(tmp_path / "logs"), OCW_WORK_BASE=str(tmp_path / "work"), OCW_TTY=str(self.answers),
