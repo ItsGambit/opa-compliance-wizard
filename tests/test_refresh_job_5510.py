@@ -846,3 +846,11 @@ def test_no_part_or_sub_message_of_a_failed_refresh_names_an_exception_class(rig
     view = rig.run().status_view()
     texts = [view["parts"][p].get("message", "") for p in rj.PARTS] + [v.get("message", "") for v in view["parts"]["okta"]["sub"].values()] + [view["parts"]["opa"].get("audit_line", "")]
     assert not [t for t in texts if re.search(r"\b[A-Za-z]+(Error|Exception)\b", t)], texts
+
+
+def test_a_part_that_ran_out_of_time_says_what_it_kept():
+    log = rj.timed_out_message("log", 90)
+    assert "Events fetched before the stop are saved; the next run continues from there." in log and "previous data" not in log
+    assert "The previous data is kept." in rj.timed_out_message("opa", 45)
+    assert "Captures that finished are kept" in rj.timed_out_message("okta", 30)
+    assert rj.timed_out_message("opa", 1).startswith("Stopped after 1 minute.")

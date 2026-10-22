@@ -286,8 +286,15 @@ def log_failure(kind, status, previous_message=None):
 
 
 def timed_out_message(part, minutes, previous_kept=True):
-    return (f"Stopped after {minutes} minutes." + (" The previous data is kept." if previous_kept else "") +
-            " Try again; if it keeps timing out, check the network between this server and the service.")
+    """What a part that ran out of time kept. The OPA scan and the Okta captures keep their previous data; the System Log sync keeps the
+    events it fetched before the stop and carries on from its saved position."""
+    if part == "log":
+        kept = " Events fetched before the stop are saved; the next run continues from there."
+    elif part == "okta":
+        kept = " Captures that finished are kept; the others keep their previous data."
+    else:
+        kept = " The previous data is kept." if previous_kept else ""
+    return f"Stopped after {minutes} minute{'s' if minutes != 1 else ''}." + kept + " Try again; if it keeps timing out, check the network between this server and the service."
 
 
 def cancelled_message(by_admin=True):
