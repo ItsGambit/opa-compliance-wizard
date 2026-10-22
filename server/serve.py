@@ -625,7 +625,7 @@ def _seal_access_state(environment_id, model, built_at, audit_ctx):
     if snap is None:
         return {"state": "not_due"}
     _audit_for(audit_ctx, "okta_snapshot.captured", {"kind": opa_access_state.KIND, "snapshot_id": snap["snapshot_id"], "status": snap["status"],
-                                                      "item_count": snap["item_count"], "trigger": (audit_ctx or {}).get("trigger")})
+                                                      "item_count": snap["item_count"], "trigger": (audit_ctx or {}).get("snapshot_trigger") or (audit_ctx or {}).get("trigger")})
     return {"state": "sealed", "snapshot_id": snap["snapshot_id"], "items": snap["item_count"]}
 
 
@@ -1320,8 +1320,8 @@ def _refresh_current(job):
 
 
 def _refresh_audit(job, ctx):
-    return {"name": ctx["env_name"], "trigger": job.trigger, "actor_email": ctx.get("actor_email"), "actor_sub": ctx.get("actor_sub"),
-            "client_ip": ctx.get("client_ip"), "user_agent": ctx.get("user_agent")}
+    return {"name": ctx["env_name"], "trigger": job.trigger, "snapshot_trigger": _snapshot_trigger(job), "actor_email": ctx.get("actor_email"),
+            "actor_sub": ctx.get("actor_sub"), "client_ip": ctx.get("client_ip"), "user_agent": ctx.get("user_agent")}
 
 
 def _snapshot_trigger(job):

@@ -169,3 +169,11 @@ def test_the_list_needs_view_archive_but_items_diff_and_export_also_need_live_re
     exported = b(f"/export?snapshot_id={first['snapshot_id']}")
     assert exported.status_code == 200 and exported.json()["kind"] == "opa_access_state" and FIXTURE_EMAIL in exported.text
     assert exported.json()["verification"]["valid"] is True
+
+
+@pytest.mark.parametrize("trigger,parts,expected", [("manual", None, "refresh"), ("scheduled", None, "scheduled"), ("manual", ["opa"], "manual")])
+def test_the_sealed_state_is_audited_with_the_same_trigger_as_the_other_captures(rig, tmp_audit_log, trigger, parts, expected):  # noqa: F811
+    rig.run(parts, trigger=trigger)
+    rows = [r for r in rig.audit(tmp_audit_log) if r["action"] == "okta_snapshot.captured"]
+    assert {r["details"]["kind"]: r["details"]["trigger"] for r in rows if r["details"]["kind"] in ("opa_access_state", "okta_admins", "inventory_counts")} \
+        == ({"opa_access_state": expected} if parts else {"opa_access_state": expected, "okta_admins": expected, "inventory_counts": expected})
