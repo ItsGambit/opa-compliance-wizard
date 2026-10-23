@@ -303,7 +303,7 @@ export default function App() {
                 {activeTab === 'overview' &&
                   'Okta and OPA privileged access in one place: who can change the gate, who can open the vault, who holds both, and whether the evidence behind it is complete. Counts of people open the list behind them. Home page for administrators and archive viewers; other users land on Compliance Reports.'}
                 {activeTab === 'reports' && reportsSubTab === 'browse' &&
-                  'Audit evidence for SOC 2 / SOX / ISO 27001 and similar frameworks, generated from OPA + core Okta audit history.'}
+                  'Audit evidence with a proposed SOC 2 mapping (other frameworks are planned), generated from OPA + core Okta audit history.'}
                 {activeTab === 'reports' && reportsSubTab === 'secrets_access' &&
                   'See who created, updated, retrieved, or deleted each secret and folder in a resource group/project.'}
                 {activeTab === 'reports' && reportsSubTab === 'service_accounts' &&

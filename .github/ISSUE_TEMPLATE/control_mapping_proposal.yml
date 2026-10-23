@@ -1,0 +1,64 @@
+name: Control mapping proposal
+description: Propose a change to how a report maps to a control or criterion
+title: "[Mapping]: "
+labels: ["control-mapping"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The mappings in this project are **proposed**: nobody has reviewed them, and proposals are how they improve. SOC 2 is the only framework mapped today; others are planned.
+
+        Describe event types and criteria in general terms. Do not paste real events, names, identifiers or tenant data.
+  - type: input
+    id: framework
+    attributes:
+      label: Framework and version
+      placeholder: "SOC 2 (2017 Trust Services Criteria)"
+    validations:
+      required: true
+  - type: input
+    id: control
+    attributes:
+      label: Control or criterion
+      placeholder: "CC6.1"
+    validations:
+      required: true
+  - type: input
+    id: report
+    attributes:
+      label: Report concerned
+      description: The report's name as the app shows it, or "a new report".
+    validations:
+      required: true
+  - type: dropdown
+    id: change
+    attributes:
+      label: Kind of change
+      options:
+        - Add a mapping
+        - Remove a mapping
+        - Move a report to a different control
+        - Change the wording of a mapping
+    validations:
+      required: true
+  - type: textarea
+    id: rationale
+    attributes:
+      label: Why
+      description: What the control asks for and why this report's events are (or are not) evidence for it. Cite the published text of the framework, not a private document.
+    validations:
+      required: true
+  - type: textarea
+    id: events
+    attributes:
+      label: Event types involved, if you know them
+      description: Okta System Log or OPA event type names only (for example `user.session.start`).
+    validations:
+      required: false
+  - type: checkboxes
+    id: sanitised
+    attributes:
+      label: Before you submit
+      options:
+        - label: I did not include names, tenant or host names, identifiers, or any data from a real environment.
+          required: true

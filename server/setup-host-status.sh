@@ -5,7 +5,7 @@
 # "Host status for monitoring".
 #
 # Run ON THE SERVER as the app user (not root); it uses sudo itself:
-#   bash server/setup-host-status.sh --services "nginx opa-secrets-wizard opa-auth-gate cloudflared" [--port 8790]
+#   bash server/setup-host-status.sh --services "nginx opa-compliance-wizard opa-auth-gate cloudflared" [--port 8790]
 #
 # Installs unit opa-host-status (runs as the app user, sandboxed read-only, no capabilities) and a
 # sudoers line so server/deploy.sh can restart it. Safe to re-run: the unit is regenerated each time.

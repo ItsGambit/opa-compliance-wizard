@@ -259,6 +259,32 @@ From Okta's System Log query guide and the role-assignment API pages; the 5.50.0
    unless filtered; the lifecycle check therefore looks users up one by one (`GET /api/v1/users/{id|login}`, which does
    return a deprovisioned user). The user object includes a `credentials` object: it is never stored.
 
+## Okta reads behind the Overview and the stored OPA scan (5.50.0, 5.51.0)
+
+Every read below is a `GET`, runs with the environment's existing Okta token and is part of a refresh. What the code
+shows is stated as fact; anything the code does not record as confirmed live is marked *unverified*.
+
+1. **Inventory counts** (`inventory_counts.py`, `OktaClient.count_okta_objects`). Okta has no count endpoint, so each
+   count pages the list and counts the items: `GET /api/v1/users?limit=200`, `/api/v1/groups?limit=200`,
+   `/api/v1/apps?limit=200`, and `GET /api/v1/policies?type=<TYPE>` once for each of `OKTA_SIGN_ON`, `PASSWORD`,
+   `MFA_ENROLL`, `ACCESS_POLICY` and `PROFILE_ENROLLMENT`. A walk stops at 50,000 items and the count is then a lower
+   bound. The user list omits DEPROVISIONED users (item 5 of the section above), so the user count does too. A count whose
+   read Okta refuses is left out of that day's snapshot and listed in its meta: the series shows a gap, never a zero.
+   Two more Okta series are not separate reads: users holding an admin role (taken from the latest Okta Admins capture)
+   and Okta-managed devices (counted from the OPA scan's device list, below). Only counts are stored, never names.
+   *Unverified:* how `GET /api/v1/policies` pages on a very large org.
+2. **Okta-managed devices** (`OktaClient.list_devices`, kept in the stored OPA scan). `GET /api/v1/devices?limit=200`,
+   following the `Link: rel="next"` header, then per device `GET /api/v1/devices/{id}/authenticator-enrollments` and
+   `GET /api/v1/devices/{id}/users`. Confirmed live: the answer is a list of devices with `id`, `status` and a `profile`
+   (`displayName`, `platform`, `manufacturer`, `model`, `osVersion`, `serialNumber`, `registered`,
+   `secureHardwarePresent`, `diskEncryptionType`; not every field on every platform, for example iOS has no
+   `diskEncryptionType`). A device's users come back as a list (one device can have several users). The
+   authenticator-enrollments call answers 401 "Missing capability" on an org without the underlying Okta feature; the app
+   then records an empty list for that device instead of failing the whole scan. These devices are a different thing from
+   OPA's enrolled clients: the two lists only partly overlap.
+3. **Lifecycle status of OPA users** (the C1 cross-check): `GET /api/v1/users/{id|login}`, one call per principal, at most
+   5,000 principals per run (`MAX_PRINCIPALS` in `okta_admins.py`); see the section above for why the list endpoint is not used.
+
 ## Idempotency
 
 Existing folders are detected by recursively walking the full folder
