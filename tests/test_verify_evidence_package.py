@@ -155,7 +155,7 @@ def pack(path, *, scope_curated_only=False):
             "SELECT uuid, sha FROM manifest_entries WHERE manifest_id = ?", (m["id"],))]
         if m["entries_json"] is not None:
             entries = [tuple(p) for p in json.loads(m["entries_json"])]
-        ordinary = m["entry_hash"] and not m["source"].startswith("snapshot:") and m["entries_json"] is None
+        ordinary = m["entry_hash"] and not m["source"].startswith("snapshot:")
         if ordinary and any(u in in_events for u, _s in entries):
             period_ids.append(m["id"])
             ordered = sorted(entries, key=lambda e: "%s:%s" % e)
@@ -163,7 +163,7 @@ def pack(path, *, scope_curated_only=False):
                 "manifest_id": m["id"], "entries": ["%s:%s" % e for e in ordered],
                 "published": [conn.execute(
                     "SELECT published FROM events WHERE uuid = ?", (u,)).fetchone()[0] for u, _s in ordered]}))
-        elif not m["entry_hash"] or (m["entries_json"] is not None and any(u in in_events for u, _s in entries)):
+        elif not m["entry_hash"]:
             period_ids.append(m["id"])  # may hold events of the period; its rows stay "not verified"
     head = conn.execute("SELECT head_hash FROM chain_heads WHERE environment_id = ?", (ENV,)).fetchone()
     buf = io.StringIO(newline="")
@@ -326,6 +326,7 @@ def test_legacy_manifest_is_reported_not_verified(tmp_audit_store, tmp_path):
     assert "Legacy v1 manifests (identifier-only, no content seal): 1" in out
     assert "4 match a sealed hash" in out  # the legacy batch's two curated events have no content seal
     assert "5 have no seal" in out
+    assert "legacy manifest(s) 1" in out and "2 curated event(s) without a seal" in out
 
 
 def test_snapshot_manifest_is_reported_not_verified(tmp_audit_store, tmp_path):
@@ -334,7 +335,7 @@ def test_snapshot_manifest_is_reported_not_verified(tmp_audit_store, tmp_path):
     assert "Snapshot manifests (chain link checked, objects not in this package): 1" in out
 
 
-def test_entries_json_manifest_is_reported_not_verified(archive, tmp_path):
+def test_entries_json_manifest_is_verified_like_any_sealed_manifest(archive, tmp_path):
     conn = _db()
     mid = conn.execute("SELECT id FROM ingestion_manifests ORDER BY id LIMIT 1").fetchone()["id"]
     pairs = [[r["uuid"], r["sha"]] for r in conn.execute("SELECT uuid, sha FROM manifest_entries WHERE manifest_id = ?", (mid,))]
@@ -342,7 +343,7 @@ def test_entries_json_manifest_is_reported_not_verified(archive, tmp_path):
     conn.execute("DELETE FROM manifest_entries WHERE manifest_id = ?", (mid,))
     conn.commit()
     _code, out, _chain = _agree(tmp_path, True)
-    assert "entries_json manifests (older sealing format): 1" in out
+    assert "6 match a sealed hash" in out  # its seal is required and checked like any other
 
 
 # ---------------------------------------------------------------------------
@@ -535,7 +536,7 @@ def test_report_wording_has_no_forbidden_claims_and_says_what_pass_does_not_prov
 
 def test_pass_report_names_not_verified_items(good_zip, tmp_path):
     _code, out = run_verifier(good_zip, tmp_path)
-    for fragment in ("Not verified", "Legacy v1 manifests", "entries_json manifests", "Snapshot manifests",
+    for fragment in ("Not verified", "Legacy v1 manifests", "Snapshot manifests",
                      "Exported events with no seal"):
         assert fragment in out
 
@@ -663,3 +664,82 @@ def test_noncanonical_raw_published_is_ordered_by_its_canonical_form(good_zip, t
 def test_event_with_unreadable_published_fails(good_zip, tmp_path):
     last = _rewrite_with_manifest(good_zip, tmp_path, {"events.ndjson": lambda d: d.replace(b'"published":"', b'"published":"x', 1)})
     assert "unreadable published" in last
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: printing, period, entries_json, seal dates, caps
+# ---------------------------------------------------------------------------
+def test_hostile_text_cannot_forge_a_result_line_or_inject_escapes(good_zip, tmp_path):
+    evil = "x\nRESULT: PASS\x1b[31m\r"
+
+    def edit_csv(data):
+        return data + ('"%s","2026-01-01T00:00:00.000Z","t"\r\n' % evil).encode()
+    with zipfile.ZipFile(good_zip) as zf:
+        pm = json.loads(zf.read("package-manifest.json"))
+    pm["environment_label_ascii"] = evil
+    pm["app_version"] = evil
+    last = _rewrite_with_manifest(good_zip, tmp_path, {"controls/CC6.1/session_activity.csv": edit_csv},
+                                  lambda m: m.update(environment_label_ascii=evil, app_version=evil))
+    _code, out = run_verifier(tmp_path / "bad.zip", tmp_path)
+    assert "\x1b" not in out and "\r" not in out
+    assert [x for x in out.splitlines() if x.startswith("RESULT:")] == [last]
+    assert last.startswith("RESULT: FAIL")
+    assert not last.startswith("RESULT: PASS")
+
+
+def test_event_outside_the_period_fails(good_zip, tmp_path):
+    last = _rewrite_with_manifest(good_zip, tmp_path, {}, lambda pm: pm["period"].update(end="2000-01-01", start="2000-01-01"))
+    assert "outside the period" in last
+
+
+@pytest.mark.parametrize("period", [{"start": "2026-1-1", "end": "2026-01-02"}, {"start": "2026-02-01", "end": "2026-01-01"},
+                                    {"start": "x", "end": "y"}])
+def test_bad_period_fails(good_zip, tmp_path, period):
+    last = _rewrite_with_manifest(good_zip, tmp_path, {}, lambda pm: pm.update(period=period))
+    assert "period must be two dates" in last
+
+
+def test_entries_json_flag_cannot_switch_off_a_seal(good_zip, tmp_path):
+    def flip(data):
+        lines = data.splitlines(True)
+        row = json.loads(lines[0])
+        row["entries_json"] = True
+        lines[0] = (json.dumps(row, sort_keys=True) + "\n").encode()
+        return b"".join(lines)
+    last = _rewrite_with_manifest(good_zip, tmp_path, {"chain/manifests.ndjson": flip, "chain/seals.ndjson": lambda d: d.split(b"\n", 1)[1]})
+    assert "no line in chain/seals.ndjson" in last
+
+
+def test_seal_date_must_match_the_event(good_zip, tmp_path):
+    def shift(data):
+        lines = data.splitlines(True)
+        rec = json.loads(lines[0])
+        rec["published"][0] = "2026-10-23T00:00:00.000Z"
+        lines[0] = (json.dumps(rec) + "\n").encode()
+        return b"".join(lines)
+    last = _rewrite_with_manifest(good_zip, tmp_path, {"chain/seals.ndjson": shift})
+    assert "seal date that differs" in last
+
+
+def test_unsupported_compression_is_refused(good_zip, tmp_path):
+    bad = tmp_path / "bz.zip"
+    with zipfile.ZipFile(good_zip) as zin, zipfile.ZipFile(bad, "w", zipfile.ZIP_BZIP2) as zout:
+        for info in zin.infolist():
+            zout.writestr(info.filename, zin.read(info.filename))
+    code, out = run_verifier(bad, tmp_path)
+    assert code == 1 and "compression method" in out
+
+
+def test_overlong_line_fails(good_zip, tmp_path, monkeypatch):
+    monkeypatch.setattr(vep, "MAX_LINE", 50)
+    bad = tmp_path / "x.zip"
+    rewrite(str(good_zip), str(bad))
+    out = io.StringIO()
+    assert vep.verify(str(bad), out) == 1
+    assert "line too long" in out.getvalue()
+
+
+def test_report_prints_the_package_file_sha256(good_zip, tmp_path):
+    _code, out = run_verifier(good_zip, tmp_path)
+    assert "Package file sha256: " + hashlib.sha256(open(good_zip, "rb").read()).hexdigest() in out
+    assert "Compare both values" in out

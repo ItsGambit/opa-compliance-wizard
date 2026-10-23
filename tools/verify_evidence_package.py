@@ -40,6 +40,10 @@ MANIFEST_KEYS = ("files", "built_at", "app_version", "environment_label_ascii", 
                  "chain_head", "catalogue_version", "curated_event_types", "period_manifest_ids")
 MAX_ENTRIES = 100000
 MAX_PACKAGE_MANIFEST_BYTES = 64 * 1024 * 1024
+MAX_COMPLETENESS_BYTES = 64 * 1024 * 1024
+MAX_LINE = 16 * 1024 * 1024
+MAX_SEAL_LINE = 256 * 1024 * 1024  # one line per manifest; a first backfill can seal about a million events
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$", re.ASCII)
 CHUNK = 1024 * 1024
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 NAME_OK = re.compile(r"^[A-Za-z0-9._ -]+$")
@@ -54,17 +58,31 @@ NOT_PROVED = (
 )
 
 
+def clean(text):
+    """Printable ASCII only: anything else (newline, escape, non-ASCII) becomes '?'."""
+    return "".join(c if 0x20 <= ord(c) <= 0x7e else "?" for c in str(text))
+
+
+def shown(value):
+    """A package-controlled value, made safe to print: printable ASCII only, at most 120 characters."""
+    text = clean(value)
+    return text if len(text) <= 120 else text[:120] + "..."
+
+
 class Report:
+    """Every line is cleaned on the way in, so no package text can add a line or a terminal escape to the report."""
+
     def __init__(self):
         self.lines = []
         self.failures = []
+        self.zip_sha256 = None
 
     def info(self, text):
-        self.lines.append(text)
+        self.lines.append(clean(text))
 
     def fail(self, text):
-        self.failures.append(text)
-        self.lines.append("  FAIL: " + text)
+        self.failures.append(clean(text))
+        self.lines.append("  FAIL: " + clean(text))
 
 
 def sha256_hex(data):
@@ -168,10 +186,20 @@ def read_bytes(zf, info, limit):
     return b"".join(read_stream(zf, info, limit))
 
 
-def iter_lines(zf, info):
-    """Lines of an entry as bytes, each with its trailing newline (the last may lack one)."""
+class LineTooLong(Exception):
+    pass
+
+
+def iter_lines(zf, info, max_line=None):
+    """Lines of an entry as bytes, each with its trailing newline (the last may lack one). Raises LineTooLong."""
+    max_line = max_line or MAX_LINE
     with zf.open(info, "r") as fh:
-        for line in fh:
+        while True:
+            line = fh.readline(max_line + 1)
+            if not line:
+                return
+            if len(line) > max_line:
+                raise LineTooLong()
             yield line
 
 
@@ -197,22 +225,26 @@ def check_names(zf, report):
         name = info.filename
         reason = unsafe_name(name)
         if reason:
-            report.fail("refused entry name %r: %s" % (name if len(name) < 80 else name[:80] + "...", reason))
+            report.fail("refused entry name %s: %s" % (shown(repr(name)), reason))
             ok = False
             continue
         low = name.lower()
         if low in seen:
-            report.fail("duplicate entry name %r" % name)
+            report.fail("duplicate entry name %s" % shown(name))
             ok = False
             continue
         seen.add(low)
         mode = (info.external_attr >> 16) & 0xFFFF
         if stat.S_IFMT(mode) not in (0, stat.S_IFREG):
-            report.fail("entry %r is not a regular file" % name)
+            report.fail("entry %s is not a regular file" % shown(name))
             ok = False
             continue
         if info.flag_bits & 0x1:
-            report.fail("entry %r is encrypted" % name)
+            report.fail("entry %s is encrypted" % shown(name))
+            ok = False
+            continue
+        if info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+            report.fail("entry %s uses a compression method other than stored or deflate" % shown(name))
             ok = False
             continue
         by_name[name] = info
@@ -234,7 +266,7 @@ def check_package_manifest(zf, by_name, report):
         report.fail("package-manifest.json is not a JSON object")
         return None
     if manifest.get("format") != FORMAT or isinstance(manifest.get("format"), bool):
-        report.fail("package format is %r; this verifier reads format %d" % (manifest.get("format"), FORMAT))
+        report.fail("package format is %s; this verifier reads format %d" % (shown(repr(manifest.get("format"))), FORMAT))
         return None
     missing = [k for k in MANIFEST_KEYS if k not in manifest]
     if missing:
@@ -243,6 +275,9 @@ def check_package_manifest(zf, by_name, report):
     period = manifest["period"]
     if not (isinstance(period, dict) and isinstance(period.get("start"), str) and isinstance(period.get("end"), str)):
         report.fail("package-manifest.json period is not {start, end}")
+        return None
+    if not (DATE_RE.match(period["start"]) and DATE_RE.match(period["end"]) and period["start"] <= period["end"]):
+        report.fail("package-manifest.json period must be two dates, YYYY-MM-DD, start not after end")
         return None
     types = manifest["curated_event_types"]
     ids = manifest["period_manifest_ids"]
@@ -267,10 +302,10 @@ def check_file_list(zf, by_name, manifest, report):
             report.fail("package-manifest.json has a malformed file record")
             return False
         if item["path"] in listed:
-            report.fail("package-manifest.json lists %r twice" % item["path"])
+            report.fail("package-manifest.json lists %s twice" % shown(item["path"]))
             return False
         if not HEX64.match(item["sha256"]):
-            report.fail("package-manifest.json has a malformed sha256 for %r" % item["path"])
+            report.fail("package-manifest.json has a malformed sha256 for %s" % shown(item["path"]))
             return False
         listed[item["path"]] = item
     actual = set(by_name) - {MANIFEST_NAME}
@@ -281,10 +316,10 @@ def check_file_list(zf, by_name, manifest, report):
         report.fail("package-manifest.json lists itself")
         ok = False
     for name in extra:
-        report.fail("file not listed in the manifest: %s" % name)
+        report.fail("file not listed in the manifest: %s" % shown(name))
         ok = False
     for name in missing:
-        report.fail("file listed in the manifest but absent: %s" % name)
+        report.fail("file listed in the manifest but absent: %s" % shown(name))
         ok = False
     for name in REQUIRED_FILES:
         if name not in actual:
@@ -329,6 +364,9 @@ def load_manifest_rows(zf, by_name, report):
                 report.fail("chain/manifests.ndjson line %d is not newline-terminated" % n)
                 return None
             rows.append(load_json_bytes(line[:-1]))
+    except LineTooLong:
+        report.fail("chain/manifests.ndjson: line too long")
+        return None
     except (ValueError, UnicodeDecodeError, zipfile.BadZipFile, OSError, EOFError, RuntimeError):
         report.fail("chain/manifests.ndjson is unreadable")
         return None
@@ -337,7 +375,7 @@ def load_manifest_rows(zf, by_name, report):
 
 def check_chain(rows, package_manifest, report):
     """Walks the manifest rows the way audit_store.verify_ingestion_chain does. Returns (by_id, stats) or (None, None)."""
-    stats = {"total": len(rows), "sealed": 0, "legacy": 0, "entries_json": 0, "snapshot": 0}
+    stats = {"total": len(rows), "sealed": 0, "legacy": 0, "snapshot": 0, "legacy_ids": []}
     by_id = {}
     expected_prev = None
     seen_v2 = False
@@ -349,7 +387,7 @@ def check_chain(rows, package_manifest, report):
             return None, None
         mid = row.get("manifest_id")
         if not is_int(mid) or (last_id is not None and mid <= last_id):
-            report.fail("manifest ids are missing, repeated or out of order (at %r)" % (mid,))
+            report.fail("manifest ids are missing, repeated or out of order (at %s)" % shown(repr(mid)))
             return None, None
         last_id = mid
         str_fields = ("environment_id", "source", "created_at", "batch_hash")
@@ -374,6 +412,7 @@ def check_chain(rows, package_manifest, report):
                 report.fail("chain broken at manifest %s: a manifest without v2 fields follows a sealed manifest (downgrade)" % mid)
                 return None, None
             stats["legacy"] += 1
+            stats["legacy_ids"].append(mid)
             expected_prev = row["batch_hash"]
             continue
         seen_v2 = True
@@ -388,8 +427,6 @@ def check_chain(rows, package_manifest, report):
             return None, None
         if row["source"].startswith(SNAPSHOT_SOURCE_PREFIX):
             stats["snapshot"] += 1
-        elif row.get("entries_json") is True:
-            stats["entries_json"] += 1
         else:
             stats["sealed"] += 1
         expected_prev = row["entry_hash"]
@@ -407,8 +444,9 @@ def check_chain(rows, package_manifest, report):
         report.info("  Chain: the package holds no manifests and records no head (an archive with nothing ingested)")
     else:
         report.info("  Chain: %d manifests link from the first record to the recorded head" % len(rows))
-    report.info("  Chain head: %s" % head)
-    report.info("    Compare this value with the operator's server-side build log entry for this package. That log is the only "
+    report.info("  Package file sha256: %s" % report.zip_sha256)
+    report.info("  Chain head: %s" % shown(head))
+    report.info("    Compare both values with the operator's server-side build log entry for this package. That log is the only "
                 "independent record of the chain head.")
     return by_id, stats
 
@@ -423,7 +461,7 @@ def load_seals(zf, by_name, by_id, period_ids, period, report):
     skipped = 0
     in_period_entries = []  # (uuid, published) of sealed entries of period manifests whose published date is in the period
     try:
-        for n, line in enumerate(iter_lines(zf, by_name["chain/seals.ndjson"]), 1):
+        for n, line in enumerate(iter_lines(zf, by_name["chain/seals.ndjson"], MAX_SEAL_LINE), 1):
             if not line.endswith(b"\n"):
                 report.fail("chain/seals.ndjson line %d is not newline-terminated" % n)
                 return None, None
@@ -442,8 +480,8 @@ def load_seals(zf, by_name, by_id, period_ids, period, report):
                 report.fail("manifest %s has two seal records" % mid)
                 return None, None
             seen.add(mid)
-            if (not row["entry_hash"] or row["source"].startswith(SNAPSHOT_SOURCE_PREFIX) or row.get("entries_json") is True):
-                skipped += 1  # legacy, snapshot and entries_json manifests are reported as not verified
+            if not row["entry_hash"] or row["source"].startswith(SNAPSHOT_SOURCE_PREFIX):
+                skipped += 1  # legacy and snapshot manifests are reported as not verified
                 continue
             pairs = []
             names = set()
@@ -469,11 +507,14 @@ def load_seals(zf, by_name, by_id, period_ids, period, report):
                 if canonical_published(pub) != pub:
                     report.fail("manifest %s has a seal date that is not in canonical form" % mid)
                     return None, None
-                uuid_seals.setdefault(uuid, []).append((mid, sha))
+                uuid_seals.setdefault(uuid, []).append((mid, sha, pub))
                 if mid in period_ids and period["start"] <= pub[:10] <= period["end"]:
                     in_period_entries.append((uuid, pub))
             unsealed_rows += row["row_count"] - len(pairs)
             checked += 1
+    except LineTooLong:
+        report.fail("chain/seals.ndjson: line too long")
+        return None, None
     except (ValueError, UnicodeDecodeError, zipfile.BadZipFile, OSError, EOFError, RuntimeError):
         report.fail("chain/seals.ndjson is unreadable")
         return None, None
@@ -482,13 +523,16 @@ def load_seals(zf, by_name, by_id, period_ids, period, report):
                         "sealed_ids": seen}
 
 
-def check_events(zf, by_name, uuid_seals, curated_types, lenient_curated, report):
+def check_events(zf, by_name, uuid_seals, curated_types, lenient_curated, period, report):
     """Hashes every line of events.ndjson against the seals. Returns (uuids set, counts) or (None, None)."""
     uuids = set()
     verified = 0
     unverified = 0
     bad = []
     unsealed_curated = []
+    outside = []
+    wrong_date = []
+    tolerated = 0
     prev_key = None
     try:
         for n, line in enumerate(iter_lines(zf, by_name["events.ndjson"]), 1):
@@ -506,13 +550,15 @@ def check_events(zf, by_name, uuid_seals, curated_types, lenient_curated, report
                 report.fail("events.ndjson line %d has no event uuid" % n)
                 return None, None
             if uuid in uuids:
-                report.fail("events.ndjson holds event %s twice" % uuid)
+                report.fail("events.ndjson holds event %s twice" % shown(uuid))
                 return None, None
             uuids.add(uuid)
             published = canonical_published(event.get("published"))
             if published is None:
                 report.fail("events.ndjson line %d has a missing or unreadable published time" % n)
                 return None, None
+            if not (period["start"] <= published[:10] <= period["end"]):
+                outside.append(uuid)
             key = (published, uuid)
             if prev_key is not None and key < prev_key:
                 report.fail("events.ndjson is not ordered by published time then uuid (line %d)" % n)
@@ -521,24 +567,37 @@ def check_events(zf, by_name, uuid_seals, curated_types, lenient_curated, report
             seals = uuid_seals.get(uuid)
             if not seals:
                 unverified += 1
-                if event.get("eventType") in curated_types and not lenient_curated:
-                    unsealed_curated.append(uuid)
+                if event.get("eventType") in curated_types:
+                    if lenient_curated:
+                        tolerated += 1
+                    else:
+                        unsealed_curated.append(uuid)
                 continue
             digest = content_hash_of_event(body)
-            if all(sha == digest for _mid, sha in seals):
+            if any(pub != published for _mid, _sha, pub in seals):
+                wrong_date.append(uuid)
+            if all(sha == digest for _mid, sha, _pub in seals):
                 verified += 1
             else:
                 bad.append(uuid)
+    except LineTooLong:
+        report.fail("events.ndjson: line too long")
+        return None, None
     except (zipfile.BadZipFile, OSError, EOFError, RuntimeError):
         report.fail("events.ndjson is unreadable")
         return None, None
+    if outside:
+        report.fail("%d event(s) are dated outside the period (first: %s)" % (len(outside), shown(outside[0])))
+    if wrong_date:
+        report.fail("%d event(s) have a seal date that differs from the event's published time (first: %s)"
+                    % (len(wrong_date), shown(wrong_date[0])))
     if unsealed_curated:
-        report.fail("%d event(s) of a sealed type have no seal (first: %s)" % (len(unsealed_curated), unsealed_curated[0]))
+        report.fail("%d event(s) of a sealed type have no seal (first: %s)" % (len(unsealed_curated), shown(unsealed_curated[0])))
     if bad:
-        report.fail("%d event(s) do not match their sealed hash (first: %s)" % (len(bad), bad[0]))
+        report.fail("%d event(s) do not match their sealed hash (first: %s)" % (len(bad), shown(bad[0])))
     report.info("  Events: %d in events.ndjson; %d match a sealed hash; %d have no seal in this package (not verified)"
                 % (len(uuids), verified, unverified))
-    return uuids, {"verified": verified, "unverified": unverified, "bad": len(bad)}
+    return uuids, {"verified": verified, "unverified": unverified, "bad": len(bad), "tolerated": tolerated}
 
 
 def check_csvs(zf, by_name, uuids, report):
@@ -555,7 +614,7 @@ def check_csvs(zf, by_name, uuids, report):
                 reader = csv.reader(text)
                 header = next(reader, None)
                 if header is None or EVENT_UUID_COLUMN not in header:
-                    report.fail("%s has no %s column" % (name, EVENT_UUID_COLUMN))
+                    report.fail("%s has no %s column" % (shown(name), EVENT_UUID_COLUMN))
                     continue
                 col = header.index(EVENT_UUID_COLUMN)
                 for rec in reader:
@@ -571,10 +630,10 @@ def check_csvs(zf, by_name, uuids, report):
                     else:
                         missing.append((name, value))
         except (csv.Error, UnicodeDecodeError, zipfile.BadZipFile, OSError, EOFError, RuntimeError):
-            report.fail("%s could not be read as CSV" % name)
+            report.fail("%s could not be read as CSV" % shown(name))
     if missing:
         report.fail("%d CSV row(s) name an event that is not in events.ndjson (first: %s in %s)"
-                    % (len(missing), missing[0][1], missing[0][0]))
+                    % (len(missing), shown(missing[0][1]), shown(missing[0][0])))
     try:
         with zf.open(by_name["control-matrix.csv"], "r") as raw:
             reader = csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8-sig", newline=""))
@@ -584,13 +643,13 @@ def check_csvs(zf, by_name, uuids, report):
                 try:
                     want = int(row.get("rows_in_period"))
                 except (TypeError, ValueError):
-                    report.fail("control-matrix.csv has no usable rows_in_period for %s" % cid)
+                    report.fail("control-matrix.csv has no usable rows_in_period for %s" % shown(cid))
                     continue
                 listed.add(cid)
                 if per_control.get(cid, 0) != want:
-                    report.fail("control-matrix.csv says %d rows for %s; its report files hold %d" % (want, cid, per_control.get(cid, 0)))
+                    report.fail("control-matrix.csv says %d rows for %s; its report files hold %d" % (want, shown(cid), per_control.get(cid, 0)))
             for cid in sorted(set(per_control) - listed):
-                report.fail("report files for %s are not in control-matrix.csv" % cid)
+                report.fail("report files for %s are not in control-matrix.csv" % shown(cid))
     except (csv.Error, UnicodeDecodeError, zipfile.BadZipFile, OSError, EOFError, RuntimeError):
         report.fail("control-matrix.csv could not be read as CSV")
     report.info("  CSV files: %d report files; %d rows tie to an event in events.ndjson; %d rows carry no %s (not verified)"
@@ -600,7 +659,7 @@ def check_csvs(zf, by_name, uuids, report):
 
 def read_completeness(zf, by_name, report):
     try:
-        data = load_json_bytes(read_bytes(zf, by_name["completeness.json"], 256 * 1024 * 1024))
+        data = load_json_bytes(read_bytes(zf, by_name["completeness.json"], MAX_COMPLETENESS_BYTES))
     except (ValueError, UnicodeDecodeError, zipfile.BadZipFile, OSError, EOFError, RuntimeError):
         report.fail("completeness.json is unreadable")
         return None
@@ -628,7 +687,12 @@ def verify(path, out):
         return 2
     with zf:
         report.info("OPA Compliance Wizard evidence package verifier (format v%d)" % FORMAT)
-        report.info("Package: %s" % os.path.basename(path))
+        report.info("Package: %s" % shown(os.path.basename(path)))
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(CHUNK), b""):
+                h.update(chunk)
+        report.zip_sha256 = h.hexdigest()
         by_name = check_names(zf, report)
         manifest = None
         if by_name is not None:
@@ -636,8 +700,9 @@ def verify(path, out):
         if manifest is not None:
             period = manifest["period"]
             report.info("Built %s by app version %s; environment label %s; period %s to %s (UTC, inclusive); data as of %s"
-                        % (manifest["built_at"], manifest["app_version"], manifest["environment_label_ascii"],
-                           period["start"], period["end"], manifest["data_as_of"]))
+                        % (shown(manifest["built_at"]), shown(manifest["app_version"]),
+                           shown(manifest["environment_label_ascii"]), shown(period["start"]), shown(period["end"]),
+                           shown(manifest["data_as_of"])))
             report.info("Checks:")
             files_ok = check_file_list(zf, by_name, manifest, report)
             present = all(n in by_name for n in REQUIRED_FILES)
@@ -656,19 +721,22 @@ def verify(path, out):
                         uuid_seals, seal_info = load_seals(zf, by_name, by_id, period_ids, manifest["period"], report)
                 uuids = counts = None
                 if uuid_seals is not None:
-                    ordinary = lambda r: bool(r["entry_hash"]) and not r["source"].startswith(SNAPSHOT_SOURCE_PREFIX) and r.get("entries_json") is not True
+                    ordinary = lambda r: bool(r["entry_hash"]) and not r["source"].startswith(SNAPSHOT_SOURCE_PREFIX)
                     for mid in sorted(period_ids):
                         if ordinary(by_id[mid]) and mid not in seal_info["sealed_ids"]:
                             report.fail("manifest %s holds events of the period but has no line in chain/seals.ndjson" % mid)
-                    lenient = any(not ordinary(by_id[m]) and not by_id[m]["source"].startswith(SNAPSHOT_SOURCE_PREFIX) for m in period_ids)
-                    if lenient:
-                        report.info("  Note: the period's manifests include a legacy or entries_json manifest, which carries no "
-                                    "seal in this package; curated events without a seal are counted as not verified, not failed.")
-                    uuids, counts = check_events(zf, by_name, uuid_seals, set(manifest["curated_event_types"]), lenient, report)
+                    legacy_in_period = sorted(m for m in period_ids if not by_id[m]["entry_hash"])
+                    lenient = bool(legacy_in_period)
+                    uuids, counts = check_events(zf, by_name, uuid_seals, set(manifest["curated_event_types"]), lenient,
+                                                 manifest["period"], report)
+                    if lenient and counts is not None:
+                        report.info("  Note: the period's manifests include legacy manifest(s) %s, which carry no seal in this package; "
+                                    "%d curated event(s) without a seal are counted as not verified instead of failed."
+                                    % (", ".join(str(m) for m in legacy_in_period[:20]), counts["tolerated"]))
                     if uuids is not None:
                         gone = [u for u, _p in seal_info["in_period_entries"] if u not in uuids]
                         if gone:
-                            report.fail("%d sealed event(s) dated inside the period are missing from events.ndjson (first: %s)" % (len(gone), gone[0]))
+                            report.fail("%d sealed event(s) dated inside the period are missing from events.ndjson (first: %s)" % (len(gone), shown(gone[0])))
                 blank = 0
                 if uuids is not None:
                     blank = check_csvs(zf, by_name, uuids, report)
@@ -676,7 +744,6 @@ def verify(path, out):
                 if stats is not None and seal_info is not None and counts is not None:
                     report.info("Not verified (stated, never counted as verified):")
                     report.info("  Legacy v1 manifests (identifier-only, no content seal): %d" % stats["legacy"])
-                    report.info("  entries_json manifests (older sealing format): %d" % stats["entries_json"])
                     report.info("  Snapshot manifests (chain link checked, objects not in this package): %d" % stats["snapshot"])
                     report.info("  Rows counted by the sealed manifests that hold events of the period but not content-sealed "
                                 "(not curated; retention may have removed them): %d" % seal_info["unsealed_rows"])
@@ -691,9 +758,9 @@ def verify(path, out):
         report.lines.append(NOT_PROVED)
         report.lines.append("")
         if report.failures:
-            shown = report.failures[:5]
-            more = len(report.failures) - len(shown)
-            reasons = "; ".join(shown) + ("; and %d more" % more if more else "")
+            first = report.failures[:5]
+            more = len(report.failures) - len(first)
+            reasons = "; ".join(first) + ("; and %d more" % more if more else "")
             report.lines.append("RESULT: FAIL (%s)" % reasons)
             code = 1
         else:

@@ -19,19 +19,24 @@ In short: the verifier detects accidental or partial change to the package, and 
 
 - **Not signed, unkeyed hashes.** Anyone who can rewrite the whole package, or the archive it was built from, and recompute every hash can produce a package that verifies. Nothing in the package proves who built it.
 - It does not prove who produced the events, or that the archive was never altered by someone who could rewrite it.
-- It does not prove that `events.ndjson` holds every event of the period. The `published` dates in `chain/seals.ndjson` are outside every hash, so a builder could misstate them and hide a missing event. The completeness statement (`completeness.json`) is the builder's own statement.
+- It does not prove that `events.ndjson` holds every event of the period. The `published` dates in `chain/seals.ndjson` and the list `period_manifest_ids` in `package-manifest.json` are outside every hash, so a builder could misstate them and hide a missing event. The completeness statement (`completeness.json`) is the builder's own statement.
 - Only events the archive sealed are checked against a seal. These are not verified, and the verifier lists their counts by name every time:
   - events with no seal in the package (rows the archive does not content-seal, for example events outside the curated set, and rows removed by retention);
   - **legacy v1 manifests**: written before content sealing began, they record identifiers only;
-  - **`entries_json` manifests**: an older sealing format that a package does not carry seals for;
   - **snapshot manifests**: configuration snapshots; their link in the chain is checked, their objects are not in the package;
   - report rows that carry no `event_uuid`;
   - pruned days, which the package builder states in `completeness.json`: a statement the verifier prints and does not check.
-- The verifier prints the chain head on its own line. The operator's server-side build log (written when the package was built) is the only independent record of who built it, when, and with what result. Compare the package's sha256 and chain head with that log.
+- The verifier prints the chain head on its own line. The operator's server-side build log (written when the package was built) is the only independent record of who built it, when, and with what result. The verifier also prints the sha256 of the zip file itself; compare both it and the chain head with that log.
 
 ## Getting the verifier and checking it
 
-The verifier is `tools/verify_evidence_package.py`, one file, Python standard library only. It ships inside the signed release of the OPA Compliance Wizard, and a convenience copy is placed in every package. Its sha256 is printed in the release notes, on the signing-key page and on the package's cover sheet. Before you rely on a copy, compute its sha256 yourself and compare:
+The verifier is `tools/verify_evidence_package.py`, one file, Python standard library only. Where to get it, most trusted first:
+
+1. **The sha256 in the release notes and on the signing-key page.** Both are outside the package. This is the authoritative value.
+2. **The signed release tarball** of the OPA Compliance Wizard contains the verifier. Verify the release as the README describes, then take the file from it.
+3. **The value on the package's cover sheet and the copy inside the package** (`tools/verify_evidence_package.py` inside the zip, listed in `package-manifest.json` like every file) are conveniences only. They come from the same place as the package, so they prove nothing about themselves.
+
+Before you rely on a copy, compute its sha256 yourself and compare it with the authoritative value:
 
 ```
 sha256sum tools/verify_evidence_package.py        # Linux
@@ -39,15 +44,16 @@ shasum -a 256 tools/verify_evidence_package.py    # macOS
 Get-FileHash tools\verify_evidence_package.py     # Windows PowerShell
 ```
 
-If the value differs from the one published with the release, do not use that copy. A copy found only inside the package proves nothing about itself.
+If the value differs, do not use that copy.
 
 ## Running it
 
 ```
-python3 -I tools/verify_evidence_package.py package.zip
+python3 -I tools/verify_evidence_package.py package.zip      # Linux, macOS
+py -I tools\verify_evidence_package.py package.zip           # Windows
 ```
 
-`-I` runs Python in isolated mode, so nothing from the current directory or the environment is loaded. The verifier reads the zip in memory, never extracts a file, never follows a path named inside the package, and imports nothing from the application. It refuses entry names that are absolute, contain `..`, a backslash or a colon, are not plain ASCII, repeat (ignoring case), or are not regular files.
+Use an operating-system Python you already trust. `-I` runs Python in isolated mode: it ignores the current directory, `PYTHONPATH` and the user's site-packages. The installation's own library and its `sitecustomize` still load, so isolated mode does not protect against a Python installation that is itself altered. Running from an empty directory is a further precaution, not a guarantee. The verifier reads the zip in memory, never extracts a file, never follows a path named inside the package, and imports nothing from the application. It refuses entry names that are absolute, contain `..`, a backslash or a colon, are not plain ASCII, repeat (ignoring case), or are not regular files.
 
 Output is a short report and a final line:
 
@@ -68,6 +74,7 @@ Entries are ASCII names built from fixed keys. Order in the zip is as listed; th
 | `control-matrix.csv` | `control_id`, `framework`, `mapping_status` (`proposed` or `auditor-reviewed`), `reports`, `rows_in_period`, `status` |
 | `controls/<control_id>/<report_key>.csv` | one per control and report; see the `event_uuid` column contract below |
 | `events.ndjson` | every event of the period in scope, one per line, oldest first (ties by uuid) |
+| `tools/verify_evidence_package.py` | convenience copy of the verifier; listed in `package-manifest.json` like every file; not a trusted source (see above) |
 | `chain/manifests.ndjson` | every manifest record of the environment, first to head, in chain order |
 | `chain/seals.ndjson` | for each manifest holding an event of the period, its sealed entries |
 | `completeness.json` | the builder's statement of rows, scope, counts, coverage and pruned days |
@@ -97,17 +104,17 @@ Ordered by canonical `published` time ascending, ties by `uuid` ascending (the v
 
 One JSON object per line, ascending `manifest_id`:
 
-`manifest_id` (integer), `environment_id`, `source`, `since` (or null), `until` (or null), `row_count` (integer), `batch_hash`, `prev_manifest_hash` (null for the first record), `created_at`, `content_hash` (null for legacy), `entry_hash` (null for legacy), and `entries_json` (true for an older-format manifest whose entries live in a single cell).
+`manifest_id` (integer), `environment_id`, `source`, `since` (or null), `until` (or null), `row_count` (integer), `batch_hash`, `prev_manifest_hash` (null for the first record), `created_at`, `content_hash` (null for legacy), `entry_hash` (null for legacy), and `entries_json` (true for an older-format manifest whose entries live in a single cell; informational, outside every hash, and ignored by the verifier: such a manifest is checked like any other sealed one).
 
 A manifest whose `source` starts with `snapshot:` is a snapshot manifest.
 
 ### chain/seals.ndjson
 
-One object per line: `{"manifest_id": 7, "entries": ["<event uuid>:<content hash>", ...], "published": ["<published time of each entry's event>", ...]}`. `entries` are all of the manifest's curated rows (sorted); `published` is parallel to `entries` (same length and order), written in the archive's canonical form (`YYYY-MM-DDTHH:MM:SS.mmmZ`, UTC). It is outside every hash; the verifier uses it only to decide whether a sealed event that is missing from `events.ndjson` fell inside the period, so it is a statement by the builder, not something the archive sealed. A seal line is present for every manifest in `period_manifest_ids` that is ordinary: sealed (v2), not a snapshot and not `entries_json`. Lines for legacy, snapshot and `entries_json` manifests are ignored and counted as not verified.
+One object per line: `{"manifest_id": 7, "entries": ["<event uuid>:<content hash>", ...], "published": ["<published time of each entry's event>", ...]}`. `entries` are all of the manifest's curated rows (sorted); `published` is parallel to `entries` (same length and order), written in the archive's canonical form (`YYYY-MM-DDTHH:MM:SS.mmmZ`, UTC). It is outside every hash; the verifier uses it only to decide whether a sealed event that is missing from `events.ndjson` fell inside the period, so it is a statement by the builder, not something the archive sealed. A seal line is present for every manifest in `period_manifest_ids` that is sealed (v2) and not a snapshot, including an older-format (`entries_json`) manifest. Lines for legacy and snapshot manifests are ignored and counted as not verified. When an event is present in `events.ndjson`, its seal's `published` must equal the event's canonical `published` time.
 
 ### The `event_uuid` column contract for report CSVs
 
-Every file under `controls/` has a header row containing a column named exactly `event_uuid`. For each data row, `event_uuid` is either the uuid of the System Log event the row was built from, which must be in `events.ndjson`, or empty when the row is not derived from a single event (the verifier counts these and reports them as not verified). A leading apostrophe added by formula neutralisation is accepted and ignored. Files are read as UTF-8 (a byte order mark is accepted) with standard CSV quoting.
+Every file under `controls/` has a header row containing a column named exactly `event_uuid`. For each data row, `event_uuid` is either the uuid of the System Log event the row was built from, which must be in `events.ndjson`, or empty when the row is not derived from a single event (the verifier counts these and reports them as not verified). A leading apostrophe added by formula neutralisation is accepted and ignored. Only the uuid ties a row to an event: the other cells of a row are not compared with the event, and the `reports` column of the matrix is not cross-checked. Files are read as UTF-8 (a byte order mark is accepted) with standard CSV quoting.
 
 In `control-matrix.csv`, `rows_in_period` for a control must equal the number of data rows in the CSV files under `controls/<control_id>/`, and every control that has report files must be in the matrix.
 
@@ -136,10 +143,10 @@ Golden values (the test suite asserts them against both the application and the 
 2. Read `package-manifest.json`: `format` is 1 and the required keys are present. Its `files` must name exactly the other entries; each entry's byte count and sha256 must match; every required file must be present.
 3. Walk `chain/manifests.ndjson` in order. Ids ascend; the first record's `prev_manifest_hash` is null; each record's `prev_manifest_hash` equals the previous record's link (its `entry_hash`, or `batch_hash` for a legacy record); a legacy record after a sealed one is a downgrade and fails; each sealed record's `entry_hash` recomputes by formula 3. The last link must equal `chain_head` in `package-manifest.json`.
 4. Every id in `period_manifest_ids` must be in the chain. For each ordinary sealed manifest among them there must be a seal line; the entries recompute to the record's `content_hash` by formula 2, and there are no more of them than `row_count`.
-5. For each line of `events.ndjson`: it is in order (published, then uuid); if the event's uuid is in a seal, its content hash (formula 1) must equal the sealed value. An event whose `eventType` is in `curated_event_types` and that has no seal fails, unless a legacy or `entries_json` manifest is among the period's manifests (it might hold that event; the event is then counted as not verified). Other events with no seal are counted as not verified.
-6. Every sealed entry of a period manifest whose published date is inside the period must be in `events.ndjson`; one that is absent fails (a curated event is missing).
+5. For each line of `events.ndjson`: it is in order (published, then uuid); if the event's uuid is in a seal, its content hash (formula 1) must equal the sealed value. An event whose `eventType` is in `curated_event_types` and that has no seal fails, unless a legacy (pre-sealing) manifest is among the period's manifests (it might hold that event; the event is then counted as not verified, and the report prints the legacy manifest ids and how many events were tolerated). Other events with no seal are counted as not verified.
+6. Every event's canonical `published` date lies inside `period` (a date pair `YYYY-MM-DD`, start not after end). Every sealed entry of a period manifest whose published date is inside the period must be in `events.ndjson`; one that is absent fails (a curated event is missing).
 7. For each `controls/**/*.csv` row with an `event_uuid`, that uuid is in `events.ndjson`; the matrix row counts match the report files.
-8. Print the report, the chain head on its own labelled line, and the final `RESULT:` line.
+8. Print the report (package text is shown as printable ASCII only, at most 120 characters per value), the zip's sha256 and the chain head on their own labelled lines, and the final `RESULT:` line. Lines longer than 16 MiB (256 MiB for a seals line), a `completeness.json` over 64 MiB and zip entries that are not stored or deflated fail.
 
 ## Limits and memory
 
