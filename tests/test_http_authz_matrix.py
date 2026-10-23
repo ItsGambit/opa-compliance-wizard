@@ -633,7 +633,7 @@ def _raw_post(base_url, path, headers, body=b""):
     host, port = base_url.replace("http://", "").split(":")
     with socket.create_connection((host, int(port)), timeout=10) as conn:
         conn.settimeout(3)  # a handler stuck reading the body never answers -> socket.timeout fails the test
-        head = f"POST {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n"
+        head = f"POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n"
         head += "".join(f"{k}: {v}\r\n" for k, v in headers.items())
         conn.sendall(head.encode() + b"\r\n" + body)
         data = b""
