@@ -11,14 +11,15 @@ Okta, Inc.*
 
 **A compliance evidence helper for Okta Privileged Access (OPA) and core
 Okta.** Okta's own System Log only keeps 90 days of history; most audits
-(SOC 2, SOX, ISO 27001) ask for 12 months or more. This tool closes that
+ask for 12 months or more. This tool closes that
 gap — it continuously archives System Log history past Okta's retention
-window and turns it into 16 pre-built, framework-mapped reports, giving
-PAM admins the underlying evidence their auditors ask for without
-needing to know Okta's System Log event-type names or write a query. It
-doesn't produce a finished SOC 2/SOX/ISO 27001 report on its own — it
-gets you most of the way there, and that's the direction this project is
-headed. It also includes Folder Builder, for creating OPA vault folders,
+window and turns it into pre-built reports, mapped to SOC 2 criteria
+(the mapping is labelled proposed; ISO 27001 and SOX are planned, not
+mapped yet), giving PAM admins the underlying evidence their auditors ask
+for without needing to know Okta's System Log event-type names or write
+a query. It doesn't produce a finished SOC 2 (or SOX or ISO 27001)
+report on its own — it gets you most of the way there, and that's the
+direction this project is headed. It also includes Folder Builder, for creating OPA vault folders,
 resource groups, projects, and access policies from a CSV or a visual tree.
 
 Ships as both an interactive dashboard for everyday use and a CLI for
@@ -62,13 +63,13 @@ worth reporting privately.
 
 ## What it does
 
-1. **Generates audit-ready evidence reports** — MFA enforcement,
+1. **Generates evidence for your auditor** — reports on MFA enforcement,
    provisioning, privileged access, policy changes, and more — from a
    local, indefinitely-retained archive of Okta System Log + OPA
-   activity, mapped to the controls auditors ask about (SOC 2, SOX,
-   ISO 27001). This is the data PAM admins need to hand their auditors;
-   it isn't a finished SOC 2/SOX/ISO 27001 report in itself. **This is
-   the primary use case.** See
+   activity, mapped to SOC 2 criteria (CC6, CC7 and CC8; the mapping is
+   labelled proposed; ISO 27001 and SOX are planned, not mapped). This is
+   the data PAM admins need to hand their auditors; it isn't a finished
+   SOC 2 report in itself. **This is the primary use case.** See
    [Compliance Reports Dashboard](docs/features.md#compliance-reports-dashboard),
    plus two per-resource views built on the same archive: the
    [Secrets Access Dashboard](docs/features.md#secrets-access-dashboard)
@@ -80,6 +81,17 @@ worth reporting privately.
    Since 5.50.0, two views that join Okta and OPA: the
    [Okta Admins report](docs/features.md#okta-admins-report-and-cross-checks)
    and the lifecycle cross-check.
+   Around the reports sit four more pages: the
+   [Overview](docs/features.md#overview) (counts of who holds Okta admin
+   and OPA privileged access, who holds both, and how complete the
+   evidence behind them is, with one **Refresh** for everything), the
+   [Access Explorer](docs/features.md#access-explorer) ("who has access
+   to what", opening from a stored OPA scan with an "as of" time), the
+   [Okta Admins](docs/features.md#okta-admins-report-and-cross-checks)
+   report, and, for administrators, the
+   [Audit Log](docs/features.md#audit-log-page) and the
+   [Updates page](docs/features.md#updates-page) (the update check and
+   upgrades, see [Upgrading](#upgrading)).
 2. **Creates a tree of OPA vault secret folders** (any depth) — and, if
    needed, the resource group / project / access group they live under —
    from a CSV file or the dashboard's visual tree editor. See
@@ -157,8 +169,9 @@ sudo bash get-ocw.sh
 ```
 
 That key line is published in the same repository as the script, so it only helps if you get it from somewhere GitHub's account does
-not control: the command trusts GitHub for the first file; to check it independently, compare the key id with the project's security
-advisories page. Python packages are installed with `pip --require-hashes` from the hash-pinned list inside the signed release;
+not control: the command trusts GitHub for the first file. To check it independently, compare the key id with the one published on
+a page the project controls outside GitHub, <https://apps.ruchir.pw/keys/opa-compliance-wizard> (plain text: `/keys/opa-compliance-wizard.txt`).
+If they differ, stop and report it privately (see [SECURITY.md](SECURITY.md)). Python packages are installed with `pip --require-hashes` from the hash-pinned list inside the signed release;
 system packages come signed from your distribution. **No independent third-party audit of this installer or the project has been
 performed.**
 
@@ -239,7 +252,7 @@ the System Log in one job; the daily schedule runs the same job.
 Never stored: secret values, service-user key secrets, the OPA service key, the Okta token, Okta `credentials` objects, any Okta profile
 attribute beyond login, e-mail and name. (The stored scan does include device names and serial numbers, and people's names and e-mails: they
 are in the table above.) A scan that contains a credential-shaped value is refused and not stored. The sealed records (the access state, the
-Okta admins and the lifecycle status hold names) are part of the same tamper-evident chain as the archived log and are never pruned by
+Okta admins and the lifecycle status hold names) are part of the same hash chain as the archived log and are never pruned by
 retention: they are kept until the environment's archive is purged. A deep integrity check verifies them.
 
 **Keep the data folder on an encrypted disk.** The app does not encrypt the archive (`audit_store.db`, `audit_log.jsonl` and the environment
@@ -266,10 +279,12 @@ banner asks for MFA as well. A computer running without a login gate (local mode
 upgrade itself needs nothing from you and changes no nginx or service file; an additional login gate's site generated before
 5.42.0 must be regenerated first (see [docs/hosting.md](docs/hosting.md), "Opening Settings and Updates needs a fresh MFA too").
 
-**Nothing else changes for you unless you choose it.** Upgrading to 5.51.0 changes no
-behaviour of an existing install: the update check is **off**, `server/deploy.sh` and `--ref`
+**Nothing else changes for you unless you choose it.** Upgrading changes no other
+behaviour of an existing install by itself: the update check is **off**, `server/deploy.sh` and `--ref`
 keep working in place (with a note that the install can move to the upgrade layout), and no
-key has to be pinned. 5.46.0 added **signed releases** and the update check; 5.47.0 adds the
+key has to be pinned. One thing you will notice after a *minor* upgrade (for example 5.52 to 5.53):
+the stored OPA scan is tied to the release's minor number, so the first refresh reads OPA again
+instead of reusing the scan stored by the earlier release. A patch upgrade keeps it. 5.46.0 added **signed releases** and the update check; 5.47.0 adds the
 **upgrade layout** and the **updater**: one command stages a signed release, backs up the
 archive, switches versions, health-checks the result and rolls back by itself if it is not healthy.
 
@@ -652,15 +667,19 @@ This tool is provided **as-is, with no warranty of any kind** — see
 OPA/Okta tenant via real API calls; **you are responsible for
 reviewing what it does before running it against a production
 environment**, and assume all risk of using it. The same notice is
-shown in the dashboard itself via the ⓘ icon next to the gear/settings
-icon.
+shown in the dashboard itself under **About** (the ⓘ item at the bottom
+of the sidebar).
 
 ## Security: encrypted credential storage
 
-**No secret is ever written to disk in plaintext.** The dashboard's
-multi-environment store (`environments.json`, next to this README) holds
-only non-secret metadata (base domain, team name, key ID, Okta URL).
-The two actual secrets — the OPA service-user **key secret** and the
+**The credentials for your OPA team and Okta org are never written to
+disk in plaintext.** The dashboard's multi-environment store (the
+`app_environments` table of `audit_store.db` in the data directory: the
+folder `OPA_DATA_DIR` names, `/var/lib/opa-compliance-wizard` on the
+upgrade layout, otherwise the project folder; `environments.json` is only
+the legacy file older versions imported once) holds only non-secret
+metadata (base domain, team name, key ID, Okta URL). The two
+per-environment secrets — the OPA service-user **key secret** and the
 **Okta API token** — are stored exclusively in your OS's encrypted
 credential store via the `keyring` package:
 
@@ -677,6 +696,25 @@ it's already excluded via `.gitignore` if you do), (3) the dashboard's
 encrypted environment store — whichever environment is active there.
 This means the CLI automatically follows whatever environment you last
 activated in the dashboard, with zero plaintext involved.
+
+A server installed with `server/install.sh` (hosted mode) stores a few
+more things, none of them in the repository:
+
+* `/etc/opa-compliance-wizard.env` (mode 0600, owned by the application
+  account) holds three generated secrets (`NGINX_PROXY_SECRET`,
+  `KEYRING_UNLOCK_PASSWORD`, `INTERNAL_API_SHARED_SECRET`) in plaintext,
+  with the other settings. The installer never prints them.
+* `/etc/opa-secrets-wizard-session.key` (32 random bytes, root-owned,
+  readable by the application group) signs the login gate's sessions.
+* The nginx site file carries the proxy secret and is group-readable
+  (mode 0640), not world-readable.
+* The keyring on that server (the application account's login keyring,
+  under the data directory) also holds the Okta client secret and the
+  admin-check token the login gate needs, besides each environment's
+  OPA key secret and Okta API token.
+
+Keep the host's disk encrypted and its backups private (see
+[docs/hosting.md](docs/hosting.md#backups-and-restore)).
 
 This only protects secrets at rest on disk. The OS keychain backends
 above unlock with your OS login session — on an unlocked, logged-in

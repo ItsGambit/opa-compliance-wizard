@@ -1,0 +1,63 @@
+name: Feedback on an evidence package (auditors and users)
+description: Tell us what was unclear, missing or wrong in an evidence package
+title: "[Evidence package]: "
+labels: ["evidence-package", "feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never paste data from a package into this form, and do not attach any file from it.** A package can hold people's names, e-mail addresses, IP addresses and identifiers. Describe the problem in words, and say where in the package you saw it (for example "the cover sheet", "the control matrix", "a file under controls/", "the verifier output").
+
+        Do not include the names of people, organisations, tenants or hosts. If you think you found a security problem, do not post it here: report it privately (see SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: App version that built the package
+      description: Printed in README-FOR-AUDITORS.txt and on the cover sheet.
+      placeholder: "5.53.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: role
+    attributes:
+      label: Your role
+      options:
+        - Auditor or reviewer of a package
+        - Administrator who built the package
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: What the feedback is about
+      options:
+        - The instructions (README-FOR-AUDITORS.txt)
+        - The cover sheet
+        - The control matrix or a control mapping
+        - A report file
+        - Wording about gap, zero-event or pruned days
+        - The verifier
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: feedback
+    attributes:
+      label: What was unclear, missing or wrong
+      description: In words only. No cell values, no file contents, no screenshots of package data.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What would have helped
+    validations:
+      required: false
+  - type: checkboxes
+    id: no-data
+    attributes:
+      label: Before you submit
+      options:
+        - label: I did not paste or attach any data from a package.
+          required: true

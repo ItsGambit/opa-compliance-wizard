@@ -1,0 +1,61 @@
+name: Bug report
+description: Something does not work as the documentation says
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. **If this is a security problem, stop here** and report it privately (see SECURITY.md); do not open a public issue for it.
+
+        Do not paste secrets, tokens, keys, environment files, customer data, or real names, e-mail addresses, tenant names or host names. Replace them with placeholders such as `example.okta.com` and `user@example.com`.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Shown in the page footer, or run `ocw-updater status` on a server.
+      placeholder: "5.53.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: How it runs
+      options:
+        - Local (python launch.py on one computer)
+        - Hosted behind nginx and the Okta login gate
+        - Installed with the one-line installer
+        - Other or not sure
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you saw instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Messages or log lines (sanitised)
+      description: Only the lines that matter, with names, addresses and identifiers replaced by placeholders.
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: sanitised
+    attributes:
+      label: Before you submit
+      options:
+        - label: I removed secrets, personal data, tenant and host names and identifiers from everything above.
+          required: true
