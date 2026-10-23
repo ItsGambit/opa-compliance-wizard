@@ -161,6 +161,15 @@ updater never runs the application's Python. A re-check of the installed
 packages against their pip `RECORD` hashes after installation is planned for
 5.54.0.
 
+### The evidence package verifier's sha256
+
+Each release publishes the sha256 of `tools/verify_evidence_package.py` in three places outside any evidence package: the signed
+`manifest.json` of the release (field `verifier_sha256`, covered by the release signature), the release notes, and the project's
+signing-key page. To check a copy, compute its sha256 (`sha256sum`, `shasum -a 256`, `Get-FileHash`) and compare it with the
+signed manifest's value, which you can read after verifying the release as described above, and with the other two. The cover
+sheet of a package and the copy inside it are conveniences: they come from the same place as the package. No value is written
+in this repository.
+
 ## Evidence packages
 
 An evidence package (5.53.0) is one zip of the archived events of an audit period, with report files, the archive's hash
@@ -180,7 +189,7 @@ chain as it stood when the package was built, and the data an auditor needs to c
   build time. It does not show who produced the events, that the archive was never altered by someone who could rewrite it,
   or that `events.ndjson` holds every event of the period (the completeness statement is the builder's own). Events with no
   seal, legacy and snapshot manifests, and report rows with no `event_uuid` are listed as not verified, never counted as
-  verified. Get the verifier's sha256 from the release notes or the signing-key page, not from the package.
+  verified. Get the verifier's sha256 from the signed release, its notes or the signing-key page (see "The evidence package verifier's sha256" under Release signing keys), not from the package.
 - **Who can build one.** The environment's owner always can. Other people who see the environment need both *View archived
   reports* and *Build evidence packages* (denied by default; the environment form asks who may). Permission is checked when
   a build starts, on every status read and on every download. On a hosted server a build needs a fresh MFA, as every
@@ -188,10 +197,11 @@ chain as it stood when the package was built, and the data an auditor needs to c
   the Settings approval cannot start a build. A package is available only to the person who built it (their sign-in
   session), for 15 minutes after it is finished; then the file is deleted. Packages are written to
   `<data folder>/packages/` (folder 0700, file 0600), deleted when the server starts, and never included in a support bundle.
-- **Not covered.** A package that has been downloaded is outside this server's control. The nginx template is unchanged in
-  5.53.0, so an additional login gate's site does not refuse the evidence package routes the way it refuses Access control or
-  Overview: there the same checks still apply (the person must see the environment and hold both permissions, and the package
-  is bound to their sign-in session), and refusing the routes on those sites is left to the template changes of 5.54.0.
+- **Not covered.** A package that has been downloaded is outside this server's control.
+- **Additional login gates.** Building and downloading packages there is intended. The control is the capability: a per-user
+  grant for that gate's issuer, or the environment-wide setting. "Owner and people this environment is shared with" allows every
+  person who sees the environment, through any gate. To keep packages to the main gate, leave the environment setting at owner
+  only and grant per user.
 
 ## Supported versions
 

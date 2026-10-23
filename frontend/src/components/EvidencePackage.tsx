@@ -367,7 +367,7 @@ export function EvidencePackage({ resume, onResumeConsumed }: Props) {
               <details className="text-xs text-text-dim">
                 <summary className="cursor-pointer">How the package is checked</summary>
                 <ol className="list-decimal pl-4 mt-1 flex flex-col gap-1">
-                  <li>Get <code>verify_evidence_package.py</code> from the release (the sha256 is in the release notes and on the signing-key page), or use the copy inside the package.</li>
+                  <li>Get <code>verify_evidence_package.py</code> from the release (the authoritative sha256 is in the signed release and its notes and on the signing-key page; the copy inside the package is a convenience).</li>
                   <li>Run <code>python3 -I verify_evidence_package.py package.zip</code>. It reads the zip without unpacking it and ends with <code>RESULT: PASS</code> or <code>RESULT: FAIL</code>.</li>
                   <li>It detects accidental or partial change and checks the events against the archive's hash chain as it stood at build time. The hashes are unkeyed and the package is not signed.</li>
                 </ol>

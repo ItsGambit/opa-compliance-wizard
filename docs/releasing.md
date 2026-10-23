@@ -124,6 +124,10 @@ notifications before you publish. Then:
    `python tools/release.py verify ocw-5.47.0.tar.gz ocw-5.47.0.tar.gz.minisig --bootstrap get-ocw.sh --bootstrap-sig get-ocw.sh.minisig`, and
    `minisign -Vm get-ocw.sh -P <the release key's minisign line> -H` (see the README). The first re-renders `get-ocw.sh` from the
    tarball's own template, verifier and key list and compares it byte for byte, so a script that is not what the release produces is caught.
+3a. **Publish the evidence package verifier's sha256** (5.53.0). `release.py build` writes it into `manifest.json` (field
+   `verifier_sha256`, signed with the release) and into the manifest's changelog excerpt, and prints a ready-to-paste line. The
+   GitHub release notes are written by hand, so paste that line into them, and put the same value on the project's signing-key page
+   (the page the README and SECURITY.md name). Auditors compare a package's verifier with it.
 4. Never reuse a version number. A bad release is superseded by the next patch (and its notes say so).
 5. **`get-ocw.sh`, the one-line installer (5.52.0).** `release.py build` renders it next to the tarball, from the **tagged**
    `server/get-ocw.sh.in`, `server/updater/root/ocw_crypto.py`, `ocw_trust.py`, `ocw_bootstrap_verify.py` and `server/release_keys.json`

@@ -48,7 +48,7 @@ card). The page has six steps; each heading takes keyboard focus when you arrive
 6. **Result.** A download button (the package stays on the server for **15 minutes** after it is finished; you can download it
    again inside that time), the package's **sha256** and the **chain head**. Write both down or leave the page open: the build log
    in the Audit Log (`evidence_package.build_finished`) has the same two values, and an auditor's check prints them, so a match shows
-   the file is the one this server built.
+   the file is the one recorded in this server's build log.
 
 A build that fails says why on the page (not enough disk, the size limit, the chain check, a permission that was withdrawn) and leaves
 nothing on the server.
@@ -56,9 +56,10 @@ nothing on the server.
 ## What to send
 
 - The zip file, exactly as downloaded. Do not open and re-zip it: the check fails on any change.
-- The **verifier's sha256** from a source outside the package (the release notes, or the signing-key page), so the auditor can
-  check the checking program before running it. The package also holds a copy of the program and its sha256 on the cover sheet,
-  but those came from the same place as the package and prove nothing about themselves.
+- The **verifier's sha256**, authoritative in the signed release (`manifest.json`, `verifier_sha256`), its release notes and the
+  signing-key page (not the package), so the auditor can check the checking program before running it. The package also holds a
+  copy of the program and its sha256 on the cover sheet; those are conveniences that came from the same place as the package and
+  prove nothing about themselves.
 - The package's **sha256** and **chain head**, from the page or the build log, by a different route than the file (for example by
   email, with the file shared another way).
 - Your own statement of the period, the environment and what you want the auditor to see. The package does not make claims for you.

@@ -32,7 +32,7 @@ In short: the verifier detects accidental or partial change to the package, and 
 
 The verifier is `tools/verify_evidence_package.py`, one file, Python standard library only. Where to get it, most trusted first:
 
-1. **The sha256 in the release notes and on the signing-key page.** Both are outside the package. This is the authoritative value.
+1. **The sha256 in the signed release (`manifest.json`, field `verifier_sha256`), in its release notes and on the signing-key page.** All are outside the package. This is the authoritative value.
 2. **The signed release tarball** of the OPA Compliance Wizard contains the verifier. Verify the release as the README describes, then take the file from it.
 3. **The value on the package's cover sheet and the copy inside the package** (`tools/verify_evidence_package.py` inside the zip, listed in `package-manifest.json` like every file) are conveniences only. They come from the same place as the package, so they prove nothing about themselves.
 
@@ -150,7 +150,7 @@ Golden values (the test suite asserts them against both the application and the 
 
 ## Limits and memory
 
-The verifier holds the uuids of the sealed entries and of the exported events in memory (about 250 bytes per event). A package of a million events needs a few hundred megabytes. Files are streamed and hashed in chunks.
+The verifier holds the uuids of the sealed entries and of the exported events in memory (about 250 bytes per event). The verifier needs about 650 MB of memory per million events (streaming it is planned for 5.54.0). Files are streamed and hashed in chunks.
 
 ## Versioning
 
