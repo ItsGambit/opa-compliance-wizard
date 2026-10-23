@@ -118,7 +118,7 @@ def test_the_start_up_sweep_and_the_operator_listing_and_clearing(tmp_audit_stor
     assert audit_store.list_settings_unlocks() == []
 
 
-# --- the operator's break-glass: `ocw-updater settings-unlocks list | clear` (runs as the application account, root only) ------
+# --- the operator's break-glass: `python -m server.updater settings-unlocks list | clear` (run as the application account) ----
 def test_cli_lists_and_clears_the_windows_and_audits_the_clearing(tmp_audit_store, tmp_audit_log, monkeypatch, capsys):
     from server.updater import __main__ as cli
 
@@ -149,10 +149,3 @@ def test_cli_on_an_archive_without_the_table_says_there_is_nothing(tmp_audit_sto
     assert cli.main(["settings-unlocks", "list"]) == 0
     assert "No Settings or Updates windows" in capsys.readouterr().out
     assert cli.main(["settings-unlocks", "clear", "--confirm", "CLEAR"]) == 0
-
-
-def test_the_wrapper_makes_the_command_root_only_and_documents_it():
-    wrapper = (Path(__file__).resolve().parent.parent / "server" / "ocw-updater.sh").read_text()
-    block = wrapper.split("  settings-unlocks)", 1)[1].split(";;", 1)[0]
-    assert 'id -u' in block and "exit 2" in block and 'as_app "$@"' in block
-    assert "ocw-updater settings-unlocks list | clear --confirm CLEAR" in wrapper

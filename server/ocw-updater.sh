@@ -9,8 +9,6 @@
 #     the root-owned updater (<opt>/updater/ocw_activate.py), which is Python
 #     standard library only and executes nothing from a release; the ones that
 #     change anything refuse to run unless you are root (use sudo);
-#   - `settings-unlocks` (list or end the open Settings/Updates windows; root only, audited) is the application's own
-#     `python -m server.updater` too, run as the application account;
 #   - the update check, `verify`, `audit` and `keys` are the application's own
 #     `python -m server.updater`, run as the APPLICATION account (as root this
 #     script drops to it with runuser, so files are never created root-owned).
@@ -38,7 +36,6 @@ ocw-updater clear-failure                           allow a version that failed 
 ocw-updater prune-backups --keep N | --name FILE ... --confirm PRUNE   delete old pre-upgrade copies (never the newest) [root]
 ocw-updater trust list | seed | add FILE | apply FILE   the signing keys root trusts                          [root to change]
 ocw-updater nginx-sync                              apply the current release's nginx template (maintenance page) [root]
-ocw-updater settings-unlocks list | clear --confirm CLEAR   see / end every open Settings and Updates window (audited) [root]
 ocw-updater check [--force] | enable-check | disable-check | verify TAR SIG | audit | keys list | keys apply-revocation FILE
                                                     the update check and key tools (run as the application account)
 EOF
@@ -63,13 +60,6 @@ case "$cmd" in
     exec env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 SUDO_USER="${SUDO_USER:-}" \
       OCW_OPT_DIR="$OPT" OCW_DATA_DIR="$DATA" OCW_ARTIFACTS_DIR="$ARTIFACTS" OCW_ENV_FILE="$ENV_FILE" \
       "$PY3" -I -B "$OPT/updater/ocw_activate.py" cli "$@"
-    ;;
-  settings-unlocks)
-    if [ "$(id -u)" -ne 0 ]; then
-      echo "ocw-updater settings-unlocks: run it with sudo (it shows and ends other people's Settings windows)." >&2
-      exit 2
-    fi
-    as_app "$@"
     ;;
   check | enable-check | disable-check | verify | audit | keys)
     as_app "$@"

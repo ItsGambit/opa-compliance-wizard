@@ -10,7 +10,7 @@ Updates page shows is also here, for admins who work from a shell).
     python -m server.updater keys list
     python -m server.updater keys apply-revocation <revocation.json>
     python -m server.updater audit [--since 2026-01-31[T10:00:00Z]] [--correlation upg-xxxxxxxx] [--last N] [--json]
-    python -m server.updater settings-unlocks list | clear --confirm CLEAR    (5.53.0; `sudo ocw-updater settings-unlocks ...`)
+    python -m server.updater settings-unlocks list | clear --confirm CLEAR    (5.53.0, run as the application account)
 
 Installing, rolling back, restoring, staging and the support bundle need root
 and are run through the `ocw-updater` command that server/install.sh puts on
