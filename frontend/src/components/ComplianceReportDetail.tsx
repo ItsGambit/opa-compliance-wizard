@@ -16,6 +16,28 @@ interface Props {
 
 const CONTROL_LABEL: Record<string, string> = { CC6: 'CC6', CC7: 'CC7', CC8: 'CC8' }
 
+const FRAMEWORK_LABEL: Record<string, string> = { soc2: 'SOC 2' }
+
+/** The controls this report is mapped to. The label and sentence say what the mapping is, in text, not only colour. */
+function MappedControls({ def }: { def: ComplianceReportDef }) {
+  const controls = def.controls ?? []
+  if (controls.length === 0) return null
+  const reviewed = def.mapping_status === 'auditor-reviewed'
+  return (
+    <div className="mt-2 text-xs text-text-faint" data-testid="mapped-controls">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="font-medium text-text">{reviewed ? 'Auditor-reviewed mapping' : 'Proposed mapping'}</span>
+        {controls.map(c => (
+          <span key={`${c.framework}:${c.id}`} className="font-mono text-[0.6875rem] border border-border rounded px-1.5 py-0.5">
+            {FRAMEWORK_LABEL[c.framework] ?? c.framework} {c.id}
+          </span>
+        ))}
+      </div>
+      {!reviewed && <p className="mt-1">Suggested by this project; not reviewed by an auditor.</p>}
+    </div>
+  )
+}
+
 export function ComplianceReportDetail({ def, environment, onBack }: Props) {
   const dateRange = useReportDateRange()
 
@@ -60,6 +82,7 @@ export function ComplianceReportDetail({ def, environment, onBack }: Props) {
           </span>
         </h2>
         <p className="text-xs text-text-faint mt-1">{def.description}</p>
+        <MappedControls def={def} />
       </div>
 
       <DateRangeFields range={dateRange} idPrefix={`report-${def.key}`} />

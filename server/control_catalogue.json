@@ -1,0 +1,296 @@
+{
+  "format": 1,
+  "frameworks": {
+    "soc2": {
+      "name": "SOC 2 (AICPA Trust Services Criteria, 2017, revised points of focus 2022)"
+    }
+  },
+  "reports": {
+    "ad_sync_activity": {
+      "controls": [
+        {
+          "framework": "soc2",
+          "id": "CC7.2",
+          "status": "proposed"
+        },
+        {
+          "framework": "soc2",
+          "id": "CC6.2",
+          "status": "proposed"
+        }
+      ],
+      "known_limits": [
+        "Shows that discovery runs completed; it does not list the accounts found or any differences.",
+        "Only events the tool has synced into the archive appear; events after the last sync, or outside the archive's coverage, are absent."
+      ],
+      "methodology": "What it shows: Recurring, automated Active Directory account discovery runs. Rows are chosen by event type: the report lists every archived System Log event whose type is on its list, within the date range, newest first. It shows that the events were recorded by the source system and archived here; it does not show that a control operated effectively, that every event was captured, or who reviewed it. Proposed mapping, suggested by this project and not reviewed by an auditor. Rationale: CC7.2 covers monitoring of system operations: recurring automated Active Directory account discovery shows that vaulted accounts are kept in step with the domain. CC6.2 is also proposed because the discovery feeds the account inventory. The report is grouped under system operations."
+    },
+    "admin_privilege_grants": {
+      "controls": [
+        {
+          "framework": "soc2",
+          "id": "CC6.1",
+          "status": "proposed"
+        },
+        {
+          "framework": "soc2",
+          "id": "CC6.3",
+          "status": "proposed"
+        }
+      ],
+      "known_limits": [
+        "Records grants; revocations appear only if Okta logs them under a type on this report's list.",
+        "Only events the tool has synced into the archive appear; events after the last sync, or outside the archive's coverage, are absent."
+      ],
+      "methodology": "What it shows: Administrator privilege and role assignment grant events. Rows are chosen by event type: the report lists every archived System Log event whose type is on its list, within the date range, newest first. It shows that the events were recorded by the source system and archived here; it does not show that a control operated effectively, that every event was captured, or who reviewed it. Proposed mapping, suggested by this project and not reviewed by an auditor. Rationale: CC6.1 covers restricting privileged access and CC6.3 covers authorizing and modifying access; administrator privilege grants are the highest-risk access changes."
+    },
+    "api_token_lifecycle": {
+      "controls": [
+        {
+          "framework": "soc2",
+          "id": "CC6.1",
+          "status": "proposed"
+        }
+      ],
+      "known_limits": [
+        "Shows creation and revocation only; token use and expiry are not covered.",
+        "Only events the tool has synced into the archive appear; events after the last sync, or outside the archive's coverage, are absent."
+      ],
+      "methodology": "What it shows: Service-account API token create and revoke events. Rows are chosen by event type: the report lists every archived System Log event whose type is on its list, within the date range, newest first. It shows that the events were recorded by the source system and archived here; it does not show that a control operated effectively, that every event was captured, or who reviewed it. Proposed mapping, suggested by this project and not reviewed by an auditor. Rationale: CC6.1 covers logical access security including credentials; API tokens are access credentials, so their creation and revocation are access-control events. (Moved from change management at the owner's decision.)"
+    },
+    "credential_rotation": {
+      "controls": [
+        {
+          "framework": "soc2",
+          "id": "CC6.1",
+          "status": "proposed"
+        }
+      ],
+      "known_limits": [
+        "The outcome column is the real result (SUCCESS, FAILURE or DEFERRED); failures are shown, not filtered out.",
+        "Per-account rotation totals are in the Service Accounts dashboard, not here.",
+        "Only events the tool has synced into the archive appear; events after the last sync, or outside the archive's coverage, are absent."
+      ],
+      "methodology": "What it shows: The service-account password rotation lifecycle, scheduled and manual. Rows are chosen by event type: the report lists every archived System Log event whose type is on its list, within the date range, newest first. It shows that the events were recorded by the source system and archived here; it does not show that a control operated effectively, that every event was captured, or who reviewed it. Proposed mapping, suggested by this project and not reviewed by an auditor. Rationale: CC6.1 covers protecting credentials; scheduled and manual password rotation is part of credential lifecycle management. (Moved from change management at the owner's decision.)"
+    },
+    "device_management": {
+      "controls": [
+        {
+          "framework": "soc2",
+          "id": "CC6.8",
+          "status": "proposed"
+        }
+      ],
+      "known_limits": [
+        "Covers enrollment, activation and user-add only; suspend, unsuspend, deactivate and delete are not covered because no live-confirmed event type exists for them yet.",
+        "Not a roster of current devices (see the live inventory in the Access Explorer).",
+        "Only events the tool has synced into the archive appear; events after the last sync, or outside the archive's coverage, are absent."
+      ],
+      "methodology": "What it shows: Okta-managed device enrollment, activation and user association. Rows are chosen by event type: the report lists every archived System Log event whose type is on its list, within the date range, newest first. It shows that the events were recorded by the source system and archived here; it does not show that a control operated effectively, that every event was captured, or who reviewed it. Proposed mapping, suggested by this project and not reviewed by an auditor. Rationale: CC6.8 covers preventing or detecting unauthorized software and endpoints; Okta-managed device enrollment and user association are the endpoint-trust record. This mapping is the least certain and is a candidate for review."
+    },
+    "jit_access_requests": {
+      "controls": [
+        {
+          "framework": "soc2",
+          "id": "CC6.1",
+          "status": "proposed"
+        },
+        {
+          "framework": "soc2",
+          "id": "CC6.3",
+          "status": "proposed"
+        }
+      ],
+      "known_limits": [
+        "Okta does not log the approve or deny decision on the resolve event, so this report cannot show which way a request was decided; the outcome column is SUCCESS regardless of the decision.",
+        "Only events the tool has synced into the archive appear; events after the last sync, or outside the archive's coverage, are absent."
+      ],
+      "methodology": "What it shows: The access-request lifecycle: create, update, resolve and expire. Rows are chosen by event type: the report lists every archived System Log event whose type is on its list, within the date range, newest first. It shows that the events were recorded by the source system and archived here; it does not show that a control operated effectively, that every event was captured, or who reviewed it. Proposed mapping, suggested by this project and not reviewed by an auditor. Rationale: CC6.1 and CC6.3 cover granting access on authorization; the access-request lifecycle shows that a request was made and resolved."
+    },
+    "mfa_enforcement": {
+      "controls": [
+        {
+          "framework": "soc2",
+          "id": "CC6.1",
+          "status": "proposed"
+        }
+      ],
+      "known_limits": [
+        "Shows MFA events that happened, not which users were exempt from MFA by policy.",
+        "Only events the tool has synced into the archive appear; events after the last sync, or outside the archive's coverage, are absent."
+      ],
+      "methodology": "What it shows: Every MFA challenge (success and abandoned) and the sign-on policy evaluation that gates it. Rows are chosen by event type: the report lists every archived System Log event whose type is on its list, within the date range, newest first. It shows that the events were recorded by the source system and archived here; it does not show that a control operated effectively, that every event was captured, or who reviewed it. Proposed mapping, suggested by this project and not reviewed by an auditor. Rationale: CC6.1 covers logical access security measures; MFA challenges and the sign-on policy evaluation that gates them are evidence of how authentication is enforced."
+    },
+    "pam_client_enrollment": {
+      "controls": [
+        {
+          "framework": "soc2",
+          "id": "CC6.1",
+          "status": "proposed"
+        }
+      ],
+      "known_limits": [
+        "Shows enrollments only; it is not a roster of clients currently enrolled (see the live roster in the Access Explorer).",
+        "Only events the tool has synced into the archive appear; events after the last sync, or outside the archive's coverage, are absent."
+      ],
+      "methodology": "What it shows: A user's local OPA client enrolling in order to connect to privileged resources. Rows are chosen by event type: the report lists every archived System Log event whose type is on its list, within the date range, newest first. It shows that the events were recorded by the source system and archived here; it does not show that a control operated effectively, that every event was captured, or who reviewed it. Proposed mapping, suggested by this project and not reviewed by an auditor. Rationale: CC6.1 covers restricting access to authorized endpoints and users; a local OPA client enrolling is the step that allows a workstation to connect to privileged resources."
+    },
+    "pam_credential_reveals": {
+      "controls": [
+        {
+          "framework": "soc2",
+          "id": "CC6.1",
+          "status": "proposed"
+        }
+      ],
+      "known_limits": [
+        "Shows that a reveal happened, never the password; the resource column names the account family.",
+        "Only events the tool has synced into the archive appear; events after the last sync, or outside the archive's coverage, are absent."
+      ],
+      "methodology": "What it shows: Password reveals for service accounts, shared credentials and vaulted server accounts. Rows are chosen by event type: the report lists every archived System Log event whose type is on its list, within the date range, newest first. It shows that the events were recorded by the source system and archived here; it does not show that a control operated effectively, that every event was captured, or who reviewed it. Proposed mapping, suggested by this project and not reviewed by an auditor. Rationale: CC6.1 covers protecting credentials; a password reveal for a shared or service account is an access to a protected credential."
+    },
+    "pam_jit_access": {
+      "controls": [
+        {
+          "framework": "soc2",
+          "id": "CC6.1",
+          "status": "proposed"
+        },
+        {
+          "framework": "soc2",
+          "id": "CC6.3",
+          "status": "proposed"
+        }
+      ],
+      "known_limits": [
+        "Shows checkouts and checkins that were logged; it does not show whether a checkout was justified.",
+        "Only events the tool has synced into the archive appear; events after the last sync, or outside the archive's coverage, are absent."
+      ],
+      "methodology": "What it shows: Resource checkout and checkin events. Rows are chosen by event type: the report lists every archived System Log event whose type is on its list, within the date range, newest first. It shows that the events were recorded by the source system and archived here; it does not show that a control operated effectively, that every event was captured, or who reviewed it. Proposed mapping, suggested by this project and not reviewed by an auditor. Rationale: CC6.1 and CC6.3 cover time-limited, authorized access; resource checkout and checkin show access granted for a bounded period (no standing privilege)."
+    },
+    "pam_policy_modifications": {
+      "controls": [
+        {
+          "framework": "soc2",
+          "id": "CC8.1",
+          "status": "proposed"
+        }
+      ],
+      "known_limits": [
+        "Shows that a change happened and who made it; it does not show that the change was approved.",
+        "Only events the tool has synced into the archive appear; events after the last sync, or outside the archive's coverage, are absent."
+      ],
+      "methodology": "What it shows: OPA security policy create and update events. Rows are chosen by event type: the report lists every archived System Log event whose type is on its list, within the date range, newest first. It shows that the events were recorded by the source system and archived here; it does not show that a control operated effectively, that every event was captured, or who reviewed it. Proposed mapping, suggested by this project and not reviewed by an auditor. Rationale: CC8.1 covers tracking changes to system configuration; OPA security policy changes alter who may reach privileged resources."
+    },
+    "pam_secrets": {
+      "controls": [
+        {
+          "framework": "soc2",
+          "id": "CC6.1",
+          "status": "proposed"
+        }
+      ],
+      "known_limits": [
+        "Records that a secret was revealed or changed, never its value.",
+        "Only events the tool has synced into the archive appear; events after the last sync, or outside the archive's coverage, are absent."
+      ],
+      "methodology": "What it shows: Vaulted secret and secret-folder create, update, delete and reveal events, and server-account password change results. Rows are chosen by event type: the report lists every archived System Log event whose type is on its list, within the date range, newest first. It shows that the events were recorded by the source system and archived here; it does not show that a control operated effectively, that every event was captured, or who reviewed it. Proposed mapping, suggested by this project and not reviewed by an auditor. Rationale: CC6.1 covers protecting credentials and secrets; vaulted secret and folder changes and reveals are access-control events on those secrets."
+    },
+    "pam_sessions": {
+      "controls": [
+        {
+          "framework": "soc2",
+          "id": "CC7.2",
+          "status": "proposed"
+        }
+      ],
+      "known_limits": [
+        "The SSH login actor is the operating-system username, not the Okta identity; correlate with a nearby credential-issuance row to attribute a session to a person.",
+        "Session content is not recorded.",
+        "Only events the tool has synced into the archive appear; events after the last sync, or outside the archive's coverage, are absent."
+      ],
+      "methodology": "What it shows: Credential issuance and SSH logins to privileged servers. Rows are chosen by event type: the report lists every archived System Log event whose type is on its list, within the date range, newest first. It shows that the events were recorded by the source system and archived here; it does not show that a control operated effectively, that every event was captured, or who reviewed it. Proposed mapping, suggested by this project and not reviewed by an auditor. Rationale: CC7.2 covers monitoring of system activity; credential issuance and SSH logins to privileged servers are the activity record for privileged sessions."
+    },
+    "policy_modifications": {
+      "controls": [
+        {
+          "framework": "soc2",
+          "id": "CC8.1",
+          "status": "proposed"
+        }
+      ],
+      "known_limits": [
+        "Shows that a change happened and who made it; it does not show that the change was approved or tested.",
+        "Only events the tool has synced into the archive appear; events after the last sync, or outside the archive's coverage, are absent."
+      ],
+      "methodology": "What it shows: Global Okta sign-on and security policy rule and mapping changes. Rows are chosen by event type: the report lists every archived System Log event whose type is on its list, within the date range, newest first. It shows that the events were recorded by the source system and archived here; it does not show that a control operated effectively, that every event was captured, or who reviewed it. Proposed mapping, suggested by this project and not reviewed by an auditor. Rationale: CC8.1 covers authorizing and tracking changes to system configuration; global sign-on and security policy rule and mapping changes are configuration changes."
+    },
+    "provisioning": {
+      "controls": [
+        {
+          "framework": "soc2",
+          "id": "CC6.2",
+          "status": "proposed"
+        },
+        {
+          "framework": "soc2",
+          "id": "CC6.3",
+          "status": "proposed"
+        }
+      ],
+      "known_limits": [
+        "Shows that an account was created or deactivated; it does not show that the request was approved or that the right access was given.",
+        "Only events the tool has synced into the archive appear; events after the last sync, or outside the archive's coverage, are absent."
+      ],
+      "methodology": "What it shows: User lifecycle create and deactivate events. Rows are chosen by event type: the report lists every archived System Log event whose type is on its list, within the date range, newest first. It shows that the events were recorded by the source system and archived here; it does not show that a control operated effectively, that every event was captured, or who reviewed it. Proposed mapping, suggested by this project and not reviewed by an auditor. Rationale: CC6.2 covers registering and authorizing new users before access is issued and CC6.3 covers removing access when it is no longer needed; user create and deactivate events are the lifecycle record."
+    },
+    "role_group_changes": {
+      "controls": [
+        {
+          "framework": "soc2",
+          "id": "CC6.3",
+          "status": "proposed"
+        }
+      ],
+      "known_limits": [
+        "Group membership only; direct app assignments and admin role assignments are not part of this report.",
+        "Only events the tool has synced into the archive appear; events after the last sync, or outside the archive's coverage, are absent."
+      ],
+      "methodology": "What it shows: Group membership add and remove events. Rows are chosen by event type: the report lists every archived System Log event whose type is on its list, within the date range, newest first. It shows that the events were recorded by the source system and archived here; it does not show that a control operated effectively, that every event was captured, or who reviewed it. Proposed mapping, suggested by this project and not reviewed by an auditor. Rationale: CC6.3 covers authorizing, modifying and removing access based on roles; group membership add and remove events show role-based access drift over time."
+    },
+    "session_activity": {
+      "controls": [
+        {
+          "framework": "soc2",
+          "id": "CC7.2",
+          "status": "proposed"
+        }
+      ],
+      "known_limits": [
+        "Successful sign-ins only; failed sign-ins are not part of this report.",
+        "Only events the tool has synced into the archive appear; events after the last sync, or outside the archive's coverage, are absent."
+      ],
+      "methodology": "What it shows: Successful sign-ins to Okta across all apps, plus PAM web-session token issuance. Rows are chosen by event type: the report lists every archived System Log event whose type is on its list, within the date range, newest first. It shows that the events were recorded by the source system and archived here; it does not show that a control operated effectively, that every event was captured, or who reviewed it. Proposed mapping, suggested by this project and not reviewed by an auditor. Rationale: CC7.2 covers monitoring of system components for anomalies; successful sign-in history is the baseline that monitoring reads."
+    },
+    "threat_detection": {
+      "controls": [
+        {
+          "framework": "soc2",
+          "id": "CC7.2",
+          "status": "proposed"
+        },
+        {
+          "framework": "soc2",
+          "id": "CC6.6",
+          "status": "proposed"
+        }
+      ],
+      "known_limits": [
+        "Shows only what Okta chose to flag; it is not a complete record of attacks or of incident response.",
+        "Only events the tool has synced into the archive appear; events after the last sync, or outside the archive's coverage, are absent."
+      ],
+      "methodology": "What it shows: Blocked requests and protected-action attempts flagged by Okta's own security controls. Rows are chosen by event type: the report lists every archived System Log event whose type is on its list, within the date range, newest first. It shows that the events were recorded by the source system and archived here; it does not show that a control operated effectively, that every event was captured, or who reviewed it. Proposed mapping, suggested by this project and not reviewed by an auditor. Rationale: CC7.2 covers monitoring for anomalies and security events and CC6.6 covers protection against threats from outside the system boundary; the events are blocks and protected-action attempts raised by Okta's own security controls."
+    }
+  },
+  "version": "5.53.0-1"
+}

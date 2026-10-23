@@ -23,4 +23,23 @@ describe('ComplianceReportDetail', () => {
     expect(screen.queryByText(/rows below are from the previous range/)).toBeNull()
     expect(runReport).toHaveBeenCalledTimes(1)
   })
+
+  it('shows the mapped controls as a proposed mapping, in words', () => {
+    vi.mocked(runReport).mockResolvedValue({ rows: [], total: 0, truncated: false } as never)
+    const mapped = {
+      ...def, controls: [{ framework: 'soc2', id: 'CC6.2', status: 'proposed' }, { framework: 'soc2', id: 'CC6.3', status: 'proposed' }],
+      mapping_status: 'proposed',
+    } as ComplianceReportDef
+    renderWithClient(<ComplianceReportDetail def={mapped} environment="dev" onBack={() => {}} />)
+    expect(screen.getByText('Proposed mapping')).toBeTruthy()
+    expect(screen.getByText('SOC 2 CC6.2')).toBeTruthy()
+    expect(screen.getByText('SOC 2 CC6.3')).toBeTruthy()
+    expect(screen.getByText('Suggested by this project; not reviewed by an auditor.')).toBeTruthy()
+  })
+
+  it('shows no mapping block when an older server sends no controls', () => {
+    vi.mocked(runReport).mockResolvedValue({ rows: [], total: 0, truncated: false } as never)
+    renderWithClient(<ComplianceReportDetail def={def} environment="dev" onBack={() => {}} />)
+    expect(screen.queryByTestId('mapped-controls')).toBeNull()
+  })
 })
