@@ -733,14 +733,22 @@ def test_pruned_days_are_reported_as_pruned_not_as_gaps(store):
     assert st[day(10)] == core.DAY_COVERED_ZERO                # inside retention, genuinely empty
     assert core.DAY_NOT_COVERED not in st.values() and cov["gap_days"] == []
     assert day(40) in cov["pruned_days"] and cov["counts"][core.DAY_PRUNED] == len(cov["pruned_days"])
-    assert cov["prune_history_recorded"] is False and cov["pruned_basis"] == "inferred"
+    assert cov["prune_history_recorded"] is True and cov["pruned_basis"] == "recorded"   # prune_events wrote a prune_history row
     assert cov["retention"]["days"] == 20 and cov["limits"]
+    # the same archive without the record (a prune from before 5.53.0): the days are the same, the basis is said to be inferred
+    audit_store._get_connection().execute("DELETE FROM prune_history")
+    audit_store._get_connection().commit()
+    with core.open_snapshot(ENV, p) as snap:
+        older = snap.coverage()
+    assert older["pruned_days"] == cov["pruned_days"] and older["pruned_basis"] == "inferred" and older["prune_history_recorded"] is False
 
 
 def test_pruned_state_with_recorded_prune_runs(store):
     build_prunable_archive()
     set_retention(days=None)                                        # the setting was removed since; the run is on record
     audit_store.prune_events(ENV, retention_days=20)
+    audit_store._get_connection().execute("DELETE FROM prune_history")   # an older prune: only the audit log knows
+    audit_store._get_connection().commit()
     now = datetime.now(timezone.utc)
     records = [{"at": iso(now), "cutoff": iso(now - timedelta(days=20)), "pruned": 2}]
     day = lambda n: day_start(n).date().isoformat()
@@ -748,7 +756,7 @@ def test_pruned_state_with_recorded_prune_runs(store):
         cov = snap.coverage()
     st = {d["date"]: d["state"] for d in cov["days"]}
     assert st[day(40)] == core.DAY_PRUNED and st[day(35)] == core.DAY_COVERED_EVENTS
-    assert cov["prune_history_recorded"] is True and cov["pruned_basis"] == "recorded"
+    assert cov["prune_history_recorded"] is True and cov["pruned_basis"] == "audit_log"
     with core.open_snapshot(ENV, rel_period(45, 1), prune_records=[]) as snap:     # the log shows no run
         none = snap.coverage()
     assert none["pruned_days"] == [] and none["prune_history_recorded"] is True

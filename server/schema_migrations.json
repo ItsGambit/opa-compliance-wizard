@@ -61,6 +61,11 @@
       "since": "5.53.0",
       "rollback_safe": true,
       "description": "Adds the record of who unlocked Settings and Updates with MFA, and until when"
+    },
+    "13": {
+      "since": "5.53.0",
+      "rollback_safe": true,
+      "description": "Adds the record of each sync, import and retention prune, so evidence coverage rests on records"
     }
   }
 }

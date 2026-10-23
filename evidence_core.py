@@ -325,6 +325,17 @@ def open_snapshot(environment_id, period, now=None, prune_records=None):
         conn.close()
 
 
+def _merge(intervals):
+    merged = []
+    for s, e in sorted(intervals):
+        if merged and s <= merged[-1][1]:
+            if e > merged[-1][1]:
+                merged[-1] = (merged[-1][0], e)
+        else:
+            merged.append((s, e))
+    return merged
+
+
 class Snapshot:
     """Everything the package needs from the archive, read inside one transaction. Created by open_snapshot()."""
 
@@ -728,19 +739,35 @@ class Snapshot:
                 continue
             intervals.append((start, end))
             prev_end = end if prev_end is None else max(prev_end, end)
-        intervals.sort()
-        merged = []
-        for s, e in intervals:
-            if merged and s <= merged[-1][1]:
-                if e > merged[-1][1]:
-                    merged[-1] = (merged[-1][0], e)
-            else:
-                merged.append((s, e))
-        return merged
+        return _merge(intervals)
+
+    def _recorded_windows(self):
+        """Merged windows from the sync_runs table: only runs that finished ok count (a failed, stopped or unfinished run
+        never does). A sync resumed from its cursor (no recorded since) starts where the previous ok sync ended; the
+        first such run, with no ok predecessor on record, has no known start and is skipped. An import counts only for
+        the date range of the rows it stored."""
+        intervals = []
+        prev_end = None
+        for r in self._conn.execute(
+                "SELECT kind, window_since, window_until FROM sync_runs WHERE environment_id = ? AND outcome = 'ok' ORDER BY id",
+                (self.environment_id,)):
+            end = audit_store._canonical_published(r["window_until"]) if r["window_until"] else None
+            since = audit_store._canonical_published(r["window_since"]) if r["window_since"] else None
+            start = since if (since or r["kind"] == "import") else prev_end
+            if r["kind"] == "sync" and end:
+                prev_end = end if prev_end is None else max(prev_end, end)
+            if start and end and end > start:
+                intervals.append((start, end))
+        return _merge(intervals)
+
+    def _recorded_prune_horizon(self):
+        """Newest cutoff of a recorded prune that deleted rows, or None."""
+        row = self._conn.execute("SELECT MAX(cutoff) FROM prune_history WHERE environment_id = ?", (self.environment_id,)).fetchone()
+        return audit_store._canonical_published(row[0]) if row and row[0] else None
 
     def _retention_horizon(self):
         """(horizon canonical timestamp or None, retention_days, max_size_mb, basis): the time before which
-        non-curated events are gone or subject to pruning. basis is "recorded" when the caller supplied the prune
+        non-curated events are gone or subject to pruning. basis is "audit_log" when the caller supplied the prune
         records of past runs (the horizon is the newest cutoff a run recorded; a size-cap run with no cutoff uses the
         oldest non-curated event still stored), "inferred" when it comes from the current retention setting."""
         row = self._conn.execute(
@@ -752,7 +779,7 @@ class Snapshot:
         horizon = None
         size_pruned = bool(size)
         if self._prune_records is not None:
-            basis = "recorded"
+            basis = "audit_log"
             cutoffs = [audit_store._canonical_published(r.get("cutoff")) for r in self._prune_records if r.get("cutoff")]
             cutoffs = [c for c in cutoffs if c]
             horizon = max(cutoffs) if cutoffs else None
@@ -789,6 +816,9 @@ class Snapshot:
         state_row = self._conn.execute("SELECT * FROM sync_state WHERE environment_id = ?", (env,)).fetchone()
         state = dict(state_row) if state_row else {}
         windows = self._sync_windows(state)
+        rec_windows = self._recorded_windows()
+        recorded_from = rec_windows[0][0] if rec_windows else None   # days starting at or after this rest on records
+        rec_prune = self._recorded_prune_horizon()
         per_day = {}
         for curated in (1, 0):
             for r in self._conn.execute(
@@ -798,7 +828,7 @@ class Snapshot:
                 cell[0 if curated else 1] += r["n"]
         first_event = self._conn.execute("SELECT MIN(published) FROM events WHERE environment_id = ?", (env,)).fetchone()[0]
         # a day that holds stored events was read from the start of that day on as far as the archive can tell
-        starts = [w[0] for w in windows] + ([first_event[:10] + "T00:00:00.000Z"] if first_event else [])
+        starts = [w[0] for w in windows] + [w[0] for w in rec_windows] + ([first_event[:10] + "T00:00:00.000Z"] if first_event else [])
         archive_start = min(starts) if starts else None
         as_of = state.get("last_sync_completed_at") or state.get("last_import_at")
         as_of_source = "sync" if state.get("last_sync_completed_at") else ("import" if state.get("last_import_at") else None)
@@ -814,22 +844,62 @@ class Snapshot:
             de = (d + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00.000Z")
             curated_n, non_curated_n = per_day.get(d.isoformat(), [0, 0])
             total = curated_n + non_curated_n
-            nc_pruned = bool(prune_possible and de <= horizon and non_curated_n == 0)
+            use_records = recorded_from is not None and ds >= recorded_from
+            day_windows = rec_windows if use_records else windows
+            cov_basis = "recorded" if use_records else "inferred"
+            prune_basis = None
+            if non_curated_n == 0:
+                if rec_prune is not None and de <= rec_prune:
+                    prune_basis = "recorded"
+                elif prune_possible and de <= horizon:
+                    prune_basis = basis
+            nc_pruned = prune_basis is not None
             if archive_start is None or ds < archive_start:
                 state_name = DAY_BEFORE_ARCHIVE
             elif as_of_ts is not None and de > as_of_ts:
                 state_name = DAY_AFTER_DATA_AS_OF
+            elif not use_records and total > 0:
+                state_name = DAY_COVERED_EVENTS
+            elif not any(s <= ds and e >= de for s, e in day_windows):
+                state_name = DAY_NOT_COVERED     # recorded basis: events alone do not make a day covered
             elif total > 0:
                 state_name = DAY_COVERED_EVENTS
-            elif any(s <= ds and e >= de for s, e in windows):
-                state_name = DAY_PRUNED if nc_pruned else DAY_COVERED_ZERO
             else:
-                state_name = DAY_NOT_COVERED
+                state_name = DAY_PRUNED if nc_pruned else DAY_COVERED_ZERO
             counts[state_name] += 1
-            days.append({"date": d.isoformat(), "state": state_name, "events": total,
+            days.append({"date": d.isoformat(), "state": state_name, "events": total, "basis": cov_basis,
+                         "prune_basis": prune_basis if state_name in (DAY_PRUNED, DAY_COVERED_EVENTS) and nc_pruned else None,
                          "non_curated_pruned": bool(nc_pruned and total > 0 and state_name == DAY_COVERED_EVENTS)})
         covered = sum(counts[s] for s in COVERED_STATES)
         n = len(days)
+        basis_counts = {"recorded": sum(1 for x in days if x["basis"] == "recorded"), "inferred": sum(1 for x in days if x["basis"] == "inferred")}
+        used = sorted({x["prune_basis"] for x in days if x["prune_basis"]})
+        pruned_basis = "+".join(used) if used else "none"
+        limits = []
+        if recorded_from:
+            limits.append(
+                "%d day(s) from %s onward rest on recorded sync and import runs: a failed, stopped or unfinished run never counts as "
+                "coverage, and an import counts only for the date range of the rows it stored (a filtered export that omits some of its range is not detected)."
+                % (basis_counts["recorded"], recorded_from[:10]))
+            if basis_counts["inferred"]:
+                limits.append(
+                    "%d earlier day(s) rest on manifest windows (inferred): a manifest names the window a run asked for, and the archive "
+                    "recorded no per-run outcome before then, so a failed or stopped sync can make such a day look covered; a day with stored "
+                    "events counts as covered, since a CSV import then recorded no date range." % basis_counts["inferred"])
+        else:
+            limits.append(
+                "All days rest on manifest windows (inferred): the archive recorded no sync or import runs yet. A failed or stopped sync can "
+                "make a day look covered (only the latest attempt's outcome is kept, and its window is cut at the watermark), and a day "
+                "with stored events counts as covered since a CSV import records no date range there.")
+        if rec_prune is not None:
+            limits.append("Days at or before %s with no stored events are shown pruned on the strength of a recorded prune run (the archive records "
+                          "each run that deleted rows; which days held events is still inferred)." % rec_prune[:10])
+        if basis in ("audit_log", "inferred"):
+            limits.append(
+                "Pruned days not covered by a recorded run (older prunes) use " + (
+                    "the retention runs the caller supplied from the application's audit log (audit_log basis)." if basis == "audit_log" else
+                    "the current retention setting (inferred; a run may never have happened)."))
+        limits.append("sync_runs and prune_history are not trimmed; they stay small (one row per run).")
         return {
             "days": days,
             "counts": counts,
@@ -843,16 +913,11 @@ class Snapshot:
             "data_as_of": as_of_ts,
             "data_as_of_source": as_of_source,
             "retention": {"days": ret_days, "max_size_mb": ret_size, "horizon": horizon},
-            "prune_history_recorded": self._prune_records is not None,
-            "pruned_basis": basis,
-            "limits": [
-                "The archive database keeps no prune history. " + (
-                    "The horizon comes from the retention runs the caller supplied (the application's audit log); which days held events is still inferred (no stored events, at or before the horizon, non-curated events shown to have existed)."
-                    if basis == "recorded" else
-                    "Pruned days are inferred from the current retention setting (day at or before the horizon, no stored events, non-curated events shown to have been ingested); a run may never have happened."),
-                "Only the latest sync attempt's outcome is recorded; an earlier failed or stopped sync can make a day look covered.",
-                "A CSV import records no date range; a day with stored events counts as covered.",
-            ],
+            "prune_history_recorded": rec_prune is not None or self._prune_records is not None,
+            "pruned_basis": pruned_basis,
+            "recorded_from": recorded_from[:10] if recorded_from else None,
+            "basis_counts": basis_counts,
+            "limits": limits,
         }
 
     # -- 5. completeness ------------------------------------------------------------------
