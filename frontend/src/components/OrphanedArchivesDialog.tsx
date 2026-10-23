@@ -11,6 +11,7 @@ import { beginStepUp } from '../utils/stepUp'
 import { DialogCloseButton } from './DialogCloseButton'
 import { ErrorNotice } from './ErrorNotice'
 import { Field } from './Field'
+import { SettingsGate } from './SettingsGate'
 
 interface Props {
   open: boolean
@@ -24,6 +25,26 @@ interface Props {
  * confirmation here; the server re-checks admin rights, refuses while the
  * environment exists or a sync runs, and audit-logs the per-table counts. */
 export function OrphanedArchivesDialog({ open, onOpenChange }: Props) {
+  return (
+    <Dialog.Root open={open} onOpenChange={onOpenChange}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
+        <Dialog.Content className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[34rem] max-h-[85vh] overflow-y-auto p-5">
+          <div className="flex items-center justify-between mb-2">
+            <Dialog.Title className="text-sm font-semibold text-text">Orphaned archives</Dialog.Title>
+            <DialogCloseButton />
+          </div>
+          {/* 5.53.0: the list of archives needs the Settings unlock (MFA behind the hosted login gate). */}
+          <SettingsGate area="settings" what="Orphaned archives" onNotNow={() => onOpenChange(false)}>
+            <OrphanedArchivesBody />
+          </SettingsGate>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  )
+}
+
+function OrphanedArchivesBody() {
   const queryClient = useQueryClient()
   const [confirmingId, setConfirmingId] = useState<string | null>(null)
   const [typed, setTyped] = useState('')
@@ -31,7 +52,7 @@ export function OrphanedArchivesDialog({ open, onOpenChange }: Props) {
   const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     queryKey: ['orphaned_archives'],
     queryFn: async () => (await fetchOrphanedArchives()).archives,
-    enabled: open,
+    enabled: true,
     // An on-demand admin scan (an index scan of the whole archive): fresh
     // every time the dialog opens, never in the background.
     staleTime: 0,
@@ -63,25 +84,10 @@ export function OrphanedArchivesDialog({ open, onOpenChange }: Props) {
     onError: (err: Error) => toast({ title: 'Could not purge the archive', description: err.message, variant: 'error' }),
   })
 
-  const handleOpenChange = (next: boolean) => {
-    if (!next) {
-      setConfirmingId(null)
-      setTyped('')
-    }
-    onOpenChange(next)
-  }
-
   const archives = data ?? []
 
   return (
-    <Dialog.Root open={open} onOpenChange={handleOpenChange}>
-      <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
-        <Dialog.Content className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[34rem] max-h-[85vh] overflow-y-auto p-5">
-          <div className="flex items-center justify-between mb-2">
-            <Dialog.Title className="text-sm font-semibold text-text">Orphaned archives</Dialog.Title>
-            <DialogCloseButton />
-          </div>
+    <>
           <Dialog.Description className="text-xs text-text-dim mb-4 leading-relaxed">
             Compliance archives whose environment has been deleted. Nothing else in the app can show, sync or export
             them. Purging one permanently deletes its events and evidence-chain records; take a backup of the
@@ -159,8 +165,6 @@ export function OrphanedArchivesDialog({ open, onOpenChange }: Props) {
               )
             })}
           </ul>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
+    </>
   )
 }

@@ -18,6 +18,8 @@ import type {
   CsvRow,
   EnvironmentFormValues,
   EnvironmentsResponse,
+  SettingsEnvironmentsResponse,
+  SettingsStatus,
   GrantUser,
   ExecuteResponse,
   FolderSecurityPolicy,
@@ -153,6 +155,36 @@ export function fetchEnvironments(): Promise<EnvironmentsResponse> {
   return apiFetch('/api/environments')
 }
 
+// ── Settings and Updates unlock (5.53.0) ─────────────────────────────────
+// Behind the hosted login gate, reading Access control, Shared permissions, Orphaned archives, the environment details and
+// the Updates page needs a fresh MFA, then stays open for a short window. Local mode has no MFA and says so.
+
+/** The environment list with its configuration (OPA domain, team, key id, Okta URL, sync schedule). Needs the unlock. */
+export function fetchSettingsEnvironments(): Promise<SettingsEnvironmentsResponse> {
+  return apiFetch('/api/settings/environments')
+}
+
+/** Where the caller stands: hosted/local, unlocked or not, seconds left. In local mode `area` makes the server record the opening. */
+export function fetchSettingsStatus(area?: 'settings' | 'updates'): Promise<SettingsStatus> {
+  return apiFetch(`/api/settings/status${area ? `?area=${area}` : ''}`)
+}
+
+/** Asks for the MFA that opens Settings: hosted mode answers 202 StepUpRequired (hand it to beginStepUp); local mode answers
+ * 200 {mode: 'local'} at once. */
+export function startSettingsUnlock(): Promise<StepUpRequired | { mode: 'local'; mfa: false }> {
+  return apiFetch('/api/settings/unlock', { method: 'POST', body: JSON.stringify({}) })
+}
+
+/** Ends the caller's own unlock now. */
+export function lockSettings(): Promise<{ locked: true }> {
+  return apiFetch('/api/settings/lock', { method: 'POST', body: JSON.stringify({}) })
+}
+
+/** True for the server's "unlock Settings first" answer (403 with reason settings_locked). Never a session expiry. */
+export function isSettingsLockedError(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 403 && err.body?.reason === 'settings_locked'
+}
+
 // can_admin (UI-06): whether the admin-only routes will serve THIS caller --
 // true for a verified admin, and for the operator of a local-mode run (no
 // login gate there; the server exempts it). is_admin stays the verified-admin
@@ -169,7 +201,9 @@ export function fetchBanner(): Promise<BannerConfig> {
   return apiFetch('/api/banner')
 }
 
-export function saveBanner(config: BannerConfig): Promise<BannerConfig> {
+/** 5.53.0: the banner is an org-wide message, so in hosted mode the save answers 202 StepUpRequired first (like every
+ * other setting); local mode applies at once. */
+export function saveBanner(config: BannerConfig): Promise<BannerConfig | StepUpRequired> {
   return apiFetch('/api/banner', { method: 'POST', body: JSON.stringify(config) })
 }
 

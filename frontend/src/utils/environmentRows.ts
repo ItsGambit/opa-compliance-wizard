@@ -76,15 +76,16 @@ export function activeRow(data: EnvironmentsResponse | undefined): Environment |
 }
 
 /** The tenant the app is connected to, as one string (UI-05): the active
- * environment's id plus the fields that decide WHICH tenant it reaches.
- * Editing the active environment to another OPA team or Okta org keeps
- * its id but changes this, so cached tenant data is dropped then too.
- * The key id is deliberately left out: rotating the API key of the same
- * team must not reset the page (and an unsaved Folder Builder tree).
- * undefined while the list hasn't loaded. */
+ * environment's id plus `scope`, the server's opaque token for the fields that
+ * decide WHICH tenant it reaches. Editing the active environment to another OPA
+ * team or Okta org keeps its id but changes this, so cached tenant data is
+ * dropped then too. (5.53.0: the list no longer carries those fields, so the
+ * server sends the token.) The key id is deliberately not part of it: rotating
+ * the API key of the same team must not reset the page (and an unsaved Folder
+ * Builder tree). undefined while the list hasn't loaded. */
 export function environmentScopeKey(data: EnvironmentsResponse | undefined): string | undefined {
   if (!data) return undefined
   const row = activeRow(data)
   const id = data.active_id ?? data.active ?? ''
-  return row ? [id, row.base_domain, row.team_name, row.okta_url].join('|') : id
+  return row ? [id, row.scope ?? ''].join('|') : id
 }

@@ -49,3 +49,47 @@ describe('stepUpReturnAction', () => {
     expect(stepUpReturnAction(false, { kind: 'access_control' })).toBeNull()
   })
 })
+
+
+describe('5.53.0: settings_unlock and evidence_package', () => {
+  const unlock = { kind: 'settings_unlock' as const, startedAt: Date.now(), reopen: 'updates' as const }
+  const evidence = {
+    kind: 'evidence_package' as const, startedAt: Date.now(), environmentId: 'env-1',
+    period: { start: '2026-01-01', end: '2026-03-31' }, gapsAcknowledged: true,
+  }
+
+  it('a Settings unlock round trip is remembered with where it came from, and carries nothing else', () => {
+    const navigate = vi.fn()
+    beginStepUp('act-9', unlock, navigate)
+    expect(navigate).toHaveBeenCalledWith('/step-up?action_id=act-9')
+    expect(readPendingStepUp()).toEqual(unlock)
+    expect(Object.keys(JSON.parse(sessionStorage.getItem('opa.pendingStepUp')!)).sort()).toEqual(['kind', 'reopen', 'startedAt'])
+  })
+
+  it('finishes an unlock with its own action, never as the Access Control save or an Environments change', () => {
+    expect(stepUpReturnAction(true, unlock)).toBe('finish_settings_unlock')
+    expect(stepUpReturnAction(false, unlock)).toBe('settings_unlock_abandoned')
+  })
+
+  it('an evidence package approval has its own actions too', () => {
+    expect(stepUpReturnAction(true, evidence)).toBe('finish_evidence_package')
+    expect(stepUpReturnAction(false, evidence)).toBe('evidence_package_abandoned')
+    sessionStorage.setItem('opa.pendingStepUp', JSON.stringify(evidence))
+    expect(readPendingStepUp()).toEqual(evidence)
+  })
+
+  it('forgets a malformed or stale record of the new kinds; a stale one still routes back from the gate', () => {
+    for (const bad of [
+      { kind: 'settings_unlock', startedAt: Date.now(), reopen: 'elsewhere' },
+      { kind: 'settings_unlock', reopen: 'settings' },
+      { kind: 'evidence_package', startedAt: Date.now(), environmentId: 'e', period: { start: 'a' }, gapsAcknowledged: true },
+      { kind: 'evidence_package', startedAt: Date.now(), environmentId: 'e', period: { start: 'a', end: 'b' } },
+    ]) {
+      sessionStorage.setItem('opa.pendingStepUp', JSON.stringify(bad))
+      expect(readPendingStepUp(Date.now(), true)).toBeNull()
+    }
+    sessionStorage.setItem('opa.pendingStepUp', JSON.stringify({ ...unlock, startedAt: 0 }))
+    expect(readPendingStepUp()).toBeNull()
+    expect(readPendingStepUp(Date.now(), true)?.kind).toBe('settings_unlock')
+  })
+})

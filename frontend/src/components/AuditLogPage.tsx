@@ -4,6 +4,7 @@ import { Download, RefreshCw, Search } from 'lucide-react'
 import { backfillMfaLogEvents, fetchAuditLog, upgradeBundleUrl } from '../api/client'
 import { toast } from '../hooks/useToast'
 import { AuditLogShiftedError, fetchAuditPage, nextAuditPageParam, type AuditPageParam } from '../utils/auditPaging'
+import { auditActionLabel } from '../utils/auditLabels'
 import { cellValue, formatDateTime, labelize } from '../utils/format'
 import { formatBytes } from '../utils/upgrade'
 import { takeAuditSearch } from '../utils/upgradeRequested'
@@ -223,6 +224,7 @@ export function AuditLogPage() {
                 <div className="flex items-center justify-between gap-2 mb-1.5">
                   <span className={`font-medium ${isDeployEvent ? deployTextColor : 'text-text'}`}>
                     <HighlightedText text={entry.action} indices={actionMatch?.indices} />
+                    {auditActionLabel(entry.action) && <span className="font-normal text-text-faint"> · {auditActionLabel(entry.action)}</span>}
                   </span>
                   <span className="text-text-faint whitespace-nowrap">{formatDateTime(entry.timestamp)}</span>
                 </div>

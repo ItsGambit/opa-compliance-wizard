@@ -1,4 +1,4 @@
-import type { EnvironmentFormValues, GrantUser, PermissionSetting, SharedCapabilityKey, SyncSchedule } from '../types'
+import type { BannerConfig, EnvironmentFormValues, GrantUser, PermissionSetting, SharedCapabilityKey, SyncSchedule } from '../types'
 
 /** 5.42.0: what the browser remembers across the step-up MFA round trip
  * (a full-page redirect to Okta and back, the same one the Access Control
@@ -9,6 +9,19 @@ import type { EnvironmentFormValues, GrantUser, PermissionSetting, SharedCapabil
  * and are re-entered if the approval doesn't complete. */
 export type PendingStepUp =
   | { kind: 'access_control' }
+  // 5.53.0: the MFA that opens Settings or Updates (POST /api/settings/unlock). Nothing else is pending: a Settings screen
+  // that was open reopens by itself once unlocked, and the page the user came from is `reopen`.
+  | { kind: 'settings_unlock'; startedAt: number; reopen: 'settings' | 'updates' }
+  // 5.53.0: reserved for the evidence package build (the build itself ships later). The MFA that approves a build is a
+  // different approval from the Settings unlock and never opens Settings.
+  | {
+      kind: 'evidence_package'
+      startedAt: number
+      environmentId: string
+      /** UTC calendar dates, inclusive. */
+      period: { start: string; end: string }
+      gapsAcknowledged: boolean
+    }
   | {
       kind: 'environment_change'
       action: string
@@ -26,9 +39,18 @@ export type PendingStepUp =
         user?: GrantUser
         settings: Partial<Record<SharedCapabilityKey, PermissionSetting>>
       }
+      /** Announcement banner input (5.53.0: saving it needs MFA). */
+      bannerDraft?: BannerConfig
       /** Which screen to reopen if the change wasn't applied. */
-      reopen?: 'environments' | 'orphaned_archives' | 'shared_permissions' | 'updates'
+      reopen?: 'environments' | 'orphaned_archives' | 'shared_permissions' | 'updates' | 'banner'
     }
+
+/** The approvals the server knows (serve.py ENV_CHANGE_ACTION_TYPES, plus the Access Control save). Documentation for readers
+ * of this file; the browser treats an action it does not know as an opaque label from the server. */
+export type StepUpActionType =
+  | 'environment.upsert' | 'environment.share' | 'environment.delete' | 'sync_schedule.update' | 'sync.reset_watermark'
+  | 'sync.import_csv' | 'archive.purge' | 'shared_permissions.update' | 'upgrade.settings' | 'upgrade.request'
+  | 'banner.update' | 'settings.unlock' | 'evidence_package.build' | 'access_control.update'
 
 const KEY = 'opa.pendingStepUp'
 /** Forget a draft older than the server's own pending-action lifetime. */
@@ -58,6 +80,18 @@ export function readPendingStepUp(now = Date.now(), includeStale = false): Pendi
   try {
     const parsed = JSON.parse(raw) as PendingStepUp
     if (parsed?.kind === 'access_control') return parsed
+    if (parsed?.kind === 'settings_unlock') {
+      if (typeof parsed.startedAt !== 'number' || (parsed.reopen !== 'settings' && parsed.reopen !== 'updates')) return null
+      if (!includeStale && now - parsed.startedAt > MAX_AGE_MS) return null
+      return parsed
+    }
+    if (parsed?.kind === 'evidence_package') {
+      const period = parsed.period
+      if (typeof parsed.startedAt !== 'number' || typeof parsed.environmentId !== 'string' || typeof parsed.gapsAcknowledged !== 'boolean') return null
+      if (!period || typeof period.start !== 'string' || typeof period.end !== 'string') return null
+      if (!includeStale && now - parsed.startedAt > MAX_AGE_MS) return null
+      return parsed
+    }
     if (parsed?.kind !== 'environment_change' || typeof parsed.action !== 'string') return null
     if (typeof parsed.startedAt !== 'number') return null
     if (!includeStale && now - parsed.startedAt > MAX_AGE_MS) return null
@@ -93,7 +127,12 @@ export function environmentDraftFrom(values: EnvironmentFormValues): Omit<Enviro
  * the Access Control save (the original, and the default when nothing was
  * recorded -- e.g. a save started before this version). */
 export function stepUpReturnAction(returned: boolean, pending: PendingStepUp | null):
-  'finish_environment_change' | 'environment_change_abandoned' | 'finish_access_control' | null {
+  | 'finish_environment_change' | 'environment_change_abandoned' | 'finish_access_control'
+  | 'finish_settings_unlock' | 'settings_unlock_abandoned' | 'finish_evidence_package' | 'evidence_package_abandoned' | null {
   if (pending?.kind === 'environment_change') return returned ? 'finish_environment_change' : 'environment_change_abandoned'
+  // 5.53.0: the Settings unlock is finished by the same save route as every other approved change, but its own kind keeps
+  // it from ever being taken for (or spent as) the Access Control save, and the other way round.
+  if (pending?.kind === 'settings_unlock') return returned ? 'finish_settings_unlock' : 'settings_unlock_abandoned'
+  if (pending?.kind === 'evidence_package') return returned ? 'finish_evidence_package' : 'evidence_package_abandoned'
   return returned ? 'finish_access_control' : null
 }

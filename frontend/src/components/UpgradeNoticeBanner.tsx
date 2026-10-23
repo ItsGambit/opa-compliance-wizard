@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { AlertTriangle, CalendarClock, Info, X } from 'lucide-react'
-import { useUpgradeNotice, useUpgradeStatus } from '../api/hooks'
+import { useUpgradeNotice } from '../api/hooks'
 import { formatDateTime } from '../utils/format'
 import { browserZone, maintenanceWhen } from '../utils/upgradeFlow'
 
@@ -24,9 +24,9 @@ const STYLE = {
  * running and failed stay. */
 export function UpgradeNoticeBanner({ canAdmin = false, onOpenUpdates }: { canAdmin?: boolean; onOpenUpdates?: () => void }) {
   const { data: notice } = useUpgradeNotice()
-  const { data: status } = useUpgradeStatus(canAdmin)
   const [dismissed, setDismissed] = useState<string | null>(null)
-  const rev = canAdmin ? status?.revocation ?? null : null
+  // 5.53.0: administrators get the recent key revocation with the notice itself, so the red banner works while Updates is locked.
+  const rev = canAdmin ? notice?.revocation ?? null : null
   // One banner at a time. A running or failed upgrade comes first; then a signing-key revocation (red, stays); then the rest.
   const urgent = notice?.kind === 'running' || notice?.kind === 'failed'
   if (rev && !urgent) {
@@ -34,7 +34,7 @@ export function UpgradeNoticeBanner({ canAdmin = false, onOpenUpdates }: { canAd
       <div role="alert" className={`w-full border-b px-4 py-2 flex items-center gap-2 text-xs ${STYLE.err}`}>
         <AlertTriangle size={14} className="shrink-0" aria-hidden="true" />
         <span className="flex-1">
-          Release-key revocation applied on {formatDateTime(rev.applied_at)}: {rev.revoked.length === 1 ? 'the signing key' : 'signing keys'}{' '}
+          Release-key revocation applied on {formatDateTime(rev.applied_at ?? '')}: {rev.revoked.length === 1 ? 'the signing key' : 'signing keys'}{' '}
           {rev.revoked.join(', ')} {rev.revoked.length === 1 ? 'is' : 'are'} revoked{rev.added.length > 0 ? ' and a new key is trusted' : ''}.
           Releases signed by the old key after the revocation are no longer accepted.{' '}
           {onOpenUpdates && <button type="button" className="underline bg-transparent border-0 p-0 cursor-pointer text-inherit" onClick={onOpenUpdates}>Review on the Updates page</button>}

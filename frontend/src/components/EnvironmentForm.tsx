@@ -1,9 +1,9 @@
 import { useState, type ChangeEvent } from 'react'
-import type { Environment, EnvironmentFormValues } from '../types'
+import type { EnvironmentFormValues, SettingsEnvironment } from '../types'
 import { Field } from './Field'
 
 interface Props {
-  initial?: Environment
+  initial?: SettingsEnvironment
   /** 5.42.0: input restored after an MFA approval that didn't complete --
    * never secrets, which the user re-enters. */
   draft?: Partial<EnvironmentFormValues>

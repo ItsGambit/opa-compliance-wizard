@@ -5,8 +5,7 @@ import type { Environment } from '../types'
 import { usableEnvironments } from './usableEnvironments'
 
 function env(name: string, is_own: boolean, shared: boolean, id = `${name}-${is_own}-${shared}`): Environment {
-  return { id, name, is_own, shared, base_domain: '', team_name: '', key_id: '', okta_url: '',
-           has_okta_token: false, sync_schedule: {} as Environment['sync_schedule'] }
+  return { id, name, is_own, shared }
 }
 
 describe('usableEnvironments', () => {

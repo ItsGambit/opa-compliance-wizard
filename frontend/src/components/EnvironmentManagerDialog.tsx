@@ -4,17 +4,19 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { Globe, KeyRound, Lock, Pencil, Plus, Trash2, X } from 'lucide-react'
 import { activateEnvironment, deleteEnvironment, isStepUpRequired, saveEnvironment, setEnvironmentShared, type ApiError } from '../api/client'
 import { toast } from '../hooks/useToast'
-import type { Environment, EnvironmentFormValues, EnvironmentsResponse } from '../types'
+import { useSettingsEnvironments } from '../api/hooks'
+import type { EnvironmentFormValues, SettingsEnvironment } from '../types'
 import { can, canManageSync, isActiveRow, isAddressable } from '../utils/environmentRows'
 import { beginStepUp, environmentDraftFrom, type PendingStepUp } from '../utils/stepUp'
 import { EnvironmentPermissionsEditor } from './EnvironmentPermissionsEditor'
+import { ErrorNotice } from './ErrorNotice'
+import { SettingsGate } from './SettingsGate'
 import { DialogCloseButton } from './DialogCloseButton'
 import { EnvironmentForm } from './EnvironmentForm'
 import { StatusBadge } from './StatusBadge'
 import { SyncScheduleDialog } from './SyncScheduleDialog'
 
 interface Props {
-  data: EnvironmentsResponse | undefined
   open: boolean
   onOpenChange: (open: boolean) => void
   // True only for a verified Okta-admin-group member (see
@@ -40,8 +42,35 @@ const SHARED_ROW_CAPABILITIES = [
   ['reset_watermark', 'watermark reset'],
 ] as const
 
-export function EnvironmentManagerDialog({ data, open, onOpenChange, isAdmin, canAdmin, restore }: Props) {
-  const [editing, setEditingState] = useState<Environment | 'new' | null>(null)
+/** 5.53.0: the environment details (OPA domain, team, key id, Okta URL, sync schedule) are read after the Settings unlock
+ * (hosted mode: MFA first), not from the list every screen uses. The title and the close button are always there; the
+ * body below is only mounted, and so only fetches, once the gate lets it through. */
+export function EnvironmentManagerDialog({ open, onOpenChange, isAdmin, canAdmin, restore }: Props) {
+  return (
+    <Dialog.Root open={open} onOpenChange={onOpenChange}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
+        <Dialog.Content
+          aria-describedby={undefined}
+          className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[30rem] max-h-[85vh] overflow-y-auto p-5"
+        >
+          <div className="flex items-center justify-between mb-3">
+            <Dialog.Title className="text-sm font-semibold text-text">Environments</Dialog.Title>
+            <DialogCloseButton />
+          </div>
+          <SettingsGate area="settings" what="Environments" onNotNow={() => onOpenChange(false)}>
+            <EnvironmentsBody isAdmin={isAdmin} canAdmin={canAdmin} restore={restore} />
+          </SettingsGate>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  )
+}
+
+function EnvironmentsBody({ isAdmin, canAdmin, restore }: Pick<Props, 'isAdmin' | 'canAdmin' | 'restore'>) {
+  const open = true
+  const { data, isLoading, isError, error, refetch, isFetching } = useSettingsEnvironments()
+  const [editing, setEditingState] = useState<SettingsEnvironment | 'new' | null>(null)
   const [formDraft, setFormDraft] = useState<Partial<EnvironmentFormValues> | undefined>(undefined)
   const [permissionsFor, setPermissionsFor] = useState<string | null>(null)
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null)
@@ -52,7 +81,10 @@ export function EnvironmentManagerDialog({ data, open, onOpenChange, isAdmin, ca
 
   // Environment-scoped caches are dropped by App when the active
   // environment actually changes (UI-05); here only the list itself.
-  const invalidateList = () => queryClient.invalidateQueries({ queryKey: ['environments'] })
+  const invalidateList = () => {
+    void queryClient.invalidateQueries({ queryKey: ['environments'] })
+    void queryClient.invalidateQueries({ queryKey: ['settings_environments'] })
+  }
 
   const saveMutation = useMutation({
     mutationFn: (values: EnvironmentFormValues) => saveEnvironment(values),
@@ -89,7 +121,7 @@ export function EnvironmentManagerDialog({ data, open, onOpenChange, isAdmin, ca
   })
 
   // UI-16: a fresh form never shows the previous attempt's error.
-  const setEditing = (next: Environment | 'new' | null) => {
+  const setEditing = (next: SettingsEnvironment | 'new' | null) => {
     saveMutation.reset()
     setFormDraft(undefined)
     setEditingState(next)
@@ -114,7 +146,7 @@ export function EnvironmentManagerDialog({ data, open, onOpenChange, isAdmin, ca
   const activateMutation = useMutation({
     // UI-07: by name (what the server resolves) plus the row's id, so the
     // server refuses instead of activating a different same-named tenant.
-    mutationFn: (env: Environment) => activateEnvironment(env.name, env.id),
+    mutationFn: (env: SettingsEnvironment) => activateEnvironment(env.name, env.id),
     onSuccess: (resp) => {
       toast({ title: `Switched to '${resp.active}'`, variant: 'success' })
       invalidateList()
@@ -161,35 +193,17 @@ export function EnvironmentManagerDialog({ data, open, onOpenChange, isAdmin, ca
     onError: (err: Error) => toast({ title: 'Could not change sharing', description: err.message, variant: 'error' }),
   })
 
-  const handleOpenChange = (next: boolean) => {
-    if (!next) {
-      // UI-16: reopening starts clean -- no half-open edit panel or
-      // pending "Delete …?" prompt from an earlier visit.
-      setEditing(null)
-      setConfirmingDelete(null)
-      setConfirmingShare(null)
-      setPermissionsFor(null)
-    }
-    onOpenChange(next)
-  }
+  // UI-16: reopening starts clean -- no half-open edit panel or pending "Delete …?" prompt from an earlier visit. (The body is
+  // unmounted whenever the dialog closes, so every opening starts from nothing.)
 
   const saveApiError = (saveMutation.error as ApiError | null)?.body?.error
 
   return (
-    <Dialog.Root open={open} onOpenChange={handleOpenChange}>
-      <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
-        <Dialog.Content
-          aria-describedby={undefined}
-          className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[30rem] max-h-[85vh] overflow-y-auto p-5"
-        >
-          <div className="flex items-center justify-between mb-3">
-            <Dialog.Title className="text-sm font-semibold text-text">Environments</Dialog.Title>
-            <DialogCloseButton />
-          </div>
-
+    <>
+          {isLoading && <div className="text-xs text-text-faint mb-4">Loading…</div>}
+          {isError && <div className="mb-4"><ErrorNotice title="Could not load the environments" error={error} onRetry={() => { void refetch() }} retrying={isFetching} /></div>}
           <div className="flex flex-col gap-2 mb-4">
-            {(data?.environments ?? []).length === 0 && (
+            {data && data.environments.length === 0 && (
               <div className="text-xs text-text-faint">No environments saved yet.</div>
             )}
             {(data?.environments ?? []).map(env => {
@@ -380,8 +394,6 @@ export function EnvironmentManagerDialog({ data, open, onOpenChange, isAdmin, ca
               />
             </div>
           )}
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
+    </>
   )
 }

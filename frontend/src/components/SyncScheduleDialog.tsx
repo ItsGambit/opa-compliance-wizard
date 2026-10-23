@@ -7,7 +7,7 @@ import { useCsvFiles, useWhoami } from '../api/hooks'
 import { useIntegrityCheck } from '../hooks/useIntegrityCheck'
 import { useSyncJob } from '../hooks/useSyncJob'
 import { toast } from '../hooks/useToast'
-import type { Environment, IngestionScope, SyncSchedule } from '../types'
+import type { IngestionScope, SettingsEnvironment, SyncSchedule } from '../types'
 import { getSyncProgressPercent } from '../utils/syncProgress'
 import { canAdminFrom } from '../utils/whoami'
 import { can, permissionReason } from '../utils/environmentRows'
@@ -17,7 +17,7 @@ import { IntegrityResultView } from './IntegrityResultView'
 import { Select } from './Select'
 
 interface Props {
-  env: Environment
+  env: SettingsEnvironment
   /** 5.42.0: settings restored after an MFA approval that didn't complete --
    * the dialog opens with them. */
   restoreDraft?: SyncSchedule

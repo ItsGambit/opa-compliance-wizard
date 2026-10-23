@@ -1,6 +1,6 @@
 import { REPO_CHANGELOG_URL, REPO_README_URL } from '../utils/links'
 import { RefreshCw } from 'lucide-react'
-import { useEnvironments, useSyncStatus, useUpgradeStatus, useVersion, useWhoami } from '../api/hooks'
+import { useEnvironments, useSyncStatus, useUpgradeNotice, useVersion, useWhoami } from '../api/hooks'
 import { useRefreshActions, useRefreshStatus, useRefreshWatcher } from '../hooks/useRefresh'
 import { formatDateTime, formatDateTimeZone } from '../utils/format'
 import { activeRow, can, refreshReason } from '../utils/environmentRows'
@@ -22,7 +22,9 @@ export function Footer() {
   const { data: environments } = useEnvironments()
   const { data: whoami } = useWhoami()
   // 5.46.0: admins see a newer release (when the opt-in check found one) here too.
-  const { data: upgrade } = useUpgradeStatus(canAdminFrom(whoami))
+  // 5.53.0: from the notice (it carries the newer version for administrators), so it works while Updates is locked.
+  const { data: notice } = useUpgradeNotice()
+  const newerVersion = canAdminFrom(whoami) ? notice?.update_available ?? null : null
   const activeEnv = environments?.active ?? undefined  // null (no active env) -> undefined, which the hooks treat as "disabled"
   const { data: syncStatus } = useSyncStatus(activeEnv)
   // 5.42.0: "Sync now" on an environment shared with this user follows what
@@ -48,8 +50,8 @@ export function Footer() {
   return (
     <footer className="max-w-4xl mx-auto w-full mt-4 pt-3 border-t border-border text-xs text-text-faint flex flex-wrap items-center justify-center gap-3">
       <span>OPA Compliance Wizard{version && ` v${version.version}`}</span>
-      {upgrade?.check.enabled && upgrade.update_available && upgrade.latest && (
-        <span className="text-accent">Update available: v{upgrade.latest.version}</span>
+      {newerVersion && (
+        <span className="text-accent">Update available: v{newerVersion}</span>
       )}
       {activeEnv && (
         <>
