@@ -53,7 +53,7 @@ def key_summary(keys_bytes):
 def render(version, files):
     """`files`: {repository path: bytes} holding the template and every embedded file. Returns the script bytes."""
     if not _VERSION_RE.match(version):
-        raise RenderError("version must look like 5.52.0")
+        raise RenderError("version must look like MAJOR.MINOR.PATCH, for example 5.53.0")
     try:
         template = files[TEMPLATE_PATH]
     except KeyError:
