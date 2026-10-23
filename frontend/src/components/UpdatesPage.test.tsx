@@ -299,7 +299,7 @@ describe('Navigation and brand', () => {
 })
 
 describe('Audit log rows for update events (artboard 11)', () => {
-  it('system events get the accent border and no empty IP/agent rows; failures are red; human rows are plain', async () => {
+  it('every upgrade event gets the accent border; system ones have no empty IP/agent rows; failures are red', async () => {
     vi.mocked(fetchAuditLog).mockResolvedValue({ entries: [
       { timestamp: '2026-10-20T12:00:00Z', actor_email: null, actor_sub: null, action: 'upgrade.check', details: { outcome: 'failed', result: 'failed: network', correlation_id: 'upd-1' } },
       { timestamp: '2026-10-20T11:00:00Z', actor_email: null, actor_sub: null, action: 'upgrade.key_revoked', details: { revoked: ['AA'], correlation_id: 'upd-2' } },
@@ -308,7 +308,7 @@ describe('Audit log rows for update events (artboard 11)', () => {
     const { container } = renderWithClient(<AuditLogPage />)
     await screen.findByText('upgrade.key_revoked')
     expect(container.querySelectorAll('.border-l-loss')).toHaveLength(1)
-    expect(container.querySelectorAll('.border-l-accent')).toHaveLength(1)
+    expect(container.querySelectorAll('.border-l-accent')).toHaveLength(2)   // 5.53.0: an admin's settings row is an upgrade event too
     expect(screen.getByText('scheduler (server)')).toBeTruthy()
     expect(screen.getByText('update check (server)')).toBeTruthy()
     expect(screen.getAllByText('Client IP')).toHaveLength(1)           // only the human row shows it

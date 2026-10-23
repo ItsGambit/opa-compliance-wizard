@@ -28,6 +28,7 @@ import {
   fetchPeopleList,
   fetchUpgradeNotice,
   fetchUpgradeStatus,
+  isSettingsLockedError,
   fetchUserResourceAccess,
   fetchVersion,
   fetchWhoami,
@@ -86,18 +87,23 @@ export function useUpgradeStatus(enabled: boolean, pollMs?: number) {
     // 5.48.0: while an upgrade is starting or running the page polls (2 s). The server restarts underneath it, so a failed
     // poll is not retried here (the next tick is the retry) and the last good answer stays on screen.
     refetchInterval: pollMs ?? 10 * 60_000,
-    ...(pollMs ? { retry: false, refetchIntervalInBackground: true } : {}),
+    ...(pollMs ? { retry: false, refetchIntervalInBackground: true } : {
+      // 5.53.0: a locked answer is final (retrying it only keeps the page on "Loading…"); anything else gets the usual few tries.
+      retry: (count: number, err: unknown) => !isSettingsLockedError(err) && count < 3,
+    }),
   })
 }
 
 /** 5.48.0: the one-line upgrade banner for every signed-in user (scheduled / running / failed; admins also "available"). */
-export function useUpgradeNotice() {
+export function useUpgradeNotice(pollMs?: number) {
   return useQuery({
     queryKey: ['upgrade_notice'],
     queryFn: fetchUpgradeNotice,
     refetchOnWindowFocus: true,
-    staleTime: 30_000,
-    refetchInterval: 60_000,
+    staleTime: pollMs ? 0 : 30_000,
+    // 5.53.0: the Updates page asks every 2 s while an upgrade runs, so its step list keeps moving when the status is locked.
+    refetchInterval: pollMs ?? 60_000,
+    ...(pollMs ? { retry: false, refetchIntervalInBackground: true } : {}),
   })
 }
 

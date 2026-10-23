@@ -604,7 +604,27 @@ export type UpgradeNotice = UpgradeNoticeBase & UpgradeNoticeAdminExtras
 export interface UpgradeNoticeAdminExtras {
   update_available?: string | null
   revocation?: UpgradeRevocation | null
-  run?: Record<string, unknown> | null
+  run?: UpgradeNoticeRun | null
+}
+
+/** The upgrade run as the notice carries it (server NOTICE_RUN_FIELDS): progress only, no step details, check text or failure text. */
+export interface UpgradeNoticeRun {
+  correlation_id: string | null
+  action: string | null
+  version_from: string | null
+  version_to: string | null
+  step: string | null
+  result: UpgradeRun['result']
+  reason_code: string | null
+  failed_step: string | null
+  started_at: string | null
+  updated_at: string | null
+  seconds: number | null
+  rolled_back_to: string | null
+  step_started_at: string | null
+  backup?: { size: number | null; integrity: string | null } | null
+  steps_done?: { step: string; at: string; seconds: number }[] | null
+  health?: { id: string; ok: boolean }[] | null
 }
 
 export type UpgradeNoticeBase =

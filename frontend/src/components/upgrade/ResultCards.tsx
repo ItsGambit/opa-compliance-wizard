@@ -10,6 +10,7 @@ import {
   HEALTH_CHECK_LABELS, HEALTH_CHECK_ORDER, HEALTH_CHECK_SHORT, clockIn, dateTimeIn, describeReason, formatDuration, serverZoneOf, shortSha, stampFromName, browserZone,
 } from '../../utils/upgradeFlow'
 import { bundleCoolingDown, openAuditLogFor } from '../../utils/upgradeRequested'
+import { StepSummary } from './FinishedCard'
 import { Badge, CARD_TITLE, CommandBlock, KV, Row, SEC_LABEL } from './parts'
 import { TypedConfirmDialog } from './TypedConfirmDialog'
 import { useOperationsBlock, useUpgradeRequest } from './useUpgradeRequest'
@@ -74,6 +75,7 @@ export function SuccessCards({ run, status }: { run: UpgradeRun; status: Upgrade
           </div>
         </div>
       </section>
+      {(run.steps_done?.length ?? 0) > 0 && <StepSummary run={run} zone={zone} title="Every step, with its time" showHealth={false} />}
       <section className="card p-4" aria-labelledby="t-checked">
         <h2 className={CARD_TITLE} id="t-checked">What was checked after the restart {checks.length > 0 && <Badge tone={passed === checks.length ? 'ok' : 'warn'}>{passed} of {HEALTH_CHECK_ORDER.length} passed</Badge>}</h2>
         <ul className="m-0 p-0 list-none grid sm:grid-cols-2 gap-x-8 gap-y-1.5 text-xs text-text-dim">
