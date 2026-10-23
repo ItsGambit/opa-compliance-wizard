@@ -169,8 +169,9 @@ sudo bash get-ocw.sh
 ```
 
 That key line is published in the same repository as the script, so it only helps if you get it from somewhere GitHub's account does
-not control: the command trusts GitHub for the first file; to check it independently, compare the key id with the project's security
-advisories page. Python packages are installed with `pip --require-hashes` from the hash-pinned list inside the signed release;
+not control: the command trusts GitHub for the first file. To check it independently, compare the key id with the one published on
+a page the project controls outside GitHub, <https://apps.ruchir.pw/keys/opa-compliance-wizard> (plain text: `/keys/opa-compliance-wizard.txt`).
+If they differ, stop and report it privately (see [SECURITY.md](SECURITY.md)). Python packages are installed with `pip --require-hashes` from the hash-pinned list inside the signed release;
 system packages come signed from your distribution. **No independent third-party audit of this installer or the project has been
 performed.**
 

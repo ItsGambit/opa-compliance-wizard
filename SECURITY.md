@@ -109,11 +109,13 @@ The release key's minisign public key line is
 from the key itself: it is the first 8 bytes of the fingerprint (shown
 byte-reversed for the release key, the way minisign shows ids).
 
-**Limit.** These values are published in this repository, so they are only as
-trustworthy as the repository and the account behind it. The project does not
-yet publish the key id on a page that is independent of GitHub; until it does,
-compare the key id with a second source you trust before relying on it for a
-first install.
+**Check the key against a second source.** The values above are published in
+this repository, so on their own they are only as trustworthy as the repository
+and the account behind it. The same key ids are published on a page the project
+controls outside GitHub: <https://apps.ruchir.pw/keys/opa-compliance-wizard>
+(plain text: `/keys/opa-compliance-wizard.txt`). Before a first install, check
+that the key id there matches the one here and in the installer's output. If
+they differ, stop and report it privately.
 
 ### How to verify a release
 
