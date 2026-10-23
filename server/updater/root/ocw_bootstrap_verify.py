@@ -298,10 +298,13 @@ def copy_in(src, out_path, max_bytes):
 
 BUNDLE_RE = re.compile(r"^ocw-(\d+\.\d+\.\d+)-offline\.tar\.gz$")
 _WHEEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+!-]{0,200}\.whl$")
-MAX_BUNDLE_BYTES = 3 * 1024 ** 3
-MAX_WHEEL_BYTES = 120 * 1024 * 1024
+# Ceilings, not expectations: the project's requirements.lock needs roughly 50-130 wheels of at most a few MB each (about 100 MB at
+# the very worst, tests/test_bootstrap_sh.py works it out from the real lock) beside a release of at most MAX_TARBALL_BYTES. These
+# leave about ten times that room, so a crafted bundle cannot fill the disk before the signature is checked.
+MAX_BUNDLE_BYTES = 1024 ** 3
+MAX_WHEEL_BYTES = 64 * 1024 * 1024
 MAX_WHEELS = 800
-MAX_BUNDLE_TOTAL_BYTES = 2 * 1024 ** 3
+MAX_BUNDLE_TOTAL_BYTES = 1024 ** 3
 
 
 def _copy_member(tar, member, dest_path, cap, mode):
@@ -310,6 +313,7 @@ def _copy_member(tar, member, dest_path, cap, mode):
     src = tar.extractfile(member)
     fd = os.open(dest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode)
     with src, os.fdopen(fd, "wb") as out:
+        os.fchmod(out.fileno(), mode)  # the umask may have narrowed the creation mode
         while True:
             chunk = src.read(1 << 20)
             if not chunk:
@@ -318,7 +322,6 @@ def _copy_member(tar, member, dest_path, cap, mode):
             if written > cap:
                 raise Refused("bad_bundle", f"{os.path.basename(dest_path)} in the bundle is larger than allowed")
             out.write(chunk)
-    os.chmod(dest_path, mode)
     return written
 
 
@@ -351,7 +354,9 @@ def unbundle(src, release_out, wheels_out):
                     count += 1
                     if count > MAX_WHEELS + 10:
                         raise Refused("bad_bundle", "the offline bundle holds too many files")
-                    name = member.name[2:] if member.name.startswith("./") else member.name
+                    name = member.name
+                    if name == "." or name.startswith("./"):
+                        raise Refused("bad_bundle", "the bundle has a ./ entry; rebuild it with the project's release tool (tools/release.py build-offline)")
                     if member.isdir():
                         if name.rstrip("/") not in ("wheels", "."):
                             raise Refused("unsafe_member", f"the bundle contains an unexpected folder ({member.name!r}); do not use it")

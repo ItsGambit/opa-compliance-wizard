@@ -817,6 +817,62 @@ def test_a_tampered_release_inside_the_bundle_is_still_refused(bw):
     assert p.returncode != 0 and not (bw.stub / "install.args").exists() and not bw.opt.exists()
 
 
+def test_the_dot_slash_entry_is_refused_with_a_plain_reason(bw):
+    tar, sig = bw.publish()
+    d = bw.w / "usb"
+    d.mkdir()
+    hand_bundle(d / "ocw-5.52.0-offline.tar.gz", [("./ocw-5.52.0.tar.gz", Path(tar).read_bytes()), ("./ocw-5.52.0.tar.gz.minisig", Path(sig).read_bytes())])
+    p = bw.run("--from-dir", str(d), "--yes", "--yes-no-revocation-check", "--server-name", "a.example.com", "--self-signed")
+    assert p.returncode == 2 and "the bundle has a ./ entry; rebuild it with the project's release tool" in p.stderr, p.stderr
+
+
+def test_the_bundle_ceilings_are_realistic_for_the_real_lock():
+    """No network here, so this is an estimate, not a measurement of a real build-offline output: count the wheels the project's own
+    requirements.lock can need across every default target and price them generously: 1 MB for a pure or cffi wheel, 10 MB for a cryptography wheel (a few MB in practice) and 50 MB for the release itself."""
+    import release as release_tool
+    sys.path.insert(0, str(REPO))
+    from server.updater.root import ocw_bootstrap_verify as v
+    entries = release_tool.parse_lock((REPO / "requirements.lock").read_text(encoding="utf-8"))
+    pure, binary = set(), set()
+    for py in release_tool.OFFLINE_PYTHONS:
+        for plat in release_tool.OFFLINE_DEFAULT_PLATFORMS:
+            for e in release_tool.entries_for(entries, py, plat):
+                if e["name"] in ("cryptography", "cffi"):
+                    binary.add((e["name"], e["version"], py if e["name"] == "cffi" else "", plat))   # cffi: per Python and platform; cryptography: abi3, per platform
+                else:
+                    pure.add((e["name"], e["version"]))                 # a pure-Python wheel is one file for every target
+    worst = (len(pure) + sum(1 for b in binary if b[0] == "cffi")) * 1024 * 1024 + sum(1 for b in binary if b[0] == "cryptography") * 10 * 1024 * 1024 + 50 * 1024 * 1024
+    assert len(pure) + len(binary) < v.MAX_WHEELS
+    assert worst * 2 < v.MAX_BUNDLE_TOTAL_BYTES <= 1024 ** 3 and v.MAX_BUNDLE_BYTES <= 1024 ** 3   # at least twice the worst case in room
+    assert v.MAX_WHEEL_BYTES <= 64 * 1024 * 1024
+
+
+def test_a_bundle_is_refused_before_unpacking_when_there_is_no_room(bw):
+    d = bw.w / "usb"
+    real_bundle(bw, d)
+    bw.put_stub("df", "#!/bin/bash\necho 'Filesystem 1024-blocks Used Available Capacity Mounted'\necho 'x 1000 900 100 90% /'\n")
+    p = bw.run("--from-dir", str(d), "--yes", "--yes-no-revocation-check", "--server-name", "a.example.com", "--self-signed",
+               extra_env={"OCW_MIN_FREE_KB_TEST": "1"})
+    assert p.returncode == 2 and "not enough free disk space" in p.stderr and "unpack the offline bundle" in p.stderr, p.stderr
+    assert not (bw.stub / "install.args").exists() and not [x for x in (bw.w / "work").iterdir() if x.name.startswith("ocw-wheels")]
+
+
+def test_a_dry_run_keeps_the_packages_with_the_work_directory_and_a_later_run_sweeps_both(bw):
+    d = bw.w / "usb"
+    real_bundle(bw, d)
+    p = bw.run("--from-dir", str(d), "--dry-run", "--yes-no-revocation-check", "--server-name", "a.example.com", "--self-signed")
+    assert p.returncode == 0, p.stderr + p.stdout
+    kept = sorted(x.name for x in (bw.w / "work").iterdir())
+    assert any(n.startswith("ocw-install.") for n in kept) and any(n.startswith("ocw-wheels.") for n in kept), kept
+    # a day later both are stale: the next run removes them, then leaves its own behind (dry run) -- the old names are gone
+    old = [bw.w / "work" / n for n in kept]
+    for o in old:
+        os.utime(o, (1_000_000_000, 1_000_000_000))
+    p = bw.run("--from-dir", str(d), "--yes", "--yes-no-revocation-check", "--server-name", "a.example.com", "--self-signed")
+    assert p.returncode == 0, p.stderr + p.stdout
+    assert not any(o.exists() for o in old) and not bw.work_dirs()
+
+
 # --- uninstall --------------------------------------------------------------------------------------------------------------------------------
 
 

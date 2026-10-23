@@ -81,13 +81,13 @@ say_err() {
 refuse() { say_err "refused: $*"; exit 2; }
 fail() { say_err "failed: $*"; exit 3; }
 
-cleanup() { # the work directory goes after every run (done, refused, failed or interrupted) unless --keep-work or --dry-run; the log stays
+cleanup() { # the work directory (and the offline bundle's packages beside it) go after every run (done, refused, failed or interrupted) unless --keep-work or --dry-run; the log stays
   local _rc=$?
   trap - EXIT
   if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ] && [ -z "$KEEP_WORK" ] && [ -z "$DRY_RUN" ]; then
     rm -rf -- "$WORK_DIR"
   fi
-  if [ -n "$WHEEL_DIR" ] && [ -d "$WHEEL_DIR" ] && [ -z "$KEEP_WORK" ]; then
+  if [ -n "$WHEEL_DIR" ] && [ -d "$WHEEL_DIR" ] && [ -z "$KEEP_WORK" ] && [ -z "$DRY_RUN" ]; then
     rm -rf -- "$WHEEL_DIR"
   fi
   if [ -n "$LOG_FILE" ] && [ "$_rc" -ne 0 ]; then say_err "Log: $LOG_FILE"; fi
@@ -365,6 +365,12 @@ resolve_and_download() {
       TAR_FILE="$WORK_DIR/dl/ocw-$VERSION.tar.gz"
       SIG_FILE="$TAR_FILE.minisig"
       say "     reading the offline bundle from $FROM_DIR"
+      # unpacking needs about the bundle's own size again in the work area: check before writing anything
+      local _bkb _free
+      _bkb=$(( $(wc -c < "$_bundle") / 1024 + 1 ))
+      _free="$(free_kb "$(dirname -- "$WORK_DIR")")"
+      case "${_free:-0}" in *[!0-9]*) _free=0 ;; esac
+      [ "${_free:-0}" -ge $(( _bkb + 262144 )) ] || refuse "not enough free disk space in $(dirname -- "$WORK_DIR") to unpack the offline bundle ($((_bkb / 1024 + 256)) MB needed, $((${_free:-0} / 1024)) MB free). Nothing was changed. Free some space and run this again."
       if [ -z "$WHEELHOUSE" ]; then
         WHEEL_DIR="$(mktemp -d "$(dirname -- "$WORK_DIR")/ocw-wheels.XXXXXXXX")" || fail "could not create a folder for the bundle's packages. Nothing was changed."
         chmod 0755 "$WHEEL_DIR" # the installer's pip runs as another user and reads the packages from here; the packages are public files
@@ -732,7 +738,7 @@ main() {
 
   setup_sources
   # a work directory only root can enter; a stale one from a dry run is removed after a day
-  find "$_work_base" -maxdepth 1 -type d -name 'ocw-install.*' -user "$(id -un)" -mtime +0 -exec rm -rf {} + 2>/dev/null || true
+  find "$_work_base" -maxdepth 1 -type d \( -name 'ocw-install.*' -o -name 'ocw-wheels.*' \) -user "$(id -un)" -mtime +0 -exec rm -rf {} + 2>/dev/null || true
   WORK_DIR="$(mktemp -d "$_work_base/ocw-install.XXXXXXXX")" || fail "could not create a work directory in $_work_base. Nothing was changed."
   chmod 0700 "$WORK_DIR"
   mkdir -m 0700 "$WORK_DIR/verifier"
