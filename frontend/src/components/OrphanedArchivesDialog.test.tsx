@@ -1,15 +1,16 @@
 /** DATA-12 admin UI: list orphaned archives; purge only after typed confirmation. */
 import { fireEvent, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { fetchOrphanedArchives, purgeOrphanedArchive } from '../api/client'
+import { fetchOrphanedArchives, fetchSettingsStatus, purgeOrphanedArchive } from '../api/client'
 import { renderWithClient } from '../test/renderWithClient'
 import { OrphanedArchivesDialog } from './OrphanedArchivesDialog'
 
-vi.mock('../api/client', () => ({ fetchOrphanedArchives: vi.fn(), purgeOrphanedArchive: vi.fn() }))
+vi.mock('../api/client', () => ({ fetchOrphanedArchives: vi.fn(), purgeOrphanedArchive: vi.fn(), fetchSettingsStatus: vi.fn() }))
 
 const ID = '3f2a9c1e-0000-4000-8000-000000000001'
 beforeEach(() => {
   vi.clearAllMocks()
+  vi.mocked(fetchSettingsStatus).mockResolvedValue({ mode: 'local', mfa: false, unlocked: true, unlocked_until: null, seconds_left: 0, local_notice: 'No MFA in local mode. (test)' })
   vi.mocked(fetchOrphanedArchives).mockResolvedValue({ archives: [{
     environment_id: ID, event_count: 1200, bytes: 2_500_000, oldest_published: '2026-07-01T00:00:00Z',
     newest_published: '2026-09-30T00:00:00Z', manifest_count: 14,

@@ -23,12 +23,6 @@ export interface Environment {
   // possible -- see EnvironmentManagerDialog.tsx.
   id: string
   name: string
-  base_domain: string
-  team_name: string
-  key_id: string
-  okta_url: string
-  has_okta_token: boolean
-  sync_schedule: SyncSchedule
   // Per-user environment scoping (server-hosted, logged-in deployments only --
   // both are always true for a local/standalone run, since there's only ever
   // one unscoped owner). `shared` = visible to every other logged-in user;
@@ -52,6 +46,20 @@ export interface Environment {
   /** 5.42.0, admins only: this environment's stored overrides (a capability
    * absent here inherits the global default). */
   permission_overrides?: Partial<Record<SharedCapabilityKey, PermissionValue>>
+  /** 5.53.0: an opaque token that changes when this environment's connection settings (OPA domain, team, Okta URL) change.
+   * The list every screen reads no longer carries those settings, so the tenant scope (UI-05) keys on this instead. */
+  scope?: string
+}
+
+/** 5.53.0: an environment as the Settings screens read it (GET /api/settings/environments, after the MFA unlock): the
+ * switcher's row plus its non-secret configuration. */
+export interface SettingsEnvironment extends Environment {
+  base_domain: string
+  team_name: string
+  key_id: string
+  okta_url: string
+  has_okta_token: boolean
+  sync_schedule: SyncSchedule
 }
 
 // ── Shared-environment permissions (5.42.0) ──────────────────────────────
@@ -135,6 +143,21 @@ export interface EnvironmentsResponse {
   /** 5.40.7 (UI-07): the active environment's id -- compare rows by this,
    * never by name (an admin sees several owners' same-named rows). */
   active_id?: string | null
+}
+
+export interface SettingsEnvironmentsResponse extends Omit<EnvironmentsResponse, 'environments'> {
+  environments: SettingsEnvironment[]
+}
+
+/** 5.53.0: GET /api/settings/status. Hosted: whether this sign-in has passed the MFA that opens Settings and Updates, and
+ * how long is left (computed by the server; the browser never compares its clock with the server's). Local mode: no MFA. */
+export interface SettingsStatus {
+  mode: 'hosted' | 'local'
+  mfa: boolean
+  unlocked: boolean
+  unlocked_until: string | null
+  seconds_left: number
+  local_notice: string | null
 }
 
 /** One archive left behind by a deleted environment (DATA-12). */
@@ -574,7 +597,17 @@ export interface UpgradeView {
 }
 
 /** The one-line banner every signed-in user may see (GET /api/upgrade/notice). */
-export type UpgradeNotice =
+export type UpgradeNotice = UpgradeNoticeBase & UpgradeNoticeAdminExtras
+
+/** 5.53.0: what administrators also get from the notice, so the Updates badge, the key-revocation banner and the progress
+ * card work while Updates is locked. Never settings, keys or backups. */
+export interface UpgradeNoticeAdminExtras {
+  update_available?: string | null
+  revocation?: UpgradeRevocation | null
+  run?: Record<string, unknown> | null
+}
+
+export type UpgradeNoticeBase =
   | { kind: 'none' }
   | { kind: 'available'; version: string }
   | { kind: 'scheduled'; version: string; when_utc: string; downtime_estimate_seconds: number | null }
@@ -735,6 +768,9 @@ export interface ApiErrorBody {
    * "already_consumed"; audit-log backfill "busy"; 5.42.0
    * "shared_permission_denied", "secrets_expired", "step_up_unavailable"). */
   reason?: string
+  /** 5.53.0: a "settings_locked" refusal (403) names the scope that needs the MFA unlock. */
+  scope?: string
+  step_up_required?: boolean
   /** 5.52.0: a "busy_other_parts" refusal (409): the parts the running refresh is still working on, and the parts that were asked for. */
   running?: string[]
   missing?: string[]

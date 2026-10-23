@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from server.nginx_second_site import _location_blocks, build, missing_denies, server_blocks, site_params
+from server.nginx_second_site import _location_blocks, build, lacks_step_up_location, missing_denies, server_blocks, site_params
 
 TEMPLATE = (Path(__file__).resolve().parent.parent / "server" / "nginx-opa-secrets-wizard.conf").read_text()
 MAIN = TEMPLATE.replace("REPLACE_WITH_NGINX_PROXY_SECRET_VALUE", "s3cr3t-live-value")
@@ -350,6 +350,39 @@ def test_missing_denies_finds_a_site_generated_before_the_upgrade_deny_existed(s
     # a deny that is only commented out, or quoted, does not count
     assert missing_denies(old.replace("    location /api/archives {", "    # location /api/upgrade { return 403; }\n    location /api/archives {")) == ["/api/upgrade"]
     assert missing_denies(old.replace("location /api/upgrade", "location /api/upgrade-x")) != []
+
+
+def test_a_generated_site_has_the_step_up_location_and_one_without_it_is_found(site):
+    """5.53.0: Settings and Updates are unlocked, and every change approved, through this location; a site generated before 5.42.0
+    has none and fails closed (read-only check; nothing rewrites the site)."""
+    assert lacks_step_up_location(site) is False
+    block = next(b for path, b in _location_blocks(site) if path == "/api/environment_changes/save")
+    old = site.replace(block, "")
+    assert lacks_step_up_location(old) is True
+    start = site.index("    location = /api/environment_changes/save {")
+    # commented out, quoted, a prefix location, or without the auth_request: not the step-up location
+    assert lacks_step_up_location(site.replace("    location = /api/environment_changes/save {", "    # location = /api/environment_changes/save {\n    location = /x {", 1)) is True
+    assert lacks_step_up_location(site.replace("location = /api/environment_changes/save", "location /api/environment_changes/save", 1)) is True
+    first = site.index("auth_request /verify_stepup;", start)
+    assert lacks_step_up_location(site[:first] + "# " + site[first:]) is True
+
+
+def test_check_step_up_command_line_exit_codes(site, tmp_path):
+    import subprocess
+    import sys
+
+    script = Path(__file__).resolve().parent.parent / "server" / "nginx_second_site.py"
+    good, old = tmp_path / "good", tmp_path / "old"
+    good.write_text(site)
+    old.write_text(site.replace(next(b for path, b in _location_blocks(site) if path == "/api/environment_changes/save"), ""))
+    run = lambda f: subprocess.run([sys.executable, str(script), "--check-step-up", str(f)], capture_output=True, text=True).returncode  # noqa: E731
+    assert (run(good), run(old), run(tmp_path / "missing")) == (0, 1, 2)
+
+
+def test_the_step_up_check_is_not_a_deny_and_the_deny_list_is_unchanged(site):
+    assert "/api/settings" not in SECOND_SITE_DENIED_PREFIXES and not any(p.startswith("/api/settings") for p in SECOND_SITE_DENIED_PREFIXES)
+    assert "location /api/settings" not in site
+    assert missing_denies(site) == []
 
 
 def test_regenerating_from_the_read_back_parameters_reproduces_the_site(site):

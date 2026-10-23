@@ -1,9 +1,9 @@
-import { useState, type ChangeEvent } from 'react'
-import type { Environment, EnvironmentFormValues } from '../types'
+import { useEffect, useState, type ChangeEvent } from 'react'
+import type { EnvironmentFormValues, SettingsEnvironment } from '../types'
 import { Field } from './Field'
 
 interface Props {
-  initial?: Environment
+  initial?: SettingsEnvironment
   /** 5.42.0: input restored after an MFA approval that didn't complete --
    * never secrets, which the user re-enters. */
   draft?: Partial<EnvironmentFormValues>
@@ -11,6 +11,8 @@ interface Props {
   onSubmit: (values: EnvironmentFormValues) => void
   isSubmitting: boolean
   errorMessage?: string
+  /** Called with the current input (secrets included: the caller must not store them). */
+  onValuesChange?: (values: EnvironmentFormValues) => void
 }
 
 const EMPTY: EnvironmentFormValues = {
@@ -19,10 +21,12 @@ const EMPTY: EnvironmentFormValues = {
 
 /** Callers key this form by the environment being edited, so switching rows
  * (or "Add environment") always starts from that row's values. */
-export function EnvironmentForm({ initial, draft, submitLabel, onSubmit, isSubmitting, errorMessage }: Props) {
+export function EnvironmentForm({ initial, draft, submitLabel, onSubmit, isSubmitting, errorMessage, onValuesChange }: Props) {
   const [values, setValues] = useState<EnvironmentFormValues>(
     { ...EMPTY, ...(initial ?? {}), ...(draft ?? {}), key_secret: '', okta_api_token: '' }
   )
+
+  useEffect(() => { onValuesChange?.(values) }, [values, onValuesChange])
 
   const isEditing = !!initial
   const set = (field: keyof EnvironmentFormValues) => (e: ChangeEvent<HTMLInputElement>) =>

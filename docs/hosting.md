@@ -593,6 +593,70 @@ read-only views are not gated. **Local mode** has no login gate and no
 identity provider to step up with, so there these changes apply at once,
 as before.
 
+**Opening Settings and Updates needs a fresh MFA too (5.53.0).** Behind
+the login gate, the Access control, Shared permissions, Orphaned archives
+and Environments screens (the environment details: OPA domain, team, key
+ID, Okta URL, sync schedule) and the whole Updates page, including its
+signing-key page and the support-bundle download, show nothing until you
+pass the same step-up. The screen offers **Continue with Okta**; the
+browser goes through the gate's `/step-up` and comes back to
+`/api/environment_changes/save` as `settings.unlock`, whose only effect
+is a row in `settings_unlocks` (migration 012) that says *this person, in
+this login session, through this gate* may read Settings until it
+expires **10 minutes** later. The server checks that row on every
+protected request (a refused read answers `403` with `"scope":
+"settings"` and `"reason": "settings_locked"`); the browser only explains
+it, with a countdown and a **Lock now** link. Every save and every
+upgrade still asks for its own fresh MFA, and a completed save of the
+kinds listed in the changelog (every Environments change, the Access
+control save, the announcement banner, the update settings and upgrade
+requests) also restarts the 10 minutes, because it just proved the same
+thing. The approval of a Settings unlock can open Settings and nothing
+else, and no other approval, such as a future evidence package build,
+opens or extends it. The window belongs to one sign-in: signing out and
+in again, or another person, starts locked. A restart of the application
+(an upgrade) keeps it. The announcement banner is also a step-up change
+now. The list every screen uses to switch environments no longer carries
+the OPA domain, team, key ID, Okta URL or sync schedule; those come with
+the unlock. The audit log records `settings.unlocked`, `settings.locked`
+(`reason`: `manual`, `expired` when the first refused request after
+expiry notices it, or `operator`) and, in local mode,
+`settings.access_without_mfa_local`. **Local mode** has no login gate and
+no identity provider, so Settings and Updates open without a second
+factor there, say so in a notice, and record each opening (at most one
+entry per area per 10 minutes). An additional login gate's nginx site
+generated before 5.42.0 has no step-up location, so its users cannot
+unlock Settings (or approve any change): `setup-second-gate.sh` and the
+updater's pre-upgrade checks warn about such a site, and
+`sudo bash <install>/current/server/install.sh --regenerate-second-sites`
+repairs it. The audit log page itself is not behind the unlock.
+
+**Locked out of Settings (break-glass).** The unlock only guards *reading*
+Settings and Updates in the browser; the people who run the server keep
+every tool they had. If Okta or the second factor is unavailable, the
+browser cannot open Settings, Access control or Updates until it is back,
+by design (every save and upgrade would need the same MFA anyway), and
+nothing else is affected: reports, the Overview and the Audit Log keep
+working. Root on the host can still upgrade, roll back and restore with
+`sudo ocw-updater ...` (it does not use the browser), and can change the
+Okta group IDs by editing `access_control.json` in the data directory
+(the gate reads it at each login). To end **every open Settings and
+Updates window now** (for example after a suspected stolen session), run
+the application's own command as the application account, then check the
+Audit Log for the `settings.locked` entry with `"reason": "operator"`:
+
+```bash
+sudo runuser -u <application account> -- env OPA_DATA_DIR=/var/lib/opa-compliance-wizard \
+  /opt/opa-compliance-wizard/current/.venv/bin/python -m server.updater settings-unlocks list
+sudo runuser -u <application account> -- env OPA_DATA_DIR=/var/lib/opa-compliance-wizard \
+  /opt/opa-compliance-wizard/current/.venv/bin/python -m server.updater settings-unlocks clear --confirm CLEAR
+```
+
+Clearing only removes access: nobody can read Settings again until they
+pass a new MFA, and it can never open one. There is no command that opens
+a window without MFA, on purpose. (`ocw-updater` does not forward this
+command yet; use the form above.)
+
 **Admin access.** Members of one designated Okta group get full admin
 rights across the whole dashboard: every environment becomes visible and
 editable (not just their own or explicitly shared ones), and a new

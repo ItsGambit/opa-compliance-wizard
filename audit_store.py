@@ -948,6 +948,23 @@ def _migration_011_opa_model_cache(conn):
         conn.execute("ALTER TABLE sync_state ADD COLUMN last_refresh_json TEXT")
 
 
+def _migration_012_settings_unlocks(conn):
+    """5.53.0: opening Settings and Updates needs a fresh MFA on a hosted server. One row per (user, gate, login session) records
+    that the user passed it and until when. Additive and rollback-safe: older code never reads the table."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS settings_unlocks (
+            actor_sub   TEXT NOT NULL,
+            issuer      TEXT NOT NULL DEFAULT '',
+            session_fp  TEXT NOT NULL,
+            action_id   TEXT NOT NULL,
+            unlocked_at TEXT NOT NULL,
+            expires_at  TEXT NOT NULL,
+            PRIMARY KEY (actor_sub, issuer, session_fp)
+        );
+        CREATE INDEX IF NOT EXISTS idx_settings_unlocks_expires ON settings_unlocks (expires_at);
+    """)
+
+
 MIGRATIONS = {
     1: _migration_001_unified_schema,
     2: _migration_002_ingestion_manifests,
@@ -960,6 +977,7 @@ MIGRATIONS = {
     9: _migration_009_shared_permission_grants_and_known_identities,
     10: _migration_010_snapshots_polling_sync_and_correlation,
     11: _migration_011_opa_model_cache,
+    12: _migration_012_settings_unlocks,
 }
 
 # DATA-08: migration 4 needs ALTER TABLE ... DROP COLUMN (SQLite 3.35.0,
@@ -1039,6 +1057,7 @@ def init_db():
     reflag_curated_rows()
     backfill_correlation_columns()
     _cleanup_expired_pending_admin_actions()
+    _cleanup_expired_settings_unlocks()
     _cleanup_retired_secrets_log_cache()
 
 
@@ -2377,6 +2396,133 @@ def _cleanup_expired_pending_admin_actions():
             "DELETE FROM pending_admin_actions WHERE expires_at < ? AND consumed_at IS NULL",
             (now_iso,),
         )
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Settings unlock (5.53.0, migration 012). A row says: this user, signed in through this gate, in this login session,
+# passed a fresh MFA and may read Settings and Updates until expires_at. All times are UTC ISO strings written here.
+# ---------------------------------------------------------------------------
+
+def _unlock_iso(moment):
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _unlock_key(actor_sub, issuer, session_fp):
+    return (str(actor_sub or ""), str(issuer or ""), str(session_fp or ""))
+
+
+def upsert_settings_unlock(actor_sub, issuer, session_fp, action_id, ttl_seconds, now=None):
+    """Creates or replaces the unlock for this user, gate and session. Returns (unlocked_at, expires_at) as ISO strings.
+    Refuses an empty subject or session fingerprint (fails closed)."""
+    key = _unlock_key(actor_sub, issuer, session_fp)
+    if not key[0] or not key[2]:
+        raise ValueError("an unlock needs a subject and a session fingerprint")
+    now = now or datetime.now(timezone.utc)
+    unlocked_at, expires_at = _unlock_iso(now), _unlock_iso(now + timedelta(seconds=ttl_seconds))
+    conn = _get_connection()
+    with _db_lock:
+        try:
+            conn.execute("DELETE FROM settings_unlocks WHERE expires_at < ?", (unlocked_at,))
+            conn.execute(
+                """INSERT INTO settings_unlocks (actor_sub, issuer, session_fp, action_id, unlocked_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (actor_sub, issuer, session_fp) DO UPDATE SET
+                     action_id = excluded.action_id, unlocked_at = excluded.unlocked_at, expires_at = excluded.expires_at""",
+                (*key, str(action_id or ""), unlocked_at, expires_at),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return unlocked_at, expires_at
+
+
+def renew_settings_unlock(actor_sub, issuer, session_fp, action_id, ttl_seconds, now=None):
+    """A completed write that passed its own fresh MFA restarts the window (an upsert, so a save after expiry opens it
+    again). Same arguments and result as upsert_settings_unlock."""
+    return upsert_settings_unlock(actor_sub, issuer, session_fp, action_id, ttl_seconds, now=now)
+
+
+def settings_unlock_active(actor_sub, issuer, session_fp, now=None, delete_expired=True):
+    """The unlock row as a dict if unlocked_at <= now < expires_at, else None. An expired row is deleted on the way out (unless
+    `delete_expired` is False: the status poll must leave it for the first refused request to record the expiry); a row whose
+    unlocked_at is in the future (the clock went back) is refused and left alone."""
+    key = _unlock_key(actor_sub, issuer, session_fp)
+    if not key[0] or not key[2]:
+        return None
+    now_iso = _unlock_iso(now or datetime.now(timezone.utc))
+    conn = _get_connection()
+    with _db_lock:
+        row = conn.execute(
+            "SELECT * FROM settings_unlocks WHERE actor_sub = ? AND issuer = ? AND session_fp = ?", key
+        ).fetchone()
+        if row is None:
+            return None
+        if row["expires_at"] <= now_iso:
+            if delete_expired:
+                conn.execute(
+                    "DELETE FROM settings_unlocks WHERE actor_sub = ? AND issuer = ? AND session_fp = ?", key
+                )
+                conn.commit()
+            return None
+        if row["unlocked_at"] > now_iso:
+            return None
+        return dict(row)
+
+
+def take_expired_settings_unlock(actor_sub, issuer, session_fp, now=None):
+    """If this key's row has expired, deletes it and returns it (once: a second caller gets None), so the first refused request
+    after expiry can record `settings.locked`. A live row is left alone."""
+    key = _unlock_key(actor_sub, issuer, session_fp)
+    now_iso = _unlock_iso(now or datetime.now(timezone.utc))
+    conn = _get_connection()
+    with _db_lock:
+        row = conn.execute(
+            "SELECT * FROM settings_unlocks WHERE actor_sub = ? AND issuer = ? AND session_fp = ?", key
+        ).fetchone()
+        if row is None or row["expires_at"] > now_iso:
+            return None
+        conn.execute("DELETE FROM settings_unlocks WHERE actor_sub = ? AND issuer = ? AND session_fp = ?", key)
+        conn.commit()
+    return dict(row)
+
+
+def delete_settings_unlock(actor_sub, issuer, session_fp):
+    """Ends the window now. Returns the deleted row as a dict, or None if there was none."""
+    key = _unlock_key(actor_sub, issuer, session_fp)
+    conn = _get_connection()
+    with _db_lock:
+        row = conn.execute(
+            "SELECT * FROM settings_unlocks WHERE actor_sub = ? AND issuer = ? AND session_fp = ?", key
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute("DELETE FROM settings_unlocks WHERE actor_sub = ? AND issuer = ? AND session_fp = ?", key)
+        conn.commit()
+    return dict(row)
+
+
+def list_settings_unlocks():
+    """Every unlock row (expired ones included), for the operator's break-glass listing. Holds no secrets."""
+    conn = _get_connection()
+    with _db_lock:
+        return [dict(r) for r in conn.execute("SELECT * FROM settings_unlocks ORDER BY unlocked_at").fetchall()]
+
+
+def clear_settings_unlocks():
+    """Deletes every unlock row. Returns how many there were."""
+    conn = _get_connection()
+    with _db_lock:
+        n = conn.execute("DELETE FROM settings_unlocks").rowcount
+        conn.commit()
+    return n
+
+
+def _cleanup_expired_settings_unlocks():
+    conn = _get_connection()
+    with _db_lock:
+        conn.execute("DELETE FROM settings_unlocks WHERE expires_at < ?", (_unlock_iso(datetime.now(timezone.utc)),))
         conn.commit()
 
 

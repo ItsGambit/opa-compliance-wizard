@@ -15,6 +15,8 @@ import {
   fetchSecretsAccessReport,
   fetchServiceAccount,
   fetchServiceAccountsReport,
+  fetchSettingsEnvironments,
+  fetchSettingsStatus,
   fetchSharedPermissions,
   fetchSyncStatus,
   fetchAuditLog,
@@ -43,6 +45,32 @@ export function useEnvironments() {
     // scope (UI-05) -- an exception to the app-wide no-focus-refetch rule.
     refetchOnWindowFocus: true,
     staleTime: 0,
+  })
+}
+
+/** 5.53.0: the environment list WITH its configuration (OPA domain, team, key id, Okta URL, sync schedule). Server-side it needs
+ * the Settings unlock, so it is only asked for from inside an unlocked Settings screen. */
+export function useSettingsEnvironments(enabled = true) {
+  return useQuery({
+    queryKey: ['settings_environments'],
+    queryFn: fetchSettingsEnvironments,
+    enabled,
+    refetchOnWindowFocus: true,
+    staleTime: 0,
+  })
+}
+
+/** 5.53.0: where this sign-in stands with the Settings unlock. `area` makes a local-mode server record the opening. Polled
+ * gently so a lock from another tab, or a save that renewed the window, shows up; the countdown itself runs in the browser
+ * from `seconds_left` (the browser never compares its clock with the server's). */
+export function useSettingsStatus(area: 'settings' | 'updates', enabled = true) {
+  return useQuery({
+    queryKey: ['settings_status', area],
+    queryFn: () => fetchSettingsStatus(area),
+    enabled,
+    staleTime: 0,
+    refetchOnWindowFocus: true,
+    refetchInterval: 30_000,
   })
 }
 

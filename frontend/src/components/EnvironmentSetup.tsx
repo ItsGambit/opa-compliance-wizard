@@ -71,7 +71,6 @@ export function EnvironmentSetup({ draft }: Props = {}) {
                 <div className="text-sm text-text truncate">{env.name}</div>
                 <div className="text-xs text-text-faint truncate">
                   {env.is_own ? 'Yours' : 'Shared with you'}
-                  {env.team_name ? ` · ${env.team_name}` : ''}
                 </div>
               </div>
               <button

@@ -261,6 +261,10 @@ else
   if ! python3 "$APP/server/nginx_second_site.py" --check "$NEW_SITE" >/dev/null 2>&1; then
     warn "$NEW_SITE is missing a 403 deny the current rules add (the current rules deny every route listed in server/nginx_second_site.py SECOND_SITE_DENIED_PREFIXES). Regenerate it with: sudo bash $APP/server/install.sh --regenerate-second-sites"
   fi
+  # 5.53.0: users of this site open Settings and make every change through the step-up location; a site generated before 5.42.0 has none
+  if ! python3 "$APP/server/nginx_second_site.py" --check-step-up "$NEW_SITE" >/dev/null 2>&1; then
+    warn "$NEW_SITE has no step-up location (it predates 5.42.0), so its users cannot unlock Settings or approve changes. Regenerate it with: sudo bash $APP/server/install.sh --regenerate-second-sites"
+  fi
 fi
 # OPS-14: never leave a site enabled that breaks `nginx -t` -- every later reload (deploy.sh's included) and
 # nginx's own start at boot would fail. If the config is invalid, find out whether this site is the cause by

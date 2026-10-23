@@ -1129,6 +1129,50 @@ class Updater:
                                              "that unpacked directory; it refreshes the units, the command and the updater, records the version "
                                              "and touches no data. Then apply this release again.", "staged")
 
+    def _second_gate_sites_where(self, lacks):
+        """The names of the additional login gates' generated nginx sites (read-only, like check_second_gate_sites) whose
+        active text (comments dropped) satisfies `lacks`. Never raises."""
+        found = []
+        try:
+            directory = self.cfg.second_gate_sites_dir
+            main = os.path.basename(self.cfg.nginx_site)
+            for name in sorted(os.listdir(directory)):
+                if not name.startswith("opa-") or name == main:
+                    continue
+                try:
+                    fd = open_regular(os.path.join(directory, name))
+                    with os.fdopen(fd, "rb") as fh:
+                        raw = fh.read(1 << 20)
+                except OSError:
+                    continue
+                text = raw.decode("utf-8", "replace")
+                if "# OPA auth gate '" not in text[:600]:
+                    continue    # not a site setup-second-gate.sh generated
+                active = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+                if lacks(active):
+                    found.append(name[:60])
+        except OSError:
+            return []
+        return found
+
+    def check_second_gate_step_up(self):
+        """Read-only (5.53.0). A generated second-gate site needs the step-up location (`location = /api/environment_changes/save`
+        with `auth_request /verify_stepup`): every approved change and the MFA that opens Settings and Updates are finished
+        there. A site generated before 5.42.0 has none and fails closed, so its users cannot unlock Settings. Warns and writes
+        an audit entry; never rewrites a site (`install.sh --regenerate-second-sites` does). Returns the site names."""
+        def lacks(active):
+            return not re.search(r"location\s*=\s*/api/environment_changes/save\s*\{[^}]*?auth_request\s+/verify_stepup\s*;", active, re.S)
+        found = self._second_gate_sites_where(lacks)
+        if found:
+            msg = ("the nginx site of an additional login gate has no step-up location, so its users cannot unlock Settings or approve "
+                   "changes: " + ", ".join(found) + ". Run `sudo server/install.sh --regenerate-second-sites` from the installed release.")
+            log("WARN", msg)
+            try:
+                self.audit("upgrade.step", {"step": "second_gate_site_without_step_up", "sites": found, "detail": msg[:300]})
+            except OSError as exc:
+                log("WARN", f"could not write the audit entry: {exc.strerror}")
+        return found
+
     def check_second_gate_sites(self):
         """Read-only. The nginx site of an additional login gate (setup-second-gate.sh) must answer 403 on /api/upgrade, or an
         administrator of that org could reach this server's upgrade routes through its hostname. Neither this updater nor
@@ -1194,12 +1238,15 @@ class Updater:
         if self.st["manifest"].get("nginx_template_changed"):
             self.nginx_prepare()
         unprotected = self.check_second_gate_sites()
+        without_step_up = self.check_second_gate_step_up()
         self.st["schema_before"] = snap.get("schema_version")
         self.st["chain_heads_before"] = snap.get("chain_heads") or {}
         self.st["preflight"] = {"free_opt_mb": free_opt // 2**20, "free_data_mb": free_data // 2**20, "sync_waited_s": waited,
                                 "nginx_template_changed": bool(self.st["manifest"].get("nginx_template_changed"))}
         if unprotected:
             self.st["preflight"]["second_gate_sites_without_upgrade_deny"] = unprotected
+        if without_step_up:
+            self.st["preflight"]["second_gate_sites_without_step_up"] = without_step_up
         # baseline for "not worse than before"
         status, body = self.host.http_get(c.backend_port, "/healthz")
         self.st["baseline"] = {"healthz": _healthz_status(body) if status == 200 else None}

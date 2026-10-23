@@ -259,7 +259,14 @@ test the token's permissions up front: each screen says what it could not read.
 
 ## Upgrading
 
-**Nothing changes for you unless you choose it.** Upgrading to 5.51.0 changes no
+**After upgrading to 5.53.0, opening Settings or Updates asks for MFA** on a hosted server: the first time you open Access control,
+Shared permissions, Orphaned archives, the environment details or the Updates page, the wizard sends you through your Okta
+step-up sign-in and back, then keeps Settings open for 10 minutes (a countdown shows how long is left). Saving the announcement
+banner asks for MFA as well. A computer running without a login gate (local mode) is not asked, and says so on screen. The
+upgrade itself needs nothing from you and changes no nginx or service file; an additional login gate's site generated before
+5.42.0 must be regenerated first (see [docs/hosting.md](docs/hosting.md), "Opening Settings and Updates needs a fresh MFA too").
+
+**Nothing else changes for you unless you choose it.** Upgrading to 5.51.0 changes no
 behaviour of an existing install: the update check is **off**, `server/deploy.sh` and `--ref`
 keep working in place (with a note that the install can move to the upgrade layout), and no
 key has to be pinned. 5.46.0 added **signed releases** and the update check; 5.47.0 adds the
