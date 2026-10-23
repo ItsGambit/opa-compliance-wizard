@@ -300,6 +300,14 @@ def _notice_run(run):
     backup = run.get("backup")
     if isinstance(backup, dict):
         out["backup"] = {"size": backup.get("size"), "integrity": backup.get("integrity")}
+    # 5.53.0: the step list and the health checks as progress only (names, times, pass or fail), so the Updates page can keep
+    # showing the steps while its own status is locked or the server restarts. No step details, no check text.
+    steps = run.get("steps_done")
+    out["steps_done"] = [{"step": str(s.get("step"))[:40], "at": s.get("at"), "seconds": s.get("seconds")}
+                         for s in steps[:20] if isinstance(s, dict)] if isinstance(steps, list) else None
+    health = run.get("health")
+    out["health"] = [{"id": str(h.get("id"))[:40], "ok": bool(h.get("ok"))}
+                     for h in health[:20] if isinstance(h, dict)] if isinstance(health, list) else None
     return out
 
 

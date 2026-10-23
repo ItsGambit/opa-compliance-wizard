@@ -1,17 +1,19 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, CheckCircle2, Download, RefreshCw } from 'lucide-react'
-import { ApiError, checkUpgradeNow, fetchUpgradeStatus, reviewUpgrade } from '../api/client'
-import { useUpgradeStatus, useVersion, useWhoami } from '../api/hooks'
+import { ApiError, checkUpgradeNow, fetchUpgradeStatus, isSettingsLockedError, reviewUpgrade } from '../api/client'
+import { useUpgradeNotice, useUpgradeStatus, useVersion, useWhoami } from '../api/hooks'
 import { toast } from '../hooks/useToast'
 import type { UpgradeStatus } from '../types'
 import { clearRequested, readRequested, type RequestedUpgrade } from '../utils/upgradeRequested'
 import { UPGRADE_STEPS, browserZone, describeReason, isFailureResult, isRunning, serverZoneOf } from '../utils/upgradeFlow'
 import { formatDateTime } from '../utils/format'
+import { mergeRun } from '../utils/upgradeRun'
 import { describeCheckFailure, frequencyLabel, latestIsStale, latestOlderThanInstalled, updateState } from '../utils/upgrade'
 import { UpdateCheckForm } from './UpdateCheckForm'
 import { AvailableSection } from './upgrade/AvailableSection'
 import { BackupsCard } from './upgrade/BackupsCard'
+import { UpgradeFinishedCard } from './upgrade/FinishedCard'
 import { ConfirmUpgrade, type ConfirmMode } from './upgrade/ConfirmUpgrade'
 import { Badge, CARD_TITLE, CommandBlock, KeyId, KV, Row } from './upgrade/parts'
 import { ProgressCard, WhileRestarting } from './upgrade/ProgressCard'
@@ -331,12 +333,14 @@ const STEP_AT_OR_BEFORE_DOWNLOAD = ['validated', 'downloaded']
 
 /** The admin-only Updates page: check for signed releases, review what changes, upgrade now or on a schedule with a step-up MFA
  * approval, follow the live progress through the restart, and see the result. The daily check is OFF until an admin chooses. */
-export function UpdatesPage({ onOpenKeys, onHeader }: { onOpenKeys: () => void; onHeader?: (h: UpdatesHeader) => void }) {
+export function UpdatesPage({ onOpenKeys, onHeader, reloadAfterSeconds = 10 }: { onOpenKeys: () => void; onHeader?: (h: UpdatesHeader) => void; reloadAfterSeconds?: number }) {
   const { data: whoami } = useWhoami()
   const isLocal = !!whoami?.is_local
   const { data: loadedVersion } = useVersion()
   const [polling, setPolling] = useState(false)
   const { data: status, isLoading, isError, error } = useUpgradeStatus(true, polling ? 2000 : undefined)
+  // 5.53.0: the notice answers even while Updates is locked, so it keeps the step list moving; the status adds the detail.
+  const { data: notice } = useUpgradeNotice(polling ? 2000 : undefined)
   const queryClient = useQueryClient()
   const [notNow, setNotNow] = useState(false)
   const [requested, setRequested] = useState<RequestedUpgrade | null>(() => readRequested())
@@ -349,7 +353,8 @@ export function UpdatesPage({ onOpenKeys, onHeader }: { onOpenKeys: () => void; 
   const [reviewError, setReviewError] = useState<string | null>(null)
   const [tried, setTried] = useState<string | null>(null)
 
-  const run = status?.upgrade?.run ?? null
+  const run = mergeRun(status?.upgrade?.run ?? null, notice?.run ?? null)
+  const locked = isError && isSettingsLockedError(error)
   const running = isRunning(run)
   const stepIdx = run?.step ? UPGRADE_STEPS.findIndex(s => s.id === run.step) : -1
   const received = (r: RequestedUpgrade) => {
@@ -363,7 +368,7 @@ export function UpdatesPage({ onOpenKeys, onHeader }: { onOpenKeys: () => void; 
   // The "Starting" card stays (with Follow progress) while the run is in its first steps; the progress card takes over when the user follows or the run is past the download.
   const pastDownload = !!run && (run.result !== null || stepIdx > STEP_AT_OR_BEFORE_DOWNLOAD.length - 1)
   const showStarting = !!requested && (refused || !isReceived || (!requested.kind ? !following && !pastDownload : false))
-  const restarting = isError && isTransient(error) && !!status
+  const restarting = isError && isTransient(error) && (!!status || !!run)
 
   // Poll every 2 s while an upgrade is starting or running (the server restarts underneath; failed polls just wait for the next tick).
   useEffect(() => { setPolling(running || (!!requested && !refused)) }, [running, requested, refused])
@@ -377,15 +382,16 @@ export function UpdatesPage({ onOpenKeys, onHeader }: { onOpenKeys: () => void; 
     return () => clearInterval(id)
   }, [requested, isReceived, refused, queryClient])
 
-  // When the new version answers, reload once so the browser runs the new interface.
-  useEffect(() => {
-    if (!status || !loadedVersion || !run || run.result !== 'completed') return
-    if (status.installed_version === loadedVersion.version) return
-    const guard = `opa.upgradeReloaded:${run.correlation_id}`
-    try { if (sessionStorage.getItem(guard)) return; sessionStorage.setItem(guard, '1') } catch { /* reload anyway, once per mount */ }
+  // When the new version answers, the page shows the result of the upgrade and reloads once so the browser runs the new interface
+  // (never in a loop: after one automatic reload for this run the reload is the user's to make).
+  const finished = !!run && run.result === 'completed' && run.action === 'apply' && !!run.version_to && !!loadedVersion && loadedVersion.version !== run.version_to
+  const reloadGuard = run?.correlation_id ? `opa.upgradeReloaded:${run.correlation_id}` : null
+  const alreadyReloaded = (() => { try { return !!reloadGuard && !!sessionStorage.getItem(reloadGuard) } catch { return false } })()
+  const reloadNow = useCallback(() => {
+    try { if (reloadGuard) sessionStorage.setItem(reloadGuard, '1') } catch { /* reload anyway */ }
     clearRequested()
     window.location.reload()
-  }, [status, loadedVersion, run])
+  }, [reloadGuard])
 
   // The "Starting" card has done its job once the run is past the download (or the user followed it), or the run is over.
   useEffect(() => {
@@ -449,6 +455,16 @@ export function UpdatesPage({ onOpenKeys, onHeader }: { onOpenKeys: () => void; 
   }, [headerKey, onHeader])
   useEffect(() => () => onHeader?.({ subtitle: null, fullPage: false }), [onHeader])
 
+  // 5.53.0: no status (locked again, or not answering yet) but the notice knows the run: show it rather than a spinner or an error.
+  if (!status && run && finished) return <UpgradeFinishedCard run={run} zone={zone} autoReloadSeconds={alreadyReloaded ? Infinity : reloadAfterSeconds} onReload={reloadNow} />
+  if (!status && run && running) {
+    return (
+      <div className="flex flex-col gap-5">
+        <ProgressCard run={run} restarting={restarting} locked={locked} zone={zone} />
+        <WhileRestarting from={run.version_from} to={run.version_to} />
+      </div>
+    )
+  }
   if (isLoading) return <p className="text-xs text-muted">Loading…</p>
   if (!status) return <p role="alert" className="text-xs text-loss">Could not load the update status: {(error as Error | null)?.message}</p>
 
@@ -480,11 +496,13 @@ export function UpdatesPage({ onOpenKeys, onHeader }: { onOpenKeys: () => void; 
   if (running && run) {
     return (
       <div className="flex flex-col gap-5">
-        <ProgressCard run={run} restarting={restarting} zone={zone} />
+        <ProgressCard run={run} restarting={restarting} locked={locked} zone={zone} />
         <WhileRestarting from={run.version_from} to={run.version_to} />
       </div>
     )
   }
+  // The new version answered: the result first (steps, times, health checks), then the reload.
+  if (finished && run) return <UpgradeFinishedCard run={run} zone={zone} autoReloadSeconds={alreadyReloaded ? Infinity : reloadAfterSeconds} onReload={reloadNow} />
   // Artboard 10: after a failure the page is the result (and what to do about it), nothing else.
   if (failureShown && run) {
     return <div className="flex flex-col gap-5"><FailureCards run={run} status={status} /></div>

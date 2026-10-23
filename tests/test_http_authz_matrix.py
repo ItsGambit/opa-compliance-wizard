@@ -2360,7 +2360,8 @@ def test_the_nested_notice_run_and_revocation_key_sets_are_pinned(matrix_server,
         "correlation_id": "upg-00000001", "action": "apply", "version_from": "5.52.0", "version_to": "5.53.0", "step": "switching",
         "result": None, "started_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:01:00Z",
         "backup": {"name": "audit_store-pre-5.53.0.db", "size": 123, "integrity": "ok", "path": "/x"},
-        "steps_done": [{"step": "validated", "detail": {"note": "internal"}}], "failure": {"detail": "internal text"},
+        "steps_done": [{"step": "validated", "detail": {"note": "internal"}}],
+        "health": [{"id": "unit", "ok": True, "detail": "internal check text"}], "failure": {"detail": "internal text"},
         "reason_text": "internal reason", "next_step": "internal next", "bundle": {"name": "ocw-support-x.tar.gz"},
         "manifest": {"migrations": []}, "sha256": "a" * 64, "requested_by": "someone"}))
     real_status = serve.update_service.status
@@ -2368,8 +2369,11 @@ def test_the_nested_notice_run_and_revocation_key_sets_are_pinned(matrix_server,
         "serial": 2, "issued_at": "2026-01-01T00:00:00Z", "applied_at": "2026-01-02T00:00:00Z", "reason": "r", "advisory_url": None,
         "revoked": ["AA"], "added": ["BB"], "signed_by": "CC", "source": "release_assets", "keys_blob": ["secret-shaped"], "raw": {"x": 1}}})
     admin = requests.get(base_url + "/api/upgrade/notice", headers=_who(ADMIN, admin=True), timeout=10).json()
-    assert set(admin["run"]) == set(serve.NOTICE_RUN_FIELDS) | {"backup"}
+    assert set(admin["run"]) == set(serve.NOTICE_RUN_FIELDS) | {"backup", "steps_done", "health"}
     assert admin["run"]["backup"] == {"size": 123, "integrity": "ok"}
+    # progress only: step names and times, check ids and pass or fail; the step's detail stays behind the unlock
+    assert admin["run"]["steps_done"] == [{"step": "validated", "at": None, "seconds": None}]
+    assert admin["run"]["health"] == [{"id": "unit", "ok": True}]
     assert set(admin["revocation"]) == set(serve.NOTICE_REVOCATION_FIELDS)
     text = _json.dumps(admin)
     for leaked in ("audit_store-pre", "internal", "ocw-support", "keys_blob", "someone", "a" * 64):

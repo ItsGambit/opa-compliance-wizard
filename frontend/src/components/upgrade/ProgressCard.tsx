@@ -8,6 +8,8 @@ interface Props {
   run: UpgradeRun
   /** The poll is failing because the app is restarting underneath the page (502/503/network). */
   restarting: boolean
+  /** 5.53.0: the Settings unlock ran out while the upgrade runs: the steps come from the limited progress view until it is unlocked again. */
+  locked?: boolean
   /** The zone the times are shown in (the server's, else the browser's). */
   zone: string
   now?: () => number
@@ -25,7 +27,7 @@ function Ring() {
 
 /** Artboard 08a: the live step list. Polled every 2 s by the page; when the backend disappears during the restart the card says so
  * and keeps waiting (the page reloads itself once the new version answers). */
-export function ProgressCard({ run, restarting, zone, now = Date.now }: Props) {
+export function ProgressCard({ run, restarting, locked = false, zone, now = Date.now }: Props) {
   const [tick, setTick] = useState(now())
   useEffect(() => {
     const id = setInterval(() => setTick(now()), 1000)
@@ -49,7 +51,12 @@ export function ProgressCard({ run, restarting, zone, now = Date.now }: Props) {
         </h2>
         {restarting && (
           <p role="status" className="text-xs text-text mt-0 mb-3 flex items-center gap-2 rounded-lg border border-accent/40 bg-accent-dim px-2.5 py-2">
-            <Spinner size={12} />Restarting — this normally takes under a minute. This page keeps asking and reloads itself when the new version answers.
+            <Spinner size={12} />Restarting — this normally takes under a minute. The steps below stay as they were; this page keeps asking and shows the result when the new version answers.
+          </p>
+        )}
+        {locked && !restarting && (
+          <p role="status" className="text-xs text-text-dim mt-0 mb-3 rounded-lg border border-border bg-bg-elevated px-2.5 py-2">
+            Updates locked again (the 10-minute MFA unlock ran out). The upgrade is not affected and the steps below keep updating; the step details come back when you unlock Updates.
           </p>
         )}
       </div>
@@ -105,7 +112,7 @@ export function WhileRestarting({ from, to }: { from: string | null; to: string 
       <h2 className={CARD_TITLE} id="t-restart">While the server restarts</h2>
       <p className="text-xs text-text-dim m-0 max-w-[90ch]">
         When the backend stops answering (nginx returns 503 with the maintenance page), this page shows "Restarting — this normally takes under a minute" and keeps asking{' '}
-        <code className="font-mono">/api/version</code>. Once {to ?? 'the new version'} answers it reloads once; if {from ?? 'the previous version'} answers instead, it shows the rollback result.
+        <code className="font-mono">/api/version</code>. Once {to ?? 'the new version'} answers it shows the result (every step, its time and the health checks) and then reloads once; if {from ?? 'the previous version'} answers instead, it shows the rollback result.
         Other users see the maintenance page. Your session cookie survives the restart.
       </p>
     </section>
