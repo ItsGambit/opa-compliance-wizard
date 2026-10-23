@@ -78,14 +78,17 @@ apostrophe; events.ndjson is the authoritative copy.
 6. HOW TO CHECK THIS PACKAGE
 
 You need Python 3 (3.9 or newer) from your own operating system. No other
-software and no network access is needed.
+software and no network access is needed. The program needs about 650 MB of
+memory per million events in the package.
 
   Step 1. Get the checking program from a source you trust.
-          Most trusted first: (a) the sha256 value printed in the release notes
-          and on the project's signing-key page, which are outside this
-          package; (b) the signed release of the tool; (c) the copy inside this
-          package (tools/verify_evidence_package.py) and the value on the cover
-          sheet. The copy and the cover-sheet value came from the same place as
+          Most trusted first: (a) the authoritative sha256 value, which is in
+          the signed release (manifest.json, field verifier_sha256) and its
+          release notes, and on the project's signing-key page, all outside
+          this package; (b) the signed release of the tool, which holds the
+          program; (c) conveniences: the copy inside this package
+          (tools/verify_evidence_package.py) and the value on the cover sheet.
+          The copy and the cover-sheet value came from the same place as
           this package, so they prove nothing about themselves. Compute the
           sha256 of the file you will run and compare it with value (a):
             Linux:    sha256sum verify_evidence_package.py

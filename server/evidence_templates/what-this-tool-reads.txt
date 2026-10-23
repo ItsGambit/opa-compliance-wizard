@@ -18,8 +18,8 @@ affiliated with Okta.
    reach what. The report files in this package are built from archived System
    Log events only.
 
-What it does not read or store: secret values, passwords or any other credential
-value. Okta System Log events can name a user, an email address, an IP address
+The package holds no credential: not the API token or service-user key saved in
+the tool, and no secret values or passwords. Okta System Log events can name a user, an email address, an IP address
 and a place; those appear in this package exactly as the archive holds them.
 
 What this package is built from: only the local archive of this environment,

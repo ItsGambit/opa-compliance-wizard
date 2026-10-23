@@ -22,6 +22,7 @@ saves it via POST /api/environments.
 
 import argparse
 import contextlib
+import errno
 import csv as _csv
 import hashlib
 import hmac
@@ -990,6 +991,17 @@ def _run_evidence_build(job_id, ctx):
         _evidence.fail(job_id, exc.reason, str(exc))
         _evidence_log(ctx, "evidence_package.build_failed", {**base, "outcome": "refused" if exc.reason in (
             "no_coverage", "gaps_unacknowledged") else "failed", "reason": exc.reason, "seconds": round(time.monotonic() - started, 1)}, "WARN")
+    except OSError as exc:
+        if exc.errno != errno.ENOSPC:
+            engine.log("ERROR", f"Evidence package build {job_id[:6]} failed with {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+            _evidence.fail(job_id, "internal", "The package could not be built because of an internal error. The details are in the server log.")
+            _evidence_log(ctx, "evidence_package.build_failed", {**base, "outcome": "failed", "reason": "internal",
+                                                                  "seconds": round(time.monotonic() - started, 1)}, "ERROR")
+            return
+        # the disk filled while writing (a sync running at the same time can use the space the check saw): the partial file is removed
+        _evidence.fail(job_id, "disk_space", "The disk ran out of space while the package was being written. Free some space (or choose a shorter period) and try again.")
+        _evidence_log(ctx, "evidence_package.build_failed", {**base, "outcome": "failed", "reason": "disk_space",
+                                                              "seconds": round(time.monotonic() - started, 1)}, "WARN")
     except Exception as exc:  # the person sees a generic sentence; the detail stays in the server log
         engine.log("ERROR", f"Evidence package build {job_id[:6]} failed with {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
         _evidence.fail(job_id, "internal", "The package could not be built because of an internal error. The details are in the server log.")
@@ -2148,7 +2160,8 @@ def _upgrade_context():
     except OSError:
         log_bytes = 0
     backups = upgrade_service.backups_view() or {}
-    return {"sync_running": running, "evidence_build_running": _evidence.running(), "db_bytes": db_bytes, "audit_log_bytes": log_bytes, "backups_total": backups.get("total_bytes") or 0,
+    return {"sync_running": running, "evidence_build_running": _evidence.running(),
+            "evidence_package_waiting_until": _evidence.waiting_until(), "db_bytes": db_bytes, "audit_log_bytes": log_bytes, "backups_total": backups.get("total_bytes") or 0,
             "sync_hint": Handler._upgrade_sync_hint(), "run": update_service.upgrade_run()}
 
 
@@ -6004,6 +6017,8 @@ def main():
     # 5.53.0: evidence packages never outlive the process that built them (their download window is 15 minutes).
     try:
         removed = _evidence.cleanup_startup()
+        if _evidence.startup_skipped:
+            engine.log("WARN", f"Evidence packages folder not cleaned: {_evidence.startup_skipped}.")
         if removed:
             engine.log("INFO", f"Deleted {removed} evidence package folder(s) left from an earlier run.")
     except OSError as exc:

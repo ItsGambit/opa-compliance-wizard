@@ -372,7 +372,14 @@ def preflight(manifest, size, ctx, now):
     # end it and delete its half-written file. Refused (not waited for) until the build is over (minutes, never hours).
     items.append({"id": "evidence_build", "ok": not ctx.get("evidence_build_running"),
                   "text": "No evidence package is being built." if not ctx.get("evidence_build_running")
-                  else "An evidence package is being built. Wait for it to finish (a few minutes), then try again."})
+                  else "An evidence package is being built. Wait for it to finish (a few minutes), then try again. "
+                  "A scheduled upgrade waits for a build only as long as it waits for a sync (10 minutes), then proceeds."})
+    waiting = ctx.get("evidence_package_waiting_until")
+    hm = _utc_hm(waiting) if waiting else None
+    if waiting:
+        items.append({"id": "evidence_package_waiting", "ok": False,
+                      "text": f"A package is waiting to be downloaded (until {hm or '?'} UTC). The restart an upgrade needs deletes finished "
+                              "packages: download it first, or wait until its 15 minutes are over."})
     run = ctx.get("run") or {}
     busy = bool(run) and run.get("result") is None and bool(run.get("step"))
     if busy:

@@ -602,3 +602,50 @@ def test_the_approved_request_runs_whatever_the_save_request_says(ev, monkeypatc
     done = requests.post(base + "/api/environment_changes/save", json={"start": "2019-01-01", "end": "2020-12-31", "environment": "other"},
                          headers={**me, "X-Auth-Action-Id": aid, "X-Nginx-Stepup-Location": SECRET}, timeout=15)
     assert done.status_code == 202 and done.json()["period"] == {"start": "2020-03-02", "end": "2020-03-03"}
+
+
+def test_a_full_disk_while_writing_is_a_plain_disk_space_failure(ev, monkeypatch, tmp_audit_log):
+    import errno
+    import evidence_package
+    base, serve, env_id, root = ev
+
+    def full(*a, **k):
+        raise OSError(errno.ENOSPC, "No space left on device")
+    monkeypatch.setattr(evidence_package, "build_package", full)
+    job_id = prepare(base).json()["job_id"]
+    status = wait_done(base, job_id)
+    assert status["status"] == "error" and status["reason"] == "disk_space" and "ran out of space" in status["error"]
+    assert "No space left" not in json.dumps(status) and not (root / "packages" / job_id).exists()
+    failed = next(e for e in audit(tmp_audit_log) if e["action"] == "evidence_package.build_failed")
+    assert failed["details"]["reason"] == "disk_space"
+
+
+def test_the_preflight_counts_a_finished_package_still_in_its_window_but_the_tick_does_not(ev, monkeypatch):
+    base, serve, env_id, root = ev
+    from datetime import datetime, timezone
+    from server.updater import upgrade as upgrade_service
+    now = datetime.now(timezone.utc)
+
+    def items():
+        return {i["id"]: i for i in upgrade_service.preflight({}, 1000, serve._upgrade_context(), now)}
+    assert "evidence_package_waiting" not in items()
+    job_id = prepare(base).json()["job_id"]
+    wait_done(base, job_id)
+    ctx = serve._upgrade_context()
+    assert ctx["evidence_build_running"] is False and ctx["evidence_package_waiting_until"]
+    waiting = items()["evidence_package_waiting"]
+    until = ctx["evidence_package_waiting_until"][11:16]
+    assert waiting["ok"] is False and f"a package is waiting to be downloaded (until {until} UTC)" in waiting["text"].replace("A package", "a package")
+    assert items()["evidence_build"]["ok"] is True                 # nothing is being built; the tick only looks at that flag
+    monkeypatch.setattr(serve._evidence, "_clock", lambda: time.monotonic() + 10_000)          # the window is over
+    assert serve._evidence.waiting_until() is None and "evidence_package_waiting" not in items()
+
+
+def test_start_up_cleanup_refuses_a_packages_folder_that_is_a_symlink(ev, tmp_path):
+    base, serve, env_id, root = ev
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("not ours")
+    (root / "packages").symlink_to(outside, target_is_directory=True)
+    assert serve._evidence.cleanup_startup() == 0
+    assert (outside / "keep.txt").exists() and "symbolic link" in serve._evidence.startup_skipped

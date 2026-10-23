@@ -48,6 +48,7 @@ class Registry:
         self._lock = threading.Lock()
         self._jobs = {}
         self._timers = set()
+        self.startup_skipped = None
 
     # -- folder ------------------------------------------------------------------------------
     def packages_dir(self):
@@ -73,6 +74,10 @@ class Registry:
         whose window is unknown is not kept). Returns the number of entries removed."""
         base = self.packages_dir()
         removed = 0
+        if os.path.islink(base):
+            # Never follow a link: if the folder itself was replaced by one, nothing behind it is ours to delete.
+            self.startup_skipped = "the packages folder is a symbolic link"
+            return 0
         if os.path.isdir(base):
             for name in os.listdir(base):
                 full = os.path.join(base, name)
@@ -104,6 +109,16 @@ class Registry:
     def running(self):
         with self._lock:
             return any(j["status"] == "running" for j in self._jobs.values())
+
+    def waiting_until(self):
+        """The ISO time (UTC) the latest finished package's download window ends, or None when no package is still in its window.
+        The upgrade preflight uses it: a restart deletes packages."""
+        with self._lock:
+            gone = self._expire_locked()
+            ends = [j["expires_at"] for j in self._jobs.values() if j["status"] == "done"]
+        for g in gone:
+            self._remove_dir(g)
+        return max(ends) if ends else None
 
     def start(self, spec):
         """Registers a new job (status running) and creates its folder. `spec`: environment_id, environment_name, period
