@@ -48,6 +48,7 @@ import create_secret_folders as engine  # noqa: E402
 from server import refresh_jobs as rj  # noqa: E402
 from server.updater import service as update_service  # noqa: E402
 from server.updater import upgrade as upgrade_service  # noqa: E402
+from server.gate_config import SESSION_COOKIE  # noqa: E402
 
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 # 5.47.0: user-saved folder templates and execution records live with the data
@@ -189,6 +190,31 @@ ENV_CHANGE_ACTION_TYPES = (
     "environment.upsert", "environment.share", "environment.delete",
     "sync_schedule.update", "sync.reset_watermark", "sync.import_csv",
     "archive.purge", "shared_permissions.update", "upgrade.settings", "upgrade.request",
+    # 5.53.0: the announcement banner is an org-wide message, so saving it needs a fresh MFA like the rest.
+    "banner.update",
+    # 5.53.0: opening Settings and Updates needs a fresh MFA; the approval only ever creates the unlock (see
+    # SETTINGS_RENEWING_ACTION_TYPES for what may extend it).
+    "settings.unlock",
+    # 5.53.0: reserved name for the evidence package build (its executor ships with that feature). Listed here only so an
+    # approval of this type can be consumed and refused; it never touches the Settings unlock.
+    "evidence_package.build",
+)
+
+# 5.53.0: how long a Settings/Updates unlock lasts after the MFA that opened it. An application constant that matches the
+# identity provider's own 10-minute re-authentication policy by decision; it is not read from the provider (the step-up
+# always forces a fresh sign-in, so the provider asks regardless).
+SETTINGS_UNLOCK_TTL_SECONDS = 10 * 60
+
+# 5.53.0: the action types whose completed approval renews the caller's Settings unlock, because they just passed a fresh
+# MFA for the same user in the same session. An explicit tuple on purpose: a new action type never renews anything until it
+# is added HERE deliberately. `settings.unlock` is not in it (it only creates the window) and neither is
+# `evidence_package.build` (a build approval must never open or extend Settings). The first ten are the
+# ENV_CHANGE_ACTION_TYPES of 5.52.0.
+SETTINGS_RENEWING_ACTION_TYPES = (
+    "environment.upsert", "environment.share", "environment.delete",
+    "sync_schedule.update", "sync.reset_watermark", "sync.import_csv",
+    "archive.purge", "shared_permissions.update", "upgrade.settings", "upgrade.request",
+    "access_control.update", "banner.update",
 )
 
 # The environment form's two secrets never go into pending_admin_actions
@@ -258,6 +284,51 @@ def _request_passed_stepup_location(headers):
     if not isinstance(presented, str):
         return False
     return hmac.compare_digest(presented.encode("utf-8"), NGINX_PROXY_SECRET.encode("utf-8"))
+
+
+def _session_fingerprint(headers):
+    """5.53.0: tells one login session from another for the Settings unlock. sha256 of the gate's opaque session cookie value
+    (first 32 hex characters); this process never parses or trusts the cookie's content, it only hashes the string the gate
+    minted. The session token is minted once per sign-in and not rotated, so the value is stable across the MFA round trip and
+    changes at every sign-out and sign-in. Local mode has no gate and no cookie: "local". None in hosted mode when the cookie
+    is absent or unreadable, which makes every unlock check fail closed."""
+    if not _step_up_required_for_changes():
+        return "local"
+    raw = headers.get("Cookie")
+    if not isinstance(raw, str) or not raw:
+        return None
+    import http.cookies
+    jar = http.cookies.SimpleCookie()
+    try:
+        jar.load(raw)
+    except http.cookies.CookieError:
+        return None
+    morsel = jar.get(SESSION_COOKIE)
+    if morsel is None or not morsel.value:
+        return None
+    return hashlib.sha256(morsel.value.encode("utf-8", "replace")).hexdigest()[:32]
+
+
+LOCAL_MODE_NOTICE = (
+    "No MFA in local mode. This computer runs the wizard without a login gate or identity provider, so Settings and "
+    "Updates open without a second factor. Anyone who can use this computer as you can change these settings. Each "
+    "opening is recorded in the Audit Log."
+)
+SETTINGS_AREAS = ("settings", "updates")
+LOCAL_ACCESS_AUDIT_INTERVAL_SECONDS = 10 * 60
+_local_access_logged = {}  # area -> time.monotonic() of the last audit entry in this process
+_local_access_lock = threading.Lock()
+
+
+def _local_access_due(area):
+    """True at most once per area per 10 minutes per process (the first opening, then one line per window)."""
+    now = time.monotonic()
+    with _local_access_lock:
+        last = _local_access_logged.get(area)
+        if last is not None and now - last < LOCAL_ACCESS_AUDIT_INTERVAL_SECONDS:
+            return False
+        _local_access_logged[area] = now
+        return True
 
 
 def _shared_permission_message(capability):
@@ -2094,7 +2165,11 @@ class StrictBindHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = os.name != "nt"
 
 
-def _public_entry(environment_id, name, meta, requesting_owner):
+# 5.53.0: the entry fields only the Settings unlock may read (see GET /api/settings/environments).
+ENV_CONFIG_FIELDS = ("base_domain", "team_name", "key_id", "okta_url", "has_okta_token", "sync_schedule")
+
+
+def _public_entry(environment_id, name, meta, requesting_owner, full=True):
     """Non-secret fields only -- key_secret/okta_api_token never leave the
     keychain, let alone reach the browser. `requesting_owner` is the
     engine-layer owner (see _engine_owner) of whoever is asking, used only
@@ -2108,18 +2183,22 @@ def _public_entry(environment_id, name, meta, requesting_owner):
     engine.list_all_environments()/list_environments_for(), or inside
     meta["environment_id"] since list_environments_for now includes it),
     so this just takes it as an explicit parameter instead."""
-    return {
+    entry = {
         "id": environment_id,
         "name": name,
-        "base_domain": meta.get("base_domain", ""),
-        "team_name": meta.get("team_name", ""),
-        "key_id": meta.get("key_id", ""),
-        "okta_url": meta.get("okta_url", ""),
-        "has_okta_token": bool(engine.keyring_get(environment_id, "okta_api_token")),
         "shared": bool(meta.get("shared", False)),
         "is_own": meta.get("owner") == requesting_owner,
-        "sync_schedule": meta.get("sync_schedule", dict(engine.SYNC_SCHEDULE_DEFAULTS)),
     }
+    if full:  # 5.53.0: the configuration fields are for the Settings unlock only (ENV_CONFIG_FIELDS)
+        entry.update({
+            "base_domain": meta.get("base_domain", ""),
+            "team_name": meta.get("team_name", ""),
+            "key_id": meta.get("key_id", ""),
+            "okta_url": meta.get("okta_url", ""),
+            "has_okta_token": bool(engine.keyring_get(environment_id, "okta_api_token")),
+            "sync_schedule": meta.get("sync_schedule", dict(engine.SYNC_SCHEDULE_DEFAULTS)),
+        })
+    return entry
 
 
 def activate_environment(owner_key, name, environment_id=None):
@@ -2318,6 +2397,9 @@ _ENV_CHANGE_EXECUTORS = {
     "shared_permissions.update": "_exec_shared_permissions_update",
     "upgrade.settings": "_exec_upgrade_settings_update",
     "upgrade.request": "_exec_upgrade_request",
+    "banner.update": "_exec_banner_update",
+    "settings.unlock": "_exec_settings_unlock",
+    "evidence_package.build": "_exec_evidence_package_build",
 }
 assert set(_ENV_CHANGE_EXECUTORS) == set(ENV_CHANGE_ACTION_TYPES)
 
@@ -2365,6 +2447,9 @@ class Handler(SimpleHTTPRequestHandler):
         issuer = _issuer_from_headers(self.headers)
         if issuer:
             details = {**(details or {}), "actor_issuer": issuer}
+        if getattr(self, "_settings_unlock_renewed", False):
+            # 5.53.0: this write's own MFA also restarted the Settings unlock.
+            details = {**(details or {}), "settings_unlock_renewed": True}
         return engine.log_audit_event(
             actor_email, actor_sub, action, details,
             client_ip=self._request_client_ip(),
@@ -3015,6 +3100,179 @@ class Handler(SimpleHTTPRequestHandler):
         self._log_audit_event(actor_email, actor_sub, "archive.purge", details)
         return 200, {"purged": archive_id, **counts}
 
+    def _environments_response(self, owner_key, engine_owner, local_env_name, local_env_id, full):
+        """The environment list. full=False (GET /api/environments, every signed-in user): names, ids, permissions. full=True
+        (GET /api/settings/environments, behind the Settings unlock): the configuration fields as well."""
+        is_admin = _is_admin_from_headers(self.headers)
+        if is_admin:
+            # Admins see EVERY stored environment, not just their
+            # own/shared ones -- list_all_environments() (added for
+            # the scheduler, see its own docstring) returns
+            # {environment_id: meta} across every owner.
+            #
+            # SECURITY FIX (external review, 2026-09-30): this used
+            # to unpack storage_key into a bare display name and
+            # collapse into visible[disp_name] = meta -- if two
+            # different owners each had an environment named "dev",
+            # the second one silently overwrote the first in this
+            # dict, so an admin never even SAW both, let alone
+            # could act on the right one. Now keeps every entry by
+            # its real id (unambiguous), and passes each one's TRUE
+            # display name (meta["name"], not a shared dict key)
+            # into _public_entry -- two same-named environments
+            # from different owners both survive to the response,
+            # each with its own unique `id` (see _public_entry).
+            envs = [
+                _public_entry(environment_id, meta.get("name"), meta, engine_owner, full=full)
+                for environment_id, meta in engine.list_all_environments().items()
+            ]
+        else:
+            envs = [_public_entry(m["environment_id"], n, m, engine_owner, full=full) for n, m in engine.list_environments_for(engine_owner).items()]
+        # UI-07 (external review, 2026-10-05), additive: every
+        # name-keyed route (activate, sync, reports) acts on whatever
+        # the NAME resolves to for this caller -- `addressable` says
+        # whether that is this very row, and `active_id` lets the UI
+        # mark the active row by id. Admins see other owners' rows
+        # (and shared rows their own same-named environment hides);
+        # those are not addressable by name.
+        resolves_to = {n: m["environment_id"] for n, m in engine.list_environments_for(engine_owner).items()}
+        # 5.42.0: what THIS caller may do with each row (the same
+        # resolution the routes enforce) -- the UI only mirrors it.
+        # An owner's own rows are always "allow" (source "owner").
+        # Admins also get each row's stored overrides, for the
+        # per-environment editor.
+        defaults = engine.get_shared_permission_defaults()
+        can_admin = _can_admin(owner_key, self.headers)
+        for entry in envs:
+            entry["addressable"] = resolves_to.get(entry["name"]) == entry["id"]
+            if not entry["addressable"]:
+                # Not what this caller's by-name routes reach (another
+                # owner's private row, or one hidden by the caller's
+                # own same-named environment): nothing to say.
+                pass
+            elif entry["is_own"]:
+                entry["permissions"] = {k: {"value": "allow", "source": "owner"} for k in engine.SHARED_CAPABILITY_KEYS}
+            else:
+                entry["permissions"] = engine.effective_shared_permissions(
+                    entry["id"], defaults=defaults,
+                    caller_issuer=_issuer_from_headers(self.headers), caller_subject=engine_owner)
+            if can_admin and full:
+                entry["permission_overrides"] = engine.get_shared_permission_overrides(entry["id"])
+        return {"environments": envs, "active": local_env_name, "active_id": local_env_id}
+
+    def _exec_banner_update(self, params, dry_run, via_step_up):
+        """5.53.0: the org-wide announcement banner. Admin-only; in hosted mode it needs a fresh MFA approval like every other
+        configuration change (a stolen admin session could otherwise post a message to every user)."""
+        owner_key, _e, actor_email, actor_sub = self._caller()
+        if not _can_admin(owner_key, self.headers):
+            return 403, {"error": "Admin access required to change the announcement banner."}
+        payload = params.get("body") or {}
+        message = payload.get("message", "")
+        if not isinstance(message, str):
+            return 400, {"error": "message must be a string"}
+        if payload.get("variant", "warning") not in engine.BANNER_VARIANTS:
+            return 400, {"error": f"variant must be one of {', '.join(engine.BANNER_VARIANTS)}"}
+        if payload.get("enabled", False) and not message.strip():
+            return 400, {"error": "message is required when the banner is enabled"}
+        if dry_run:
+            return None, None
+        config = engine.set_banner_config(
+            payload.get("enabled", False), message, payload.get("variant", "warning"), payload.get("dismissible", True),
+        )
+        self._log_audit_event(actor_email, actor_sub, "banner.update", {**config, **({"step_up_verified": True} if via_step_up else {})})
+        return 200, config
+
+    def _exec_evidence_package_build(self, params, dry_run, via_step_up):
+        """5.53.0: the name is registered so its approval can be consumed and refused; the build itself is a later work
+        package. Nothing prepares this action yet, and it never touches the Settings unlock."""
+        return 501, {"error": "Evidence packages are not available in this build.", "reason": "not_available"}
+
+    def _unlock_identity(self):
+        """(actor_sub, issuer, session fingerprint) of this request for the Settings unlock; sub or fingerprint may be None."""
+        _owner_key, _e, _em, actor_sub = self._caller()
+        return actor_sub, _issuer_from_headers(self.headers) or "", _session_fingerprint(self.headers)
+
+    def _exec_settings_unlock(self, params, dry_run, via_step_up):
+        """5.53.0: opens Settings and Updates for this user, this gate and this login session for SETTINGS_UNLOCK_TTL_SECONDS.
+        Per user, never a privilege (it checks no admin right: every protected route keeps its own). It changes no setting.
+        Local mode has no MFA: it answers at once and records nothing."""
+        if not _step_up_required_for_changes():
+            return 200, {"mode": "local", "mfa": False}
+        import audit_store
+        actor_sub, issuer, fingerprint = self._unlock_identity()
+        if not actor_sub or not fingerprint:
+            return 403, {"error": "Could not tell which sign-in session this is. Sign in again.", "reason": "no_session"}
+        if dry_run:
+            return None, None
+        if params.get("session") != fingerprint:
+            return 409, {"error": "You signed in again while approving. Nothing was unlocked; start again.",
+                         "reason": "session_changed"}
+        action_id = self.headers.get("X-Auth-Action-Id") or ""
+        unlocked_at, expires_at = audit_store.upsert_settings_unlock(
+            actor_sub, issuer, fingerprint, action_id, SETTINGS_UNLOCK_TTL_SECONDS)
+        _o, _e, actor_email, _s = self._caller()
+        self._log_audit_event(actor_email, actor_sub, "settings.unlocked", {
+            "scope": "settings", "unlocked_until": expires_at, "ttl_seconds": SETTINGS_UNLOCK_TTL_SECONDS,
+            "step_up_verified": True, "action_id": action_id})
+        return 200, {"unlocked_until": expires_at, "seconds_left": SETTINGS_UNLOCK_TTL_SECONDS}
+
+    def _require_settings_unlock(self):
+        """5.53.0: True when this request may read Settings or Updates; otherwise answers 403 settings_locked and returns
+        False. Call it AFTER the route's own admin or owner check (a non-admin keeps the admin message) and BEFORE reading any
+        data. Local mode has no MFA and always passes. Branches on the process-level mode only, never on a header."""
+        if not _step_up_required_for_changes():
+            return True
+        import audit_store
+        actor_sub, issuer, fingerprint = self._unlock_identity()
+        if actor_sub and fingerprint:
+            expired = audit_store.take_expired_settings_unlock(actor_sub, issuer, fingerprint)
+            if expired:  # the first refused request after expiry records it, once (the row is deleted atomically)
+                _o, _e, actor_email, _s = self._caller()
+                self._log_audit_event(actor_email, actor_sub, "settings.locked", {
+                    "reason": "expired", "unlocked_at": expired["unlocked_at"], "expired_at": expired["expires_at"]})
+            if audit_store.settings_unlock_active(actor_sub, issuer, fingerprint):
+                return True
+        self._send_json(403, {"error": "Unlock Settings with MFA to view this.", "step_up_required": True,
+                              "scope": "settings", "reason": "settings_locked"})
+        return False
+
+    def _renew_settings_unlock_after_mfa(self, actor_sub, action_type, action_id):
+        """5.53.0: called right after a pending approval was consumed. Only the action types in
+        SETTINGS_RENEWING_ACTION_TYPES restart the caller's unlock (an upsert, so a save after expiry opens it again); any
+        other type, `settings.unlock` and `evidence_package.build` included, never creates or extends it. Returns whether it
+        renewed. Hosted mode only; fails closed without a subject or a session fingerprint."""
+        if action_type not in SETTINGS_RENEWING_ACTION_TYPES or not _step_up_required_for_changes():
+            return False
+        import audit_store
+        _sub, issuer, fingerprint = self._unlock_identity()
+        if not actor_sub or not fingerprint:
+            return False
+        audit_store.renew_settings_unlock(actor_sub, issuer, fingerprint, action_id or "", SETTINGS_UNLOCK_TTL_SECONDS)
+        return True
+
+    def _settings_status(self, qs):
+        """GET /api/settings/status: the countdown and mode for the UI. Writes nothing in hosted mode."""
+        area = (qs.get("area") or [""])[0]
+        if not _step_up_required_for_changes():
+            if area in SETTINGS_AREAS and _local_access_due(area):
+                _o, _e, actor_email, actor_sub = self._caller()
+                self._log_audit_event(actor_email, actor_sub, "settings.access_without_mfa_local",
+                                      {"area": area, "mode": "local", "mfa": False})
+            return {"mode": "local", "mfa": False, "unlocked": True, "unlocked_until": None, "seconds_left": 0,
+                    "local_notice": LOCAL_MODE_NOTICE}
+        import audit_store
+        actor_sub, issuer, fingerprint = self._unlock_identity()
+        row = audit_store.settings_unlock_active(actor_sub, issuer, fingerprint) if actor_sub and fingerprint else None
+        left = 0
+        if row:
+            try:
+                expires = datetime.strptime(row["expires_at"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+                left = max(0, int((expires - datetime.now(timezone.utc)).total_seconds()))
+            except ValueError:
+                row = None
+        return {"mode": "hosted", "mfa": True, "unlocked": bool(row), "unlocked_until": row["expires_at"] if row else None,
+                "seconds_left": left if row else 0, "local_notice": None}
+
     def _exec_upgrade_settings_update(self, params, dry_run, via_step_up):
         """5.46.0: the update check's frequency (daily / manual / off) and the share-version
         switch. Admin-only; in hosted mode it needs a fresh MFA approval like every other
@@ -3544,62 +3802,19 @@ class Handler(SimpleHTTPRequestHandler):
                 })
 
             if path == "/api/environments":
-                is_admin = _is_admin_from_headers(self.headers)
-                if is_admin:
-                    # Admins see EVERY stored environment, not just their
-                    # own/shared ones -- list_all_environments() (added for
-                    # the scheduler, see its own docstring) returns
-                    # {environment_id: meta} across every owner.
-                    #
-                    # SECURITY FIX (external review, 2026-09-30): this used
-                    # to unpack storage_key into a bare display name and
-                    # collapse into visible[disp_name] = meta -- if two
-                    # different owners each had an environment named "dev",
-                    # the second one silently overwrote the first in this
-                    # dict, so an admin never even SAW both, let alone
-                    # could act on the right one. Now keeps every entry by
-                    # its real id (unambiguous), and passes each one's TRUE
-                    # display name (meta["name"], not a shared dict key)
-                    # into _public_entry -- two same-named environments
-                    # from different owners both survive to the response,
-                    # each with its own unique `id` (see _public_entry).
-                    envs = [
-                        _public_entry(environment_id, meta.get("name"), meta, engine_owner)
-                        for environment_id, meta in engine.list_all_environments().items()
-                    ]
-                else:
-                    envs = [_public_entry(m["environment_id"], n, m, engine_owner) for n, m in engine.list_environments_for(engine_owner).items()]
-                # UI-07 (external review, 2026-10-05), additive: every
-                # name-keyed route (activate, sync, reports) acts on whatever
-                # the NAME resolves to for this caller -- `addressable` says
-                # whether that is this very row, and `active_id` lets the UI
-                # mark the active row by id. Admins see other owners' rows
-                # (and shared rows their own same-named environment hides);
-                # those are not addressable by name.
-                resolves_to = {n: m["environment_id"] for n, m in engine.list_environments_for(engine_owner).items()}
-                # 5.42.0: what THIS caller may do with each row (the same
-                # resolution the routes enforce) -- the UI only mirrors it.
-                # An owner's own rows are always "allow" (source "owner").
-                # Admins also get each row's stored overrides, for the
-                # per-environment editor.
-                defaults = engine.get_shared_permission_defaults()
-                can_admin = _can_admin(owner_key, self.headers)
-                for entry in envs:
-                    entry["addressable"] = resolves_to.get(entry["name"]) == entry["id"]
-                    if not entry["addressable"]:
-                        # Not what this caller's by-name routes reach (another
-                        # owner's private row, or one hidden by the caller's
-                        # own same-named environment): nothing to say.
-                        pass
-                    elif entry["is_own"]:
-                        entry["permissions"] = {k: {"value": "allow", "source": "owner"} for k in engine.SHARED_CAPABILITY_KEYS}
-                    else:
-                        entry["permissions"] = engine.effective_shared_permissions(
-                            entry["id"], defaults=defaults,
-                            caller_issuer=_issuer_from_headers(self.headers), caller_subject=engine_owner)
-                    if can_admin:
-                        entry["permission_overrides"] = engine.get_shared_permission_overrides(entry["id"])
-                return self._send_json(200, {"environments": envs, "active": local_env_name, "active_id": local_env_id})
+                # 5.53.0: the list every screen uses to switch environments carries names, ids and permissions only. The
+                # OPA domain, team, key id, Okta URL, token flag and sync schedule are read from /api/settings/environments
+                # after the MFA unlock.
+                return self._send_json(200, self._environments_response(owner_key, engine_owner, local_env_name, local_env_id, full=False))
+
+            if path == "/api/settings/status":
+                return self._send_json(200, self._settings_status(qs))
+
+            if path == "/api/settings/environments":
+                # 5.53.0: today's full environment entries (no secrets), same owner/admin scoping, behind the unlock.
+                if not self._require_settings_unlock():
+                    return
+                return self._send_json(200, self._environments_response(owner_key, engine_owner, local_env_name, local_env_id, full=True))
 
             if path == "/api/banner":
                 # No client/auth requirement -- this has to render even
@@ -3788,6 +4003,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # /api/audit_log -- these rows belong to no owner any more.
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to list orphaned archives."})
+                if not self._require_settings_unlock():
+                    return
                 import audit_store
                 return self._send_json(200, {"archives": audit_store.list_orphaned_archives()})
 
@@ -4149,6 +4366,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # is out of date is for the people who operate it.
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to view update status."})
+                if not self._require_settings_unlock():
+                    return
                 body = update_service.status(update_service.load(), engine.SCRIPT_VERSION)
                 body["upgrade_run"] = update_service.upgrade_run()  # 5.47.0: the root-owned updater's current/last run
                 body["upgrade"] = self._upgrade_view(qs)  # 5.48.0: everything the in-app flow shows
@@ -4157,7 +4376,16 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/upgrade/notice":
                 # 5.48.0: the one-line banner (any signed-in user): an upgrade is scheduled / running / failed; only admins
                 # are told that one is merely available.
-                return self._send_json(200, upgrade_service.notice(engine.SCRIPT_VERSION, _can_admin(owner_key, self.headers)))
+                is_admin_caller = _can_admin(owner_key, self.headers)
+                notice_body = upgrade_service.notice(engine.SCRIPT_VERSION, is_admin_caller)
+                if is_admin_caller:
+                    # 5.53.0: what the badge, the revocation banner and the progress card need while Updates is locked.
+                    # Never settings, keys or backups; those stay behind the unlock.
+                    st = update_service.status(update_service.load(), engine.SCRIPT_VERSION)
+                    notice_body = {**notice_body,
+                                   "update_available": (st["latest"] or {}).get("version") if st["check"]["enabled"] and st["update_available"] else None,
+                                   "revocation": st["revocation"], "run": upgrade_service.run_view()}
+                return self._send_json(200, notice_body)
 
             if path == "/api/upgrade/bundle":
                 # 5.47.0: download a redacted support bundle the updater built after a failed upgrade (the failed
@@ -4165,6 +4393,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # secrets, tenant data or personal data (see docs and ocw_bundle.py), and is never uploaded anywhere.
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to download a support bundle."})
+                if not self._require_settings_unlock():
+                    return
                 name = (qs.get("name") or [""])[0]
                 code, data = update_service.read_bundle(name)
                 if code != 200:
@@ -4207,6 +4437,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # operator exempt), same rule as /api/access_control.
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to view shared-environment permissions."})
+                if not self._require_settings_unlock():
+                    return
                 defaults = engine.get_shared_permission_defaults()
                 return self._send_json(200, {
                     "capabilities": [dict(c) for c in engine.SHARED_CAPABILITIES],
@@ -4231,6 +4463,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # legitimate reason to see (let alone change) them.
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to view access control settings."})
+                if not self._require_settings_unlock():
+                    return
                 return self._send_json(200, engine.get_access_control_config())
         except engine.CredentialStoreUnavailable as exc:
             return self._send_json(503, {"error": str(exc)})
@@ -4268,21 +4502,26 @@ class Handler(SimpleHTTPRequestHandler):
             payload = self._read_json_body()
 
             if path == "/api/banner":
-                # SECURITY FIX (external review, 2026-09-30): this had NO
-                # admin check at all -- confirmed exploitable: any
-                # authenticated user could publish/modify/disable the
-                # org-wide announcement banner. Same check every other
-                # admin-only write in this file already uses.
+                # SECURITY FIX (external review, 2026-09-30): this had NO admin check at all. 5.53.0: the save is also an
+                # org-wide message to every user, so in hosted mode it needs a fresh MFA approval (banner.update).
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to change the announcement banner."})
-                config = engine.set_banner_config(
-                    payload.get("enabled", False),
-                    payload.get("message", ""),
-                    payload.get("variant", "warning"),
-                    payload.get("dismissible", True),
-                )
-                self._log_audit_event(actor_email, actor_sub, "banner.update", config)
-                return self._send_json(200, config)
+                return self._environment_change("banner.update", {"body": payload})
+
+            if path == "/api/settings/unlock":
+                # 5.53.0: asks for the MFA that opens Settings and Updates (202 in hosted mode; local mode answers at once).
+                return self._environment_change("settings.unlock", {"scope": "settings", "session": _session_fingerprint(self.headers)})
+
+            if path == "/api/settings/lock":
+                # 5.53.0: ends the caller's own window now. Changes nothing else.
+                if _step_up_required_for_changes():
+                    import audit_store
+                    actor_sub_, issuer_, fingerprint_ = self._unlock_identity()
+                    gone = audit_store.delete_settings_unlock(actor_sub_, issuer_, fingerprint_) if actor_sub_ and fingerprint_ else None
+                    if gone:
+                        self._log_audit_event(actor_email, actor_sub, "settings.locked", {
+                            "reason": "manual", "unlocked_at": gone["unlocked_at"], "expired_at": gone["expires_at"]})
+                return self._send_json(200, {"locked": True})
 
             if path == "/api/upgrade/settings":
                 # 5.46.0: switch the update check on/off and choose whether it
@@ -4299,6 +4538,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # against the pinned keys and run the preflight. No install, no step-up: it is a read.
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to review an update."})
+                if not self._require_settings_unlock():
+                    return
                 status, body = self._upgrade_preview(actor_email, actor_sub)
                 return self._send_json(status, body)
 
@@ -4314,6 +4555,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # installs anything), admin-only, at most once a minute, recorded in the audit log.
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to check for updates."})
+                if not self._require_settings_unlock():
+                    return
                 status, body = update_service.check_now(engine.SCRIPT_VERSION, actor_email, actor_sub)
                 return self._send_json(status, body)
 
@@ -4379,6 +4622,7 @@ class Handler(SimpleHTTPRequestHandler):
                 except audit_store.PendingActionError as exc:
                     status = 409 if exc.reason in ("already_consumed", "expired") else 403
                     return self._send_json(status, {"error": f"Could not apply this change ({exc.reason}) -- please try again.", "reason": exc.reason})
+                renewed = self._renew_settings_unlock_after_mfa(actor_sub, "access_control.update", action_id)
                 config = engine.set_access_control_config(
                     config["admin_group_id"], config["user_group_id"], config["restrict_login"]
                 )
@@ -4398,6 +4642,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # Log page's Refresh button (backfill_mfa_log_events) still
                 # fills this field in asynchronously after the fact.
                 details = {**config, "step_up_verified": True, "okta_mfa_log_event": None}
+                if renewed:
+                    details["settings_unlock_renewed"] = True
                 audit_entry = self._log_audit_event(actor_email, actor_sub, "access_control.update", details)
                 # Phase 10: step_up_verified/saved_at are returned to the
                 # CALLER too, not just logged -- previously these only
@@ -4457,7 +4703,11 @@ class Handler(SimpleHTTPRequestHandler):
                             "reason": "secrets_expired", "action": action,
                         })
                     params = {**params, "body": {**(params.get("body") or {}), **held}}
-                status, body = getattr(self, _ENV_CHANGE_EXECUTORS[action])(params, dry_run=False, via_step_up=True)
+                self._settings_unlock_renewed = self._renew_settings_unlock_after_mfa(actor_sub, action, action_id)
+                try:
+                    status, body = getattr(self, _ENV_CHANGE_EXECUTORS[action])(params, dry_run=False, via_step_up=True)
+                finally:
+                    self._settings_unlock_renewed = False
                 body = {**(body or {}), "action": action}
                 if 200 <= status < 300:
                     body["step_up_verified"] = True
