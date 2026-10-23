@@ -21,6 +21,7 @@ import re
 import stat
 import sys
 import zipfile
+from datetime import datetime, timedelta, timezone
 
 FORMAT = 1
 SNAPSHOT_SOURCE_PREFIX = "snapshot:"
@@ -49,7 +50,7 @@ NOT_PROVED = (
     "the archive's chain as it stood when the package was built, and that chain links from its first record to its recorded head.\n"
     "It does not prove who produced the events, that the archive was never altered by someone who could rewrite it, or that\n"
     "events.ndjson holds every event of the period. The hashes are unkeyed and the package is not signed. The operator's\n"
-    "server-side build log is the independent record."
+    "server-side build log is the independent record. The seal dates in chain/seals.ndjson are outside every hash."
 )
 
 
@@ -68,6 +69,43 @@ class Report:
 
 def sha256_hex(data):
     return hashlib.sha256(data).hexdigest()
+
+
+# --- canonical published time (the same function as audit_store._canonical_published) ---
+
+_ISO_TIMESTAMP_RE = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})[T ](?P<time>\d{2}:\d{2}:\d{2})(?:\.(?P<frac>\d{1,9}))?"
+    r"(?P<tz>Z|z|[+-]\d{2}:?\d{2})?$",
+    re.ASCII,
+)
+
+
+def _iso_ms(dt):
+    dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (dt.microsecond // 1000)
+
+
+def canonical_published(value):
+    """YYYY-MM-DDTHH:MM:SS.mmmZ (UTC) for any ISO-8601-ish text, or None when it does not parse."""
+    if value is None:
+        return None
+    try:
+        text = str(value).strip()
+        m = _ISO_TIMESTAMP_RE.match(text)
+        if not m:
+            return None
+        frac = (m.group("frac") or "0")[:6].ljust(6, "0")
+        tz = m.group("tz")
+        if not tz or tz in ("Z", "z"):
+            tzinfo = timezone.utc
+        else:
+            sign = 1 if tz[0] == "+" else -1
+            digits = tz[1:].replace(":", "")
+            tzinfo = timezone(sign * timedelta(hours=int(digits[:2]), minutes=int(digits[2:])))
+        dt = datetime.strptime("%sT%s.%s" % (m.group("date"), m.group("time"), frac), "%Y-%m-%dT%H:%M:%S.%f").replace(tzinfo=tzinfo)
+        return _iso_ms(dt)
+    except (ValueError, OverflowError):
+        return None
 
 
 # --- the three hash formulas of format v1 (docs/evidence-package-format.md) ---
@@ -428,6 +466,9 @@ def load_seals(zf, by_name, by_id, period_ids, period, report):
                 report.fail("manifest %s: its sealed entries do not recompute to its content hash" % mid)
                 return None, None
             for (uuid, sha), pub in zip(pairs_in_order, rec["published"]):
+                if canonical_published(pub) != pub:
+                    report.fail("manifest %s has a seal date that is not in canonical form" % mid)
+                    return None, None
                 uuid_seals.setdefault(uuid, []).append((mid, sha))
                 if mid in period_ids and period["start"] <= pub[:10] <= period["end"]:
                     in_period_entries.append((uuid, pub))
@@ -468,9 +509,9 @@ def check_events(zf, by_name, uuid_seals, curated_types, lenient_curated, report
                 report.fail("events.ndjson holds event %s twice" % uuid)
                 return None, None
             uuids.add(uuid)
-            published = event.get("published")
-            if not isinstance(published, str):
-                report.fail("events.ndjson line %d has no published time" % n)
+            published = canonical_published(event.get("published"))
+            if published is None:
+                report.fail("events.ndjson line %d has a missing or unreadable published time" % n)
                 return None, None
             key = (published, uuid)
             if prev_key is not None and key < prev_key:
@@ -620,6 +661,9 @@ def verify(path, out):
                         if ordinary(by_id[mid]) and mid not in seal_info["sealed_ids"]:
                             report.fail("manifest %s holds events of the period but has no line in chain/seals.ndjson" % mid)
                     lenient = any(not ordinary(by_id[m]) and not by_id[m]["source"].startswith(SNAPSHOT_SOURCE_PREFIX) for m in period_ids)
+                    if lenient:
+                        report.info("  Note: the period's manifests include a legacy or entries_json manifest, which carries no "
+                                    "seal in this package; curated events without a seal are counted as not verified, not failed.")
                     uuids, counts = check_events(zf, by_name, uuid_seals, set(manifest["curated_event_types"]), lenient, report)
                     if uuids is not None:
                         gone = [u for u, _p in seal_info["in_period_entries"] if u not in uuids]

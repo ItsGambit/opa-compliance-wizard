@@ -19,7 +19,7 @@ In short: the verifier detects accidental or partial change to the package, and 
 
 - **Not signed, unkeyed hashes.** Anyone who can rewrite the whole package, or the archive it was built from, and recompute every hash can produce a package that verifies. Nothing in the package proves who built it.
 - It does not prove who produced the events, or that the archive was never altered by someone who could rewrite it.
-- It does not prove that `events.ndjson` holds every event of the period. The completeness statement (`completeness.json`) is the builder's own statement.
+- It does not prove that `events.ndjson` holds every event of the period. The `published` dates in `chain/seals.ndjson` are outside every hash, so a builder could misstate them and hide a missing event. The completeness statement (`completeness.json`) is the builder's own statement.
 - Only events the archive sealed are checked against a seal. These are not verified, and the verifier lists their counts by name every time:
   - events with no seal in the package (rows the archive does not content-seal, for example events outside the curated set, and rows removed by retention);
   - **legacy v1 manifests**: written before content sealing began, they record identifiers only;
@@ -91,7 +91,7 @@ Entries are ASCII names built from fixed keys. Order in the zip is as listed; th
 
 ### events.ndjson
 
-Ordered by `published` ascending, ties by `uuid` ascending (the verifier fails otherwise). One line per event, UTF-8, each line is the event's stored `raw_json` byte for byte, terminated by a single `\n` (including the last line). Each event is a JSON object with a string `uuid`. A uuid appears once.
+Ordered by canonical `published` time ascending, ties by `uuid` ascending (the verifier fails otherwise). The canonical form is `YYYY-MM-DDTHH:MM:SS.mmmZ` in UTC, derived from the event's `published` text by the archive's rule (space or `T`, 0 to 9 fractional digits, `Z`, an offset or no zone meaning UTC); the verifier carries the same function. An event whose `published` does not canonicalise fails. One line per event, UTF-8, each line is the event's stored `raw_json` byte for byte, terminated by a single `\n` (including the last line). Each event is a JSON object with a string `uuid`. A uuid appears once.
 
 ### chain/manifests.ndjson
 
@@ -103,7 +103,7 @@ A manifest whose `source` starts with `snapshot:` is a snapshot manifest.
 
 ### chain/seals.ndjson
 
-One object per line: `{"manifest_id": 7, "entries": ["<event uuid>:<content hash>", ...], "published": ["<published time of each entry's event>", ...]}`. `entries` are all of the manifest's curated rows (sorted); `published` is parallel to `entries` (same length and order) and lets the verifier tell an entry dated inside the period from one outside it. A seal line is present for every manifest in `period_manifest_ids` that is ordinary: sealed (v2), not a snapshot and not `entries_json`. Lines for legacy, snapshot and `entries_json` manifests are ignored and counted as not verified.
+One object per line: `{"manifest_id": 7, "entries": ["<event uuid>:<content hash>", ...], "published": ["<published time of each entry's event>", ...]}`. `entries` are all of the manifest's curated rows (sorted); `published` is parallel to `entries` (same length and order), written in the archive's canonical form (`YYYY-MM-DDTHH:MM:SS.mmmZ`, UTC). It is outside every hash; the verifier uses it only to decide whether a sealed event that is missing from `events.ndjson` fell inside the period, so it is a statement by the builder, not something the archive sealed. A seal line is present for every manifest in `period_manifest_ids` that is ordinary: sealed (v2), not a snapshot and not `entries_json`. Lines for legacy, snapshot and `entries_json` manifests are ignored and counted as not verified.
 
 ### The `event_uuid` column contract for report CSVs
 

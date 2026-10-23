@@ -161,7 +161,7 @@ def pack(path, *, scope_curated_only=False):
             ordered = sorted(entries, key=lambda e: "%s:%s" % e)
             seal_lines.append(json.dumps({
                 "manifest_id": m["id"], "entries": ["%s:%s" % e for e in ordered],
-                "published": [published_of.get(u) or conn.execute(
+                "published": [conn.execute(
                     "SELECT published FROM events WHERE uuid = ?", (u,)).fetchone()[0] for u, _s in ordered]}))
         elif not m["entry_hash"] or (m["entries_json"] is not None and any(u in in_events for u, _s in entries)):
             period_ids.append(m["id"])  # may hold events of the period; its rows stay "not verified"
@@ -518,7 +518,7 @@ def test_verifier_imports_only_the_standard_library():
             names.update(a.name.split(".")[0] for a in node.names)
         elif isinstance(node, ast.ImportFrom):
             names.add((node.module or "").split(".")[0])
-    assert names <= {"csv", "hashlib", "io", "json", "os", "re", "stat", "sys", "zipfile"}
+    assert names <= {"csv", "datetime", "hashlib", "io", "json", "os", "re", "stat", "sys", "zipfile"}
 
 
 def test_report_wording_has_no_forbidden_claims_and_says_what_pass_does_not_prove(good_zip, tmp_path):
@@ -630,3 +630,36 @@ def test_report_prints_the_chain_head_and_points_to_the_build_log(good_zip, tmp_
         head = json.loads(zf.read("package-manifest.json"))["chain_head"]
     assert "Chain head: " + head in out
     assert "server-side build log" in out and "only independent record" in out
+
+
+CANONICAL_INPUTS = [
+    "2026-01-02T03:04:05.678Z", "2026-01-02 03:04:05.678Z", "2026-01-02T03:04:05Z", "2026-01-02T03:04:05.1Z",
+    "2026-01-02T03:04:05.123456Z", "2026-01-02T03:04:05.123456789Z", "2026-01-02T03:04:05.999999999Z",
+    "2026-01-02T03:04:05.678+02:00", "2026-01-02T03:04:05.678-05:30", "2026-01-02T03:04:05+0200", "2026-01-02 03:04:05",
+    "2026-01-02T03:04:05z", "  2026-01-02T03:04:05Z ", "2026-13-02T03:04:05Z", "2026-01-02T03:04:05+24:00",
+    "0001-01-01T00:00:00+05:00", "9999-12-31T23:59:59-05:00", "garbage", "", None, 12345,
+    "\u0662026-01-02T03:04:05Z",
+]
+
+
+@pytest.mark.parametrize("value", CANONICAL_INPUTS, ids=[repr(v) for v in CANONICAL_INPUTS])
+def test_verifier_canonical_published_equals_the_archives(value):
+    assert vep.canonical_published(value) == audit_store._canonical_published(value)
+
+
+def test_noncanonical_raw_published_is_ordered_by_its_canonical_form(good_zip, tmp_path):
+    """A raw published written with a space and an offset is ordered by its canonical time, not its text."""
+    def edit_events(data):
+        lines = data.splitlines(True)
+        first = json.loads(lines[0])
+        first["published"] = first["published"].replace("T", " ").replace("Z", "+00:00")
+        lines[0] = json.dumps(first, separators=(",", ":")).encode() + b"\n"
+        return b"".join(lines)
+    last = _rewrite_with_manifest(good_zip, tmp_path, {"events.ndjson": edit_events})
+    assert "not ordered" not in last  # order passes; the edited event then fails its seal
+    assert "sealed hash" in last
+
+
+def test_event_with_unreadable_published_fails(good_zip, tmp_path):
+    last = _rewrite_with_manifest(good_zip, tmp_path, {"events.ndjson": lambda d: d.replace(b'"published":"', b'"published":"x', 1)})
+    assert "unreadable published" in last
