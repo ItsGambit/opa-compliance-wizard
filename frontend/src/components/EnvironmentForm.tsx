@@ -16,7 +16,7 @@ interface Props {
 }
 
 const EMPTY: EnvironmentFormValues = {
-  name: '', base_domain: '', team_name: '', key_id: '', key_secret: '', okta_url: '', okta_api_token: '',
+  name: '', base_domain: '', team_name: '', key_id: '', key_secret: '', okta_url: '', okta_api_token: '', evidence_builders: 'owner',
 }
 
 /** Callers key this form by the environment being edited, so switching rows
@@ -94,6 +94,24 @@ export function EnvironmentForm({ initial, draft, submitLabel, onSubmit, isSubmi
           />
         )}
       </Field>
+
+      <fieldset className="border-t border-border-sub pt-3 mt-1 flex flex-col gap-1.5">
+        <legend className="section-label">Who can build evidence packages</legend>
+        <label className="flex items-center gap-2 text-sm text-text">
+          <input type="radio" name="evidence_builders" value="owner" checked={values.evidence_builders !== 'shared'}
+            onChange={() => setValues(v => ({ ...v, evidence_builders: 'owner' }))} />
+          Environment owner only
+        </label>
+        <label className="flex items-center gap-2 text-sm text-text">
+          <input type="radio" name="evidence_builders" value="shared" checked={values.evidence_builders === 'shared'}
+            onChange={() => setValues(v => ({ ...v, evidence_builders: 'shared' }))} />
+          Owner and people this environment is shared with
+        </label>
+        <p className="text-xs text-text-faint">
+          An evidence package holds people's names and activity from this environment's archive. It is not encrypted and not signed.
+          People you allow here also need permission to view archived reports. Changing this later needs MFA, like any other change here.
+        </p>
+      </fieldset>
 
       {draft && (
         <div className="text-xs text-warn" role="status">

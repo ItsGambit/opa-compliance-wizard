@@ -1,5 +1,5 @@
 import { useMutation } from '@tanstack/react-query'
-import { AlertTriangle, Download, FileClock, KeyRound, Shield, Users } from 'lucide-react'
+import { AlertTriangle, Download, FileClock, KeyRound, PackageCheck, Shield, Users } from 'lucide-react'
 import { useEnvironments, useReportDefs, useSyncStatus } from '../api/hooks'
 import type { ComplianceControl, ComplianceReportDef } from '../types'
 import { ComplianceReportDetail } from './ComplianceReportDetail'
@@ -8,7 +8,6 @@ import { exportSections } from '../utils/export'
 import { runReport } from '../api/client'
 import { toast } from '../hooks/useToast'
 import { ErrorNotice } from './ErrorNotice'
-import { exportAllReports } from '../utils/reportExports'
 
 // UI-03/DATA-07 (external review, 2026-10-05): both export paths below
 // call runReport with no `from`/`to` and no `limit`, so a tenant with
@@ -114,9 +113,11 @@ interface Props {
    * the app. An unknown key (e.g. a stale link) just shows the grid. */
   selectedReport: string | null
   onSelectReport: (key: string | null) => void
+  /** 5.53.0: opens the Evidence package page (it replaced "Export all (CSV)" here; one export path for everything is 5.54.0). */
+  onOpenEvidencePackage?: () => void
 }
 
-export function ComplianceReports({ selectedReport, onSelectReport }: Props) {
+export function ComplianceReports({ selectedReport, onSelectReport, onOpenEvidencePackage }: Props) {
   const { data: environments } = useEnvironments()
   const activeEnv = environments?.active ?? undefined  // null (no active env) -> undefined, which the hooks treat as "disabled"
   const { data: reports, isError: reportsError, error: reportsErrorValue, refetch: refetchReports, isFetching: reportsFetching } = useReportDefs(activeEnv)
@@ -124,25 +125,6 @@ export function ComplianceReports({ selectedReport, onSelectReport }: Props) {
   // doc comment) -- this page just needs to know "is the data behind
   // these reports currently degraded," not live sync progress.
   const { data: syncStatus } = useSyncStatus(activeEnv)
-
-  const exportAllMutation = useMutation({
-    mutationFn: () => exportAllReports(reports ?? [], activeEnv),
-    onSuccess: ({ sections, failed }) => {
-      // A file named "all reports" must contain all of them: if any report
-      // failed, nothing is downloaded (as before) -- but the failures are
-      // now named instead of being a silent unhandled rejection (UI-14).
-      if (failed.length > 0) {
-        toast({
-          title: 'Export failed — nothing was downloaded',
-          description: `Could not load ${failed.length} of ${sections.length + failed.length} reports: ${failed.map(f => `${f.def.label} (${f.error})`).join('; ')}. Try again, or export reports one at a time from their cards.`,
-          variant: 'error',
-        })
-        return
-      }
-      for (const { def, resp } of sections) warnIfTruncated(def.label, resp.truncated, resp.total, resp.rows.length)
-      exportSections(sections.map(({ section }) => section), 'csv', 'opa-compliance-reports-all')
-    },
-  })
 
   if (selectedReport && reports) {
     const def = reports.find(r => r.key === selectedReport)
@@ -179,13 +161,8 @@ export function ComplianceReports({ selectedReport, onSelectReport }: Props) {
       )}
 
       <div className="flex items-center justify-end">
-        <button
-          type="button"
-          className="btn-secondary text-xs"
-          disabled={!reports || reports.length === 0 || exportAllMutation.isPending}
-          onClick={() => exportAllMutation.mutate()}
-        >
-          <Download size={12} aria-hidden="true" /> {exportAllMutation.isPending ? 'Exporting…' : 'Export all (CSV)'}
+        <button type="button" className="btn-secondary text-xs" onClick={() => onOpenEvidencePackage?.()} disabled={!onOpenEvidencePackage}>
+          <PackageCheck size={12} aria-hidden="true" /> Build an evidence package…
         </button>
       </div>
 

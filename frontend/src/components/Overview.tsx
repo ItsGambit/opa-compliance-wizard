@@ -513,7 +513,7 @@ function Inventory({ o }: { o: OverviewData }) {
   )
 }
 
-function EvidenceReadiness({ o, environment, onOpenReports }: { o: OverviewData; environment: string; onOpenReports: () => void }) {
+function EvidenceReadiness({ o, environment, onOpenReports, onOpenEvidencePackage }: { o: OverviewData; environment: string; onOpenReports: () => void; onOpenEvidencePackage?: () => void }) {
   const { data: defs } = useReportDefs(environment)
   const [busy, setBusy] = useState(false)
   const exportAll = async () => {
@@ -527,7 +527,10 @@ function EvidenceReadiness({ o, environment, onOpenReports }: { o: OverviewData;
   }
   return (
     <section aria-labelledby="ov-ev" className="card p-4 flex flex-col gap-3">
-      <SectionHead id="ov-ev" title="Evidence readiness"><button type="button" className="btn-primary" disabled={busy || !defs} onClick={exportAll}>Export all reports</button></SectionHead>
+      <SectionHead id="ov-ev" title="Evidence readiness">
+        {onOpenEvidencePackage && <button type="button" className="btn-primary" onClick={onOpenEvidencePackage}>Build evidence package</button>}
+        <button type="button" className={onOpenEvidencePackage ? 'btn-secondary' : 'btn-primary'} disabled={busy || !defs} onClick={exportAll}>Export all reports</button>
+      </SectionHead>
       <div className="grid gap-4 lg:grid-cols-[1.4fr_1fr]">
         <table className="w-full text-xs">
           <thead><tr className="text-left text-text-faint border-b border-border"><th className="py-1 pr-2 font-medium">Reports</th><th className="py-1 pr-2 font-medium">Built from</th><th className="py-1 pr-2 font-medium">Current through</th><th className="py-1"><span className="sr-only">Open</span></th></tr></thead>
@@ -545,6 +548,7 @@ function EvidenceReadiness({ o, environment, onOpenReports }: { o: OverviewData;
         <div className="text-xs text-text-dim">
           <div className="section-label mb-1">What the pack contains</div>
           <ul className="list-disc pl-4 flex flex-col gap-1">
+            <li>An evidence package: a zip of the archived events of an audit period under proposed SOC 2 criteria, with what an auditor needs to check it offline. It holds people's names and activity, is not encrypted and is not signed.</li>
             <li>Every report as CSV for the date range you set on the report, formulas neutralised.</li>
             <li>Each Okta configuration snapshot can be exported as JSON with its sha256 from the Okta Admins page.</li>
             <li>A methodology note per report is in each report's "How this is calculated".</li>
@@ -559,6 +563,8 @@ function EvidenceReadiness({ o, environment, onOpenReports }: { o: OverviewData;
 // ── Page ────────────────────────────────────────────────────────────────────────────────────────────────────────
 interface OverviewPageProps {
   onOpenReports: () => void
+  /** 5.53.0: the Evidence package page. */
+  onOpenEvidencePackage?: () => void
   /** Where the count links go (administrators only: those pages hold names). */
   onOpenOktaAdmins?: () => void
   onOpenAccessUsers?: () => void
@@ -566,7 +572,7 @@ interface OverviewPageProps {
   onOpenEnvironments?: () => void
 }
 
-export function OverviewPage({ onOpenReports, onOpenOktaAdmins, onOpenAccessUsers, onOpenServiceAccounts, onOpenEnvironments }: OverviewPageProps) {
+export function OverviewPage({ onOpenReports, onOpenEvidencePackage, onOpenOktaAdmins, onOpenAccessUsers, onOpenServiceAccounts, onOpenEnvironments }: OverviewPageProps) {
   const { data: environments } = useEnvironments()
   const { data: whoami } = useWhoami()
   const canAdmin = canAdminFrom(whoami)  // 5.51.0: an archive viewer sees the counts; the lists of names are administrators-only
@@ -700,7 +706,7 @@ export function OverviewPage({ onOpenReports, onOpenOktaAdmins, onOpenAccessUser
       <CrossChecks o={o} onOpen={canAdmin ? setDrawer : undefined} />
       <SignIns o={o} environment={environment} onOpen={canAdmin ? setDrawer : undefined} />
       <Inventory o={o} />
-      <EvidenceReadiness o={o} environment={environment} onOpenReports={onOpenReports} />
+      <EvidenceReadiness o={o} environment={environment} onOpenReports={onOpenReports} onOpenEvidencePackage={onOpenEvidencePackage} />
       <PeopleDrawer environment={environment} list={drawer} asOf={effectiveAsOf} onClose={() => setDrawer(null)} />
     </div>
   )

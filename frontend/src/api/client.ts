@@ -53,6 +53,10 @@ import type {
   RefreshPartName,
   RefreshStartResponse,
   RefreshStatus,
+  EvidenceCoverage,
+  EvidenceJob,
+  EvidenceJobStarted,
+  EvidencePeriod,
 } from '../types'
 
 /** Thrown for any non-2xx answer from the API. `status` lets callers (and
@@ -724,4 +728,37 @@ export function fetchPeopleList(environment: string, list: NamedPeopleList['list
   const params = new URLSearchParams({ environment, list })
   if (asOf) params.set('as_of', asOf)
   return apiFetch(`/api/overview/people?${params.toString()}`)
+}
+
+
+// ── Evidence package (5.53.0) ────────────────────────────────────────────
+
+function evidencePrepareUrl(environment: string): string {
+  return `/api/evidence_packages/prepare?environment=${encodeURIComponent(environment)}`
+}
+
+/** The coverage check of a period: gap, zero-event, pruned and before-archive days, and the control matrix preview. Starts nothing. */
+export function checkEvidencePackage(environment: string, period: EvidencePeriod, environmentId?: string): Promise<EvidenceCoverage> {
+  return apiFetch(evidencePrepareUrl(environment), {
+    method: 'POST', body: JSON.stringify({ ...period, environment_id: environmentId, check_only: true }),
+  })
+}
+
+/** Starts a build. Local mode answers 202 with the job; hosted mode answers 202 StepUpRequired first (nothing is built until the
+ * MFA approval returns and the save runs). The server refuses unacknowledged gap days and a period with no coverage. */
+export function prepareEvidencePackage(
+  environment: string, period: EvidencePeriod, gapsAcknowledged: boolean, environmentId?: string,
+): Promise<EvidenceJobStarted | StepUpRequired> {
+  return apiFetch(evidencePrepareUrl(environment), {
+    method: 'POST', body: JSON.stringify({ ...period, gaps_acknowledged: gapsAcknowledged, environment_id: environmentId }),
+  })
+}
+
+export function fetchEvidencePackage(jobId: string): Promise<EvidenceJob> {
+  return apiFetch(`/api/evidence_packages/${encodeURIComponent(jobId)}`)
+}
+
+/** A plain GET with the session cookie; the server answers an attachment, repeatable for 15 minutes. */
+export function evidencePackageDownloadUrl(jobId: string): string {
+  return `/api/evidence_packages/${encodeURIComponent(jobId)}/download`
 }

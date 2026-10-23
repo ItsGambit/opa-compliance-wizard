@@ -36,7 +36,7 @@ describe('environment rows', () => {
     expect(canManageSync(env('f', 'team', { is_own: false, shared: true, addressable: true }))).toBe(false)
     const allow = { value: 'allow', source: 'override' } as const
     const deny = { value: 'deny', source: 'built_in' } as const
-    const perms = { view_archive: allow, live_read: allow, tenant_write: allow, import_csv: allow, reset_watermark: allow, sync_now: deny, sync_settings: deny }
+    const perms = { view_archive: allow, live_read: allow, tenant_write: allow, import_csv: allow, reset_watermark: allow, sync_now: deny, sync_settings: deny, build_evidence_package: deny }
     expect(canManageSync(env('g', 'team', { is_own: false, shared: true, permissions: perms }))).toBe(false)
     expect(canManageSync(env('g', 'team', { is_own: false, shared: true, permissions: { ...perms, sync_now: allow } }))).toBe(true)
     // never on a row the name-keyed routes don't reach (UI-07), nor another owner's private row (admin view)
@@ -48,7 +48,7 @@ describe('environment rows', () => {
     const deny = { value: 'deny', source: 'default' } as const
     const shared = env('s', 'team', {
       is_own: false, shared: true,
-      permissions: { view_archive: deny, live_read: deny, tenant_write: deny, import_csv: deny, reset_watermark: deny, sync_now: deny, sync_settings: deny },
+      permissions: { view_archive: deny, live_read: deny, tenant_write: deny, import_csv: deny, reset_watermark: deny, sync_now: deny, sync_settings: deny, build_evidence_package: deny },
     })
     expect(can(shared, 'live_read')).toBe(false)
     expect(permissionReason(shared, 'tenant_write')).toMatch(/hasn't allowed shared users to make changes/)

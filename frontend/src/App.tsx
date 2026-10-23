@@ -24,6 +24,7 @@ import { ServiceAccountsDashboard } from './components/ServiceAccountsDashboard'
 import { OktaAdminsReport } from './components/OktaAdminsReport'
 import { OverviewPage } from './components/Overview'
 import { CrossChecks } from './components/CrossChecks'
+import { EvidencePackage, type EvidenceResume } from './components/EvidencePackage'
 import { REPORTS_SUB_TABS, SideNav } from './components/SideNav'
 import { UserMenu } from './components/UserMenu'
 import { UpgradeNoticeBanner } from './components/UpgradeNoticeBanner'
@@ -63,6 +64,9 @@ export default function App() {
   // 5.42.0: an Environments change whose step-up approval didn't complete --
   // its screen reopens with the user's input (see utils/stepUp.ts).
   const [restore, setRestore] = useState<Extract<PendingStepUp, { kind: 'environment_change' }> | null>(null)
+  // 5.53.0: an evidence package build that went through the MFA step-up: the inputs the person had, and the build the approved
+  // save started (or why it did not start). The Evidence package page picks it up.
+  const [evidenceResume, setEvidenceResume] = useState<EvidenceResume | null>(null)
   const { data: environments, isLoading: environmentsLoading } = useEnvironments()
   const { data: whoami } = useWhoami()
   // UI-06: the Audit Log and banner settings follow what the server will
@@ -229,6 +233,21 @@ export default function App() {
     },
   })
 
+  const finishEvidencePackage = useMutation({
+    mutationFn: (_inputs: EvidenceResume) => saveEnvironmentChange(),
+    onSuccess: (resp, inputs) => setEvidenceResume({ ...inputs, jobId: String(resp.job_id) }),
+    onError: (err: ApiError, inputs) => {
+      const reason = err.body?.reason
+      setEvidenceResume({
+        ...inputs,
+        error: isSessionExpiredError(err as unknown) || reason === 'expired'
+          ? 'The MFA approval expired before the build started.'
+          : reason === 'already_consumed' || reason === 'not_found' ? 'This approval was already used or abandoned.' : err.message,
+      })
+      toast({ title: 'Evidence package not built', description: err.message, variant: 'error' })
+    },
+  })
+
   useEffect(() => {
     const url = new URL(window.location.href)
     const returned = url.searchParams.get('stepup_complete') === '1'
@@ -251,9 +270,18 @@ export default function App() {
       return
     }
     if (pending?.kind === 'evidence_package') {
-      // 5.53.0: reserved. The evidence package build ships later; nothing prepares this approval yet, so there is nothing to
-      // finish. It is cleared so it can never be mistaken for the Access Control save, and it never opens Settings.
+      // 5.53.0: the MFA approval of an evidence package build. It is finished by the same save route as every approved change,
+      // never mistaken for the Access Control save, and it never opens Settings. The Evidence package page gets the period and the
+      // acknowledgement back, with the build (or the reason there is none).
       clearPendingStepUp()
+      const base = { environmentId: pending.environmentId, period: pending.period, gapsAcknowledged: pending.gapsAcknowledged }
+      navigate({ tab: 'reports', reportsSubTab: 'evidence_package' })
+      if (next === 'finish_evidence_package') {
+        finishEvidencePackage.mutate(base)
+      } else {
+        setEvidenceResume(base)
+        toast({ title: 'Evidence package not built', description: 'The MFA step was not completed, so nothing was built. Your choices are restored.', variant: 'error' })
+      }
       return
     }
     if (pending?.kind === 'environment_change') {
@@ -353,6 +381,7 @@ export default function App() {
                 {activeTab === 'reports' && reportsSubTab === 'service_accounts' && 'Service Accounts Dashboard'}
                 {activeTab === 'reports' && reportsSubTab === 'okta_admins' && 'Okta Admins'}
                 {activeTab === 'reports' && reportsSubTab === 'cross_checks' && 'Cross-checks'}
+                {activeTab === 'reports' && reportsSubTab === 'evidence_package' && 'Evidence package'}
                 {activeTab === 'access' && 'Access Explorer'}
                 {activeTab === 'builder' && 'Folder Builder'}
                 {activeTab === 'audit_log' && 'Audit Log'}
@@ -372,6 +401,8 @@ export default function App() {
                   'Who holds an administrator role in Okta, as of any date there is a snapshot for, and which of them also hold an OPA admin role.'}
                 {activeTab === 'reports' && reportsSubTab === 'cross_checks' &&
                   'Questions only a tool that sees both Okta and OPA can answer. Candidates for review, not findings.'}
+                {activeTab === 'reports' && reportsSubTab === 'evidence_package' &&
+                  'A zip of the archived events of an audit period, grouped under proposed SOC 2 criteria, with the data an auditor needs to check it offline.'}
                 {activeTab === 'access' &&
                   'Who can reach what in OPA: resource groups, projects, resources, policies, relationships, users and groups, resolved from the stored OPA scan. Live lookups (last accessed, resource evidence) say so where they appear.'}
                 {activeTab === 'builder' &&
@@ -400,10 +431,15 @@ export default function App() {
           <SharedEnvironmentNotice />
 
           {activeTab === 'overview' && canViewOverview && <OverviewPage onOpenReports={() => navigate({ tab: 'reports', reportsSubTab: 'browse' })}
+            onOpenEvidencePackage={() => navigate({ tab: 'reports', reportsSubTab: 'evidence_package' })}
             onOpenOktaAdmins={() => navigate({ tab: 'reports', reportsSubTab: 'okta_admins' })} onOpenAccessUsers={() => navigate({ tab: 'access', accessSubTab: 'users' })}
             onOpenServiceAccounts={() => navigate({ tab: 'reports', reportsSubTab: 'service_accounts' })} onOpenEnvironments={() => setEnvironmentsOpen(true)} />}
           {activeTab === 'reports' && reportsSubTab === 'browse' && (
-            <ComplianceReports selectedReport={route.reportKey} onSelectReport={key => navigate({ tab: 'reports', reportsSubTab: 'browse', reportKey: key })} />
+            <ComplianceReports selectedReport={route.reportKey} onSelectReport={key => navigate({ tab: 'reports', reportsSubTab: 'browse', reportKey: key })}
+              onOpenEvidencePackage={() => navigate({ tab: 'reports', reportsSubTab: 'evidence_package' })} />
+          )}
+          {activeTab === 'reports' && reportsSubTab === 'evidence_package' && (
+            <EvidencePackage resume={evidenceResume} onResumeConsumed={() => setEvidenceResume(null)} />
           )}
           {activeTab === 'reports' && reportsSubTab === 'secrets_access' && <SecretsAccessDashboard />}
           {activeTab === 'reports' && reportsSubTab === 'service_accounts' && <ServiceAccountsDashboard />}

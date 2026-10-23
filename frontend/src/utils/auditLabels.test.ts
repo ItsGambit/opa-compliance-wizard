@@ -9,3 +9,11 @@ describe('auditActionLabel (5.53.0)', () => {
     expect(auditActionLabel('environment.upsert')).toBeNull()
   })
 })
+
+describe('evidence package entries (5.53.0)', () => {
+  it('has a plain label for each of the four build-log actions', () => {
+    for (const a of ['evidence_package.build', 'evidence_package.build_finished', 'evidence_package.build_failed', 'evidence_package.downloaded']) {
+      expect(auditActionLabel(a)).toMatch(/^Evidence package/)
+    }
+  })
+})
