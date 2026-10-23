@@ -15,7 +15,7 @@ import requests
 import updater_fakes as uf
 from fake_release_server import FakeReleaseServer
 from release_helpers import TestKey, TestStandby, key_list, make_release_tar, sign_release
-from test_http_authz_matrix import ADMIN, SECRET, _who, matrix_server  # noqa: F401  (the fixture)
+from test_http_authz_matrix import ADMIN, SECRET, _unlock, _who, matrix_server  # noqa: F401  (the fixture)
 
 import audit_store
 import create_secret_folders as engine
@@ -74,6 +74,8 @@ class Armed:
 def armed(matrix_server, monkeypatch, tmp_path):  # noqa: F811
     base_url, serve = matrix_server
     monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+    for admin in (ADMIN, OTHER_ADMIN):      # 5.53.0: reading Updates needs the Settings unlock (the MFA is covered in the matrix tests)
+        _unlock(serve, admin)
     machine = uf.Machine(tmp_path / "machine")
     monkeypatch.setenv("OPA_UPGRADE_DIR", str(machine.data / "upgrade"))
     monkeypatch.setenv("OCW_OPT_DIR", str(machine.opt))
@@ -445,7 +447,9 @@ def test_the_held_approval_expires_and_can_be_declined(armed):
 def test_notice_for_users_and_admins(armed):
     user = lambda: requests.get(armed.base_url + "/api/upgrade/notice", headers=_who("00uUSER"), timeout=10).json()  # noqa: E731
     admin = lambda: requests.get(armed.base_url + "/api/upgrade/notice", headers=_who(ADMIN, admin=True), timeout=10).json()  # noqa: E731
-    assert user()["kind"] == "none" and admin() == {"kind": "available", "version": TARGET}
+    assert user() == {"kind": "none"}
+    # 5.53.0: administrators also get what the badge, the revocation banner and the progress card need while Updates is locked
+    assert admin() == {"kind": "available", "version": TARGET, "update_available": TARGET, "revocation": None, "run": None}
     take_preview(armed)
     armed.request(armed.schedule_body(hours=5))
     assert user()["kind"] == "scheduled" and user()["version"] == TARGET and "sha256" not in user()
