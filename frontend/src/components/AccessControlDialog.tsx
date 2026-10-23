@@ -8,15 +8,18 @@ import { prepareAccessControl } from '../api/client'
 import type { AccessControlConfig } from '../types'
 import { beginStepUp } from '../utils/stepUp'
 import { SettingsGate } from './SettingsGate'
+import { useRegisterSettingsDraft } from './settingsDraft'
 
 interface Props {
   open: boolean
   onOpenChange: (open: boolean) => void
+  /** Input restored after a Settings unlock (or an approval that did not complete). */
+  draft?: AccessControlConfig
 }
 
 /** 5.53.0: the dialog opens with the Settings unlock gate (hosted mode asks for MFA before anything is read); the form and its
  * request live in the body, which is only mounted once the gate lets it through. */
-export function AccessControlDialog({ open, onOpenChange: setOpen }: Props) {
+export function AccessControlDialog({ open, onOpenChange: setOpen, draft }: Props) {
   return (
     <Dialog.Root open={open} onOpenChange={setOpen}>
       <Dialog.Portal>
@@ -26,8 +29,8 @@ export function AccessControlDialog({ open, onOpenChange: setOpen }: Props) {
             <Dialog.Title className="text-sm font-semibold text-text">Access control</Dialog.Title>
             <DialogCloseButton />
           </div>
-          <SettingsGate area="settings" what="Access control" onNotNow={() => setOpen(false)}>
-            <AccessControlBody />
+          <SettingsGate area="settings" reopen="access_control" what="Access control" onNotNow={() => setOpen(false)}>
+            <AccessControlBody draft={draft} />
           </SettingsGate>
         </Dialog.Content>
       </Dialog.Portal>
@@ -35,7 +38,7 @@ export function AccessControlDialog({ open, onOpenChange: setOpen }: Props) {
   )
 }
 
-function AccessControlBody() {
+function AccessControlBody({ draft }: { draft?: AccessControlConfig }) {
   const { data: config } = useAccessControl(true)
 
   const [adminGroupId, setAdminGroupId] = useState('')
@@ -46,12 +49,17 @@ function AccessControlBody() {
   // reasoning as BannerSettingsDialog -- a second admin's more recent edit
   // isn't silently clobbered by whatever this browser happened to have open.
   useEffect(() => {
-    if (config) {
-      setAdminGroupId(config.admin_group_id ?? '')
-      setUserGroupId(config.user_group_id ?? '')
-      setRestrictLogin(config.restrict_login)
+    const source = draft ?? config
+    if (source) {
+      setAdminGroupId(source.admin_group_id ?? '')
+      setUserGroupId(source.user_group_id ?? '')
+      setRestrictLogin(source.restrict_login)
     }
-  }, [config])
+  }, [config, draft])
+  // Kept across a Settings unlock (the gate asks for it only when the user unlocks).
+  useRegisterSettingsDraft('access_control', () => ({
+    accessControlDraft: { admin_group_id: adminGroupId.trim() || null, user_group_id: userGroupId.trim() || null, restrict_login: restrictLogin },
+  }))
 
   // Phase 3: validates+stores the proposed config server-side (keyed by
   // an opaque action_id) BEFORE ever leaving this page -- the browser

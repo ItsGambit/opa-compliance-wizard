@@ -29,7 +29,7 @@ function Body() {
 }
 
 function renderGate(onNotNow = vi.fn(), area: 'settings' | 'updates' = 'settings') {
-  return { onNotNow, ...renderWithClient(<SettingsGate area={area} what="Access control" onNotNow={onNotNow}><Body /></SettingsGate>) }
+  return { onNotNow, ...renderWithClient(<SettingsGate area={area} reopen={area === 'updates' ? 'updates' : 'access_control'} what="Access control" onNotNow={onNotNow}><Body /></SettingsGate>) }
 }
 
 beforeEach(() => { vi.clearAllMocks() })
@@ -95,12 +95,12 @@ describe('SettingsGate', () => {
     await act(async () => { await client.refetchQueries({ queryKey: ['settings_status'] }) })
     const alert = await screen.findByRole('alert')
     expect(alert.textContent).toContain('Settings locked again')
-    expect(alert.textContent).toContain('A save asks for its own MFA anyway')
+    expect(alert.textContent).toContain('a save asks for its own MFA anyway')
     expect((screen.getByLabelText('draft') as HTMLInputElement).value).toBe('half-typed group id')
     expect(screen.queryByText('Unlock Access control with MFA')).toBeNull()
     vi.mocked(startSettingsUnlock).mockResolvedValue({ step_up_required: true, action_id: 'act-2', action: 'settings.unlock' })
-    fireEvent.click(screen.getByRole('button', { name: 'Unlock' }))
-    await waitFor(() => expect(beginStepUp).toHaveBeenCalledWith('act-2', expect.objectContaining({ kind: 'settings_unlock', reopen: 'settings' })))
+    fireEvent.click(screen.getByRole('button', { name: 'Verify with Okta' }))
+    await waitFor(() => expect(beginStepUp).toHaveBeenCalledWith('act-2', expect.objectContaining({ kind: 'settings_unlock', reopen: 'access_control' })))
   })
 
   it('a save elsewhere that renewed the window brings the pill back', async () => {

@@ -35,7 +35,7 @@ import { canAdminFrom } from './utils/whoami'
 import { SettingsGate } from './components/SettingsGate'
 import { SharedPermissionsDialog } from './components/SharedPermissionsDialog'
 import { SharedEnvironmentNotice } from './components/SharedEnvironmentNotice'
-import { clearPendingStepUp, readPendingStepUp, stepUpReturnAction, type PendingStepUp } from './utils/stepUp'
+import { clearPendingStepUp, readPendingStepUp, restoreFromUnlock, stepUpReturnAction, type PendingStepUp } from './utils/stepUp'
 
 // Every navigable view is a hash route (see utils/route.ts) so the browser
 // keeps a history entry per in-app navigation -- the mouse back button on
@@ -140,8 +140,9 @@ export default function App() {
       })
       queryClient.invalidateQueries({ queryKey: ['settings_status'] })
       queryClient.invalidateQueries({ queryKey: ['audit_log'] })
-      // The Updates page is a route: it is still there, and now opens. A Settings dialog is opened again from its menu entry.
+      // The Updates page is a route: it is still there, and now opens. A dialog reopens with the user's input put back.
       if (pending.reopen === 'updates') setActiveTab('updates')
+      setRestore(restoreFromUnlock(pending))
     },
     onError: (err: ApiError, pending) => {
       clearPendingStepUp()
@@ -160,6 +161,7 @@ export default function App() {
         variant: 'error',
       })
       if (pending.reopen === 'updates') setActiveTab('updates')
+      setRestore(restoreFromUnlock(pending))     // nothing was unlocked, but nothing typed is lost either
     },
   })
 
@@ -244,6 +246,7 @@ export default function App() {
         clearPendingStepUp()
         toast({ title: 'Settings not unlocked', description: 'The MFA step was not completed. Nothing changed.', variant: 'error' })
         if (pending.reopen === 'updates') setActiveTab('updates')
+        setRestore(restoreFromUnlock(pending))
       }
       return
     }
@@ -283,6 +286,7 @@ export default function App() {
     if (!restore) return
     if (restore.reopen === 'updates') { setActiveTab('updates'); setRestore(null) }
     else if (restore.reopen === 'banner') setBannerOpen(true)
+    else if (restore.reopen === 'access_control') setAccessControlOpen(true)
     else if (restore.reopen === 'orphaned_archives') setOrphansOpen(true)
     else if (restore.reopen === 'shared_permissions') setSharedPermissionsOpen(true)
     else setEnvironmentsOpen(true)
@@ -410,12 +414,12 @@ export default function App() {
           {activeTab === 'audit_log' && canAdmin && <AuditLogPage />}
           {/* 5.53.0: Updates (and its signing-key page) open after the Settings unlock: MFA first behind the hosted login gate. */}
           {activeTab === 'updates' && canAdmin && (
-            <SettingsGate area="updates" what="Updates" onNotNow={() => navigate({ tab: 'overview' })}>
+            <SettingsGate area="updates" reopen="updates" what="Updates" onNotNow={() => navigate({ tab: 'overview' })}>
               <UpdatesPage onOpenKeys={() => setActiveTab('update_keys')} onHeader={setUpdatesHeader} />
             </SettingsGate>
           )}
           {activeTab === 'update_keys' && canAdmin && (
-            <SettingsGate area="updates" what="Updates" onNotNow={() => navigate({ tab: 'overview' })}>
+            <SettingsGate area="updates" reopen="updates" what="Updates" onNotNow={() => navigate({ tab: 'overview' })}>
               <UpdateKeysPage onBack={() => setActiveTab('updates')} />
             </SettingsGate>
           )}
@@ -431,7 +435,7 @@ export default function App() {
         onOpenChange={next => { setEnvironmentsOpen(next); if (!next) setRestore(null) }}
         isAdmin={whoami?.is_admin}
         canAdmin={canAdmin}
-        restore={restore && restore.reopen !== 'orphaned_archives' && restore.reopen !== 'shared_permissions' && restore.reopen !== 'updates' && restore.reopen !== 'banner' ? restore : null}
+        restore={restore && restore.reopen !== 'orphaned_archives' && restore.reopen !== 'shared_permissions' && restore.reopen !== 'updates' && restore.reopen !== 'banner' && restore.reopen !== 'access_control' ? restore : null}
       />
       {canAdmin && <OrphanedArchivesDialog open={orphansOpen} onOpenChange={next => { setOrphansOpen(next); if (!next) setRestore(null) }} />}
       {canAdmin && (
@@ -442,7 +446,7 @@ export default function App() {
         />
       )}
       <BannerSettingsDialog open={bannerOpen} onOpenChange={next => { setBannerOpen(next); if (!next) setRestore(null) }} draft={restore?.bannerDraft} />
-      <AccessControlDialog open={accessControlOpen} onOpenChange={setAccessControlOpen} />
+      <AccessControlDialog open={accessControlOpen} onOpenChange={next => { setAccessControlOpen(next); if (!next) setRestore(null) }} draft={restore?.accessControlDraft} />
       <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} dataLocationNotice={whoami?.data_location_notice} />
     </div>
   )

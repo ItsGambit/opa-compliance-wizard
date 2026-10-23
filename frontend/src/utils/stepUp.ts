@@ -1,4 +1,4 @@
-import type { BannerConfig, EnvironmentFormValues, GrantUser, PermissionSetting, SharedCapabilityKey, SyncSchedule } from '../types'
+import type { AccessControlConfig, BannerConfig, EnvironmentFormValues, GrantUser, PermissionSetting, SharedCapabilityKey, SyncSchedule } from '../types'
 
 /** 5.42.0: what the browser remembers across the step-up MFA round trip
  * (a full-page redirect to Okta and back, the same one the Access Control
@@ -7,11 +7,34 @@ import type { BannerConfig, EnvironmentFormValues, GrantUser, PermissionSetting,
  * cancelled or failed approval loses nothing. Secrets (key secret, Okta API
  * token) are never kept here -- they wait on the server, in memory only,
  * and are re-entered if the approval doesn't complete. */
+export type EnvironmentDraft = Omit<EnvironmentFormValues, 'key_secret' | 'okta_api_token'>
+export type SyncDraft = { environmentId: string; schedule: SyncSchedule }
+export type PermissionsDraft = {
+  environmentId?: string
+  user?: GrantUser
+  settings: Partial<Record<SharedCapabilityKey, PermissionSetting>>
+}
+/** The screens a Settings unlock can return to (the one the user was opening, or had open when the window ran out). */
+export type SettingsUnlockReopen =
+  | 'settings' | 'updates' | 'environments' | 'shared_permissions' | 'orphaned_archives' | 'access_control' | 'banner' | 'sync_schedule'
+const UNLOCK_REOPEN: readonly string[] = [
+  'settings', 'updates', 'environments', 'shared_permissions', 'orphaned_archives', 'access_control', 'banner', 'sync_schedule',
+]
+
 export type PendingStepUp =
   | { kind: 'access_control' }
-  // 5.53.0: the MFA that opens Settings or Updates (POST /api/settings/unlock). Nothing else is pending: a Settings screen
-  // that was open reopens by itself once unlocked, and the page the user came from is `reopen`.
-  | { kind: 'settings_unlock'; startedAt: number; reopen: 'settings' | 'updates' }
+  // 5.53.0: the MFA that opens Settings or Updates (POST /api/settings/unlock). Nothing is applied by it: `reopen` is the
+  // screen to open again once unlocked, with the user's unsaved input (never secrets) restored when the window ran out mid-edit.
+  | {
+      kind: 'settings_unlock'
+      startedAt: number
+      reopen: SettingsUnlockReopen
+      environmentDraft?: EnvironmentDraft
+      syncDraft?: SyncDraft
+      permissionsDraft?: PermissionsDraft
+      bannerDraft?: BannerConfig
+      accessControlDraft?: AccessControlConfig
+    }
   // 5.53.0: reserved for the evidence package build (the build itself ships later). The MFA that approves a build is a
   // different approval from the Settings unlock and never opens Settings.
   | {
@@ -29,20 +52,18 @@ export type PendingStepUp =
       label: string
       startedAt: number
       /** Environment form input (never its secrets). */
-      environmentDraft?: Omit<EnvironmentFormValues, 'key_secret' | 'okta_api_token'>
+      environmentDraft?: EnvironmentDraft
       /** Sync settings form input, and which environment it was for. */
-      syncDraft?: { environmentId: string; schedule: SyncSchedule }
+      syncDraft?: SyncDraft
       /** Shared-permission settings being saved (environmentId absent =
        * the global defaults; user = one user's exceptions, 5.43.0). */
-      permissionsDraft?: {
-        environmentId?: string
-        user?: GrantUser
-        settings: Partial<Record<SharedCapabilityKey, PermissionSetting>>
-      }
+      permissionsDraft?: PermissionsDraft
       /** Announcement banner input (5.53.0: saving it needs MFA). */
       bannerDraft?: BannerConfig
+      /** Access control input (5.53.0: restored after a Settings unlock). */
+      accessControlDraft?: AccessControlConfig
       /** Which screen to reopen if the change wasn't applied. */
-      reopen?: 'environments' | 'orphaned_archives' | 'shared_permissions' | 'updates' | 'banner'
+      reopen?: 'environments' | 'orphaned_archives' | 'shared_permissions' | 'updates' | 'banner' | 'access_control'
     }
 
 /** The approvals the server knows (serve.py ENV_CHANGE_ACTION_TYPES, plus the Access Control save). Documentation for readers
@@ -56,9 +77,17 @@ const KEY = 'opa.pendingStepUp'
 /** Forget a draft older than the server's own pending-action lifetime. */
 const MAX_AGE_MS = 15 * 60 * 1000
 
+/** Defence in depth: whatever a caller passes, the two secrets never reach storage. */
+function withoutSecrets(pending: PendingStepUp): PendingStepUp {
+  if (pending.kind !== 'settings_unlock' && pending.kind !== 'environment_change') return pending
+  if (!pending.environmentDraft) return pending
+  const { key_secret: _s, okta_api_token: _t, ...rest } = pending.environmentDraft as EnvironmentDraft & Partial<EnvironmentFormValues>
+  return { ...pending, environmentDraft: rest }
+}
+
 export function rememberStepUp(pending: PendingStepUp): void {
   try {
-    sessionStorage.setItem(KEY, JSON.stringify(pending))
+    sessionStorage.setItem(KEY, JSON.stringify(withoutSecrets(pending)))
   } catch {
     // Storage unavailable (private mode, quota): the change still applies
     // on the way back; only the "restore my form" convenience is lost.
@@ -81,7 +110,7 @@ export function readPendingStepUp(now = Date.now(), includeStale = false): Pendi
     const parsed = JSON.parse(raw) as PendingStepUp
     if (parsed?.kind === 'access_control') return parsed
     if (parsed?.kind === 'settings_unlock') {
-      if (typeof parsed.startedAt !== 'number' || (parsed.reopen !== 'settings' && parsed.reopen !== 'updates')) return null
+      if (typeof parsed.startedAt !== 'number' || !UNLOCK_REOPEN.includes(parsed.reopen)) return null
       if (!includeStale && now - parsed.startedAt > MAX_AGE_MS) return null
       return parsed
     }
@@ -120,6 +149,18 @@ export function beginStepUp(actionId: string, pending: PendingStepUp, navigate: 
 export function environmentDraftFrom(values: EnvironmentFormValues): Omit<EnvironmentFormValues, 'key_secret' | 'okta_api_token'> {
   const { key_secret: _secret, okta_api_token: _token, ...rest } = values
   return rest
+}
+
+/** A Settings unlock that came back (finished or not) as the restore record the screens already understand: the dialog to
+ * reopen and the input to put back. null when there is nothing to reopen ("settings", or the Updates page, which is a route). */
+export function restoreFromUnlock(pending: Extract<PendingStepUp, { kind: 'settings_unlock' }>): Extract<PendingStepUp, { kind: 'environment_change' }> | null {
+  if (pending.reopen === 'settings' || pending.reopen === 'updates') return null
+  return {
+    kind: 'environment_change', action: 'settings.unlock', label: 'Settings', startedAt: pending.startedAt,
+    environmentDraft: pending.environmentDraft, syncDraft: pending.syncDraft, permissionsDraft: pending.permissionsDraft,
+    bannerDraft: pending.bannerDraft, accessControlDraft: pending.accessControlDraft,
+    reopen: pending.reopen === 'sync_schedule' ? 'environments' : pending.reopen,
+  }
 }
 
 /** What App.tsx does on load (5.42.0): finish an Environments change the

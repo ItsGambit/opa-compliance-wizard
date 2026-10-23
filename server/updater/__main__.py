@@ -195,7 +195,7 @@ def cmd_verify(a):
 
 
 def _operator():
-    """Who ran a root-only command: the person behind sudo, else the operating-system user."""
+    """Who ran the command: the person behind sudo, else the operating-system user."""
     import os
     return "cli:" + (os.environ.get("SUDO_USER") or getpass.getuser())
 

@@ -12,6 +12,7 @@ import { getSyncProgressPercent } from '../utils/syncProgress'
 import { canAdminFrom } from '../utils/whoami'
 import { can, permissionReason } from '../utils/environmentRows'
 import { beginStepUp } from '../utils/stepUp'
+import { useRegisterSettingsDraft } from './settingsDraft'
 import { DialogCloseButton } from './DialogCloseButton'
 import { IntegrityResultView } from './IntegrityResultView'
 import { Select } from './Select'
@@ -105,6 +106,14 @@ function SyncScheduleContent({ env, restoreDraft }: Props) {
     initial.retention_max_size_mb != null ? String(initial.retention_max_size_mb) : ''
   )
   const [saving, setSaving] = useState(false)
+  // Kept across a Settings unlock while this dialog is open (only valid whole numbers; an empty or odd entry means "no limit").
+  const wholeOrNull = (raw: string) => (/^[1-9]\d*$/.test(raw.trim()) ? Number(raw) : null)
+  useRegisterSettingsDraft('sync_schedule', () => ({
+    syncDraft: {
+      environmentId: env.id,
+      schedule: { enabled, run_time: runTime, ingestion_scope: ingestionScope, retention_days: wholeOrNull(retentionDays), retention_max_size_mb: wholeOrNull(retentionMaxSizeMb) },
+    },
+  }))
 
   // UI-09 / ENG2-04 (external review, 2026-10-05): validate here with the
   // same rules the server enforces (create_secret_folders.py's

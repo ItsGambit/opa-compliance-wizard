@@ -35,7 +35,7 @@ export function OrphanedArchivesDialog({ open, onOpenChange }: Props) {
             <DialogCloseButton />
           </div>
           {/* 5.53.0: the list of archives needs the Settings unlock (MFA behind the hosted login gate). */}
-          <SettingsGate area="settings" what="Orphaned archives" onNotNow={() => onOpenChange(false)}>
+          <SettingsGate area="settings" reopen="orphaned_archives" what="Orphaned archives" onNotNow={() => onOpenChange(false)}>
             <OrphanedArchivesBody />
           </SettingsGate>
         </Dialog.Content>

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { Globe, KeyRound, Lock, Pencil, Plus, Trash2, X } from 'lucide-react'
@@ -11,6 +11,7 @@ import { beginStepUp, environmentDraftFrom, type PendingStepUp } from '../utils/
 import { EnvironmentPermissionsEditor } from './EnvironmentPermissionsEditor'
 import { ErrorNotice } from './ErrorNotice'
 import { SettingsGate } from './SettingsGate'
+import { useRegisterSettingsDraft } from './settingsDraft'
 import { DialogCloseButton } from './DialogCloseButton'
 import { EnvironmentForm } from './EnvironmentForm'
 import { StatusBadge } from './StatusBadge'
@@ -58,7 +59,7 @@ export function EnvironmentManagerDialog({ open, onOpenChange, isAdmin, canAdmin
             <Dialog.Title className="text-sm font-semibold text-text">Environments</Dialog.Title>
             <DialogCloseButton />
           </div>
-          <SettingsGate area="settings" what="Environments" onNotNow={() => onOpenChange(false)}>
+          <SettingsGate area="settings" reopen="environments" what="Environments" onNotNow={() => onOpenChange(false)}>
             <EnvironmentsBody isAdmin={isAdmin} canAdmin={canAdmin} restore={restore} />
           </SettingsGate>
         </Dialog.Content>
@@ -73,6 +74,13 @@ function EnvironmentsBody({ isAdmin, canAdmin, restore }: Pick<Props, 'isAdmin' 
   const [editing, setEditingState] = useState<SettingsEnvironment | 'new' | null>(null)
   const [formDraft, setFormDraft] = useState<Partial<EnvironmentFormValues> | undefined>(undefined)
   const [permissionsFor, setPermissionsFor] = useState<string | null>(null)
+  // The form's live input, for a Settings unlock mid-edit. Only the non-secret fields are ever handed on.
+  const liveForm = useRef<EnvironmentFormValues | null>(null)
+  useRegisterSettingsDraft('environment', () => {
+    const v = liveForm.current
+    if (!v || editing === null) return null
+    return { environmentDraft: { id: v.id, name: v.name, base_domain: v.base_domain, team_name: v.team_name, key_id: v.key_id, okta_url: v.okta_url } }
+  })
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null)
   // UI-16: sharing hands every logged-in user working use of the
   // environment's credentials -- one click no longer does it.
@@ -391,6 +399,7 @@ function EnvironmentsBody({ isAdmin, canAdmin, restore }: Pick<Props, 'isAdmin' 
                 isSubmitting={saveMutation.isPending}
                 errorMessage={saveApiError}
                 onSubmit={values => saveMutation.mutate(values)}
+                onValuesChange={values => { liveForm.current = values }}
               />
             </div>
           )}

@@ -11,6 +11,7 @@ import { DialogCloseButton } from './DialogCloseButton'
 import { ErrorNotice } from './ErrorNotice'
 import { PermissionSettingsList } from './PermissionSettingsList'
 import { SettingsGate } from './SettingsGate'
+import { useRegisterSettingsDraft } from './settingsDraft'
 
 interface Props {
   open: boolean
@@ -35,7 +36,7 @@ export function SharedPermissionsDialog({ open, onOpenChange, draft }: Props) {
             <DialogCloseButton />
           </div>
           {/* 5.53.0: reading these settings needs the Settings unlock (MFA behind the hosted login gate). */}
-          <SettingsGate area="settings" what="Shared permissions" onNotNow={() => onOpenChange(false)}>
+          <SettingsGate area="settings" reopen="shared_permissions" what="Shared permissions" onNotNow={() => onOpenChange(false)}>
             <SharedPermissionsBody onOpenChange={onOpenChange} draft={draft} />
           </SettingsGate>
         </Dialog.Content>
@@ -74,6 +75,7 @@ function SharedPermissionsBody({ onOpenChange, draft }: Pick<Props, 'onOpenChang
 
   const changes = data ? changedSettings(stored(), settings) : {}
   const hasChanges = Object.keys(changes).length > 0
+  useRegisterSettingsDraft('shared_permissions', () => (hasChanges ? { permissionsDraft: { settings } } : null))
 
   const save = useMutation({
     mutationFn: () => saveSharedPermissions(changes),

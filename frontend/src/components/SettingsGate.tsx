@@ -1,10 +1,11 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { Info, Loader2, Lock, LockOpen } from 'lucide-react'
 import { lockSettings, startSettingsUnlock, isStepUpRequired } from '../api/client'
 import { useSettingsStatus } from '../api/hooks'
 import { toast } from '../hooks/useToast'
-import { beginStepUp } from '../utils/stepUp'
+import { beginStepUp, type SettingsUnlockReopen } from '../utils/stepUp'
+import { createRegistry, SettingsDraftContext } from './settingsDraft'
 import { ErrorNotice } from './ErrorNotice'
 
 /** Shown when the server did not send its own wording (it does: GET /api/settings/status `local_notice`). */
@@ -35,6 +36,8 @@ function timeLeftLabel(seconds: number): string {
 interface Props {
   /** Which part of the app this gate protects: recorded in local mode, and where the unlock returns to. */
   area: 'settings' | 'updates'
+  /** The screen to open again after the unlock (and to put the user's unsaved input back into). */
+  reopen: SettingsUnlockReopen
   /** What the prompt names, e.g. "Access control". */
   what: string
   /** "Not now": the screen closes. */
@@ -53,7 +56,8 @@ interface Props {
  * - Local mode (no login gate): no prompt, a persistent notice, and the server records each opening.
  *
  * The browser never decides anything: every protected request is checked by the server. This only explains it. */
-export function SettingsGate({ area, what, onNotNow, children }: Props) {
+export function SettingsGate({ area, reopen, what, onNotNow, children }: Props) {
+  const drafts = useMemo(createRegistry, [])
   const queryClient = useQueryClient()
   const { data: status, isLoading, isError, error, refetch, isFetching, dataUpdatedAt } = useSettingsStatus(area)
   const seconds = useSecondsLeft(status?.mode === 'hosted' && status.unlocked ? status.seconds_left : undefined, dataUpdatedAt)
@@ -69,7 +73,7 @@ export function SettingsGate({ area, what, onNotNow, children }: Props) {
     mutationFn: () => startSettingsUnlock(),
     onSuccess: resp => {
       if (isStepUpRequired(resp)) {
-        beginStepUp(resp.action_id, { kind: 'settings_unlock', startedAt: Date.now(), reopen: area })
+        beginStepUp(resp.action_id, { kind: 'settings_unlock', startedAt: Date.now(), reopen, ...drafts.collect() })
         return
       }
       void queryClient.invalidateQueries({ queryKey: ['settings_status'] })
@@ -128,7 +132,7 @@ export function SettingsGate({ area, what, onNotNow, children }: Props) {
 
   const expiringSoon = live && seconds <= EXPIRING_SOON_SECONDS
   return (
-    <>
+    <SettingsDraftContext.Provider value={drafts.registry}>
       {live ? (
         <div className="flex items-center justify-end gap-2 mb-3 text-xs">
           <span
@@ -154,15 +158,15 @@ export function SettingsGate({ area, what, onNotNow, children }: Props) {
         <div role="alert" className="w-full border rounded px-3 py-2 mb-3 flex items-start gap-2 text-xs bg-warn/10 text-text border-warn/40">
           <Lock size={14} className="shrink-0 mt-0.5 text-warn" aria-hidden="true" />
           <span className="flex-1">
-            Settings locked again. A save asks for its own MFA anyway, so you can still save what you have typed; to keep browsing,
-            unlock again (that leaves this page, so anything unsaved is lost).
+            Settings locked again. What you typed is kept. Verify with Okta to carry on (this screen reopens with your input);
+            a save asks for its own MFA anyway.
           </span>
           <button type="button" className="btn-secondary !py-0.5 !px-2 shrink-0" onClick={() => unlock.mutate()} disabled={unlock.isPending}>
-            {unlock.isPending ? 'Preparing…' : 'Unlock'}
+            {unlock.isPending ? 'Preparing…' : 'Verify with Okta'}
           </button>
         </div>
       )}
       {children}
-    </>
+    </SettingsDraftContext.Provider>
   )
 }
