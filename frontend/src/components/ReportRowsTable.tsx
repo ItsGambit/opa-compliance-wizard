@@ -76,6 +76,9 @@ interface Props {
    * (or pass truncated=false) when the caller has no such concept. */
   total?: number
   truncated?: boolean
+  /** 5.53.0: the page has a CSV export that comes from the server and covers the whole range (the report page); the
+   * resource history's export still writes only the rows listed, and its banner says so. */
+  completeCsvAbove?: boolean
   /** UI-04: a failed load. Rendered as an error with Retry -- never as the
    * empty message, which would read as "nothing happened". */
   error?: unknown
@@ -94,7 +97,7 @@ interface Props {
  * Outcome dropdown, same as before this extraction) -- callers only see
  * the rendered table plus, optionally, the filtered rows via
  * onFilteredRowsChange. */
-export function ReportRowsTable({ rows, isLoading, emptyMessage, onFilteredRowsChange, total, truncated, error, onRetry, retrying, stale }: Props) {
+export function ReportRowsTable({ rows, isLoading, emptyMessage, onFilteredRowsChange, total, truncated, completeCsvAbove, error, onRetry, retrying, stale }: Props) {
   const [userFilter, setUserFilter] = useState('')
   const [actionFilter, setActionFilter] = useState('')
   const [resourceFilter, setResourceFilter] = useState('')
@@ -169,7 +172,10 @@ export function ReportRowsTable({ rows, isLoading, emptyMessage, onFilteredRowsC
       {truncated && !isLoading && (
         <div className="px-3 py-2 text-[0.6875rem] text-warn bg-warn/10 border-b border-border">
           Showing the newest {rows.length.toLocaleString()} of {(total ?? rows.length).toLocaleString()} events in
-          this date range. Narrow the date range or export in smaller windows to see the rest.
+          this date range.{' '}
+          {completeCsvAbove
+            ? 'The CSV export above has every event in the range; the table and the Markdown export show only these.'
+            : 'Narrow the date range to see the rest; an export from this list has only these events.'}
         </div>
       )}
       {isLoading ? (

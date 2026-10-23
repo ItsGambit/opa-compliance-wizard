@@ -3,9 +3,8 @@ import { ArrowLeft } from 'lucide-react'
 import { useReport } from '../api/hooks'
 import { useReportDateRange } from '../hooks/useReportDateRange'
 import type { ComplianceReportDef, ComplianceReportRow } from '../types'
-import { complianceReportExportSections } from '../utils/exportSections'
 import { DateRangeFields } from './DateRangeFields'
-import { ExportButtons } from './ExportButtons'
+import { ReportExportButtons } from './ReportExportButtons'
 import { ReportRowsTable } from './ReportRowsTable'
 
 interface Props {
@@ -83,7 +82,9 @@ export function ComplianceReportDetail({ def, environment, onBack }: Props) {
         <button type="button" className="btn-secondary text-xs" onClick={onBack}>
           <ArrowLeft size={12} /> Back to reports
         </button>
-        <ExportButtons sections={complianceReportExportSections(def.label, filteredRows)} filenameBase={`opa-report-${def.key}`}
+        <ReportExportButtons
+          environment={environment} reportKey={def.key} reportLabel={def.label} range={dateRange.range}
+          rows={rows} filteredRows={filteredRows} total={data?.total} truncated={data?.truncated}
           disabledReason={isPlaceholderData ? 'Loading the new date range…' : isError ? 'The report did not load' : undefined}
         />
       </div>
@@ -112,6 +113,7 @@ export function ComplianceReportDetail({ def, environment, onBack }: Props) {
         onFilteredRowsChange={setFilteredRows}
         total={data?.total}
         truncated={data?.truncated}
+        completeCsvAbove
       />
     </div>
   )

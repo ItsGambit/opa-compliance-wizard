@@ -75,7 +75,10 @@ export function toMarkdown(sections: ExportSection[]): string {
 }
 
 export function downloadTextFile(filename: string, content: string, mimeType: string): void {
-  const blob = new Blob([content], { type: mimeType })
+  downloadBlob(filename, new Blob([content], { type: mimeType }))
+}
+
+export function downloadBlob(filename: string, blob: Blob): void {
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
