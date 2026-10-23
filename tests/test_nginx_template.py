@@ -50,10 +50,46 @@ if NGINX is None and os.environ.get("OPA_REQUIRE_NGINX_TESTS") == "1":  # set in
 pytestmark = pytest.mark.skipif(NGINX is None, reason="nginx binary not available")
 
 
+_ISSUED_PORTS = set()
+
+
 def _free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    """A loopback port nobody is listening on. The port is released before nginx binds it, so never hand the same
+    number out twice in one run (the OS may reuse a just-closed ephemeral port for the next call)."""
+    for _ in range(50):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        if port not in _ISSUED_PORTS:
+            _ISSUED_PORTS.add(port)
+            return port
+    raise RuntimeError("could not find an unused loopback port")
+
+
+def _start_nginx(prefix, conf, ports, timeout=30):
+    """Starts nginx and waits until every given port accepts a connection. Fails loudly, with nginx's own error
+    output, if it exits early or never listens -- a test that goes on against a server that is not up gives a
+    refused connection that looks like a product bug (the old wait gave up silently after 10 s)."""
+    proc = subprocess.Popen([NGINX, "-p", str(prefix), "-c", str(conf), "-e", str(prefix / "logs" / "e.log")],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    deadline = time.time() + timeout
+    pending = list(ports)
+    while pending:
+        if proc.poll() is not None:
+            err = proc.stderr.read().decode(errors="replace")
+            log = prefix / "logs" / "e.log"
+            raise AssertionError(f"nginx exited with {proc.returncode} before listening: {err} "
+                                 f"{log.read_text() if log.exists() else ''}")
+        try:
+            socket.create_connection(("127.0.0.1", pending[0]), timeout=0.5).close()
+            pending.pop(0)
+        except OSError:
+            if time.time() > deadline:
+                proc.terminate()
+                proc.wait(timeout=10)
+                raise AssertionError(f"nginx did not listen on port {pending[0]} within {timeout} s")
+            time.sleep(0.05)
+    return proc
 
 
 def _self_signed(tmp):
@@ -224,15 +260,7 @@ def served(tmp_path):
                           backend=backend.server_address[1], gate=gate.server_address[1])
     conf = _write_config(tmp_path, site)
     assert _nginx_t(conf, tmp_path).returncode == 0
-    proc = subprocess.Popen([NGINX, "-p", str(tmp_path), "-c", str(conf), "-e", str(tmp_path / "logs" / "e.log")],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        try:
-            socket.create_connection(("127.0.0.1", https_port), timeout=0.2).close()
-            break
-        except OSError:
-            time.sleep(0.05)
+    proc = _start_nginx(tmp_path, conf, [http_port, https_port])
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -434,15 +462,7 @@ def served_second(tmp_path):
     second = second.replace("127.0.0.1:8766", f"127.0.0.1:{backend.server_address[1]}")
     conf = _write_config(tmp_path, main, [second])
     assert _nginx_t(conf, tmp_path).returncode == 0
-    proc = subprocess.Popen([NGINX, "-p", str(tmp_path), "-c", str(conf), "-e", str(tmp_path / "logs" / "e.log")],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        try:
-            socket.create_connection(("127.0.0.1", second_port), timeout=0.2).close()
-            break
-        except OSError:
-            time.sleep(0.05)
+    proc = _start_nginx(tmp_path, conf, [second_port])
 
     def request(method, path):
         conn = http.client.HTTPConnection("127.0.0.1", second_port, timeout=10)

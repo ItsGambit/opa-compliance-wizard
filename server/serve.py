@@ -2534,6 +2534,43 @@ class Handler(SimpleHTTPRequestHandler):
             "correlation_id": correlation_id,
         })
 
+    def _allowed_hosts(self):
+        """5.53.0: the Host header values a local-mode request may carry: the
+        three loopback forms on the bound port, plus the host part of each
+        EXTRA_ALLOWED_ORIGINS entry (the existing operator override)."""
+        port = self.server.server_address[1]
+        allowed = {f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"}
+        for origin in EXTRA_ALLOWED_ORIGINS:
+            netloc = urlparse(origin).netloc.lower()
+            if netloc:
+                allowed.add(netloc)
+        return allowed
+
+    def parse_request(self):
+        """Local mode only: refuse any request whose Host is not this
+        server's own loopback name and port (DNS rebinding defence: a web
+        page on another name that resolves to 127.0.0.1 carries its own name
+        in Host). Runs after the request line and headers are parsed and
+        before any do_* handler, so it covers every method. Hosted mode is
+        unchanged (nginx sets Host)."""
+        if not super().parse_request():
+            return False
+        if DEPLOYMENT_MODE == "hosted":
+            return True
+        hosts = self.headers.get_all("Host") or []
+        if len(hosts) == 1 and hosts[0].strip().lower() in self._allowed_hosts():
+            return True
+        body = b"Misdirected request: this host name is not served here.\n"
+        self.send_response(421)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+        self.close_connection = True
+        return False
+
     def _allowed_origins(self):
         port = self.server.server_address[1]
         return {DEV_FRONTEND_ORIGIN, f"http://127.0.0.1:{port}", f"http://localhost:{port}"} | EXTRA_ALLOWED_ORIGINS

@@ -720,7 +720,9 @@ own() { # own <owner:group> <mode> <path>
   if [ -z "$TESTING" ] || command -v chown >/dev/null 2>&1; then chown "$1" "$3" 2>/dev/null || { [ -n "$TESTING" ] || die "chown $1 $3 failed"; }; fi
   chmod "$2" "$3"
 }
-mkd() { mkdir -p "$3"; own "$1" "$2" "$3"; }
+# -m applies to the leaf only (SC2174), which is intended: the leaf is born with its final mode, so there is no window with the default one
+# shellcheck disable=SC2174
+mkd() { mkdir -p -m "$2" "$3"; own "$1" "$2" "$3"; }
 render() { # render <template> <output>: fill in the __NAME__ words
   sed -e "s|__OPT_DIR__|$OPT_DIR|g" -e "s|__DATA_DIR__|$DATA_DIR|g" -e "s|__APP_USER__|$APP_USER|g" -e "s|__PYTHON3__|$PY3|g" -e "s|__ARTIFACTS_DIR__|$ARTIFACTS_DIR|g" -e "s|__ENV_FILE__|$ENV_FILE|g" \
       -e "s|__APP_DIR__|$OPT_DIR/current|g" -e "s|__APP_UID__|${APP_UID:-0}|g" -e "s|__APP_USER_HOME__|${APP_HOME:-}|g" \
@@ -752,7 +754,8 @@ fresh_prerequisites() { # what a fresh install needs from the system, checked be
 fresh_account() { # the application account, its lingering user manager, and the facts the units need
   if [ -n "$APP_WILL_CREATE" ]; then
     note "    creating the account $APP_USER (home $DATA_DIR/home, shell nologin)"
-    mkdir -p "$DATA_DIR"
+    # shellcheck disable=SC2174  # the leaf only is intended, as in mkd
+    mkdir -p -m 0750 "$DATA_DIR"
     local _grp=(--user-group)
     if getent group "$APP_USER" >/dev/null 2>&1; then _grp=(--gid "$APP_USER"); fi
     useradd "${_grp[@]}" --create-home --home-dir "$DATA_DIR/home" --shell /usr/sbin/nologin "$APP_USER" || die "could not create the account $APP_USER"
