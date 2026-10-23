@@ -54,6 +54,14 @@ FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 # 5.47.0: user-saved folder templates and execution records live with the data
 # files when OPA_DATA_DIR is set (the /var/lib layout; the code directory is
 # read-only to this process there). Unset = the project directory, as always.
+EXPORT_MIN_FREE_BYTES = 256 * 1024 * 1024  # a report export is refused (507) below this much free space
+
+
+def _free_bytes(path):
+    import shutil
+    return shutil.disk_usage(path).free
+
+
 def _csv_dir():
     return Path(os.environ["OPA_DATA_DIR"]) if os.environ.get("OPA_DATA_DIR") else PROJECT_ROOT
 
@@ -2705,8 +2713,21 @@ class Handler(SimpleHTTPRequestHandler):
             period = evidence_core.parse_period(since, until)
         except evidence_core.PeriodError as exc:
             return self._send_json(400, {"error": str(exc)})
+        # The file is built on disk in a `tmp` folder of the data directory (the archive's folder; the service's own /tmp
+        # may be memory), anonymous and removed on close. Refuse early if the disk is nearly full.
+        tmp_dir = os.path.join(os.path.dirname(audit_store._audit_db_path()), "tmp")
         try:
-            with tempfile.TemporaryFile() as out:
+            os.makedirs(tmp_dir, mode=0o700, exist_ok=True)
+            free = _free_bytes(tmp_dir)
+        except OSError as exc:
+            engine.log("WARN", f"report csv export: temporary folder unusable: {exc}")
+            return self._send_json(507, {"error": "The server has no usable temporary space for this export."})
+        if free < EXPORT_MIN_FREE_BYTES:
+            return self._send_json(507, {"error": (
+                f"The server has only {free // (1024 * 1024)} MB of free disk space; an export needs at least "
+                f"{EXPORT_MIN_FREE_BYTES // (1024 * 1024)} MB. Free some space and try again.")})
+        try:
+            with tempfile.TemporaryFile(dir=tmp_dir) as out:
                 with evidence_core.open_snapshot(meta["environment_id"], period) as snap:
                     rows = evidence_core.write_report_csv(out, snap.report_rows(report_key))
                 size = out.tell()

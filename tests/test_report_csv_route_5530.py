@@ -157,3 +157,36 @@ def test_formula_like_cells_are_neutralised_and_every_field_is_quoted(matrix_ser
     first_line = body.split(b"\r\n")[1].decode("utf-8")
     assert first_line.startswith('"') and first_line.endswith('"')   # quoted, CRLF line ends, no byte-order mark
     assert not body.startswith(b"\xef\xbb\xbf")
+
+
+def test_the_file_is_built_in_a_tmp_folder_of_the_data_directory(matrix_server, monkeypatch):
+    import os
+    import tempfile
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+    _seed(env_id, 2)
+    seen = []
+    real = tempfile.TemporaryFile
+    monkeypatch.setattr(tempfile, "TemporaryFile", lambda *a, **k: (seen.append(k.get("dir")), real(*a, **k))[1])
+    assert _call(base_url, "GET", f"{URL}?{RANGE}", headers=_who(OWNER_A)).status_code == 200
+    data_dir = os.path.dirname(audit_store._audit_db_path())
+    assert seen == [os.path.join(data_dir, "tmp")]
+    assert os.path.isdir(seen[0]) and os.listdir(seen[0]) == []          # created, and nothing left behind
+    assert (os.stat(seen[0]).st_mode & 0o077) == 0                        # owner only
+
+
+def test_low_disk_space_is_a_507_with_a_message_and_no_audit_entry(matrix_server, monkeypatch, tmp_audit_log):
+    base_url, serve = matrix_server
+    _seed_owner_a_with_session(serve)
+    monkeypatch.setattr(serve, "_free_bytes", lambda path: 10 * 1024 * 1024)
+    resp = _call(base_url, "GET", f"{URL}?{RANGE}", headers=_who(OWNER_A))
+    assert resp.status_code == 507 and "10 MB of free disk space" in resp.json()["error"]
+    assert not tmp_audit_log.exists() or not [a for a in _actions(tmp_audit_log) if a["action"] == "report.csv_exported"]
+
+
+def test_the_support_bundle_never_reads_the_data_directory():
+    """The bundle is built from named texts in memory; it walks no folder, so the export's tmp folder cannot enter it."""
+    import re
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "server" / "updater" / "root" / "ocw_bundle.py").read_text(encoding="utf-8")
+    assert not re.search(r"os\.walk|glob|listdir|iterdir|scandir|tar\.add\(", src)
