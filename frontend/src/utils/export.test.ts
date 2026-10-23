@@ -1,6 +1,7 @@
 /** FE-09: CSV / Markdown export correctness. */
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { csvEscape, downloadTextFile, markdownCell, toCsv, toMarkdown } from './export'
+import { csvEscape, downloadTextFile, markdownCell, neutralizeFormula, toCsv, toMarkdown } from './export'
+import sharedCasesRaw from '../../../tests/fixtures/csv_formula_cases.json?raw'
 
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks() })
 
@@ -88,5 +89,18 @@ describe('markdownHeading', () => {
     expect(markdownHeading('line one\nline two')).toBe('line one line two')
     const md = toMarkdown([{ title: 'Overview: [x](http://example.com)', rows: [{ A: '1' }] }])
     expect(md.split('\n')[0]).toBe('## Overview: \\[x\\](http://example.com)')
+  })
+})
+
+// Evidence package (5.53.0): the server's CSV writer (evidence_core.py) is tested against the SAME cases, so the
+// formula neutralisation and quoting of the two exports cannot drift apart.
+describe('shared CSV cases (tests/fixtures/csv_formula_cases.json)', () => {
+  const shared = JSON.parse(sharedCasesRaw) as { cases: { input: string; neutralised: string; frontend_csv: string; server_csv: string }[] }
+  it('has cases', () => { expect(shared.cases.length).toBeGreaterThan(10) })
+  it.each(shared.cases.map(c => [JSON.stringify(c.input), c] as const))('neutralises and escapes %s', (_label, c) => {
+    expect(neutralizeFormula(c.input)).toBe(c.neutralised)
+    expect(csvEscape(c.input)).toBe(c.frontend_csv)
+    // the server writer quotes every field: the same text, quoted when the app did not need to
+    expect(c.server_csv).toBe(c.frontend_csv.startsWith('"') ? c.frontend_csv : `"${c.frontend_csv}"`)
   })
 })

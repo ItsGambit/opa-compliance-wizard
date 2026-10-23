@@ -14,7 +14,7 @@ export interface ExportSection {
 // treats a leading `'` as "force this cell to text", stripping the
 // apostrophe itself from the displayed value) and does not change what
 // a plain-text/CSV-aware reader sees.
-function neutralizeFormula(value: string): string {
+export function neutralizeFormula(value: string): string {
   return /^[=+\-@\t\r]/.test(value) ? `'${value}` : value
 }
 

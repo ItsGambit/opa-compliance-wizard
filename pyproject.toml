@@ -9,4 +9,5 @@ pythonpath = ["."]
 testpaths = ["tests"]
 markers = [
     "real_audit_db_path: the test exercises audit_store._audit_db_path itself (conftest's guard is off)",
+    "perf: slow performance test, skipped unless OPA_PERF=1 (CI may also deselect it with -m \"not perf\")",
 ]
