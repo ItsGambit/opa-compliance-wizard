@@ -73,4 +73,21 @@ describe('ComplianceReports', () => {
     await waitFor(() => expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({ title: 'Could not export "MFA"' })))
     expect(exportSections).not.toHaveBeenCalled()
   })
+
+  it('groups by the server-derived control: the two moved reports sit under Access Controls', async () => {
+    const defs = [
+      { key: 'api_token_lifecycle', label: 'API Token Lifecycle', description: 'd', control: 'CC6', controls: [{ framework: 'soc2', id: 'CC6.1', status: 'proposed' }], mapping_status: 'proposed', count: 1 },
+      { key: 'credential_rotation', label: 'Credential Rotation', description: 'd', control: 'CC6', controls: [{ framework: 'soc2', id: 'CC6.1', status: 'proposed' }], mapping_status: 'proposed', count: 1 },
+      { key: 'policy_modifications', label: 'Policy Modifications', description: 'd', control: 'CC8', count: 1 },
+    ]
+    vi.mocked(fetchReportDefs).mockResolvedValue({ reports: defs as never })
+    renderWithClient(<ComplianceReports selectedReport={null} onSelectReport={() => {}} />)
+    const access = (await screen.findByText('Access Controls — CC6')).parentElement as HTMLElement
+    expect(access.textContent).toContain('API Token Lifecycle')
+    expect(access.textContent).toContain('Credential Rotation')
+    expect(access.textContent).not.toContain('Policy Modifications')
+    const change = screen.getByText('Change Management — CC8').parentElement as HTMLElement
+    expect(change.textContent).toContain('Policy Modifications')
+    expect(change.textContent).not.toContain('Credential Rotation')
+  })
 })

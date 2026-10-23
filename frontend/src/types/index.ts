@@ -299,10 +299,23 @@ export interface AuditLogEntry {
 
 export type ComplianceControl = 'CC6' | 'CC7' | 'CC8'
 
+/** 5.53.0: one mapped control from the server's control catalogue. */
+export interface ComplianceControlMapping {
+  framework: string
+  id: string
+  status: 'proposed' | 'auditor-reviewed'
+}
+
 export interface ComplianceReportDef {
   key: string
   label: string
   control: ComplianceControl
+  /** 5.53.0: the controls this report is mapped to; older servers omit both fields. */
+  controls?: ComplianceControlMapping[]
+  mapping_status?: 'proposed' | 'auditor-reviewed'
+  /** 5.53.0: plain-text note on what the report shows and how rows are chosen, and its known limits. */
+  methodology?: string
+  known_limits?: string[]
   description: string
   event_types: string[]
   count?: number

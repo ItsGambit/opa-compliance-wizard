@@ -90,12 +90,22 @@ not mapped yet:
 
 - **CC6 — Access Controls:** MFA Enforcement, Provisioning &
   De-provisioning, Role/Group Changes, Admin Privilege Grants, JIT
-  Access Requests, PAM Secrets, PAM JIT Access (Checkout/Checkin), PAM
-  Credential Reveals, Client Enrollment, Device Management
+  Access Requests, API Token Lifecycle, PAM Secrets, PAM JIT Access
+  (Checkout/Checkin), PAM Credential Reveals, Client Enrollment, Device
+  Management, Credential Rotation
 - **CC7 — System Operations:** Session Activity, Threat Detection, PAM
   Sessions, Active Directory Sync Activity
-- **CC8 — Change Management:** API Token Lifecycle, Policy
-  Modifications, PAM Policy Modifications, Credential Rotation
+- **CC8 — Change Management:** Policy Modifications, PAM Policy
+  Modifications
+
+The mappings live in a versioned data file, `server/control_catalogue.json`,
+which ships with each release. For every report it names the specific SOC 2
+criteria (for example CC6.1), a plain-text methodology note (what the report
+shows and does not show, and how rows are chosen) and its known limits. Every
+mapping is labelled **Proposed**: it is suggested by this project and has not
+been reviewed by an auditor, and the report's detail view says so next to the
+criteria it lists. The three groups above come from the first criterion
+listed for each report.
 
 Click any report card to open its detail view: a date-range filter and
 a results table in the **four-field audit standard** — **User**,

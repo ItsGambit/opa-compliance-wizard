@@ -63,7 +63,7 @@ COMPLIANCE_EVENT_TYPES = {
     # CC7 -- System Operations
     "security.request.blocked": "threat_detection",
     "security.protected_action.attempt": "threat_detection",
-    # CC8 -- Change Management
+    # CC6 -- Access Controls (API tokens moved here from CC8 in 5.53.0; see server/control_catalogue.json)
     "system.api_token.create": "api_token_lifecycle",
     "system.api_token.revoke": "api_token_lifecycle",
     "policy.rule.add": "policy_modifications",
@@ -143,34 +143,28 @@ INGESTION_SCOPES = ("curated", "all")
 COMPLIANCE_REPORTS = {
     "mfa_enforcement": {
         "label": "MFA Enforcement",
-        "control": "CC6",
         "description": "Every MFA challenge (success and abandoned) plus the sign-on policy evaluation that gates it.",
     },
     "session_activity": {
         "label": "Session Activity",
-        "control": "CC7",
         "description": "Successful sign-ins to Okta across all apps.",
     },
     "provisioning": {
         "label": "Provisioning & De-provisioning",
-        "control": "CC6",
         "description": "User lifecycle create/deactivate events.",
     },
     "role_group_changes": {
         "label": "Role/Group Changes",
-        "control": "CC6",
         "description": "Group membership add/remove — RBAC drift over time.",
     },
     "admin_privilege_grants": {
         "label": "Admin Privilege Grants",
-        "control": "CC6",
         "description": "Super-admin / role assignment changes.",
     },
     "jit_access_requests": {
         "label": "JIT Access Requests",
-        "control": "CC6",
         "description": (
-            "Access-request lifecycle (create/update/resolve/expire) -- proves an access request was "
+            "Access-request lifecycle (create/update/resolve/expire) -- shows an access request was "
             "made and resolved. Known limitation, confirmed live 2026-09-30 against a real denied "
             "request: Okta's own System Log does not capture the actual approve/deny DECISION anywhere "
             "on the resolve event (debugContext.debugData.decisions is always the literal string \"[]\", "
@@ -180,62 +174,50 @@ COMPLIANCE_REPORTS = {
     },
     "threat_detection": {
         "label": "Threat Detection",
-        "control": "CC7",
         "description": "Blocked requests and protected-action attempts flagged by Okta's own security controls.",
     },
     "api_token_lifecycle": {
         "label": "API Token Lifecycle",
-        "control": "CC8",
         "description": "Service-account API token create/revoke.",
     },
     "policy_modifications": {
         "label": "Policy Modifications",
-        "control": "CC8",
         "description": "Global Okta sign-on/security policy rule and mapping changes.",
     },
     "pam_secrets": {
         "label": "PAM Secrets",
-        "control": "CC6",
         "description": "Vaulted secret and secret-folder create/update/delete/reveal.",
     },
     "pam_jit_access": {
         "label": "PAM JIT Access (Checkout/Checkin)",
-        "control": "CC6",
-        "description": "Zero Standing Privileges evidence — resource checkout and checkin.",
+        "description": "Resource checkout and checkin.",
     },
     "pam_sessions": {
         "label": "PAM Sessions",
-        "control": "CC7",
         "description": "Credential issuance and SSH logins to privileged servers. Note: SSH login actor is the OS-level username, not the Okta identity — correlate with a nearby credential-issuance row to attribute a session to a real person.",
     },
     "pam_credential_reveals": {
         "label": "PAM Credential Reveals",
-        "control": "CC6",
         "description": "Service-account/shared-credential password reveals. The resource column names the account family (SaaS app, Okta, Database, Active Directory, Server). For a per-account roster with status and full history of SaaS/Okta service accounts, see the Service Accounts dashboard.",
     },
     "pam_policy_modifications": {
         "label": "PAM Policy Modifications",
-        "control": "CC8",
         "description": "OPA security policy create/update.",
     },
     "pam_client_enrollment": {
         "label": "Client Enrollment",
-        "control": "CC6",
         "description": "A user's local OPA client (laptop/workstation) enrolling to connect to privileged resources. See also the Access Explorer's Resources tab for the current live roster of enrolled clients.",
     },
     "device_management": {
         "label": "Device Management",
-        "control": "CC6",
-        "description": "Okta-managed device enrollment and user association -- device-trust evidence, separate from OPA client enrollment above. Known gap: only enrollment/activation/user-add are covered; suspend/unsuspend/deactivate/delete exist per Okta's own device-lifecycle docs but have no live-confirmed eventType yet (see COMPLIANCE_EVENT_TYPES comment). See also the Access Explorer's Resources tab for the current live device inventory.",
+        "description": "Okta-managed device enrollment and user association -- device registration record, separate from OPA client enrollment above. Known gap: only enrollment/activation/user-add are covered; suspend/unsuspend/deactivate/delete exist per Okta's own device-lifecycle docs but have no live-confirmed eventType yet (see COMPLIANCE_EVENT_TYPES comment). See also the Access Explorer's Resources tab for the current live device inventory.",
     },
     "ad_sync_activity": {
         "label": "Active Directory Sync Activity",
-        "control": "CC7",
-        "description": "Recurring, automated Active Directory account discovery -- evidence that AD-vaulted accounts stay in sync with the domain.",
+        "description": "Recurring, automated Active Directory account discovery -- shows that discovery runs completed.",
     },
     "credential_rotation": {
         "label": "Credential Rotation",
-        "control": "CC8",
         "description": "Service-account password rotation lifecycle (scheduled and manual). The resource column names the account family (SaaS app, Okta, Database, Active Directory); the outcome column is the real result (SUCCESS / FAILURE / DEFERRED). For per-account rotation totals on SaaS/Okta service accounts, see the Service Accounts dashboard.",
     },
 }
@@ -245,12 +227,51 @@ def _event_types_for_report(report_key):
     return [et for et, key in COMPLIANCE_EVENT_TYPES.items() if key == report_key]
 
 
+CONTROL_CATALOGUE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server", "control_catalogue.json")
+_CONTROL_CATALOGUE = None
+
+
+def load_control_catalogue(path=None):
+    """5.53.0: the control catalogue (framework mappings, methodology notes and known limits per report) is versioned data
+    in server/control_catalogue.json, not code. Cached after the first read of the default file."""
+    global _CONTROL_CATALOGUE
+    if path is None and _CONTROL_CATALOGUE is not None:
+        return _CONTROL_CATALOGUE
+    with open(path or CONTROL_CATALOGUE_PATH, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if path is None:
+        _CONTROL_CATALOGUE = data
+    return data
+
+
+def report_catalogue_entry(report_key):
+    return load_control_catalogue()["reports"][report_key]
+
+
+def report_controls(report_key):
+    """The report's mapped controls, in catalogue order ([{framework, id, status}, ...])."""
+    return list(report_catalogue_entry(report_key)["controls"])
+
+
+def report_control(report_key):
+    """Coarse grouping ('CC6', 'CC7', 'CC8') derived from the first mapped control ('CC6.1' -> 'CC6')."""
+    return report_controls(report_key)[0]["id"].split(".")[0]
+
+
+def report_mapping_status(report_key):
+    """'proposed' unless every mapped control is auditor-reviewed. Nothing is auditor-reviewed in 5.53.0."""
+    statuses = {c["status"] for c in report_controls(report_key)}
+    return "auditor-reviewed" if statuses == {"auditor-reviewed"} else "proposed"
+
+
 def list_reports():
-    """Returns every report definition plus its derived event_types list --
-    the frontend's report picker renders directly from this, grouped by
-    `control`."""
+    """Returns every report definition plus its derived event_types list, its mapped controls and mapping status
+    -- the frontend's report picker renders directly from this, grouped by `control` (derived from the first
+    mapped control)."""
     return [
-        {"key": key, "event_types": _event_types_for_report(key), **meta}
+        {"key": key, "event_types": _event_types_for_report(key), **meta,
+         "control": report_control(key), "controls": report_controls(key), "mapping_status": report_mapping_status(key),
+         "methodology": report_catalogue_entry(key)["methodology"], "known_limits": list(report_catalogue_entry(key)["known_limits"])}
         for key, meta in COMPLIANCE_REPORTS.items()
     ]
 
