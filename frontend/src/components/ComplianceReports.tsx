@@ -3,29 +3,10 @@ import { AlertTriangle, Download, FileClock, KeyRound, Shield, Users } from 'luc
 import { useEnvironments, useReportDefs, useSyncStatus } from '../api/hooks'
 import type { ComplianceControl, ComplianceReportDef } from '../types'
 import { ComplianceReportDetail } from './ComplianceReportDetail'
-import { complianceReportExportSections } from '../utils/exportSections'
 import { exportSections } from '../utils/export'
-import { runReport } from '../api/client'
 import { toast } from '../hooks/useToast'
 import { ErrorNotice } from './ErrorNotice'
-import { exportAllReports } from '../utils/reportExports'
-
-// UI-03/DATA-07 (external review, 2026-10-05): both export paths below
-// call runReport with no `from`/`to` and no `limit`, so a tenant with
-// more than the server's default 1000-row cap for that report used to
-// write a silently-partial CSV with no indication the file was missing
-// its oldest rows. There's no truncation UI here the way the detail
-// view's ReportRowsTable has (this is a direct-to-file export, not a
-// table render) -- a toast after the fact is the simplest honest signal
-// without blocking the export outright.
-function warnIfTruncated(label: string, truncated: boolean, total: number, shown: number) {
-  if (!truncated) return
-  toast({
-    title: `Export of "${label}" is incomplete`,
-    description: `Showing the newest ${shown.toLocaleString()} of ${total.toLocaleString()} events. Open the report and narrow the date range to export the rest.`,
-    variant: 'error',
-  })
-}
+import { CARD_EXPORT_DAYS, cardExportRange, downloadReportCsv, eventCount, exportAllReports, truncationRefusal } from '../utils/reportExports'
 
 const CONTROL_LABELS: Record<ComplianceControl, string> = {
   CC6: 'Access Controls — CC6',
@@ -57,11 +38,13 @@ function ReportCard({ def, environment, onClick }: { def: ComplianceReportDef; e
   // UI-14 (external review, 2026-10-05): a pending state (no duplicate
   // downloads from impatient clicks) and an error toast (a failed export
   // used to be a silent unhandled rejection).
+  // 5.53.0: the file comes from the server (every event of the range, no 1,000-row cut) for the report's default range,
+  // the last 90 UTC days. The range is stated on the button so the file is never taken for "all time".
+  const range = cardExportRange()
   const exportMutation = useMutation({
-    mutationFn: () => runReport(def.key, environment),
-    onSuccess: resp => {
-      warnIfTruncated(def.label, resp.truncated, resp.total, resp.rows.length)
-      exportSections(complianceReportExportSections(def.label, resp.rows), 'csv', `opa-report-${def.key}`)
+    mutationFn: () => downloadReportCsv(environment as string, def.key, range.from, range.to),
+    onSuccess: ({ rows }) => {
+      if (rows !== null) toast({ title: `Exported "${def.label}"`, description: `${eventCount(rows)}, ${range.from} to ${range.to} (UTC).`, variant: 'success' })
     },
     onError: (err: Error) => toast({ title: `Could not export "${def.label}"`, description: err.message, variant: 'error' }),
   })
@@ -89,9 +72,9 @@ function ReportCard({ def, environment, onClick }: { def: ComplianceReportDef; e
       </button>
       <button
         type="button"
-        title={`Export "${def.label}" (all time) as CSV`}
+        title={`Export "${def.label}" as CSV: every event from ${range.from} to ${range.to} (UTC, the last ${CARD_EXPORT_DAYS} days). Open the report to choose another range.`}
         aria-label={`Export ${def.label} as CSV`}
-        disabled={exportMutation.isPending}
+        disabled={exportMutation.isPending || !environment}
         className="absolute top-2 right-2 w-6 h-6 rounded-md border border-border bg-bg-card text-text-faint
           opacity-0 group-hover:opacity-100 focus-visible:opacity-100 disabled:opacity-100 hover:text-accent hover:border-accent transition-opacity flex items-center justify-center"
         onClick={e => {
@@ -127,7 +110,7 @@ export function ComplianceReports({ selectedReport, onSelectReport }: Props) {
 
   const exportAllMutation = useMutation({
     mutationFn: () => exportAllReports(reports ?? [], activeEnv),
-    onSuccess: ({ sections, failed }) => {
+    onSuccess: ({ sections, failed, truncated }) => {
       // A file named "all reports" must contain all of them: if any report
       // failed, nothing is downloaded (as before) -- but the failures are
       // now named instead of being a silent unhandled rejection (UI-14).
@@ -139,9 +122,16 @@ export function ComplianceReports({ selectedReport, onSelectReport }: Props) {
         })
         return
       }
-      for (const { def, resp } of sections) warnIfTruncated(def.label, resp.truncated, resp.total, resp.rows.length)
+      // 5.53.0: this file is built from capped lists. Say so before anything is written, and write nothing.
+      // (The evidence package replaces this entry point.)
+      const refusal = truncationRefusal(truncated)
+      if (refusal) {
+        toast({ ...refusal, variant: 'error' })
+        return
+      }
       exportSections(sections.map(({ section }) => section), 'csv', 'opa-compliance-reports-all')
     },
+    onError: (err: Error) => toast({ title: 'Export failed — nothing was downloaded', description: err.message, variant: 'error' }),
   })
 
   if (selectedReport && reports) {

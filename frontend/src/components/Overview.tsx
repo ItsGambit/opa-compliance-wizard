@@ -12,7 +12,7 @@ import { downloadTextFile, exportSections, toCsv } from '../utils/export'
 import { formatDateTime, formatDateTimeZone } from '../utils/format'
 import { activeRow, can, refreshReason } from '../utils/environmentRows'
 import { ageText, completedWords, formatDayYear, formatTimeOnly, isActive, ordinal, requestedParts, scanFreshness, staleBadgeText } from '../utils/refresh'
-import { exportAllReports } from '../utils/reportExports'
+import { exportAllReports, truncationRefusal } from '../utils/reportExports'
 import {
   FACTOR_ROWS, approx, dayLabel, inventoryCsv, leadershipPdfHtml, overviewExportSections, pct, seriesValues, signed, weekReadout, windowFigures,
 } from '../utils/overview'
@@ -520,9 +520,14 @@ function EvidenceReadiness({ o, environment, onOpenReports }: { o: OverviewData;
     if (!defs) return
     setBusy(true)
     try {
-      const { sections, failed } = await exportAllReports(defs, environment)
+      const { sections, failed, truncated } = await exportAllReports(defs, environment)
       if (failed.length) { toast({ title: 'Some reports could not be exported', description: failed.map(f => f.def.label).join(', '), variant: 'error' }); return }
+      // 5.53.0: this file is made from capped lists; say so before any file is written, and write none.
+      const refusal = truncationRefusal(truncated)
+      if (refusal) { toast({ ...refusal, variant: 'error' }); return }
       downloadTextFile('opa-all-reports.csv', toCsv(sections.map(s => s.section)), 'text/csv')
+    } catch (err) {
+      toast({ title: 'Export failed — nothing was downloaded', description: err instanceof Error ? err.message : String(err), variant: 'error' })
     } finally { setBusy(false) }
   }
   return (

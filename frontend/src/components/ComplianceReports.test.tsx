@@ -1,15 +1,16 @@
 /** UI-04 / UI-14 on the reports home. */
 import { fireEvent, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { fetchEnvironments, fetchReportDefs, fetchSyncStatus, runReport } from '../api/client'
+import { fetchEnvironments, fetchReportCsv, fetchReportDefs, fetchSyncStatus, runReport } from '../api/client'
+import { utcDaysAgo, utcToday } from '../hooks/useReportDateRange'
 import { renderWithClient } from '../test/renderWithClient'
-import { exportSections } from '../utils/export'
+import { downloadBlob, exportSections } from '../utils/export'
 import { ComplianceReports } from './ComplianceReports'
 
 vi.mock('../api/client', () => ({
-  fetchEnvironments: vi.fn(), fetchReportDefs: vi.fn(), fetchSyncStatus: vi.fn(), runReport: vi.fn(),
+  fetchEnvironments: vi.fn(), fetchReportDefs: vi.fn(), fetchSyncStatus: vi.fn(), runReport: vi.fn(), fetchReportCsv: vi.fn(),
 }))
-vi.mock('../utils/export', () => ({ exportSections: vi.fn() }))
+vi.mock('../utils/export', () => ({ exportSections: vi.fn(), downloadBlob: vi.fn() }))
 const toastSpy = vi.fn()
 vi.mock('../hooks/useToast', () => ({ toast: (m: unknown) => toastSpy(m) }))
 
@@ -64,13 +65,58 @@ describe('ComplianceReports', () => {
   it('a card export failure is a toast, and the button is busy while it runs', async () => {
     vi.mocked(fetchReportDefs).mockResolvedValue({ reports: [DEFS[0]] as never })
     let reject!: (e: Error) => void
-    vi.mocked(runReport).mockImplementation(() => new Promise((_, r) => { reject = r }))
+    vi.mocked(fetchReportCsv).mockImplementation(() => new Promise((_, r) => { reject = r }))
     renderWithClient(<ComplianceReports selectedReport={null} onSelectReport={() => {}} />)
     const btn = await screen.findByRole('button', { name: 'Export MFA as CSV' })
     fireEvent.click(btn)
     await waitFor(() => expect((btn as HTMLButtonElement).disabled).toBe(true))
     reject(new Error('timeout'))
-    await waitFor(() => expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({ title: 'Could not export "MFA"' })))
+    await waitFor(() => expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({ title: 'Could not export "MFA"', description: 'timeout', variant: 'error' })))
+    expect(downloadBlob).not.toHaveBeenCalled()
+  })
+
+  it('a card export downloads the server file for the last 90 UTC days and says so on the button', async () => {
+    vi.mocked(fetchReportDefs).mockResolvedValue({ reports: [DEFS[0]] as never })
+    const blob = new Blob(['x'])
+    vi.mocked(fetchReportCsv).mockResolvedValue({ blob, rows: 4812 })
+    renderWithClient(<ComplianceReports selectedReport={null} onSelectReport={() => {}} />)
+    const btn = await screen.findByRole('button', { name: 'Export MFA as CSV' })
+    const from = utcDaysAgo(90)
+    const to = utcToday()
+    expect(btn.getAttribute('title')).toContain(`every event from ${from} to ${to} (UTC, the last 90 days)`)
+    fireEvent.click(btn)
+    await waitFor(() => expect(downloadBlob).toHaveBeenCalledTimes(1))
+    expect(fetchReportCsv).toHaveBeenCalledWith('dev', 'mfa_enforcement', from, to)
+    expect(downloadBlob).toHaveBeenCalledWith(`opa-report-mfa_enforcement-${from}-to-${to}.csv`, blob)
+    // The count in the toast is the server's: complete, with no "incomplete" path left.
+    expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({ title: 'Exported "MFA"', description: expect.stringContaining('4,812 events') }))
+    expect(toastSpy).not.toHaveBeenCalledWith(expect.objectContaining({ title: expect.stringContaining('incomplete') }))
+    expect(runReport).not.toHaveBeenCalled()      // nothing is written from a capped list
+    expect(exportSections).not.toHaveBeenCalled()
+  })
+
+  it('Export all writes nothing and says why, before any file, when a report list is cut at the limit', async () => {
+    vi.mocked(fetchReportDefs).mockResolvedValue({ reports: DEFS as never })
+    vi.mocked(runReport).mockImplementation(async key => (
+      key === 'provisioning' ? { rows: new Array(1000).fill({}), total: 4812, truncated: true } : { rows: [], total: 0, truncated: false }) as never)
+    renderWithClient(<ComplianceReports selectedReport={null} onSelectReport={() => {}} />)
+    await screen.findAllByText('events, all time')
+    fireEvent.click(screen.getByRole('button', { name: /Export all/ }))
+    await waitFor(() => expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({
+      title: 'Export all stopped — nothing was downloaded',
+      description: expect.stringContaining('Provisioning has 4,812 events and only 1,000 can be listed here'),
+      variant: 'error',
+    })))
+    expect(exportSections).not.toHaveBeenCalled()
+  })
+
+  it('Export all shows an error when the request itself fails', async () => {
+    vi.mocked(fetchReportDefs).mockResolvedValue({ reports: DEFS as never })
+    vi.mocked(runReport).mockImplementation(() => { throw new Error('offline') })
+    renderWithClient(<ComplianceReports selectedReport={null} onSelectReport={() => {}} />)
+    await screen.findAllByText('events, all time')
+    fireEvent.click(screen.getByRole('button', { name: /Export all/ }))
+    await waitFor(() => expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({ title: 'Export failed — nothing was downloaded', description: 'offline', variant: 'error' })))
     expect(exportSections).not.toHaveBeenCalled()
   })
 
