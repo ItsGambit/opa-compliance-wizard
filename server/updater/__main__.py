@@ -10,6 +10,7 @@ Updates page shows is also here, for admins who work from a shell).
     python -m server.updater keys list
     python -m server.updater keys apply-revocation <revocation.json>
     python -m server.updater audit [--since 2026-01-31[T10:00:00Z]] [--correlation upg-xxxxxxxx] [--last N] [--json]
+    python -m server.updater settings-unlocks list | clear --confirm CLEAR    (5.53.0; `sudo ocw-updater settings-unlocks ...`)
 
 Installing, rolling back, restoring, staging and the support bundle need root
 and are run through the `ocw-updater` command that server/install.sh puts on
@@ -193,6 +194,41 @@ def cmd_verify(a):
     return EXIT_OK if verifylib.main(argv) == 0 else EXIT_FAILURE
 
 
+def _operator():
+    """Who ran a root-only command: the person behind sudo, else the operating-system user."""
+    import os
+    return "cli:" + (os.environ.get("SUDO_USER") or getpass.getuser())
+
+
+def cmd_settings_unlocks(a):
+    """5.53.0: the windows during which a signed-in user may read Settings and Updates (opened by an MFA, ended by expiry, a
+    sign-out or "Lock now"). `list` shows them; `clear` ends every one at once -- an incident response step: nobody can read
+    Settings or Updates again without a new MFA. Clearing only removes access; it can never open anything. It is audited."""
+    import sqlite3
+
+    import audit_store
+    try:
+        rows = audit_store.list_settings_unlocks()
+    except sqlite3.OperationalError:
+        rows = []          # an archive that has not been upgraded to the unlock yet has no table, so no windows
+    if a.unlock_cmd == "list":
+        if not rows:
+            print("No Settings or Updates windows are recorded.")
+        for r in rows:
+            print(f"{r['actor_sub']}  gate={r['issuer'] or '-'}  session={r['session_fp'][:8]}…  opened {r['unlocked_at'][:19]}Z  "
+                  f"until {r['expires_at'][:19]}Z")
+        return EXIT_OK
+    if a.confirm != "CLEAR":
+        print("Refused: pass --confirm CLEAR. This ends every open Settings and Updates window; people unlock again with MFA.",
+              file=sys.stderr)
+        return 2
+    cleared = audit_store.clear_settings_unlocks() if rows else 0
+    _engine().log_audit_event(_operator(), None, "settings.locked", {"reason": "operator", "cleared": cleared, "via": "cli"},
+                              user_agent="cli")
+    print(f"Ended {cleared} Settings and Updates window(s). Everyone unlocks again with MFA.")
+    return EXIT_OK
+
+
 def cmd_audit(a):
     engine = _engine()
     entries = [e for e in engine.read_audit_log(limit=5000)
@@ -258,6 +294,11 @@ def build_parser():
         r = sub.add_parser(name, add_help=False)
         r.add_argument("rest", nargs="*")
         r.set_defaults(fn=cmd_root_only)
+    u = sub.add_parser("settings-unlocks").add_subparsers(dest="unlock_cmd", required=True)
+    u.add_parser("list").set_defaults(fn=cmd_settings_unlocks)
+    s = u.add_parser("clear")
+    s.add_argument("--confirm")
+    s.set_defaults(fn=cmd_settings_unlocks)
     s = sub.add_parser("audit")
     s.add_argument("--since", help="ISO date or time, e.g. 2026-01-31 or 2026-01-31T10:00:00Z")
     s.add_argument("--correlation", help="only the entries of one upgrade run, e.g. upg-7f3a9c2e")
