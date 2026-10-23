@@ -2346,6 +2346,63 @@ def test_the_upgrade_notice_key_sets_are_pinned(matrix_server, monkeypatch):
         assert forbidden not in admin and forbidden not in plain
 
 
+def test_the_nested_notice_run_and_revocation_key_sets_are_pinned(matrix_server, monkeypatch, tmp_path):
+    """What the admin notice carries while Updates is locked: progress and the banner's summary, never the backup's name, step
+    details, failure text or the rest of a revocation history entry."""
+    import json as _json
+
+    base_url, serve = matrix_server
+    _hosted(serve, monkeypatch)
+    upgrade_dir = tmp_path / "upgrade"
+    upgrade_dir.mkdir()
+    monkeypatch.setenv("OPA_UPGRADE_DIR", str(upgrade_dir))
+    (upgrade_dir / "state.json").write_text(_json.dumps({
+        "correlation_id": "upg-00000001", "action": "apply", "version_from": "5.52.0", "version_to": "5.53.0", "step": "switching",
+        "result": None, "started_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:01:00Z",
+        "backup": {"name": "audit_store-pre-5.53.0.db", "size": 123, "integrity": "ok", "path": "/x"},
+        "steps_done": [{"step": "validated", "detail": {"note": "internal"}}], "failure": {"detail": "internal text"},
+        "reason_text": "internal reason", "next_step": "internal next", "bundle": {"name": "ocw-support-x.tar.gz"},
+        "manifest": {"migrations": []}, "sha256": "a" * 64, "requested_by": "someone"}))
+    real_status = serve.update_service.status
+    monkeypatch.setattr(serve.update_service, "status", lambda *a, **k: {**real_status(*a, **k), "revocation": {
+        "serial": 2, "issued_at": "2026-01-01T00:00:00Z", "applied_at": "2026-01-02T00:00:00Z", "reason": "r", "advisory_url": None,
+        "revoked": ["AA"], "added": ["BB"], "signed_by": "CC", "source": "release_assets", "keys_blob": ["secret-shaped"], "raw": {"x": 1}}})
+    admin = requests.get(base_url + "/api/upgrade/notice", headers=_who(ADMIN, admin=True), timeout=10).json()
+    assert set(admin["run"]) == set(serve.NOTICE_RUN_FIELDS) | {"backup"}
+    assert admin["run"]["backup"] == {"size": 123, "integrity": "ok"}
+    assert set(admin["revocation"]) == set(serve.NOTICE_REVOCATION_FIELDS)
+    text = _json.dumps(admin)
+    for leaked in ("audit_store-pre", "internal", "ocw-support", "keys_blob", "someone", "a" * 64):
+        assert leaked not in text
+
+
+def test_a_refused_recheck_does_not_renew_the_unlock(matrix_server, monkeypatch, tmp_audit_log):
+    """The approval is spent either way, but only a change that was applied restarts the Settings unlock."""
+    base_url, serve = matrix_server
+    _share_a_dev_with_b_session(serve)
+    _hosted(serve, monkeypatch)
+    # Environments change: the environment is gone by the time the approval comes back (re-check refuses).
+    aid = _prepare(base_url, "POST", "/api/environments/dev/share", {"shared": False}, OWNER_A)
+    engine.delete_environment("dev", owner=OWNER_A)
+    refused = _save(base_url, OWNER_A, aid)
+    assert refused.status_code >= 400, refused.text
+    assert _unlock_rows() == []
+    assert not any(e["details"].get("settings_unlock_renewed") for e in _audit_entries(tmp_audit_log))
+    # Access control: the write itself fails.
+    me = _who(ADMIN, admin=True)
+    cfg = {"admin_group_id": "00gADMINS", "user_group_id": "00gUSERS", "restrict_login": False}
+    aid = requests.post(base_url + "/api/access_control/prepare", json=cfg, headers=me, timeout=10).json()["action_id"]
+
+    def boom(*a, **k):
+        raise ValueError("write refused")
+
+    monkeypatch.setattr(engine, "set_access_control_config", boom)
+    resp = requests.post(base_url + "/api/access_control/save", json={}, headers={**me, "X-Auth-Action-Id": aid}, timeout=10)
+    assert resp.status_code >= 400
+    assert _unlock_rows() == []
+    assert not any(e["details"].get("settings_unlock_renewed") for e in _audit_entries(tmp_audit_log))
+
+
 def test_every_gated_route_calls_the_unlock_check_after_its_admin_check():
     """The mutation a review would try: delete _require_settings_unlock from one route. Behaviour is covered above; this pins
     the source shape, including that the admin check comes first."""

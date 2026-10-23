@@ -286,6 +286,30 @@ def _request_passed_stepup_location(headers):
     return hmac.compare_digest(presented.encode("utf-8"), NGINX_PROXY_SECRET.encode("utf-8"))
 
 
+NOTICE_RUN_FIELDS = ("correlation_id", "action", "version_from", "version_to", "step", "result", "reason_code", "failed_step",
+                     "started_at", "updated_at", "seconds", "rolled_back_to", "step_started_at")
+NOTICE_REVOCATION_FIELDS = ("serial", "issued_at", "applied_at", "reason", "advisory_url", "revoked", "added", "signed_by", "source")
+
+
+def _notice_run(run):
+    """The upgrade run as the notice shows it to administrators: progress only. The backup's file name, the steps' details and
+    the failure text stay on the Updates page (behind the unlock)."""
+    if not isinstance(run, dict):
+        return None
+    out = {k: run.get(k) for k in NOTICE_RUN_FIELDS}
+    backup = run.get("backup")
+    if isinstance(backup, dict):
+        out["backup"] = {"size": backup.get("size"), "integrity": backup.get("integrity")}
+    return out
+
+
+def _notice_revocation(rev):
+    """The recent key revocation as the banner needs it, nothing else of the history entry."""
+    if not isinstance(rev, dict):
+        return None
+    return {k: rev.get(k) for k in NOTICE_REVOCATION_FIELDS}
+
+
 def _session_fingerprint(headers):
     """5.53.0: tells one login session from another for the Settings unlock. sha256 of the gate's opaque session cookie value
     (first 32 hex characters); this process never parses or trusts the cookie's content, it only hashes the string the gate
@@ -2458,9 +2482,13 @@ class Handler(SimpleHTTPRequestHandler):
         issuer = _issuer_from_headers(self.headers)
         if issuer:
             details = {**(details or {}), "actor_issuer": issuer}
-        if getattr(self, "_settings_unlock_renewed", False):
-            # 5.53.0: this write's own MFA also restarted the Settings unlock.
-            details = {**(details or {}), "settings_unlock_renewed": True}
+        pending = getattr(self, "_settings_unlock_renewal", None)
+        if pending is not None:
+            # 5.53.0: the first audit entry of an approved change is written only once the change was applied, so that is when
+            # its MFA restarts the Settings unlock (a refused re-check logs nothing and renews nothing).
+            self._settings_unlock_renewal = None
+            if self._renew_settings_unlock_after_mfa(*pending):
+                details = {**(details or {}), "settings_unlock_renewed": True}
         return engine.log_audit_event(
             actor_email, actor_sub, action, details,
             client_ip=self._request_client_ip(),
@@ -4396,7 +4424,7 @@ class Handler(SimpleHTTPRequestHandler):
                     st = update_service.status(update_service.load(), engine.SCRIPT_VERSION)
                     notice_body = {**notice_body,
                                    "update_available": (st["latest"] or {}).get("version") if st["check"]["enabled"] and st["update_available"] else None,
-                                   "revocation": st["revocation"], "run": upgrade_service.run_view()}
+                                   "revocation": _notice_revocation(st["revocation"]), "run": _notice_run(upgrade_service.run_view())}
                 return self._send_json(200, notice_body)
 
             if path == "/api/upgrade/bundle":
@@ -4634,10 +4662,11 @@ class Handler(SimpleHTTPRequestHandler):
                 except audit_store.PendingActionError as exc:
                     status = 409 if exc.reason in ("already_consumed", "expired") else 403
                     return self._send_json(status, {"error": f"Could not apply this change ({exc.reason}) -- please try again.", "reason": exc.reason})
-                renewed = self._renew_settings_unlock_after_mfa(actor_sub, "access_control.update", action_id)
                 config = engine.set_access_control_config(
                     config["admin_group_id"], config["user_group_id"], config["restrict_login"]
                 )
+                # only now, with the write done, does this approval's MFA restart the Settings unlock
+                renewed = self._renew_settings_unlock_after_mfa(actor_sub, "access_control.update", action_id)
                 # step_up_verified is now derived from having successfully
                 # consumed a real pending action bound to this exact
                 # step-up transaction -- not hardcoded-true-by-construction
@@ -4715,11 +4744,14 @@ class Handler(SimpleHTTPRequestHandler):
                             "reason": "secrets_expired", "action": action,
                         })
                     params = {**params, "body": {**(params.get("body") or {}), **held}}
-                self._settings_unlock_renewed = self._renew_settings_unlock_after_mfa(actor_sub, action, action_id)
+                # renewed when the change's own audit entry is written (see _log_audit_event), or below if it wrote none
+                self._settings_unlock_renewal = (actor_sub, action, action_id)
                 try:
                     status, body = getattr(self, _ENV_CHANGE_EXECUTORS[action])(params, dry_run=False, via_step_up=True)
+                    if 200 <= status < 300 and self._settings_unlock_renewal is not None:
+                        self._renew_settings_unlock_after_mfa(*self._settings_unlock_renewal)
                 finally:
-                    self._settings_unlock_renewed = False
+                    self._settings_unlock_renewal = None
                 body = {**(body or {}), "action": action}
                 if 200 <= status < 300:
                     body["step_up_verified"] = True
