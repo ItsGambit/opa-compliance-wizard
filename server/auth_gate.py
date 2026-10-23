@@ -193,9 +193,9 @@ import jwt
 from jwt import PyJWKClient
 
 try:  # run as a script (systemd: python server/auth_gate.py)
-    from gate_config import access_control_path, okta_endpoints, session_key_path
+    from gate_config import SESSION_COOKIE, access_control_path, okta_endpoints, session_key_path
 except ImportError:  # imported as server.auth_gate
-    from server.gate_config import access_control_path, okta_endpoints, session_key_path
+    from server.gate_config import SESSION_COOKIE, access_control_path, okta_endpoints, session_key_path
 
 # Phase 8 of docs/fast-follow-redesign.md: same JSON-line structured-
 # logging shape as create_secret_folders.py's own log()/CORRELATION_ID
@@ -274,7 +274,6 @@ SESSION_KEY_PATH = session_key_path(os.environ)
 # client trying to smuggle an arbitrary value through -- is rejected
 # before it enters a signed cookie or a response header.
 _ACTION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}")
-SESSION_COOKIE = "opa_wizard_session"
 FLOW_COOKIE = "opa_wizard_flow"
 STEPUP_COOKIE = "opa_wizard_stepup"
 SESSION_TTL_SECONDS = 12 * 60 * 60  # 12h -- re-login once a workday

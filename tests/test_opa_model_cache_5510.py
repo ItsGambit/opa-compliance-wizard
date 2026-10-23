@@ -318,7 +318,7 @@ def test_migration_eleven_upgrades_a_5_50_database_without_touching_its_data(tmp
     audit_store.record_config_snapshot(ENV, "okta_admins", [("u", {"a": 1})])
     monkeypatch.setattr(audit_store, "MIGRATIONS", full)
     audit_store.run_migrations()
-    assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 11
+    assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == max(full)
     assert conn.execute("SELECT name FROM sqlite_master WHERE name = 'opa_model_cache'").fetchone() is not None
     assert len(audit_store.list_config_snapshots(ENV)) == 1 and audit_store.verify_ingestion_chain(ENV, deep=True)["valid"]
     audit_store.run_migrations()  # idempotent
