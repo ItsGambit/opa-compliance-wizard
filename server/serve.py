@@ -55,6 +55,14 @@ FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 # 5.47.0: user-saved folder templates and execution records live with the data
 # files when OPA_DATA_DIR is set (the /var/lib layout; the code directory is
 # read-only to this process there). Unset = the project directory, as always.
+EXPORT_MIN_FREE_BYTES = 256 * 1024 * 1024  # a report export is refused (507) below this much free space
+
+
+def _free_bytes(path):
+    import shutil
+    return shutil.disk_usage(path).free
+
+
 def _csv_dir():
     return Path(os.environ["OPA_DATA_DIR"]) if os.environ.get("OPA_DATA_DIR") else PROJECT_ROOT
 
@@ -2753,6 +2761,82 @@ class Handler(SimpleHTTPRequestHandler):
                 return True
         return False
 
+    def _report_csv_target(self, path, engine_owner):
+        """(environment name, report key, meta) for /api/environments/<name>/reports/<report_key>/export.csv, or None after
+        sending the 404. Visibility only; the route checks view_archive itself afterwards (never an existence oracle)."""
+        middle = path[len("/api/environments/"):-len("/export.csv")]
+        env_part, sep, report_key = middle.rpartition("/reports/")
+        if not (sep and env_part and report_key):
+            self._send_json(404, {"error": "Not found."})
+            return None
+        name = unquote(env_part)
+        meta = engine.list_environments_for(engine_owner).get(name)
+        if meta is None:
+            self._send_json(404, {"error": f"No environment named '{name}' visible to this user."})
+            return None
+        return name, unquote(report_key), meta
+
+    def _serve_report_csv(self, name, report_key, meta, qs):
+        """5.53.0: GET /api/environments/<name>/reports/<report_key>/export.csv?since=YYYY-MM-DD&until=YYYY-MM-DD.
+
+        Same visibility and permission as viewing the report (view_archive; not behind the Settings unlock). Every
+        event of the report in the UTC period, none dropped: the rows come from ONE evidence_core snapshot and go
+        through the same writer the evidence package uses. The file is built into a temporary file first and sent
+        with a Content-Length, so a failure while building answers with an error instead of a download that ends
+        early, and a transfer that is cut short is visible to the browser. Nothing is cached. The audit entry names
+        who, which environment and report, the range and the row count; never any event content."""
+        import audit_store
+        import evidence_core
+        import tempfile
+        if report_key not in audit_store.COMPLIANCE_REPORTS:
+            return self._send_json(404, {"error": "Unknown report."})
+        since = (qs.get("since") or [""])[0]
+        until = (qs.get("until") or [""])[0]
+        try:
+            period = evidence_core.parse_period(since, until)
+        except evidence_core.PeriodError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        # The file is built on disk in a `tmp` folder of the data directory (the archive's folder; the service's own /tmp
+        # may be memory), anonymous and removed on close. Refuse early if the disk is nearly full.
+        tmp_dir = os.path.join(os.path.dirname(audit_store._audit_db_path()), "tmp")
+        try:
+            os.makedirs(tmp_dir, mode=0o700, exist_ok=True)
+            free = _free_bytes(tmp_dir)
+        except OSError as exc:
+            engine.log("WARN", f"report csv export: temporary folder unusable: {exc}")
+            return self._send_json(507, {"error": "The server has no usable temporary space for this export."})
+        if free < EXPORT_MIN_FREE_BYTES:
+            return self._send_json(507, {"error": (
+                f"The server has only {free // (1024 * 1024)} MB of free disk space; an export needs at least "
+                f"{EXPORT_MIN_FREE_BYTES // (1024 * 1024)} MB. Free some space and try again.")})
+        try:
+            with tempfile.TemporaryFile(dir=tmp_dir) as out:
+                with evidence_core.open_snapshot(meta["environment_id"], period) as snap:
+                    rows = evidence_core.write_report_csv(out, snap.report_rows(report_key))
+                size = out.tell()
+                _o, _e, actor_email, actor_sub = self._caller()
+                self._log_audit_event(actor_email, actor_sub, "report.csv_exported", {
+                    "name": name, "report": report_key, "since": period.start.isoformat(),
+                    "until": period.end.isoformat(), "rows": rows})
+                filename = f"opa-report-{report_key}-{period.start.isoformat()}-to-{period.end.isoformat()}.csv"
+                out.seek(0)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv; charset=utf-8")
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Report-Rows", str(rows))
+                self.end_headers()
+                while True:
+                    chunk = out.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except evidence_core.EvidenceError as exc:
+            engine.log("WARN", f"report csv export: {exc}")
+            return self._send_json(409, {"error": "The archive could not be read for this export."})
+
     def _environment_from_tail(self, path, tail, engine_owner):
         """(name, meta) for /api/environments/<name><tail>, or None after sending
         the 404. Visibility only: each route then checks its own capabilities
@@ -4201,6 +4285,17 @@ class Handler(SimpleHTTPRequestHandler):
                     return self._send_json(status, body)
                 import audit_store
                 return self._send_json(200, audit_store.verify_ingestion_chain(meta["environment_id"], deep=False))
+
+            if path.startswith("/api/environments/") and path.endswith("/export.csv"):
+                # 5.53.0: one report's events for a period as a complete CSV (no row cap):
+                # GET /api/environments/<name>/reports/<key>/export.csv?since=&until=
+                found = self._report_csv_target(path, engine_owner)
+                if found is None:
+                    return
+                name, report_key, meta = found
+                if self._capability_refused(engine_owner, meta["environment_id"], ("view_archive",)):
+                    return
+                return self._serve_report_csv(name, report_key, meta, qs)
 
             if path.startswith("/api/environments/") and path.endswith("/okta_admins"):
                 # 5.50.0: the Okta Admins report, computed from the stored snapshot (never a live Okta call).

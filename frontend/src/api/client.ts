@@ -124,7 +124,7 @@ interface ApiFetchOptions {
   notifySessionExpired?: boolean
 }
 
-async function apiFetch<T>(path: string, init?: RequestInit, { notifySessionExpired = true }: ApiFetchOptions = {}): Promise<T> {
+async function apiRequest(path: string, init?: RequestInit, { notifySessionExpired = true }: ApiFetchOptions = {}): Promise<Response> {
   // Content-Type only when there is a body to describe (FE-15).
   const headers: Record<string, string> = init?.body != null ? { 'Content-Type': 'application/json' } : {}
   const res = await fetch(path, {
@@ -152,6 +152,11 @@ async function apiFetch<T>(path: string, init?: RequestInit, { notifySessionExpi
   if (!res.ok) {
     throw new ApiError(body?.error || `Request failed with status ${res.status}`, res.status, body ?? undefined)
   }
+  return res
+}
+
+async function apiFetch<T>(path: string, init?: RequestInit, options: ApiFetchOptions = {}): Promise<T> {
+  const res = await apiRequest(path, init, options)
   return res.json() as Promise<T>
 }
 
@@ -556,6 +561,24 @@ export function runReport(
   if (to) params.set('to', to)
   const qs = params.toString()
   return apiFetch(`/api/reports/${encodeURIComponent(reportKey)}${qs ? `?${qs}` : ''}`)
+}
+
+/** One report's events for a UTC period as a complete CSV (5.53.0): the server writes every event of the range, with no
+ * row cap, from one consistent read of the archive. `since` and `until` are UTC calendar days (YYYY-MM-DD), inclusive.
+ * `rows` is the server's own count of data rows (null if the header is missing); the caller saves the blob. */
+export async function fetchReportCsv(
+  environment: string,
+  reportKey: string,
+  since: string,
+  until: string
+): Promise<{ blob: Blob; rows: number | null }> {
+  const qs = new URLSearchParams({ since, until })
+  const res = await apiRequest(
+    `/api/environments/${encodeURIComponent(environment)}/reports/${encodeURIComponent(reportKey)}/export.csv?${qs.toString()}`
+  )
+  const header = res.headers.get('X-Report-Rows')
+  const rows = header !== null && /^\d+$/.test(header) ? Number(header) : null
+  return { blob: await res.blob(), rows }
 }
 
 /** The Resources tab's per-resource drill-down -- every compliance report

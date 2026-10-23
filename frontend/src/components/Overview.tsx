@@ -3,16 +3,15 @@ import * as Dialog from '@radix-ui/react-dialog'
 import { useQueryClient } from '@tanstack/react-query'
 import { Copy, FileText, List, RefreshCw } from 'lucide-react'
 import { startOktaCapture } from '../api/client'
-import { useEnvironments, useOverview, usePeopleList, useReportDefs, useWhoami } from '../api/hooks'
+import { useEnvironments, useOverview, usePeopleList, useWhoami } from '../api/hooks'
 import { useIntegrityCheck } from '../hooks/useIntegrityCheck'
 import { useRefreshActions, useRefreshStatus } from '../hooks/useRefresh'
 import { toast } from '../hooks/useToast'
 import type { CrossCheckRow, InventorySeries, MfaWeek, Overview as OverviewData, SodOverlap } from '../types'
-import { downloadTextFile, exportSections, toCsv } from '../utils/export'
+import { exportSections } from '../utils/export'
 import { formatDateTime, formatDateTimeZone } from '../utils/format'
 import { activeRow, can, refreshReason } from '../utils/environmentRows'
 import { ageText, completedWords, formatDayYear, formatTimeOnly, isActive, ordinal, requestedParts, scanFreshness, staleBadgeText } from '../utils/refresh'
-import { exportAllReports } from '../utils/reportExports'
 import {
   FACTOR_ROWS, approx, dayLabel, inventoryCsv, leadershipPdfHtml, overviewExportSections, pct, seriesValues, signed, weekReadout, windowFigures,
 } from '../utils/overview'
@@ -513,23 +512,11 @@ function Inventory({ o }: { o: OverviewData }) {
   )
 }
 
-function EvidenceReadiness({ o, environment, onOpenReports, onOpenEvidencePackage }: { o: OverviewData; environment: string; onOpenReports: () => void; onOpenEvidencePackage?: () => void }) {
-  const { data: defs } = useReportDefs(environment)
-  const [busy, setBusy] = useState(false)
-  const exportAll = async () => {
-    if (!defs) return
-    setBusy(true)
-    try {
-      const { sections, failed } = await exportAllReports(defs, environment)
-      if (failed.length) { toast({ title: 'Some reports could not be exported', description: failed.map(f => f.def.label).join(', '), variant: 'error' }); return }
-      downloadTextFile('opa-all-reports.csv', toCsv(sections.map(s => s.section)), 'text/csv')
-    } finally { setBusy(false) }
-  }
+function EvidenceReadiness({ o, onOpenReports, onOpenEvidencePackage }: { o: OverviewData; onOpenReports: () => void; onOpenEvidencePackage?: () => void }) {
   return (
     <section aria-labelledby="ov-ev" className="card p-4 flex flex-col gap-3">
       <SectionHead id="ov-ev" title="Evidence readiness">
         {onOpenEvidencePackage && <button type="button" className="btn-primary" onClick={onOpenEvidencePackage}>Build evidence package</button>}
-        <button type="button" className={onOpenEvidencePackage ? 'btn-secondary' : 'btn-primary'} disabled={busy || !defs} onClick={exportAll}>Export all reports</button>
       </SectionHead>
       <div className="grid gap-4 lg:grid-cols-[1.4fr_1fr]">
         <table className="w-full text-xs">
@@ -706,7 +693,7 @@ export function OverviewPage({ onOpenReports, onOpenEvidencePackage, onOpenOktaA
       <CrossChecks o={o} onOpen={canAdmin ? setDrawer : undefined} />
       <SignIns o={o} environment={environment} onOpen={canAdmin ? setDrawer : undefined} />
       <Inventory o={o} />
-      <EvidenceReadiness o={o} environment={environment} onOpenReports={onOpenReports} onOpenEvidencePackage={onOpenEvidencePackage} />
+      <EvidenceReadiness o={o} onOpenReports={onOpenReports} onOpenEvidencePackage={onOpenEvidencePackage} />
       <PeopleDrawer environment={environment} list={drawer} asOf={effectiveAsOf} onClose={() => setDrawer(null)} />
     </div>
   )

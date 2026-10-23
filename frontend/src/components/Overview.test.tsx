@@ -41,13 +41,13 @@ describe('OverviewPage', () => {
     expect(screen.getByRole('region', { name: 'Evidence readiness' })).toBeTruthy()
   })
 
-  it('the evidence card links to the Evidence package page (5.53.0) and keeps Export all reports', async () => {
+  it('the evidence card links to the Evidence package page (5.53.0) in place of Export all reports', async () => {
     const open = vi.fn()
     renderWithClient(<OverviewPage onOpenReports={vi.fn()} onOpenEvidencePackage={open} />)
     const card = await screen.findByRole('region', { name: 'Evidence readiness' })
     fireEvent.click(within(card).getByRole('button', { name: 'Build evidence package' }))
     expect(open).toHaveBeenCalledTimes(1)
-    expect(within(card).getByRole('button', { name: 'Export all reports' })).toBeTruthy()
+    expect(within(card).queryByRole('button', { name: 'Export all reports' })).toBeNull()
     expect(within(card).getByText(/not encrypted and is not signed/)).toBeTruthy()
   })
 

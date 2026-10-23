@@ -1,36 +1,28 @@
-import { runReport } from '../api/client'
-import type { ComplianceReportDef, ComplianceReportResponse } from '../types'
-import type { ExportSection } from './export'
+import { fetchReportCsv } from '../api/client'
+import { utcDaysAgo, utcToday } from '../hooks/useReportDateRange'
+import { downloadBlob } from './export'
 
-/** "Export all (CSV)" on the reports home: one request per report; every
- * result is collected (not just the first rejection) so the caller can
- * name each report that failed (UI-14). The caller writes the file only
- * when none failed.
- *
- * The row shape here (five columns, the raw stored timestamp) is exactly
- * what this export has always written; aligning it with the per-report
- * export (UI-08) changes evidence files, so it waits for that decision. */
-export async function exportAllReports(reports: ComplianceReportDef[], environment: string | undefined) {
-  const settled = await Promise.allSettled(reports.map(def => runReport(def.key, environment)))
-  const sections: { def: ComplianceReportDef; resp: ComplianceReportResponse; section: ExportSection }[] = []
-  const failed: { def: ComplianceReportDef; error: string }[] = []
-  settled.forEach((result, i) => {
-    const def = reports[i]
-    if (result.status === 'fulfilled') {
-      const resp = result.value
-      sections.push({
-        def,
-        resp,
-        section: {
-          title: def.label,
-          rows: resp.rows.map(r => ({
-            User: r.user, Action: r.action, Timestamp: r.timestamp, 'Affected Resource': r.resource, Outcome: r.outcome,
-          })),
-        },
-      })
-    } else {
-      failed.push({ def, error: result.reason instanceof Error ? result.reason.message : String(result.reason) })
-    }
-  })
-  return { sections, failed }
+/** The range a report card exports: the report's default window, the last 90 UTC days, today included. */
+export const CARD_EXPORT_DAYS = 90
+export function cardExportRange(now: number = Date.now()): { from: string; to: string } {
+  return { from: utcDaysAgo(CARD_EXPORT_DAYS, now), to: utcToday(now) }
+}
+
+/** "5 events" / "1 event". */
+export function eventCount(n: number): string {
+  return `${n.toLocaleString()} ${n === 1 ? 'event' : 'events'}`
+}
+
+/** Downloads one report's CSV for a UTC range from the server: every event of the range, none dropped. Resolves with the
+ * number of data rows the server wrote; rejects (the caller shows the error) if the server refuses or the transfer fails.
+ * Nothing is written from a capped list. */
+export async function downloadReportCsv(
+  environment: string,
+  reportKey: string,
+  from: string,
+  to: string
+): Promise<{ rows: number | null }> {
+  const { blob, rows } = await fetchReportCsv(environment, reportKey, from, to)
+  downloadBlob(`opa-report-${reportKey}-${from}-to-${to}.csv`, blob)
+  return { rows }
 }

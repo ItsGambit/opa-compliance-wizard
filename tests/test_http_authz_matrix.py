@@ -88,6 +88,9 @@ ROUTES = {
     ("GET", "path.startswith('/api/environments/') and path.endswith('/integrity')"):
         Route("GET", "/api/environments/dev/integrity", "env", None, 200, caps=('view_archive',)),
     # 5.50.0: Okta Admins report, cross-checks, chained snapshots, the executive overview.
+    # 5.53.0: one report's events for a period as a complete CSV; the permission of viewing the report.
+    ("GET", "path.startswith('/api/environments/') and path.endswith('/export.csv')"):
+        Route("GET", "/api/environments/dev/reports/session_activity/export.csv?since=2026-01-01&until=2026-01-31", "env", None, 200, caps=('view_archive',)),
     ("GET", "path.startswith('/api/environments/') and path.endswith('/okta_admins')"):
         Route("GET", "/api/environments/dev/okta_admins", "env", None, 200, caps=('view_archive', 'live_read')),
     ("GET", "path.startswith('/api/environments/') and path.endswith('/cross_checks')"):
