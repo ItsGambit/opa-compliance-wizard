@@ -541,3 +541,64 @@ def test_the_build_type_is_not_a_renewing_type_and_the_zip_never_stays_in_the_da
     assert "evidence_package.build" in serve.ENV_CHANGE_ACTION_TYPES
     assert "evidence_package.build" not in serve.SETTINGS_RENEWING_ACTION_TYPES
     assert serve._ENV_CHANGE_EXECUTORS["evidence_package.build"] == "_exec_evidence_package_build"
+
+
+def test_coverage_checks_are_limited_to_two_at_once(ev, monkeypatch):
+    base, serve, env_id, root = ev
+    import evidence_package
+    gate = threading.Event()
+    entered = threading.Semaphore(0)
+    real = evidence_package.preview
+
+    def slow(*a, **k):
+        entered.release()
+        gate.wait(10)
+        return real(*a, **k)
+    monkeypatch.setattr(evidence_package, "preview", slow)
+    results = []
+
+    def go():
+        results.append(requests.post(base + "/api/evidence_packages/prepare?environment=ldev", json={**PERIOD, "check_only": True}, timeout=20).status_code)
+    threads = [threading.Thread(target=go) for _ in range(2)]
+    for t in threads:
+        t.start()
+    assert entered.acquire(timeout=10) and entered.acquire(timeout=10)
+    third = requests.post(base + "/api/evidence_packages/prepare?environment=ldev", json={**PERIOD, "check_only": True}, timeout=10)
+    assert third.status_code == 429 and third.json()["reason"] == "busy"
+    gate.set()
+    for t in threads:
+        t.join(15)
+    assert results == [200, 200]
+    assert requests.post(base + "/api/evidence_packages/prepare?environment=ldev", json={**PERIOD, "check_only": True}, timeout=10).status_code == 200
+
+
+def test_every_check_runs_again_when_the_approved_build_is_started(ev, monkeypatch):
+    base, serve, env_id, root = ev
+    hosted(serve, monkeypatch)
+    share_dev(env_id, allow_build=True)
+    b = who(OWNER_B)
+    # 1. the permission is withdrawn during the MFA round trip
+    aid = prepare(base, headers=b).json()["action_id"]
+    engine.set_shared_permissions({"build_evidence_package": "deny"}, environment_id=env_id)
+    refused = save(base, aid, b)
+    assert refused.status_code == 403 and refused.json()["capability"] == "build_evidence_package"
+    assert not serve._evidence.running()
+    # 2. the name now means another environment (the target changed)
+    engine.set_shared_permissions({"build_evidence_package": "allow"}, environment_id=env_id)
+    aid = prepare(base, headers=b).json()["action_id"]
+    engine.set_environment_shared("dev", OWNER_A, False)
+    _, other = engine.upsert_environment("dev", {"base_domain": "b.example.com", "team_name": "t", "key_id": "k", "key_secret": "s"}, owner=OWNER_B)
+    seed_fixed_archive(other)
+    changed = save(base, aid, b)
+    assert changed.status_code == 409 and changed.json()["reason"] == "target_changed"
+    assert not serve._evidence.running()
+
+
+def test_the_approved_request_runs_whatever_the_save_request_says(ev, monkeypatch):
+    base, serve, env_id, root = ev
+    hosted(serve, monkeypatch)
+    me = who(OWNER_A)
+    aid = prepare(base, {"start": "2020-03-02", "end": "2020-03-03"}, headers=me).json()["action_id"]
+    done = requests.post(base + "/api/environment_changes/save", json={"start": "2019-01-01", "end": "2020-12-31", "environment": "other"},
+                         headers={**me, "X-Auth-Action-Id": aid, "X-Nginx-Stepup-Location": SECRET}, timeout=15)
+    assert done.status_code == 202 and done.json()["period"] == {"start": "2020-03-02", "end": "2020-03-03"}

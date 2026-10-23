@@ -917,6 +917,10 @@ DEEP_VERIFY_ERROR_TTL_SECS = 30
 _evidence = evidence_jobs.Registry(lambda: os.path.join(engine._data_dir(), "packages"))
 EVIDENCE_CAPABILITIES = ("view_archive", "build_evidence_package")
 EVIDENCE_STREAM_CHUNK = 1024 * 1024
+# The coverage check reads the archive (one count per event type, one pass over the period's days): at most this many at once
+# on the whole server, so a person with the permission cannot keep the archive busy by pressing the button; the rest are told to retry.
+EVIDENCE_CHECKS_AT_ONCE = 2
+_evidence_checks = threading.BoundedSemaphore(EVIDENCE_CHECKS_AT_ONCE)
 
 
 def _evidence_caller_refusal(environment_id, engine_owner, issuer):
@@ -3390,11 +3394,15 @@ class Handler(SimpleHTTPRequestHandler):
         except evidence_core.PeriodError as exc:
             return 400, {"error": str(exc), "reason": "bad_period"}
         gaps_ack = body.get("gaps_acknowledged") is True
+        if not _evidence_checks.acquire(blocking=False):
+            return 429, {"error": "The archive is busy with other coverage checks. Try again in a moment.", "reason": "busy"}
         try:
             summary = evidence_package.preview(meta["environment_id"], period,
                                                prune_records=evidence_core.prune_records_from_audit_log(meta.get("name") or name))
         except evidence_core.EvidenceError:
             return 409, {"error": "This environment has no archive yet, so there is nothing to put in a package.", "reason": "no_coverage"}
+        finally:
+            _evidence_checks.release()
         if params.get("check_only"):
             return 200, summary
         if not summary["has_coverage"]:

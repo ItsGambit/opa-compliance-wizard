@@ -207,6 +207,21 @@ describe('hosted mode: the MFA step-up keeps the period, the acknowledgement and
     expect(screen.getByRole('alert').textContent).toMatch(/was not built: This approval was already used or abandoned/)
   })
 
+  it('works the way App uses it: the page takes the inputs once, App clears them, and the check still runs when the environment arrives late', async () => {
+    let release!: (v: ReturnType<typeof env>) => void
+    vi.mocked(fetchEnvironments).mockReturnValue(new Promise(r => { release = r as never }) as never)
+    const consumed = vi.fn()
+    const inputs = { environmentId: 'env-1', period: COV.period, gapsAcknowledged: true, error: 'The MFA approval expired before the build started.' }
+    const { rerender } = renderWithClient(<EvidencePackage resume={inputs} onResumeConsumed={consumed} />)
+    await waitFor(() => expect(consumed).toHaveBeenCalled())
+    rerender(<EvidencePackage resume={null} onResumeConsumed={consumed} />)         // App cleared it
+    expect(checkEvidencePackage).not.toHaveBeenCalled()
+    release(env())
+    await screen.findByText(/Coverage: 97.8% of 92 days/)
+    expect(checkEvidencePackage).toHaveBeenCalledTimes(1)
+    expect((screen.getByRole('checkbox') as HTMLInputElement).checked).toBe(true)     // the acknowledgement came back too
+  })
+
   it('a restored period is recognised as a custom one and the dates are not replaced', async () => {
     vi.mocked(fetchEvidencePackage).mockResolvedValue({ ...DONE, status: 'running', result: undefined, seconds_left: null })
     renderWithClient(<EvidencePackage resume={{ environmentId: 'env-1', period: { start: '2026-02-01', end: '2026-02-20' }, gapsAcknowledged: false, jobId: 'job-9' }} />)

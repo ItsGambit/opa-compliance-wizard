@@ -51,6 +51,7 @@ worth reporting privately.
 |---|---|
 | Just run it on my own machine | Quickstart, below |
 | Understand what each feature does | [docs/features.md](docs/features.md) |
+| Build an evidence package for an auditor, or check one | [docs/evidence-package.md](docs/evidence-package.md), [format and checking](docs/evidence-package-format.md) |
 | Install it on a clean server with one command | [Installing on a server](#installing-on-a-server) |
 | Host it for a team, with Okta login | [docs/hosting.md](docs/hosting.md) |
 | Use the CLI instead of the dashboard | [docs/hosting.md](docs/hosting.md#running-it-as-a-cli-instead) |

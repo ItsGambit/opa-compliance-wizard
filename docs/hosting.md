@@ -406,6 +406,26 @@ What it may print, and why:
   by `deploy.sh` before 5.36.0 (it holds an old copy of the proxy secret;
   remove it).
 
+### Evidence packages on the server (5.53.0)
+
+An evidence package is built from the archive by a background job and written to `packages/` in the data directory
+(`/var/lib/opa-compliance-wizard/packages` on the installer's layout): the folder is `0700`, each package sits in its own
+folder as a `0600` file, and the whole thing belongs to the application account.
+
+| | |
+|---|---|
+| Lifetime | A package is kept for **15 minutes** after it is finished (the download window), then its folder is deleted. Everything under `packages/` is also deleted when the application starts, so a restart or an upgrade never leaves one behind. A failed build deletes its half-written file at once. |
+| Disk | Allow **free space on the data volume** of about half of the uncompressed size of the period's events, plus 256 MB; the build checks this first and refuses with the numbers if there is not enough. A full year of 1,000,000 events produced a package of about @@ZIPMB@@ MB (see the numbers in the changelog). A hard limit of 2 GiB applies to the finished zip (`OPA_EVIDENCE_MAX_BYTES` changes it); a build that would exceed it fails and the person is told to choose a shorter period. |
+| Concurrency | One build at a time on the whole server (a second asks to try again in a few minutes). The upgrade preflight refuses while a build runs. |
+| Backups | Not part of the backup set: do not back up `packages/` (the tar command below excludes it). A package is a copy of data that is in the archive. |
+| Support bundles | Never included: the bundle holds only the upgrade's own summary, journal lines and audit entries. |
+| Uninstall | `--uninstall --keep-data` keeps the data directory; if it was run during the 15 minutes a package may be in it. Delete `packages/` yourself when you remove the data. |
+| Where the record is | The Audit Log and the journal: `evidence_package.build` (who, from which address, which environment and period, whether gaps were acknowledged, local mode or MFA), `.build_finished` (rows, bytes, duration, sha256, chain head) or `.build_failed`, and one `.downloaded` for every fetch. Never row content. |
+
+Behind nginx a download is an ordinary proxied response; the template is unchanged. nginx buffers a large response to a temporary
+file (its `proxy_max_temp_file_size`, 1 GB by default) and then passes the rest on synchronously, which is fine for a package
+within the size limit.
+
 ### Backups and restore
 
 The archive, the audit log and the stored credentials exist nowhere else, and
@@ -431,7 +451,8 @@ folder and the keyring in the application account's `~/.local/share/keyrings`.
 
 Not needed: `/opt/opa-compliance-wizard` (the installed releases and the root-owned
 updater: install the release again), the `upgrade/` folder of the data directory (the updater's own
-pre-upgrade copies and bundles; large; not a substitute for the backup above) and
+pre-upgrade copies and bundles; large; not a substitute for the backup above), the `packages/` folder
+(evidence packages are temporary; see "Evidence packages on the server") and
 `/var/lib/ocw-updater` (downloads).
 
 A backup holds people's names and e-mails (the archive) and secrets (the keyring, the settings
@@ -447,7 +468,7 @@ B=/var/backups/opa-compliance-wizard/$(date +%F)
 sudo install -d -o ocw -g ocw -m 0700 /var/backups/opa-compliance-wizard "$B"
 sudo -u ocw sqlite3 /var/lib/opa-compliance-wizard/audit_store.db ".backup '$B/audit_store.db'"
 sudo tar -C /var/lib/opa-compliance-wizard -czpf "$B/data-files.tar.gz" \
-  --exclude=./upgrade --exclude=./audit_store.db --exclude='./audit_store.db-*' --exclude=./.audit_log.jsonl.lock .
+  --exclude=./upgrade --exclude=./packages --exclude=./audit_store.db --exclude='./audit_store.db-*' --exclude=./.audit_log.jsonl.lock .
 sudo tar -czpf "$B/etc-files.tar.gz" /etc/opa-compliance-wizard.env /etc/opa-secrets-wizard-session.key \
   /etc/nginx/sites-available/opa-secrets-wizard /etc/nginx/ssl/opa-secrets-wizard.crt /etc/nginx/ssl/opa-secrets-wizard.key
 sudo sh -c 'chmod 0600 "$1"/*' _ "$B"
@@ -693,7 +714,7 @@ kinds listed in the changelog (every Environments change, the Access
 control save, the announcement banner, the update settings and upgrade
 requests) also restarts the 10 minutes, because it just proved the same
 thing. The approval of a Settings unlock can open Settings and nothing
-else, and no other approval, such as a future evidence package build,
+else, and no other approval, such as an evidence package build,
 opens or extends it. The window belongs to one sign-in: signing out and
 in again, or another person, starts locked. A restart of the application
 (an upgrade) keeps it. The announcement banner is also a step-up change
@@ -835,6 +856,9 @@ site (it keeps the site while an additional login gate exists, because those sit
 | The settings file (with the generated secrets) and the login gate's session key | `/etc/opa-compliance-wizard.env`, `/etc/opa-secrets-wizard-session.key` |
 | The TLS certificate and key | `/etc/nginx/ssl/opa-secrets-wizard.crt` and `.key` |
 | The application account, the distribution packages, every `*.migrated-*` file and the directory of a legacy install | `ocw` (`userdel`), `apt` |
+
+An evidence package built in the last 15 minutes may still be in `packages/` under the data directory; it is temporary and holds
+personal data, so delete that folder together with the rest when you remove the data.
 
 **Removing the data too is a manual step**, on purpose: it deletes the only copy of evidence that may be older than Okta's own log
 retention. Make a backup first (see "Backing up and restoring the archive"), then remove the paths above yourself when you are sure.

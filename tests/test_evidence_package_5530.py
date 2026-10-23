@@ -329,3 +329,77 @@ def test_file_name_is_sanitised():
     name = ep.download_filename('..\\"; rm -rf /\r\nX', per, "2026-02-01T10:11:12.000Z")
     assert name.isascii() and all(ch.isalnum() or ch in "._-" for ch in name) and name.endswith(".zip") and "/" not in name
     assert ep.ascii_label("Café ☃ prod") == "Cafe prod"
+
+
+# ---------------------------------------------------------------------------
+# Acceptance 2 (files), 6 (quoting), 9 (rollback)
+# ---------------------------------------------------------------------------
+def _rewrite(src, dst, drop=(), add=()):
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
+        for info in zin.infolist():
+            if info.filename not in drop:
+                zout.writestr(info.filename, zin.read(info.filename))
+        for name, data in add:
+            zout.writestr(name, data)
+
+
+def test_an_extra_or_a_missing_file_fails_the_verifier(store, tmp_path):
+    build_archive(ENV)
+    dest, _ = build(tmp_path)
+    for name, kwargs in (("extra", {"add": [("notes.txt", b"hello")]}), ("missing", {"drop": ["what-this-tool-reads.txt"]}),
+                         ("missing-csv", {"drop": ["controls/CC7.2/session_activity.csv"]})):
+        out = tmp_path / f"{name}.zip"
+        _rewrite(dest, out, **kwargs)
+        code, text = run_verifier(out, tmp_path)
+        assert code == 1 and "RESULT: FAIL" in text, (name, text)
+
+
+def test_every_report_field_is_quoted_with_crlf_line_ends(store, tmp_path):
+    build_archive(ENV)
+    dest, _ = build(tmp_path)
+    files, order = read_zip(dest)
+    csvs = [n for n in order if n.endswith(".csv")]
+    assert len(csvs) > 20
+    for n in csvs:
+        data = files[n]
+        assert not data.startswith(b"\xef\xbb\xbf") and data.endswith(b"\r\n")
+        for line in data.split(b"\r\n")[:-1]:
+            assert line.startswith(b'"') and line.endswith(b'"'), (n, line)
+        header = next(csv.reader(io.StringIO(data.decode())))
+        assert (header[-1] == "event_uuid") if n.startswith("controls/") else header[0] == "control_id"
+
+
+def test_a_5_52_0_application_ignores_the_new_permission_row(store, tmp_path):
+    """Acceptance 9, the unknown-capability half: the released 5.52.0 engine reads a database holding a build_evidence_package
+    override row, ignores it and answers its own seven capabilities. (The migration half is test_migration_rollback_safety.py;
+    this feature adds no migration.)"""
+    import subprocess
+    import sys
+    try:
+        engine_old = subprocess.run(["git", "show", "v5.52.0:create_secret_folders.py"], capture_output=True, cwd=ROOT, timeout=60)
+        store_old = subprocess.run(["git", "show", "v5.52.0:audit_store.py"], capture_output=True, cwd=ROOT, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        pytest.skip("git is not available")
+    if engine_old.returncode != 0 or store_old.returncode != 0:
+        pytest.skip("the v5.52.0 tag is not available in this checkout")
+    audit_store.run_migrations()
+    env_id = ENV
+    conn = audit_store._get_connection()
+    now = "2026-01-01T00:00:00.000Z"
+    conn.execute("INSERT OR IGNORE INTO app_environments (environment_id, owner_id, display_name, base_domain, team_name, key_id, created_at, updated_at) "
+                 "VALUES (?, 'owner', 'Synthetic', 'example.okta.com', 'team', 'key', ?, ?)", (env_id, now, now))
+    conn.execute("INSERT INTO shared_permission_overrides (environment_id, capability, value, updated_at, updated_by) VALUES (?, 'build_evidence_package', 'allow', ?, 'x')",
+                 (env_id, now))
+    conn.commit()
+    old = tmp_path / "old"
+    old.mkdir()
+    (old / "create_secret_folders.py").write_bytes(engine_old.stdout)
+    (old / "audit_store.py").write_bytes(store_old.stdout)
+    script = ("import sys, json; sys.path.insert(0, %r); import create_secret_folders as e; "
+              "print(json.dumps({'overrides': e.get_shared_permission_overrides(%r), 'effective': sorted(e.effective_shared_permissions(%r)), "
+              "'keys': list(e.SHARED_CAPABILITY_KEYS)}))") % (str(old), env_id, env_id)
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, cwd=str(old),
+                          env={**os.environ, "OPA_AUDIT_DB_PATH": audit_store._audit_db_path(), "PYTHONPATH": str(old)}, timeout=120)
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    got = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert got["overrides"] == {} and "build_evidence_package" not in got["effective"] and len(got["keys"]) == 7

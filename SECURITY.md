@@ -163,7 +163,35 @@ packages against their pip `RECORD` hashes after installation is planned for
 
 ## Evidence packages
 
-Limits are described when the feature ships (5.53.0).
+An evidence package (5.53.0) is one zip of the archived events of an audit period, with report files, the archive's hash
+chain as it stood when the package was built, and the data an auditor needs to check it offline
+(`docs/evidence-package-format.md`, `docs/evidence-package.md`). What it is, and what it is not:
+
+- **It holds personal data.** Names, email addresses, IP addresses, places and what people did, exactly as the System Log
+  recorded them. It is **not encrypted**. Whoever has the file has the data. Send it only to the people who need it, over a
+  channel you trust, and delete your copies when the audit is over.
+- **It is not signed, and the hashes are unkeyed.** Anyone who can rewrite the whole package, or the archive it was built
+  from, and recompute every hash can produce a package that passes the check. Nothing in the package proves who built it. The
+  server's build log (the `evidence_package.build`, `.build_finished` and `.downloaded` entries of the Audit Log and the
+  journal: who, when, the period, row counts, the package's sha256 and the chain head, never row content) is the only
+  independent record: compare the zip's sha256 and the chain head, both printed by the verifier, with it.
+- **What the verifier shows.** `tools/verify_evidence_package.py` (one file, Python standard library only) detects
+  accidental or partial change to a package, and checks the exported events against the archive's hash chain as it stood at
+  build time. It does not show who produced the events, that the archive was never altered by someone who could rewrite it,
+  or that `events.ndjson` holds every event of the period (the completeness statement is the builder's own). Events with no
+  seal, legacy and snapshot manifests, and report rows with no `event_uuid` are listed as not verified, never counted as
+  verified. Get the verifier's sha256 from the release notes or the signing-key page, not from the package.
+- **Who can build one.** The environment's owner always can. Other people who see the environment need both *View archived
+  reports* and *Build evidence packages* (denied by default; the environment form asks who may). Permission is checked when
+  a build starts, on every status read and on every download. On a hosted server a build needs a fresh MFA, as every
+  configuration change does; that approval is its own type and never opens or extends the Settings and Updates window, and
+  the Settings approval cannot start a build. A package is available only to the person who built it (their sign-in
+  session), for 15 minutes after it is finished; then the file is deleted. Packages are written to
+  `<data folder>/packages/` (folder 0700, file 0600), deleted when the server starts, and never included in a support bundle.
+- **Not covered.** A package that has been downloaded is outside this server's control. The nginx template is unchanged in
+  5.53.0, so an additional login gate's site does not refuse the evidence package routes the way it refuses Access control or
+  Overview: there the same checks still apply (the person must see the environment and hold both permissions, and the package
+  is bound to their sign-in session), and refusing the routes on those sites is left to the template changes of 5.54.0.
 
 ## Supported versions
 

@@ -7,7 +7,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FORBIDDEN = re.compile(r"tamper[- ]?proof|tamper[- ]?evident|audit[- ]?ready|certified|auditor[- ]accepted|\bcompliant\b", re.IGNORECASE)
 
 # Paths (relative to the repository root) that are scanned: files, or directories walked recursively.
-SCANNED = ["README.md", "SECURITY.md", "docs", ".github", "tools", "server", "frontend/src"]
+SCANNED = ["README.md", "SECURITY.md", "docs", ".github", "tools", "server", "frontend/src", "evidence_package.py", "evidence_core.py"]
 TEXT_SUFFIXES = {".md", ".txt", ".yml", ".yaml", ".py", ".sh", ".ts", ".tsx", ".css", ".html", ".json", ".conf", ".template", ".service", ".in", ""}
 SKIP_DIRS = {"node_modules", "__pycache__", ".venv", "dist", "test"}
 
@@ -57,3 +57,13 @@ def test_scan_actually_detects_the_words():
 
 def test_allowlist_entries_have_reasons():
     assert all(reason.strip() for reason in ALLOWLIST.values())
+
+
+def test_the_evidence_package_templates_and_texts_are_in_the_scan():
+    """5.53.0: the static texts of an evidence package (auditors' README, cover sheet, what-this-tool-reads) and its builder are
+    scanned, so a forbidden claim cannot ship inside a package. (The built package is scanned in test_evidence_package_5530.py.)"""
+    scanned = set(_files())
+    for rel in ("server/evidence_templates/README-FOR-AUDITORS.txt", "server/evidence_templates/cover-sheet.html",
+                "server/evidence_templates/what-this-tool-reads.txt", "docs/evidence-package.md", "docs/evidence-package-format.md",
+                "server/evidence_jobs.py", "evidence_package.py", "tools/verify_evidence_package.py", "SECURITY.md"):
+        assert rel in scanned, rel

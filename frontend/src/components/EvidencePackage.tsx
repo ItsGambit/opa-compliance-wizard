@@ -44,6 +44,9 @@ export function EvidencePackage({ resume, onResumeConsumed }: Props) {
   const { data: environments } = useEnvironments()
   const row = activeRow(environments)
   const environment = environments?.active ?? undefined
+  // The inputs from the MFA round trip are read once: App clears `resume` as soon as the page has taken it.
+  const [restored] = useState(resume ?? null)
+  const autoChecked = useRef(false)
   const initialPeriod = resume?.period ?? presetPeriod('last_quarter')
   const [step, setStep] = useState<Step>(resume?.jobId ? 5 : resume ? 3 : 1)
   const [preset, setPreset] = useState<PeriodPreset>(resume ? inferPreset(resume.period) : 'last_quarter')
@@ -71,7 +74,10 @@ export function EvidencePackage({ resume, onResumeConsumed }: Props) {
 
   // A return from the MFA step-up without a finished build re-runs the coverage check for the restored period.
   useEffect(() => {
-    if (resume && !resume.jobId && environment && step === 3 && !coverage && !check.isPending) check.mutate()
+    if (restored && !restored.jobId && environment && step === 3 && !autoChecked.current) {
+      autoChecked.current = true
+      check.mutate()
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [environment])
 
