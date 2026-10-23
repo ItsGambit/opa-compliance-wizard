@@ -403,3 +403,34 @@ def test_a_5_52_0_application_ignores_the_new_permission_row(store, tmp_path):
     assert proc.returncode == 0, proc.stderr[-1500:]
     got = json.loads(proc.stdout.strip().splitlines()[-1])
     assert got["overrides"] == {} and "build_evidence_package" not in got["effective"] and len(got["keys"]) == 7
+
+
+def test_free_space_rule_is_half_the_estimate_plus_the_margin_at_the_boundary(store, tmp_path, monkeypatch):
+    import collections
+    import shutil
+    build_archive(ENV)
+    with core.open_snapshot(ENV, period()) as snap:
+        est = snap.estimate_event_bytes()
+    need = int(est * ep.FREE_SPACE_FACTOR) + ep.FREE_SPACE_MARGIN
+    assert ep.FREE_SPACE_FACTOR == 0.5 and ep.FREE_SPACE_MARGIN == 256 * 1024 * 1024 and need < est + ep.FREE_SPACE_MARGIN
+    usage = collections.namedtuple("usage", "total used free")
+    kw = dict(builder="b", app_version="5.53.0", gaps_acknowledged=False)
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: usage(10 * need, 0, need - 1))
+    with pytest.raises(ep.PackageError) as exc:
+        ep.build_package(str(tmp_path / "a.zip"), ENV, "dev", period(), **kw)
+    assert exc.value.reason == "disk_space" and not (tmp_path / "a.zip").exists()
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: usage(10 * need, 0, need))
+    ep.build_package(str(tmp_path / "b.zip"), ENV, "dev", period(), **kw)
+    assert (tmp_path / "b.zip").exists()
+
+
+def test_a_label_that_looks_like_the_matrix_token_cannot_duplicate_rows(store, tmp_path):
+    build_archive(ENV)
+    dest = tmp_path / "h.zip"
+    ep.build_package(str(dest), ENV, "@@MATRIX_ROWS@@ @@MATRIX@@ <i>x</i>", period(), builder="@@MATRIX_ROWS@@", app_version="5.53.0",
+                     gaps_acknowledged=False, check_free_space=False)
+    html = read_zip(dest)[0]["cover-sheet.html"].decode()
+    assert html.count("CC6.1</td>") == 1                   # one row per criterion, once
+    assert "@@MATRIX_ROWS@@" in html and "&lt;i&gt;x&lt;/i&gt;" in html and "<i>x</i>" not in html
+    code, out = run_verifier(dest, tmp_path)
+    assert code == 0, out

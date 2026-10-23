@@ -115,7 +115,7 @@ def _template(name):
         return fh.read()
 
 
-def _fill(template, values, escape=False):
+def _fill(template, values, escape=False, trusted=()):
     """One pass: every @@TOKEN@@ is replaced by its value, and a replaced value is never scanned again (a value that
     looks like a token stays text). `escape` HTML-escapes the values (the cover sheet)."""
     def sub(m):
@@ -123,7 +123,7 @@ def _fill(template, values, escape=False):
         if key not in values:
             raise KeyError(key)
         text = str(values[key])
-        return html.escape(text, quote=True) if escape else text
+        return html.escape(text, quote=True) if escape and key not in trusted else text
     return _TOKEN_RE.sub(sub, template)
 
 
@@ -424,7 +424,7 @@ def build_package(dest_path, environment_id, environment_name, period, *, builde
                 raise PackageError("gaps_unacknowledged", "This period has days the archive did not cover. Confirm the gaps to build the package with them.")
             if check_free_space:
                 est = snap.estimate_event_bytes()
-                need = int(est * (1 + FREE_SPACE_FACTOR)) + FREE_SPACE_MARGIN
+                need = int(est * FREE_SPACE_FACTOR) + FREE_SPACE_MARGIN
                 free = shutil.disk_usage(os.path.dirname(os.path.abspath(dest_path))).free
                 if free < need:
                     raise PackageError("disk_space", "There is not enough free disk space to build this package (about %d MB needed, %d MB free). "
@@ -453,8 +453,8 @@ def build_package(dest_path, environment_id, environment_name, period, *, builde
                 **tokens, "DAYS_TOTAL": summary["days"], "COVERAGE_PCT": summary["coverage_pct"],
                 "DAYS_WITH_EVENTS": c[core.DAY_COVERED_EVENTS], "DAYS_ZERO": c[core.DAY_COVERED_ZERO], "DAYS_PRUNED": c[core.DAY_PRUNED],
                 "DAYS_GAP": c[core.DAY_NOT_COVERED], "DAYS_BEFORE": c[core.DAY_BEFORE_ARCHIVE], "DAYS_AFTER": c[core.DAY_AFTER_DATA_AS_OF],
-                "GAP_TEXT": gap_text, "MATRIX_ROWS": "@@MATRIX@@", "VERIFIER_SHA256": verifier_sha,
-            }, escape=True).replace("@@MATRIX@@", matrix_rows)
+                "GAP_TEXT": gap_text, "MATRIX_ROWS": matrix_rows, "VERIFIER_SHA256": verifier_sha,
+            }, escape=True, trusted=("MATRIX_ROWS",))
             readme = _fill(_template("README-FOR-AUDITORS.txt"), tokens)
             reads = _template("what-this-tool-reads.txt")
 
