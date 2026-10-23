@@ -325,7 +325,7 @@ def _utc_hm(text):
 
 
 def preflight(manifest, size, ctx, now):
-    """[{id, ok, text}]: what the Updates page shows as 'Preflight'. `ctx` (all optional): sync_running (bool), db_bytes, audit_log_bytes,
+    """[{id, ok, text}]: what the Updates page shows as 'Preflight'. `ctx` (all optional): sync_running (bool), evidence_build_running (bool), db_bytes, audit_log_bytes,
     backups_total (bytes of the updater's published pre-upgrade copies), sync_hint ({last_sync_completed_at, daily_run_times_utc}),
     run (state.json fields or None)."""
     items = []
@@ -368,6 +368,11 @@ def preflight(manifest, size, ctx, now):
     items.append({"id": "sync", "ok": not ctx.get("sync_running"),
                   "text": ("No sync running." + when) if not ctx.get("sync_running")
                   else "A sync is running: the upgrade waits up to 10 minutes for it to finish, then refuses to start." + when})
+    # 5.53.0: an evidence package build is a long read of the archive; the upgrade restarts the application, which would
+    # end it and delete its half-written file. Refused (not waited for) until the build is over (minutes, never hours).
+    items.append({"id": "evidence_build", "ok": not ctx.get("evidence_build_running"),
+                  "text": "No evidence package is being built." if not ctx.get("evidence_build_running")
+                  else "An evidence package is being built. Wait for it to finish (a few minutes), then try again."})
     run = ctx.get("run") or {}
     busy = bool(run) and run.get("result") is None and bool(run.get("step"))
     if busy:
@@ -600,8 +605,8 @@ def tick(installed_version, ctx_fn, now=None):
                                           "detail": "the application was not running at the scheduled time; the upgrade was not run late"})
                 return "missed"
             ctx = ctx_fn()
-            if ctx.get("sync_running") and now - when < WAIT_FOR_SYNC:
-                return "waiting_for_sync"      # the updater would wait too; a running sync is allowed to finish first
+            if (ctx.get("sync_running") or ctx.get("evidence_build_running")) and now - when < WAIT_FOR_SYNC:
+                return "waiting_for_sync"      # a running sync (or evidence package build) is allowed to finish first
             state = updater_state()
             run = ctx.get("run") or {}
             if not state["ready"] or (run.get("result") is None and run.get("step")):

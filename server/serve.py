@@ -46,6 +46,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 import create_secret_folders as engine  # noqa: E402
 from server import refresh_jobs as rj  # noqa: E402
+from server import evidence_jobs  # noqa: E402
 from server.updater import service as update_service  # noqa: E402
 from server.updater import upgrade as upgrade_service  # noqa: E402
 from server.gate_config import SESSION_COOKIE  # noqa: E402
@@ -195,8 +196,8 @@ ENV_CHANGE_ACTION_TYPES = (
     # 5.53.0: opening Settings and Updates needs a fresh MFA; the approval only ever creates the unlock (see
     # SETTINGS_RENEWING_ACTION_TYPES for what may extend it).
     "settings.unlock",
-    # 5.53.0: reserved name for the evidence package build (its executor ships with that feature). Listed here only so an
-    # approval of this type can be consumed and refused; it never touches the Settings unlock.
+    # 5.53.0: the evidence package build. Its approval starts one build and never touches the Settings unlock (it is not in
+    # SETTINGS_RENEWING_ACTION_TYPES).
     "evidence_package.build",
 )
 
@@ -232,7 +233,9 @@ MAX_PENDING_ENV_SECRETS = 1024
 MAX_OPEN_ENV_CHANGES_PER_USER = 20
 # The environment form's fields are the only ones stored for a save, each
 # capped (a secret this long is not a real API key or token).
-ENV_FORM_FIELDS = ("id", "name", "base_domain", "team_name", "key_id", "okta_url", "key_secret", "okta_api_token")
+# 5.53.0: "evidence_builders" is the form's "Who can build evidence packages" choice: "owner" or "shared" (stored as the
+# environment's build_evidence_package permission override).
+ENV_FORM_FIELDS = ("id", "name", "base_domain", "team_name", "key_id", "okta_url", "key_secret", "okta_api_token", "evidence_builders")
 MAX_ENV_FIELD_CHARS = 4096
 _pending_env_secrets_lock = threading.Lock()
 _pending_env_secrets = {}  # action_id -> (expires_monotonic, {field: value})
@@ -906,6 +909,82 @@ def _policy_write_lock(environment_id, policy_id):
 DEEP_VERIFY_WAIT_SECS = 20
 DEEP_VERIFY_RESULT_TTL_SECS = 120
 DEEP_VERIFY_ERROR_TTL_SECS = 30
+# ---------------------------------------------------------------------------
+# 5.53.0: evidence package builds. State and folder clean-up are in server/evidence_jobs.py, the zip is built by
+# evidence_package.py; this is the glue: who may build (checked again when the job starts, on every status read and on
+# every download), the worker thread, and the build log (audit log + journal).
+# ---------------------------------------------------------------------------
+_evidence = evidence_jobs.Registry(lambda: os.path.join(engine._data_dir(), "packages"))
+EVIDENCE_CAPABILITIES = ("view_archive", "build_evidence_package")
+EVIDENCE_STREAM_CHUNK = 1024 * 1024
+
+
+def _evidence_caller_refusal(environment_id, engine_owner, issuer):
+    """None when this caller may still build and read packages of the environment, else (status, body): 404 when the
+    environment is gone, 403 for a withdrawn permission (shared-environment capabilities, owner always passes)."""
+    exists, _owner = engine.environment_owner(environment_id)
+    # Visibility first (a private environment of someone else, or one unshared since, is "gone" for this caller), then the capabilities.
+    if not exists or not any(m.get("environment_id") == environment_id for m in engine.list_environments_for(engine_owner).values()):
+        return 404, {"error": "The environment this package was built from no longer exists or is no longer shared with you."}
+    for capability in EVIDENCE_CAPABILITIES:
+        if not engine.shared_capability_allowed(environment_id, engine_owner, capability, caller_issuer=issuer):
+            return 403, {"error": _shared_permission_message(capability), "reason": "shared_permission_denied", "capability": capability}
+    return None
+
+
+def _evidence_log(ctx, action, details, level="INFO"):
+    """The build log: one audit-log entry and one journal line. Never row content."""
+    entry = dict(details)
+    entry.setdefault("job_id", ctx.get("job_id"))
+    if ctx.get("issuer"):
+        entry["actor_issuer"] = ctx["issuer"]
+    engine.log_audit_event(ctx.get("actor_email"), ctx.get("actor_sub"), action, entry,
+                           client_ip=ctx.get("client_ip"), user_agent=ctx.get("user_agent"))
+    journal = {k: entry.get(k) for k in ("job_id", "environment_id", "period", "gaps_acknowledged", "outcome", "reason", "mode", "events",
+                                         "report_rows", "bytes", "sha256", "chain_head", "seconds")}
+    journal["actor_sub"] = ctx.get("actor_sub")
+    journal["client_ip"] = ctx.get("client_ip")
+    engine.log(level, action + " " + json.dumps({k: v for k, v in journal.items() if v is not None}, separators=(",", ":")))
+
+
+def _run_evidence_build(job_id, ctx):
+    """The worker thread of one build. Re-checks the caller's permission first, builds, and records the outcome."""
+    engine.CORRELATION_ID.set(ctx.get("correlation_id"))
+    import evidence_core
+    import evidence_package
+    started = time.monotonic()
+    base = {"environment": ctx["environment_name"], "environment_id": ctx["environment_id"], "period": ctx["period"],
+            "gaps_acknowledged": ctx["gaps_acknowledged"], "mode": ctx["mode"]}
+    try:
+        refusal = _evidence_caller_refusal(ctx["environment_id"], ctx["engine_owner"], ctx.get("issuer"))
+        if refusal:
+            _evidence.fail(job_id, "permission_withdrawn", refusal[1]["error"])
+            _evidence_log(ctx, "evidence_package.build_failed", {**base, "outcome": "refused", "reason": "permission_withdrawn"}, "WARN")
+            return
+        period = evidence_core.parse_period(ctx["period"]["start"], ctx["period"]["end"])
+        result = evidence_package.build_package(
+            _evidence.package_path(job_id), ctx["environment_id"], ctx["environment_name"], period,
+            builder=ctx.get("builder") or "unknown", app_version=engine.SCRIPT_VERSION, gaps_acknowledged=ctx["gaps_acknowledged"],
+            progress=lambda stage, fraction: _evidence.progress(job_id, stage, fraction),
+            prune_records=evidence_core.prune_records_from_audit_log(ctx["environment_name"]))
+        filename = evidence_package.download_filename(ctx["environment_name"], period, result["built_at"])
+        _evidence.finish(job_id, result, filename)
+        _evidence_log(ctx, "evidence_package.build_finished", {
+            **base, "outcome": "finished", "events": result["events"], "report_rows": result["report_rows"], "bytes": result["bytes"],
+            "sha256": result["sha256"], "chain_head": result["chain_head"], "seconds": round(time.monotonic() - started, 1),
+            "gap_days": result["gap_days"], "zero_days": result["zero_days"], "pruned_days": result["pruned_days"],
+            "coverage_pct": result["coverage_pct"], "files": result["files"]})
+    except evidence_package.PackageError as exc:
+        _evidence.fail(job_id, exc.reason, str(exc))
+        _evidence_log(ctx, "evidence_package.build_failed", {**base, "outcome": "refused" if exc.reason in (
+            "no_coverage", "gaps_unacknowledged") else "failed", "reason": exc.reason, "seconds": round(time.monotonic() - started, 1)}, "WARN")
+    except Exception as exc:  # the person sees a generic sentence; the detail stays in the server log
+        engine.log("ERROR", f"Evidence package build {job_id[:6]} failed with {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+        _evidence.fail(job_id, "internal", "The package could not be built because of an internal error. The details are in the server log.")
+        _evidence_log(ctx, "evidence_package.build_failed", {**base, "outcome": "failed", "reason": "internal",
+                                                              "seconds": round(time.monotonic() - started, 1)}, "ERROR")
+
+
 _deep_verify_lock = threading.Lock()
 _deep_verify_jobs = {}  # environment_id -> {"status", "started_at", "checked_at", "finished_mono", "result", "error", "event"}
 
@@ -2057,7 +2136,7 @@ def _upgrade_context():
     except OSError:
         log_bytes = 0
     backups = upgrade_service.backups_view() or {}
-    return {"sync_running": running, "db_bytes": db_bytes, "audit_log_bytes": log_bytes, "backups_total": backups.get("total_bytes") or 0,
+    return {"sync_running": running, "evidence_build_running": _evidence.running(), "db_bytes": db_bytes, "audit_log_bytes": log_bytes, "backups_total": backups.get("total_bytes") or 0,
             "sync_hint": Handler._upgrade_sync_hint(), "run": update_service.upgrade_run()}
 
 
@@ -2832,6 +2911,9 @@ class Handler(SimpleHTTPRequestHandler):
         environment_id = payload.get("id")
         if environment_id is not None and not isinstance(environment_id, str):
             return 400, {"error": "id must be a string"}
+        evidence_builders = payload.get("evidence_builders")
+        if evidence_builders is not None and evidence_builders not in ("owner", "shared"):
+            return 400, {"error": "evidence_builders must be 'owner' or 'shared'"}
         if dry_run:
             try:
                 _n, checked_id = engine.upsert_environment(
@@ -2861,6 +2943,14 @@ class Handler(SimpleHTTPRequestHandler):
             # someone else's credentials is now explicit in the log.
             "environment_id": upserted_id, "edited_other_owner": not caller_owns_target,
         }
+        if evidence_builders is not None:
+            # 5.53.0: who may build evidence packages from this environment's archive; owners always can.
+            changed = engine.set_shared_permissions(
+                {"build_evidence_package": "allow" if evidence_builders == "shared" else "deny"},
+                environment_id=upserted_id, updated_by=actor_email or actor_sub)
+            details["evidence_builders"] = evidence_builders
+            if changed:
+                details["evidence_builders_changed"] = True
         if via_step_up:
             details["step_up_verified"] = True
         self._log_audit_event(actor_email, actor_sub, "environment.upsert", details)
@@ -3242,6 +3332,10 @@ class Handler(SimpleHTTPRequestHandler):
                     caller_issuer=_issuer_from_headers(self.headers), caller_subject=engine_owner)
             if can_admin and full:
                 entry["permission_overrides"] = engine.get_shared_permission_overrides(entry["id"])
+            if full and (entry["is_own"] or can_admin):
+                # 5.53.0: the environment form's "Who can build evidence packages" choice as stored (override, else the default).
+                entry["evidence_builders"] = "shared" if engine.effective_shared_permissions(
+                    entry["id"], defaults=defaults)["build_evidence_package"]["value"] == "allow" else "owner"
         return {"environments": envs, "active": local_env_name, "active_id": local_env_id}
 
     def _exec_banner_update(self, params, dry_run, via_step_up):
@@ -3267,9 +3361,143 @@ class Handler(SimpleHTTPRequestHandler):
         return 200, config
 
     def _exec_evidence_package_build(self, params, dry_run, via_step_up):
-        """5.53.0: the name is registered so its approval can be consumed and refused; the build itself is a later work
-        package. Nothing prepares this action yet, and it never touches the Settings unlock."""
-        return 501, {"error": "Evidence packages are not available in this build.", "reason": "not_available"}
+        """5.53.0: builds an evidence package of one environment's archive for a period. Needs View archived reports AND
+        Build evidence packages on the environment (owners always pass). Hosted mode: POST /api/evidence_packages/prepare
+        checks everything (dry run), stores the request pinned to the environment id, period and gap acknowledgement, and the
+        MFA step-up returns to /api/environment_changes/save, which runs this again with every check repeated and starts the
+        job. Local mode starts it at once. `check_only` answers the coverage summary and starts nothing. This approval is not a
+        Settings unlock and never opens or extends one."""
+        import evidence_core
+        import evidence_package
+        name = params.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return 400, {"error": "environment is required"}
+        body = params.get("body") or {}
+        meta, refusal = self._visible_environment(name, params)
+        if refusal:
+            return refusal
+        refusal = self._shared_refusal(meta, "view_archive")
+        if refusal:
+            return refusal
+        refusal = self._shared_refusal(meta, "build_evidence_package")
+        if refusal:
+            return refusal
+        expected_id = body.get("environment_id")
+        if expected_id is not None and (not isinstance(expected_id, str) or expected_id != meta["environment_id"]):
+            return self._target_changed()
+        try:
+            period = evidence_core.parse_period(body.get("start"), body.get("end"))
+        except evidence_core.PeriodError as exc:
+            return 400, {"error": str(exc), "reason": "bad_period"}
+        gaps_ack = body.get("gaps_acknowledged") is True
+        try:
+            summary = evidence_package.preview(meta["environment_id"], period,
+                                               prune_records=evidence_core.prune_records_from_audit_log(meta.get("name") or name))
+        except evidence_core.EvidenceError:
+            return 409, {"error": "This environment has no archive yet, so there is nothing to put in a package.", "reason": "no_coverage"}
+        if params.get("check_only"):
+            return 200, summary
+        if not summary["has_coverage"]:
+            return 409, {"error": "The archive has no coverage at all for this period, so there is nothing to put in a package.",
+                         "reason": "no_coverage", "coverage": summary}
+        if summary["needs_acknowledgement"] and not gaps_ack:
+            return 409, {"error": "This period has days the archive did not cover. Confirm the gaps to build the package with them.",
+                         "reason": "gaps_unacknowledged", "coverage": summary}
+        actor_sub, issuer, fingerprint = self._unlock_identity()
+        if _step_up_required_for_changes() and (not actor_sub or not fingerprint):
+            return 403, {"error": "Could not tell which sign-in session this is. Sign in again.", "reason": "no_session"}
+        if dry_run:
+            return None, {"environment_id": meta["environment_id"], "start": period.start.isoformat(), "end": period.end.isoformat(),
+                          "gaps_acknowledged": gaps_ack}
+        _owner_key, engine_owner, actor_email, actor_sub = self._caller()
+        local = not _step_up_required_for_changes()
+        ctx = {
+            "environment_id": meta["environment_id"], "environment_name": meta.get("name") or name, "period": period.as_dict(),
+            "gaps_acknowledged": gaps_ack, "mode": "local mode, no MFA" if local else "hosted, MFA step-up",
+            "engine_owner": engine_owner, "actor_email": actor_email, "actor_sub": actor_sub,
+            "issuer": _issuer_from_headers(self.headers), "client_ip": self._request_client_ip(),
+            "user_agent": self.headers.get("User-Agent"), "correlation_id": engine.CORRELATION_ID.get(),
+            "builder": actor_email or actor_sub or "local operator",
+        }
+        try:
+            job_id = _evidence.start({
+                "environment_id": ctx["environment_id"], "environment_name": ctx["environment_name"], "period": ctx["period"],
+                "gaps_acknowledged": gaps_ack, "owner": actor_sub or "", "issuer": issuer, "fingerprint": fingerprint,
+                "mode": "local" if local else "hosted"})
+        except evidence_jobs.Busy as exc:
+            return 409, {"error": str(exc), "reason": exc.reason}
+        except OSError:
+            return 500, {"error": "The packages folder could not be created. Check the data folder's permissions and free space.", "reason": "packages_dir"}
+        ctx["job_id"] = job_id
+        details = {"environment": ctx["environment_name"], "environment_id": ctx["environment_id"], "period": ctx["period"],
+                   "gaps_acknowledged": gaps_ack, "mode": ctx["mode"], "outcome": "started", "job_id": job_id}
+        if via_step_up:
+            details["step_up_verified"] = True
+        else:
+            details["mfa"] = "local mode, no MFA" if local else "none"
+        self._log_audit_event(actor_email, actor_sub, "evidence_package.build", details)
+        engine.log("INFO", "evidence_package.build " + json.dumps({"job_id": job_id, "environment_id": ctx["environment_id"], "period": ctx["period"],
+                                                                    "gaps_acknowledged": gaps_ack, "mode": ctx["mode"], "outcome": "started",
+                                                                    "actor_sub": actor_sub, "client_ip": ctx["client_ip"]}, separators=(",", ":")))
+        try:
+            threading.Thread(target=_run_evidence_build, args=(job_id, ctx), daemon=True, name=f"evidence-{job_id[:6]}").start()
+        except BaseException:
+            _evidence.fail(job_id, "internal", "The build could not be started.")
+            raise
+        return 202, {"job_id": job_id, "status": "running", "environment": ctx["environment_name"], "period": ctx["period"]}
+
+    def _evidence_package_request(self, job_id, download):
+        """GET /api/evidence_packages/<job_id> and .../download. The job must be this caller's own (sub, gate issuer, login
+        session, job id) or it is a 404, whatever else is true; the caller's permission on the environment is checked again
+        on every call. A download is repeatable until the window ends and every fetch is logged."""
+        if not evidence_jobs.JOB_ID_RE.match(job_id or ""):
+            return self._send_json(404, {"error": "No such package."})
+        owner_key, engine_owner, actor_email, actor_sub = self._caller()
+        sub, issuer, fingerprint = self._unlock_identity()
+        status, job, path = _evidence.open_for_download(job_id, sub, issuer, fingerprint)
+        if status == "notfound":
+            return self._send_json(404, {"error": "No such package."})
+        refusal = _evidence_caller_refusal(job["environment_id"], engine_owner, _issuer_from_headers(self.headers))
+        if refusal:
+            return self._send_json(*refusal)
+        if not download:
+            return self._send_json(200, _evidence.public(job))
+        if status == "expired":
+            return self._send_json(410, {"error": "The download window for this package has ended. The package was deleted from the server; build it again.",
+                                         "reason": "expired"})
+        if status == "notready":
+            return self._send_json(409, {"error": "This package is not finished yet.", "reason": "not_ready", "status": job["status"]})
+        result = job["result"]
+        details = {"environment": job["environment_name"], "environment_id": job["environment_id"], "period": job["period"],
+                   "sha256": result["sha256"], "bytes": result["bytes"], "chain_head": result["chain_head"], "job_id": job_id}
+        try:
+            fh = open(path, "rb")
+        except OSError:
+            return self._send_json(410, {"error": "The download window for this package has ended. Build it again.", "reason": "expired"})
+        with fh:
+            size = os.fstat(fh.fileno()).st_size
+            self._log_audit_event(actor_email, actor_sub, "evidence_package.downloaded", {**details, "outcome": "started"})
+            engine.log("INFO", "evidence_package.downloaded " + json.dumps({"job_id": job_id, "bytes": size, "sha256": result["sha256"],
+                                                                            "actor_sub": actor_sub, "client_ip": self._request_client_ip()}, separators=(",", ":")))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", f'attachment; filename="{job["filename"]}"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            sent = 0
+            try:
+                while True:
+                    block = fh.read(EVIDENCE_STREAM_CHUNK)
+                    if not block:
+                        break
+                    self.wfile.write(block)
+                    sent += len(block)
+            except OSError:
+                self.close_connection = True
+                self._log_audit_event(actor_email, actor_sub, "evidence_package.downloaded", {**details, "outcome": "aborted", "bytes_sent": sent})
+        return None
 
     def _unlock_identity(self):
         """(actor_sub, issuer, session fingerprint) of this request for the Settings unlock; sub or fingerprint may be None."""
@@ -4472,6 +4700,14 @@ class Handler(SimpleHTTPRequestHandler):
                                    "revocation": _notice_revocation(st["revocation"]), "run": _notice_run(upgrade_service.run_view())}
                 return self._send_json(200, notice_body)
 
+            if path.startswith("/api/evidence_packages/") and path.endswith("/download"):
+                # 5.53.0: the finished package, repeatable for 15 minutes; bound to the person who built it (else 404).
+                return self._evidence_package_request(path[len("/api/evidence_packages/"):-len("/download")], True)
+
+            if path.startswith("/api/evidence_packages/"):
+                # 5.53.0: a build's status and, when finished, its sha256 and chain head (for the server-side build log).
+                return self._evidence_package_request(path[len("/api/evidence_packages/"):], False)
+
             if path == "/api/upgrade/bundle":
                 # 5.47.0: download a redacted support bundle the updater built after a failed upgrade (the failed
                 # upgrade's Audit Log entry names it). Admin-only and read-only; the bundle is created by root, holds no
@@ -4592,6 +4828,18 @@ class Handler(SimpleHTTPRequestHandler):
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to change the announcement banner."})
                 return self._environment_change("banner.update", {"body": payload})
+
+            if path == "/api/evidence_packages/prepare":
+                # 5.53.0: check an environment and a UTC period, then build (local mode: at once; hosted: after the MFA
+                # step-up, through /api/environment_changes/save). `check_only` answers the coverage summary and starts
+                # nothing. The environment is named in the query (?environment=) or the body.
+                env_names = parse_qs(urlparse(self.path).query).get("environment")
+                evidence_params = {"name": env_names[0] if env_names else payload.get("environment"),
+                                   "body": {k: payload.get(k) for k in ("start", "end", "gaps_acknowledged", "environment_id")}}
+                if payload.get("check_only") is True:
+                    status, body = self._exec_evidence_package_build({**evidence_params, "check_only": True}, dry_run=True, via_step_up=False)
+                    return self._send_json(status, body)
+                return self._environment_change("evidence_package.build", evidence_params)
 
             if path == "/api/settings/unlock":
                 # 5.53.0: asks for the MFA that opens Settings and Updates (202 in hosted mode; local mode answers at once).
@@ -5649,6 +5897,14 @@ def main():
 
     _seen_owners.add(LOCAL_OWNER_KEY_HEADER)
     _try_activate_saved_environment(LOCAL_OWNER_KEY_HEADER)
+
+    # 5.53.0: evidence packages never outlive the process that built them (their download window is 15 minutes).
+    try:
+        removed = _evidence.cleanup_startup()
+        if removed:
+            engine.log("INFO", f"Deleted {removed} evidence package folder(s) left from an earlier run.")
+    except OSError as exc:
+        engine.log("WARN", f"Could not clean the evidence packages folder: {exc}")
 
     threading.Thread(target=_scheduler_loop, daemon=True).start()
 
