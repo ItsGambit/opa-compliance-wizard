@@ -27,7 +27,7 @@ In short: the verifier detects accidental or partial change to the package, and 
   - **snapshot manifests**: configuration snapshots; their link in the chain is checked, their objects are not in the package;
   - report rows that carry no `event_uuid`;
   - pruned days, which the package builder states in `completeness.json`: a statement the verifier prints and does not check.
-- The operator's server-side build log (written when the package was built) is the independent record of who built it, when, and with what result. Compare the package's sha256 and chain head with that log.
+- The verifier prints the chain head on its own line. The operator's server-side build log (written when the package was built) is the only independent record of who built it, when, and with what result. Compare the package's sha256 and chain head with that log.
 
 ## Getting the verifier and checking it
 
@@ -82,14 +82,16 @@ Entries are ASCII names built from fixed keys. Order in the zip is as listed; th
  "files": [{"path": "...", "sha256": "<64 lowercase hex>", "bytes": 123}, ...],
  "built_at": "...", "app_version": "...", "environment_label_ascii": "...",
  "period": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"},
- "data_as_of": "...", "chain_head": "<64 hex> or null", "catalogue_version": "..."}
+ "data_as_of": "...", "chain_head": "<64 hex> or null", "catalogue_version": "...",
+ "curated_event_types": ["<event type the archive seals>", ...],
+ "period_manifest_ids": [<id of every manifest that holds an event of the period>, ...]}
 ```
 
-`files` lists every entry except `package-manifest.json` itself, exactly once each.
+`files` lists every entry except `package-manifest.json` itself, exactly once each. `curated_event_types` is the sorted list of event types the archive content-seals. `period_manifest_ids` lists, in ascending order, every manifest in the chain that holds an event of the period, including legacy and older-format ones.
 
 ### events.ndjson
 
-One line per event, UTF-8, each line is the event's stored `raw_json` byte for byte, terminated by a single `\n` (including the last line). Each event is a JSON object with a string `uuid`. A uuid appears once.
+Ordered by `published` ascending, ties by `uuid` ascending (the verifier fails otherwise). One line per event, UTF-8, each line is the event's stored `raw_json` byte for byte, terminated by a single `\n` (including the last line). Each event is a JSON object with a string `uuid`. A uuid appears once.
 
 ### chain/manifests.ndjson
 
@@ -101,11 +103,13 @@ A manifest whose `source` starts with `snapshot:` is a snapshot manifest.
 
 ### chain/seals.ndjson
 
-One object per line: `{"manifest_id": 7, "entries": ["<event uuid>:<content hash>", ...]}`. The entries are the manifest's curated rows. A seal line is present for each ordinary sealed manifest holding at least one event of the period. Lines for legacy, snapshot and `entries_json` manifests are ignored and counted as not verified.
+One object per line: `{"manifest_id": 7, "entries": ["<event uuid>:<content hash>", ...], "published": ["<published time of each entry's event>", ...]}`. `entries` are all of the manifest's curated rows (sorted); `published` is parallel to `entries` (same length and order) and lets the verifier tell an entry dated inside the period from one outside it. A seal line is present for every manifest in `period_manifest_ids` that is ordinary: sealed (v2), not a snapshot and not `entries_json`. Lines for legacy, snapshot and `entries_json` manifests are ignored and counted as not verified.
 
 ### The `event_uuid` column contract for report CSVs
 
 Every file under `controls/` has a header row containing a column named exactly `event_uuid`. For each data row, `event_uuid` is either the uuid of the System Log event the row was built from, which must be in `events.ndjson`, or empty when the row is not derived from a single event (the verifier counts these and reports them as not verified). A leading apostrophe added by formula neutralisation is accepted and ignored. Files are read as UTF-8 (a byte order mark is accepted) with standard CSV quoting.
+
+In `control-matrix.csv`, `rows_in_period` for a control must equal the number of data rows in the CSV files under `controls/<control_id>/`, and every control that has report files must be in the matrix.
 
 ## The three hash formulas
 
@@ -131,10 +135,11 @@ Golden values (the test suite asserts them against both the application and the 
 1. Open the zip without extracting. Refuse any unsafe or repeated entry name, any encrypted entry and any entry that is not a regular file.
 2. Read `package-manifest.json`: `format` is 1 and the required keys are present. Its `files` must name exactly the other entries; each entry's byte count and sha256 must match; every required file must be present.
 3. Walk `chain/manifests.ndjson` in order. Ids ascend; the first record's `prev_manifest_hash` is null; each record's `prev_manifest_hash` equals the previous record's link (its `entry_hash`, or `batch_hash` for a legacy record); a legacy record after a sealed one is a downgrade and fails; each sealed record's `entry_hash` recomputes by formula 3. The last link must equal `chain_head` in `package-manifest.json`.
-4. For each seal line of an ordinary sealed manifest: the entries recompute to the record's `content_hash` by formula 2, and there are no more of them than `row_count`.
-5. For each line of `events.ndjson`: if the event's uuid is in a seal, its content hash (formula 1) must equal the sealed value. Events with no seal are counted as not verified.
-6. For each `controls/**/*.csv` row with an `event_uuid`, that uuid is in `events.ndjson`.
-7. Print the report and the final `RESULT:` line.
+4. Every id in `period_manifest_ids` must be in the chain. For each ordinary sealed manifest among them there must be a seal line; the entries recompute to the record's `content_hash` by formula 2, and there are no more of them than `row_count`.
+5. For each line of `events.ndjson`: it is in order (published, then uuid); if the event's uuid is in a seal, its content hash (formula 1) must equal the sealed value. An event whose `eventType` is in `curated_event_types` and that has no seal fails, unless a legacy or `entries_json` manifest is among the period's manifests (it might hold that event; the event is then counted as not verified). Other events with no seal are counted as not verified.
+6. Every sealed entry of a period manifest whose published date is inside the period must be in `events.ndjson`; one that is absent fails (a curated event is missing).
+7. For each `controls/**/*.csv` row with an `event_uuid`, that uuid is in `events.ndjson`; the matrix row counts match the report files.
+8. Print the report, the chain head on its own labelled line, and the final `RESULT:` line.
 
 ## Limits and memory
 

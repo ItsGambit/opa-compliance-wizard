@@ -36,7 +36,7 @@ REQUIRED_FILES = (
 )
 MANIFEST_NAME = "package-manifest.json"
 MANIFEST_KEYS = ("files", "built_at", "app_version", "environment_label_ascii", "period", "data_as_of",
-                 "chain_head", "catalogue_version")
+                 "chain_head", "catalogue_version", "curated_event_types", "period_manifest_ids")
 MAX_ENTRIES = 100000
 MAX_PACKAGE_MANIFEST_BYTES = 64 * 1024 * 1024
 CHUNK = 1024 * 1024
@@ -206,6 +206,14 @@ def check_package_manifest(zf, by_name, report):
     if not (isinstance(period, dict) and isinstance(period.get("start"), str) and isinstance(period.get("end"), str)):
         report.fail("package-manifest.json period is not {start, end}")
         return None
+    types = manifest["curated_event_types"]
+    ids = manifest["period_manifest_ids"]
+    if not (isinstance(types, list) and all(isinstance(t, str) for t in types)):
+        report.fail("package-manifest.json curated_event_types is not a list of strings")
+        return None
+    if not (isinstance(ids, list) and all(is_int(i) for i in ids)):
+        report.fail("package-manifest.json period_manifest_ids is not a list of integers")
+        return None
     files = manifest["files"]
     if not isinstance(files, list):
         report.fail("package-manifest.json files is not a list")
@@ -361,10 +369,13 @@ def check_chain(rows, package_manifest, report):
         report.info("  Chain: the package holds no manifests and records no head (an archive with nothing ingested)")
     else:
         report.info("  Chain: %d manifests link from the first record to the recorded head" % len(rows))
+    report.info("  Chain head: %s" % head)
+    report.info("    Compare this value with the operator's server-side build log entry for this package. That log is the only "
+                "independent record of the chain head.")
     return by_id, stats
 
 
-def load_seals(zf, by_name, by_id, report):
+def load_seals(zf, by_name, by_id, period_ids, period, report):
     """Reads chain/seals.ndjson and recomputes each manifest's content hash.
     Returns (uuid_to_seals, info) or (None, None)."""
     uuid_seals = {}
@@ -372,13 +383,16 @@ def load_seals(zf, by_name, by_id, report):
     checked = 0
     unsealed_rows = 0
     skipped = 0
+    in_period_entries = []  # (uuid, published) of sealed entries of period manifests whose published date is in the period
     try:
         for n, line in enumerate(iter_lines(zf, by_name["chain/seals.ndjson"]), 1):
             if not line.endswith(b"\n"):
                 report.fail("chain/seals.ndjson line %d is not newline-terminated" % n)
                 return None, None
             rec = load_json_bytes(line[:-1])
-            if not (isinstance(rec, dict) and is_int(rec.get("manifest_id")) and isinstance(rec.get("entries"), list)):
+            if not (isinstance(rec, dict) and is_int(rec.get("manifest_id")) and isinstance(rec.get("entries"), list)
+                    and isinstance(rec.get("published"), list) and len(rec["published"]) == len(rec["entries"])
+                    and all(isinstance(x, str) for x in rec["published"])):
                 report.fail("chain/seals.ndjson line %d is malformed" % n)
                 return None, None
             mid = rec["manifest_id"]
@@ -395,6 +409,7 @@ def load_seals(zf, by_name, by_id, report):
                 continue
             pairs = []
             names = set()
+            pairs_in_order = []
             for item in rec["entries"]:
                 if not isinstance(item, str) or ":" not in item:
                     report.fail("manifest %s has a malformed seal entry" % mid)
@@ -405,29 +420,35 @@ def load_seals(zf, by_name, by_id, report):
                     return None, None
                 names.add(uuid)
                 pairs.append((uuid, sha))
+                pairs_in_order.append((uuid, sha))
             if len(pairs) > row["row_count"]:
                 report.fail("manifest %s lists more sealed rows than its row_count" % mid)
                 return None, None
             if manifest_content_hash([u + ":" + s for u, s in pairs]) != row["content_hash"]:
                 report.fail("manifest %s: its sealed entries do not recompute to its content hash" % mid)
                 return None, None
-            for uuid, sha in pairs:
+            for (uuid, sha), pub in zip(pairs_in_order, rec["published"]):
                 uuid_seals.setdefault(uuid, []).append((mid, sha))
+                if mid in period_ids and period["start"] <= pub[:10] <= period["end"]:
+                    in_period_entries.append((uuid, pub))
             unsealed_rows += row["row_count"] - len(pairs)
             checked += 1
     except (ValueError, UnicodeDecodeError, zipfile.BadZipFile, OSError, EOFError, RuntimeError):
         report.fail("chain/seals.ndjson is unreadable")
         return None, None
     report.info("  Seals: content hash recomputed from the sealed entries for %d manifests" % checked)
-    return uuid_seals, {"unsealed_rows": unsealed_rows, "skipped": skipped}
+    return uuid_seals, {"unsealed_rows": unsealed_rows, "skipped": skipped, "in_period_entries": in_period_entries,
+                        "sealed_ids": seen}
 
 
-def check_events(zf, by_name, uuid_seals, report):
+def check_events(zf, by_name, uuid_seals, curated_types, lenient_curated, report):
     """Hashes every line of events.ndjson against the seals. Returns (uuids set, counts) or (None, None)."""
     uuids = set()
     verified = 0
     unverified = 0
     bad = []
+    unsealed_curated = []
+    prev_key = None
     try:
         for n, line in enumerate(iter_lines(zf, by_name["events.ndjson"]), 1):
             if not line.endswith(b"\n"):
@@ -447,9 +468,20 @@ def check_events(zf, by_name, uuid_seals, report):
                 report.fail("events.ndjson holds event %s twice" % uuid)
                 return None, None
             uuids.add(uuid)
+            published = event.get("published")
+            if not isinstance(published, str):
+                report.fail("events.ndjson line %d has no published time" % n)
+                return None, None
+            key = (published, uuid)
+            if prev_key is not None and key < prev_key:
+                report.fail("events.ndjson is not ordered by published time then uuid (line %d)" % n)
+                return None, None
+            prev_key = key
             seals = uuid_seals.get(uuid)
             if not seals:
                 unverified += 1
+                if event.get("eventType") in curated_types and not lenient_curated:
+                    unsealed_curated.append(uuid)
                 continue
             digest = content_hash_of_event(body)
             if all(sha == digest for _mid, sha in seals):
@@ -459,6 +491,8 @@ def check_events(zf, by_name, uuid_seals, report):
     except (zipfile.BadZipFile, OSError, EOFError, RuntimeError):
         report.fail("events.ndjson is unreadable")
         return None, None
+    if unsealed_curated:
+        report.fail("%d event(s) of a sealed type have no seal (first: %s)" % (len(unsealed_curated), unsealed_curated[0]))
     if bad:
         report.fail("%d event(s) do not match their sealed hash (first: %s)" % (len(bad), bad[0]))
     report.info("  Events: %d in events.ndjson; %d match a sealed hash; %d have no seal in this package (not verified)"
@@ -472,6 +506,7 @@ def check_csvs(zf, by_name, uuids, report):
     rows_checked = 0
     rows_blank = 0
     missing = []
+    per_control = {}
     for name in names:
         try:
             with zf.open(by_name[name], "r") as raw:
@@ -485,6 +520,7 @@ def check_csvs(zf, by_name, uuids, report):
                 for rec in reader:
                     if not rec:
                         continue
+                    per_control[name.split("/")[1]] = per_control.get(name.split("/")[1], 0) + 1
                     value = rec[col] if col < len(rec) else ""
                     if value == "":
                         rows_blank += 1
@@ -498,11 +534,22 @@ def check_csvs(zf, by_name, uuids, report):
     if missing:
         report.fail("%d CSV row(s) name an event that is not in events.ndjson (first: %s in %s)"
                     % (len(missing), missing[0][1], missing[0][0]))
-    # control-matrix.csv must at least parse
     try:
         with zf.open(by_name["control-matrix.csv"], "r") as raw:
-            for _ in csv.reader(io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")):
-                pass
+            reader = csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8-sig", newline=""))
+            listed = set()
+            for row in reader:
+                cid = row.get("control_id")
+                try:
+                    want = int(row.get("rows_in_period"))
+                except (TypeError, ValueError):
+                    report.fail("control-matrix.csv has no usable rows_in_period for %s" % cid)
+                    continue
+                listed.add(cid)
+                if per_control.get(cid, 0) != want:
+                    report.fail("control-matrix.csv says %d rows for %s; its report files hold %d" % (want, cid, per_control.get(cid, 0)))
+            for cid in sorted(set(per_control) - listed):
+                report.fail("report files for %s are not in control-matrix.csv" % cid)
     except (csv.Error, UnicodeDecodeError, zipfile.BadZipFile, OSError, EOFError, RuntimeError):
         report.fail("control-matrix.csv could not be read as CSV")
     report.info("  CSV files: %d report files; %d rows tie to an event in events.ndjson; %d rows carry no %s (not verified)"
@@ -560,10 +607,24 @@ def verify(path, out):
                     by_id, stats = check_chain(rows, manifest, report)
                 uuid_seals = seal_info = None
                 if by_id is not None:
-                    uuid_seals, seal_info = load_seals(zf, by_name, by_id, report)
+                    period_ids = set(manifest["period_manifest_ids"])
+                    unknown = sorted(period_ids - set(by_id))
+                    if unknown:
+                        report.fail("period_manifest_ids names manifest %s, which is not in the chain" % unknown[0])
+                    else:
+                        uuid_seals, seal_info = load_seals(zf, by_name, by_id, period_ids, manifest["period"], report)
                 uuids = counts = None
                 if uuid_seals is not None:
-                    uuids, counts = check_events(zf, by_name, uuid_seals, report)
+                    ordinary = lambda r: bool(r["entry_hash"]) and not r["source"].startswith(SNAPSHOT_SOURCE_PREFIX) and r.get("entries_json") is not True
+                    for mid in sorted(period_ids):
+                        if ordinary(by_id[mid]) and mid not in seal_info["sealed_ids"]:
+                            report.fail("manifest %s holds events of the period but has no line in chain/seals.ndjson" % mid)
+                    lenient = any(not ordinary(by_id[m]) and not by_id[m]["source"].startswith(SNAPSHOT_SOURCE_PREFIX) for m in period_ids)
+                    uuids, counts = check_events(zf, by_name, uuid_seals, set(manifest["curated_event_types"]), lenient, report)
+                    if uuids is not None:
+                        gone = [u for u, _p in seal_info["in_period_entries"] if u not in uuids]
+                        if gone:
+                            report.fail("%d sealed event(s) dated inside the period are missing from events.ndjson (first: %s)" % (len(gone), gone[0]))
                 blank = 0
                 if uuids is not None:
                     blank = check_csvs(zf, by_name, uuids, report)

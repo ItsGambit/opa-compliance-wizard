@@ -141,6 +141,9 @@ def pack(path, *, scope_curated_only=False):
     manifests = conn.execute("SELECT * FROM ingestion_manifests WHERE environment_id = ? ORDER BY id", (ENV,)).fetchall()
     manifest_lines = []
     seal_lines = []
+    period_ids = []
+    published_of = {r["uuid"]: json.loads(r["raw_json"])["published"] for r in ev_rows}
+    days = sorted(p[:10] for p in published_of.values()) or ["2026-01-01"]
     for m in manifests:
         manifest_lines.append(json.dumps({
             "manifest_id": m["id"], "environment_id": m["environment_id"], "source": m["source"], "since": m["since"],
@@ -152,8 +155,16 @@ def pack(path, *, scope_curated_only=False):
             "SELECT uuid, sha FROM manifest_entries WHERE manifest_id = ?", (m["id"],))]
         if m["entries_json"] is not None:
             entries = [tuple(p) for p in json.loads(m["entries_json"])]
-        if m["entry_hash"] and not m["source"].startswith("snapshot:") and any(u in in_events for u, _s in entries):
-            seal_lines.append(json.dumps({"manifest_id": m["id"], "entries": sorted("%s:%s" % e for e in entries)}))
+        ordinary = m["entry_hash"] and not m["source"].startswith("snapshot:") and m["entries_json"] is None
+        if ordinary and any(u in in_events for u, _s in entries):
+            period_ids.append(m["id"])
+            ordered = sorted(entries, key=lambda e: "%s:%s" % e)
+            seal_lines.append(json.dumps({
+                "manifest_id": m["id"], "entries": ["%s:%s" % e for e in ordered],
+                "published": [published_of.get(u) or conn.execute(
+                    "SELECT published FROM events WHERE uuid = ?", (u,)).fetchone()[0] for u, _s in ordered]}))
+        elif not m["entry_hash"] or (m["entries_json"] is not None and any(u in in_events for u, _s in entries)):
+            period_ids.append(m["id"])  # may hold events of the period; its rows stay "not verified"
     head = conn.execute("SELECT head_hash FROM chain_heads WHERE environment_id = ?", (ENV,)).fetchone()
     buf = io.StringIO(newline="")
     w = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator="\r\n")
@@ -179,8 +190,9 @@ def pack(path, *, scope_curated_only=False):
         "format": 1,
         "files": [{"path": n, "sha256": hashlib.sha256(b).hexdigest(), "bytes": len(b)} for n, b in files],
         "built_at": "2026-01-05T00:00:00.000Z", "app_version": "0.0.0-test", "environment_label_ascii": "Synthetic environment",
-        "period": {"start": "2026-01-01", "end": "2026-01-05"}, "data_as_of": "2026-01-05T00:00:00.000Z",
+        "period": {"start": days[0], "end": days[-1]}, "data_as_of": "2026-01-05T00:00:00.000Z",
         "chain_head": head["head_hash"] if head else None, "catalogue_version": "test",
+        "curated_event_types": sorted(audit_store.COMPLIANCE_EVENT_TYPES), "period_manifest_ids": period_ids,
     }
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
         for n, b in files:
@@ -526,3 +538,95 @@ def test_pass_report_names_not_verified_items(good_zip, tmp_path):
     for fragment in ("Not verified", "Legacy v1 manifests", "entries_json manifests", "Snapshot manifests",
                      "Exported events with no seal"):
         assert fragment in out
+
+
+# ---------------------------------------------------------------------------
+# Contract additions (curated_event_types, period_manifest_ids, ordering, matrix counts)
+# ---------------------------------------------------------------------------
+def _seal_lines(data):
+    return [json.loads(x) for x in data.decode().splitlines()]
+
+
+def _rewrite_with_manifest(good_zip, tmp_path, edits, pm_edit=None):
+    """Edit named files and refresh the package manifest's hashes so only the contract check can object."""
+    with zipfile.ZipFile(good_zip) as zf:
+        pm = json.loads(zf.read("package-manifest.json"))
+        files = {i["path"]: zf.read(i["path"]) for i in pm["files"]}
+    for name, fn in edits.items():
+        files[name] = fn(files[name])
+    for item in pm["files"]:
+        item["sha256"] = hashlib.sha256(files[item["path"]]).hexdigest()
+        item["bytes"] = len(files[item["path"]])
+    if pm_edit:
+        pm_edit(pm)
+    bad = tmp_path / "bad.zip"
+    with zipfile.ZipFile(bad, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name, data in files.items():
+            zout.writestr(name, data)
+        zout.writestr("package-manifest.json", json.dumps(pm).encode())
+    code, out = run_verifier(bad, tmp_path)
+    assert code == 1, out
+    return out.rstrip().splitlines()[-1]
+
+
+def test_stripped_seals_file_fails(good_zip, tmp_path):
+    last = _rewrite_with_manifest(good_zip, tmp_path, {"chain/seals.ndjson": lambda d: b""})
+    assert "no line in chain/seals.ndjson" in last
+
+
+def test_one_seal_line_removed_fails(good_zip, tmp_path):
+    last = _rewrite_with_manifest(good_zip, tmp_path, {"chain/seals.ndjson": lambda d: d.split(b"\n", 1)[1]})
+    assert "no line in chain/seals.ndjson" in last
+
+
+def test_curated_event_missing_from_events_fails(good_zip, tmp_path):
+    def drop(data):
+        return b"".join(x for x in data.splitlines(True) if b'"evt-b1"' not in x)
+    last = _rewrite_with_manifest(good_zip, tmp_path, {"events.ndjson": drop})
+    assert "missing from events.ndjson" in last
+
+
+def test_events_out_of_order_fail(good_zip, tmp_path):
+    def swap(data):
+        lines = data.splitlines(True)
+        lines[0], lines[1] = lines[1], lines[0]
+        return b"".join(lines)
+    last = _rewrite_with_manifest(good_zip, tmp_path, {"events.ndjson": swap})
+    assert "not ordered" in last
+
+
+def test_matrix_count_mismatch_fails(good_zip, tmp_path):
+    last = _rewrite_with_manifest(good_zip, tmp_path, {"control-matrix.csv": lambda d: d.replace(b'"9"', b'"8"')})
+    assert "control-matrix.csv says 8 rows" in last
+
+
+def test_report_files_missing_from_matrix_fail(good_zip, tmp_path):
+    last = _rewrite_with_manifest(good_zip, tmp_path, {"control-matrix.csv": lambda d: d.split(b"\r\n")[0] + b"\r\n"})
+    assert "not in control-matrix.csv" in last
+
+
+def test_curated_event_without_seal_fails_when_no_legacy_manifest_could_hold_it(good_zip, tmp_path):
+    """The seal line is removed and its id is dropped from period_manifest_ids too: the curated events it covered now have no seal."""
+    first_id = {}
+
+    def drop_first(data):
+        first_id["id"] = json.loads(data.split(b"\n", 1)[0])["manifest_id"]
+        return data.split(b"\n", 1)[1]
+
+    def drop_id(pm):
+        pm["period_manifest_ids"].remove(first_id["id"])
+    last = _rewrite_with_manifest(good_zip, tmp_path, {"chain/seals.ndjson": drop_first}, drop_id)
+    assert "of a sealed type have no seal" in last
+
+
+def test_package_manifest_must_carry_the_new_fields(good_zip, tmp_path):
+    last = _rewrite_with_manifest(good_zip, tmp_path, {}, lambda pm: pm.pop("curated_event_types"))
+    assert "lacks: curated_event_types" in last
+
+
+def test_report_prints_the_chain_head_and_points_to_the_build_log(good_zip, tmp_path):
+    _code, out = run_verifier(good_zip, tmp_path)
+    with zipfile.ZipFile(good_zip) as zf:
+        head = json.loads(zf.read("package-manifest.json"))["chain_head"]
+    assert "Chain head: " + head in out
+    assert "server-side build log" in out and "only independent record" in out
