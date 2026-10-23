@@ -1,0 +1,155 @@
+{
+ "_comment": "Shared by tests/test_evidence_core_5530.py (server writer) and frontend/src/utils/export.test.ts. frontend_csv is csvEscape(input) in the app's export (quotes only when needed); server_csv is the evidence package writer's field (every field quoted); neutralised is the cell text after formula neutralisation.",
+ "cases": [
+  {
+   "input": "",
+   "neutralised": "",
+   "frontend_csv": "",
+   "server_csv": "\"\""
+  },
+  {
+   "input": "plain",
+   "neutralised": "plain",
+   "frontend_csv": "plain",
+   "server_csv": "\"plain\""
+  },
+  {
+   "input": "=1+1",
+   "neutralised": "'=1+1",
+   "frontend_csv": "'=1+1",
+   "server_csv": "\"'=1+1\""
+  },
+  {
+   "input": "+1",
+   "neutralised": "'+1",
+   "frontend_csv": "'+1",
+   "server_csv": "\"'+1\""
+  },
+  {
+   "input": "-2",
+   "neutralised": "'-2",
+   "frontend_csv": "'-2",
+   "server_csv": "\"'-2\""
+  },
+  {
+   "input": "@SUM(A1)",
+   "neutralised": "'@SUM(A1)",
+   "frontend_csv": "'@SUM(A1)",
+   "server_csv": "\"'@SUM(A1)\""
+  },
+  {
+   "input": "\tx",
+   "neutralised": "'\tx",
+   "frontend_csv": "'\tx",
+   "server_csv": "\"'\tx\""
+  },
+  {
+   "input": "\r=x",
+   "neutralised": "'\r=x",
+   "frontend_csv": "\"'\r=x\"",
+   "server_csv": "\"'\r=x\""
+  },
+  {
+   "input": "a=b",
+   "neutralised": "a=b",
+   "frontend_csv": "a=b",
+   "server_csv": "\"a=b\""
+  },
+  {
+   "input": " =x",
+   "neutralised": " =x",
+   "frontend_csv": " =x",
+   "server_csv": "\" =x\""
+  },
+  {
+   "input": "'already",
+   "neutralised": "'already",
+   "frontend_csv": "'already",
+   "server_csv": "\"'already\""
+  },
+  {
+   "input": "a,b",
+   "neutralised": "a,b",
+   "frontend_csv": "\"a,b\"",
+   "server_csv": "\"a,b\""
+  },
+  {
+   "input": "x\"y",
+   "neutralised": "x\"y",
+   "frontend_csv": "\"x\"\"y\"",
+   "server_csv": "\"x\"\"y\""
+  },
+  {
+   "input": "a\nb",
+   "neutralised": "a\nb",
+   "frontend_csv": "\"a\nb\"",
+   "server_csv": "\"a\nb\""
+  },
+  {
+   "input": "a\rb",
+   "neutralised": "a\rb",
+   "frontend_csv": "\"a\rb\"",
+   "server_csv": "\"a\rb\""
+  },
+  {
+   "input": "=HYPERLINK(\"http://example.com\",\"x\")",
+   "neutralised": "'=HYPERLINK(\"http://example.com\",\"x\")",
+   "frontend_csv": "\"'=HYPERLINK(\"\"http://example.com\"\",\"\"x\"\")\"",
+   "server_csv": "\"'=HYPERLINK(\"\"http://example.com\"\",\"\"x\"\")\""
+  },
+  {
+   "input": "-\n",
+   "neutralised": "'-\n",
+   "frontend_csv": "\"'-\n\"",
+   "server_csv": "\"'-\n\""
+  },
+  {
+   "input": "Zo\u00eb \u2014 ok",
+   "neutralised": "Zo\u00eb \u2014 ok",
+   "frontend_csv": "Zo\u00eb \u2014 ok",
+   "server_csv": "\"Zo\u00eb \u2014 ok\""
+  },
+  {
+   "input": "\u2014",
+   "neutralised": "\u2014",
+   "frontend_csv": "\u2014",
+   "server_csv": "\"\u2014\""
+  },
+  {
+   "input": "x=y+z-w@v",
+   "neutralised": "x=y+z-w@v",
+   "frontend_csv": "x=y+z-w@v",
+   "server_csv": "\"x=y+z-w@v\""
+  },
+  {
+   "input": "@",
+   "neutralised": "'@",
+   "frontend_csv": "'@",
+   "server_csv": "\"'@\""
+  },
+  {
+   "input": "=",
+   "neutralised": "'=",
+   "frontend_csv": "'=",
+   "server_csv": "\"'=\""
+  },
+  {
+   "input": "\"",
+   "neutralised": "\"",
+   "frontend_csv": "\"\"\"\"",
+   "server_csv": "\"\"\"\""
+  },
+  {
+   "input": "\"=x\"",
+   "neutralised": "\"=x\"",
+   "frontend_csv": "\"\"\"=x\"\"\"",
+   "server_csv": "\"\"\"=x\"\"\""
+  },
+  {
+   "input": "\n=x",
+   "neutralised": "\n=x",
+   "frontend_csv": "\"\n=x\"",
+   "server_csv": "\"\n=x\""
+  }
+ ]
+}

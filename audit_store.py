@@ -986,6 +986,77 @@ def _migration_012_settings_unlocks(conn):
     """)
 
 
+def _migration_013_sync_runs_and_prune_history(conn):
+    """5.53.0: the archive records each sync, import and prune, so an evidence package's coverage statements rest on
+    records and not on inference. sync_runs: one row per sync or CSV import (started, finished, outcome, the window it
+    read, rows stored). prune_history: one row per retention prune that deleted rows. Additive and rollback-safe: older
+    code never reads either table. No foreign keys (evidence, like the other archive tables). Not pruned by anything yet."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS sync_runs (
+            id INTEGER PRIMARY KEY,
+            environment_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            outcome TEXT,
+            window_since TEXT,
+            window_until TEXT,
+            rows INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_sync_runs_env_started ON sync_runs (environment_id, started_at);
+        CREATE TABLE IF NOT EXISTS prune_history (
+            id INTEGER PRIMARY KEY,
+            environment_id TEXT NOT NULL,
+            pruned_at TEXT NOT NULL,
+            cutoff TEXT NOT NULL,
+            rows_pruned INTEGER NOT NULL,
+            scope TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_prune_history_env_pruned ON prune_history (environment_id, pruned_at);
+    """)
+
+
+def _now_iso():
+    return _iso_ms(datetime.now(timezone.utc))
+
+
+def _run_start(environment_id, kind):
+    """Records the start of a sync or import; returns the row id, or None when it could not be written (recording
+    must never stop an ingestion: the run then simply has no record and counts for nothing)."""
+    try:
+        conn = _get_connection()
+        with _db_lock:
+            cur = conn.execute("INSERT INTO sync_runs (environment_id, kind, started_at) VALUES (?, ?, ?)",
+                               (environment_id, kind, _now_iso()))
+            conn.commit()
+            return cur.lastrowid
+    except sqlite3.Error:
+        return None
+
+
+def _run_finish(run_id, outcome, window_since=None, window_until=None, rows=None):
+    """outcome: ok | failed | stopped. A run that never reaches this (a killed process) keeps a NULL outcome and
+    never counts as coverage."""
+    if run_id is None:
+        return
+    try:
+        conn = _get_connection()
+        with _db_lock:
+            conn.execute("UPDATE sync_runs SET finished_at = ?, outcome = ?, window_since = ?, window_until = ?, rows = ? WHERE id = ?",
+                         (_now_iso(), outcome, window_since, window_until, rows, run_id))
+            conn.commit()
+    except sqlite3.Error:
+        pass
+
+
+def _record_prune(environment_id, cutoff, rows_pruned, scope):
+    """Caller holds _db_lock and commits. Written in the same transaction as the delete when it can be."""
+    if rows_pruned and cutoff:
+        conn = _get_connection()
+        conn.execute("INSERT INTO prune_history (environment_id, pruned_at, cutoff, rows_pruned, scope) VALUES (?, ?, ?, ?, ?)",
+                     (environment_id, _now_iso(), cutoff, rows_pruned, scope))
+
+
 MIGRATIONS = {
     1: _migration_001_unified_schema,
     2: _migration_002_ingestion_manifests,
@@ -999,6 +1070,7 @@ MIGRATIONS = {
     10: _migration_010_snapshots_polling_sync_and_correlation,
     11: _migration_011_opa_model_cache,
     12: _migration_012_settings_unlocks,
+    13: _migration_013_sync_runs_and_prune_history,
 }
 
 # DATA-08: migration 4 needs ALTER TABLE ... DROP COLUMN (SQLite 3.35.0,
@@ -2762,6 +2834,25 @@ def _read_poll_cursor(conn, environment_id):
 
 
 def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, on_progress=None):
+    """Pulls System Log events (see _sync_okta_events_impl) and records the run in sync_runs: started before anything
+    can fail, finished with ok (complete), stopped (a Stop or deadline) or failed (anything else, including an
+    exception, which is re-raised). The window recorded is the one asked of Okta: `since` as the manifest has it
+    (None when the run resumed from its saved cursor) and the `until` the manifest names."""
+    if ingestion_scope not in INGESTION_SCOPES:
+        raise ValueError(f"ingestion_scope must be one of {INGESTION_SCOPES}")
+    run_id = _run_start(environment_id, "sync")
+    info = {}
+    try:
+        result = _sync_okta_events_impl(okta_client, environment_id, ingestion_scope, since=since, on_progress=on_progress, _info=info)
+    except BaseException:
+        _run_finish(run_id, "failed", info.get("since"), info.get("until"), info.get("rows"))
+        raise
+    outcome = "ok" if result.get("complete") else ("stopped" if result.get("cancelled") else "failed")
+    _run_finish(run_id, outcome, result.get("since"), info.get("until"), result.get("inserted"))
+    return result
+
+
+def _sync_okta_events_impl(okta_client, environment_id, ingestion_scope, since=None, on_progress=None, _info=None):
     """Pulls System Log events from the real Okta API and archives them.
 
     Two modes (5.50.0, from Okta's System Log query guide):
@@ -2930,6 +3021,8 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
         return _seal(until)
 
     def _result(complete, chain_head, error=None):
+        if _info is not None:
+            _info["until"] = _iso_ms(safe_now_dt)
         out = {
             "inserted": total_inserted, "scanned": total_scanned, "since": original_since, "chunks": chunks,
             "complete": complete, "incomplete_chunks": incomplete_chunks, "chain_head": chain_head,
@@ -3149,8 +3242,17 @@ def import_from_csv(csv_path, environment_id, ingestion_scope, on_progress=None)
     if on_progress:
         on_progress("read_csv", "done", f"{len(rows)} row(s) read")
 
-    inserted, _max_published, new_entries = _insert_rows(conn, environment_id, rows, ingestion_scope)
-    chain_head = _record_ingestion_manifest(conn, environment_id, "csv_import", None, None, new_entries)
+    stamps = [r[2] for r in rows if r[2]]
+    run_id = _run_start(environment_id, "import")
+    try:
+        inserted, _max_published, new_entries = _insert_rows(conn, environment_id, rows, ingestion_scope)
+        chain_head = _record_ingestion_manifest(conn, environment_id, "csv_import", None, None, new_entries)
+    except BaseException:
+        _run_finish(run_id, "failed")
+        raise
+    # the range of the file's rows, half-open: [oldest, newest + 1 ms)
+    import_until = _iso_ms(datetime.fromisoformat(max(stamps).replace("Z", "+00:00")) + timedelta(milliseconds=1)) if stamps else None
+    _run_finish(run_id, "ok", min(stamps) if stamps else None, import_until, inserted)
 
     # DATA-03 (external review, 2026-10-05): a CSV import no longer
     # touches last_synced_at at all. The live-sync watermark describes
@@ -3229,6 +3331,7 @@ def prune_events(environment_id, retention_days=None, max_size_mb=None):
                     (environment_id, cutoff),
                 )
                 pruned_total += cur.rowcount
+                _record_prune(environment_id, cutoff, cur.rowcount, "retention")
                 # 5.50.0: the per-person weekly sign-in rows follow the events they were counted from (weeks that ended before
                 # the cutoff go; the all-people totals hold no names and stay). Snapshots are not touched: they are curated.
                 conn.execute("DELETE FROM mfa_week_user WHERE environment_id = ? AND week < ?", (environment_id, _week_monday(cutoff)))
@@ -3241,6 +3344,8 @@ def prune_events(environment_id, retention_days=None, max_size_mb=None):
         max_bytes = max_size_mb * 1024 * 1024
         step_days = 1
         pruned_any_by_size = False
+        size_pruned = 0
+        size_cutoff = None
 
         # DATA-12 (external review, 2026-10-05): the cap is measured
         # against THIS environment's own stored payload (the UTF-8 BYTES of
@@ -3290,6 +3395,8 @@ def prune_events(environment_id, retention_days=None, max_size_mb=None):
                         (environment_id, step_cutoff),
                     )
                     pruned_total += cur.rowcount
+                    size_pruned += cur.rowcount
+                    size_cutoff = step_cutoff
                     conn.commit()
                 except Exception:
                     conn.rollback()
@@ -3303,6 +3410,8 @@ def prune_events(environment_id, retention_days=None, max_size_mb=None):
         # its duration, so no writer should be mid-transaction when it runs.
         if pruned_any_by_size:
             with _db_lock:
+                _record_prune(environment_id, size_cutoff, size_pruned, "size")
+                conn.commit()
                 conn.execute("VACUUM")
 
     return {"pruned": pruned_total, "cutoff": cutoff}
@@ -3352,7 +3461,7 @@ def list_orphaned_archives():
 
 
 # Every table holding one environment's archive, in purge order (children first).
-ARCHIVE_TABLES = ("event_targets", "events", "sync_state", "config_snapshot_items", "config_snapshots", "mfa_week_user", "mfa_week_totals", "mfa_agg_state", "manifest_entries", "chain_heads", "ingestion_manifests", "opa_model_cache")
+ARCHIVE_TABLES = ("event_targets", "events", "sync_state", "config_snapshot_items", "config_snapshots", "mfa_week_user", "mfa_week_totals", "mfa_agg_state", "manifest_entries", "chain_heads", "ingestion_manifests", "opa_model_cache", "sync_runs", "prune_history")
 
 
 def archive_has_rows(environment_id):
