@@ -3273,7 +3273,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "local_notice": LOCAL_MODE_NOTICE}
         import audit_store
         actor_sub, issuer, fingerprint = self._unlock_identity()
-        row = audit_store.settings_unlock_active(actor_sub, issuer, fingerprint) if actor_sub and fingerprint else None
+        # (a read that leaves an expired row alone: the first refused request records the expiry, see _require_settings_unlock)
+        row = audit_store.settings_unlock_active(actor_sub, issuer, fingerprint, delete_expired=False) if actor_sub and fingerprint else None
         left = 0
         if row:
             try:

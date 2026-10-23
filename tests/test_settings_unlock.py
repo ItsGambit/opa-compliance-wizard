@@ -44,6 +44,15 @@ def test_an_expired_row_is_deleted_when_read(tmp_audit_store):
     assert conn.execute("SELECT COUNT(*) FROM settings_unlocks").fetchone()[0] == 0
 
 
+def test_the_status_read_leaves_an_expired_row_for_the_first_refused_request(tmp_audit_store):
+    audit_store.run_migrations()
+    audit_store.upsert_settings_unlock(SUB, ISSUER, FP, "act-1", 600, now=NOW)
+    later = NOW + timedelta(hours=1)
+    assert audit_store.settings_unlock_active(SUB, ISSUER, FP, now=later, delete_expired=False) is None
+    assert len(audit_store.list_settings_unlocks()) == 1
+    assert audit_store.take_expired_settings_unlock(SUB, ISSUER, FP, now=later) is not None
+
+
 def test_a_clock_that_went_back_does_not_extend_the_window(tmp_audit_store):
     audit_store.run_migrations()
     audit_store.upsert_settings_unlock(SUB, ISSUER, FP, "act-1", 600, now=NOW)

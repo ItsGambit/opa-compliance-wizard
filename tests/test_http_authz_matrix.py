@@ -2090,6 +2090,8 @@ def test_expiry_closes_the_reads_and_is_recorded_once(matrix_server, monkeypatch
     conn = audit_store._get_connection()
     conn.execute("UPDATE settings_unlocks SET expires_at = '2000-01-01T00:00:00.000Z', unlocked_at = '1999-12-31T23:50:00.000Z'")
     conn.commit()
+    # the countdown's status poll sees the lapse without erasing the evidence of it
+    assert requests.get(base_url + "/api/settings/status", headers=me, timeout=10).json()["unlocked"] is False
     for _ in range(3):
         resp = requests.get(base_url + "/api/access_control", headers=me, timeout=10)
         assert resp.status_code == 403 and resp.json() == LOCKED_BODY

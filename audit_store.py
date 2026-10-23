@@ -2444,9 +2444,10 @@ def renew_settings_unlock(actor_sub, issuer, session_fp, action_id, ttl_seconds,
     return upsert_settings_unlock(actor_sub, issuer, session_fp, action_id, ttl_seconds, now=now)
 
 
-def settings_unlock_active(actor_sub, issuer, session_fp, now=None):
-    """The unlock row as a dict if unlocked_at <= now < expires_at, else None. An expired row is deleted on the way out; a row
-    whose unlocked_at is in the future (the clock went back) is refused and left alone."""
+def settings_unlock_active(actor_sub, issuer, session_fp, now=None, delete_expired=True):
+    """The unlock row as a dict if unlocked_at <= now < expires_at, else None. An expired row is deleted on the way out (unless
+    `delete_expired` is False: the status poll must leave it for the first refused request to record the expiry); a row whose
+    unlocked_at is in the future (the clock went back) is refused and left alone."""
     key = _unlock_key(actor_sub, issuer, session_fp)
     if not key[0] or not key[2]:
         return None
@@ -2459,10 +2460,11 @@ def settings_unlock_active(actor_sub, issuer, session_fp, now=None):
         if row is None:
             return None
         if row["expires_at"] <= now_iso:
-            conn.execute(
-                "DELETE FROM settings_unlocks WHERE actor_sub = ? AND issuer = ? AND session_fp = ?", key
-            )
-            conn.commit()
+            if delete_expired:
+                conn.execute(
+                    "DELETE FROM settings_unlocks WHERE actor_sub = ? AND issuer = ? AND session_fp = ?", key
+                )
+                conn.commit()
             return None
         if row["unlocked_at"] > now_iso:
             return None
