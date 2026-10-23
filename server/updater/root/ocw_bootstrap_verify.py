@@ -7,6 +7,7 @@ are ocw_trust's (the same code root's updater uses), the algorithms are ocw_cryp
 
     python3 -I -S ocw_bootstrap_verify.py fetch URL OUT --max-bytes N --allow-host HOST [--allow-host HOST ...]
     python3 -I -S ocw_bootstrap_verify.py copy SRC OUT --max-bytes N
+    python3 -I -S ocw_bootstrap_verify.py unbundle SRC --release-out DIR --wheels-out DIR
     python3 -I -S ocw_bootstrap_verify.py manifest-version FILE
     python3 -I -S ocw_bootstrap_verify.py verify --tar F --sig F --keys F --bootstrap-version X.Y.Z --extract DIR
             --info-out FILE [--expect-version X.Y.Z] [--allow-older] [--revocation FILE ...] [--revocation-out DIR]
@@ -293,6 +294,94 @@ def copy_in(src, out_path, max_bytes):
     os.replace(part, out_path)
 
 
+# --- the offline bundle (get-ocw.sh --from-dir DIR holding ocw-X.Y.Z-offline.tar.gz) ---------------------------------------
+
+BUNDLE_RE = re.compile(r"^ocw-(\d+\.\d+\.\d+)-offline\.tar\.gz$")
+_WHEEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+!-]{0,200}\.whl$")
+MAX_BUNDLE_BYTES = 3 * 1024 ** 3
+MAX_WHEEL_BYTES = 120 * 1024 * 1024
+MAX_WHEELS = 800
+MAX_BUNDLE_TOTAL_BYTES = 2 * 1024 ** 3
+
+
+def _copy_member(tar, member, dest_path, cap, mode):
+    """Write one regular member to a new file (never overwrites, never follows a link at the destination)."""
+    written = 0
+    src = tar.extractfile(member)
+    fd = os.open(dest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode)
+    with src, os.fdopen(fd, "wb") as out:
+        while True:
+            chunk = src.read(1 << 20)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > cap:
+                raise Refused("bad_bundle", f"{os.path.basename(dest_path)} in the bundle is larger than allowed")
+            out.write(chunk)
+    os.chmod(dest_path, mode)
+    return written
+
+
+def unbundle(src, release_out, wheels_out):
+    """Take the signed release, its signature and the wheels out of an offline bundle (tools/release.py build-offline).
+    Nothing is trusted here: the release is verified afterwards exactly like a downloaded one, and pip installs the
+    wheels with --require-hashes against the signed requirements.lock. Only the fixed member names, wheel names that
+    cannot hold a path separator, regular files only, size and count caps. manifest.json and offline.json are not used.
+    Returns the version."""
+    base = os.path.basename(src)
+    match = BUNDLE_RE.match(base)
+    if not match:
+        raise Refused("bad_name", f"{base} is not named ocw-X.Y.Z-offline.tar.gz; do not rename release files.")
+    version = match.group(1)
+    try:
+        fd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError as exc:
+        raise Refused("unreadable", f"cannot read {src}: {exc.strerror or exc}")
+    release_name = f"ocw-{version}.tar.gz"
+    caps = {release_name: MAX_TARBALL_BYTES, release_name + ".minisig": MAX_SIG_BYTES}
+    seen, wheels, total, count = set(), set(), 0, 0
+    with os.fdopen(fd, "rb") as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            raise Refused("unreadable", f"{src} is not a regular file")
+        if os.fstat(fh.fileno()).st_size > MAX_BUNDLE_BYTES:
+            raise Refused("bad_bundle", "the offline bundle is larger than allowed")
+        try:
+            with tarfile.open(fileobj=fh, mode="r:gz") as tar:
+                for member in tar:
+                    count += 1
+                    if count > MAX_WHEELS + 10:
+                        raise Refused("bad_bundle", "the offline bundle holds too many files")
+                    name = member.name[2:] if member.name.startswith("./") else member.name
+                    if member.isdir():
+                        if name.rstrip("/") not in ("wheels", "."):
+                            raise Refused("unsafe_member", f"the bundle contains an unexpected folder ({member.name!r}); do not use it")
+                        continue
+                    if not member.isreg():
+                        raise Refused("unsafe_member", f"the bundle contains a link or special file ({member.name!r}); do not use it")
+                    if name in caps:
+                        if name in seen:
+                            raise Refused("bad_bundle", f"{name} appears twice in the bundle")
+                        seen.add(name)
+                        total += _copy_member(tar, member, os.path.join(release_out, name), caps[name], 0o600)
+                    elif name in (MANIFEST_NAME, "offline.json"):
+                        continue  # informational copies; the signed release is what is trusted
+                    elif name.startswith("wheels/") and name.count("/") == 1 and _WHEEL_RE.match(name[7:]):
+                        if name in wheels:
+                            raise Refused("bad_bundle", f"{name[7:]} appears twice in the bundle")
+                        wheels.add(name)
+                        total += _copy_member(tar, member, os.path.join(wheels_out, name[7:]), MAX_WHEEL_BYTES, 0o644)
+                    else:
+                        raise Refused("unsafe_path", f"the bundle contains an unexpected file ({member.name!r}); do not use it")
+                    if total > MAX_BUNDLE_TOTAL_BYTES:
+                        raise Refused("bad_bundle", "the offline bundle unpacks to an unreasonable size")
+        except (tarfile.TarError, EOFError) as exc:
+            raise Refused("bad_bundle", f"the offline bundle cannot be read as a .tar.gz ({exc}). Bring it over again.")
+    for needed in caps:
+        if needed not in seen:
+            raise Refused("bad_bundle", f"the offline bundle does not contain {needed}; it is not a valid bundle")
+    return version
+
+
 # --- verification -----------------------------------------------------------------------------------------------------
 
 _HINT_REDOWNLOAD = ("Download again; if it repeats, the download is being altered in transit: stop and contact the project.")
@@ -436,6 +525,15 @@ def cmd_copy(a):
     return 0
 
 
+def cmd_unbundle(a):
+    try:
+        unbundle(a.src, a.release_out, a.wheels_out)
+    except Refused as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    return 0
+
+
 def cmd_manifest_version(a):
     try:
         manifest = json.loads(_read_small(a.file, 4 * 1024 * 1024).decode("utf-8"))
@@ -492,6 +590,11 @@ def build_parser():
     s.add_argument("out")
     s.add_argument("--max-bytes", type=int, required=True)
     s.set_defaults(fn=cmd_copy)
+    s = sub.add_parser("unbundle")
+    s.add_argument("src")
+    s.add_argument("--release-out", required=True)
+    s.add_argument("--wheels-out", required=True)
+    s.set_defaults(fn=cmd_unbundle)
     s = sub.add_parser("manifest-version")
     s.add_argument("file")
     s.set_defaults(fn=cmd_manifest_version)

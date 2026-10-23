@@ -173,7 +173,7 @@ performed.**
 - It does not set up Okta. The four Okta settings (commented in the settings file) and the client secret and admin-check token (in the
   application's keyring, with the backend running) are still entered by you; the last lines of the run print the exact steps. The login gate is installed
   but **neither enabled nor started** until you have done that (an enabled gate without its settings would crash-loop at every boot); the last lines of the run give the command.
-- The offline bundle is not accepted by `--from-dir` yet (bring the release file, its signature and `--wheelhouse DIR` for the packages).
+- `get-ocw.sh --from-dir DIR` accepts the offline bundle (`ocw-X.Y.Z-offline.tar.gz`) as well as the loose release file and its signature; its packages are used unless you pass `--wheelhouse DIR`.
 - `--uninstall` keeps the data (the archive, audit log, settings file, session key, TLS files, the application account and the packages).
   Removing them is a manual step, listed in [docs/hosting.md](docs/hosting.md#uninstalling).
 
