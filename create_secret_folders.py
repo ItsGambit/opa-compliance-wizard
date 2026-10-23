@@ -5486,6 +5486,8 @@ SHARED_CAPABILITIES = (
      "description": "Starts a refresh (the OPA scan, the Okta scan and the System Log sync) with the owner's Okta API token and the owner's saved sync settings. The OPA scan also needs the Live read permission."},
     {"key": "sync_settings", "label": "Change sync settings", "builtin": "deny",
      "description": "Turns the daily refresh on or off and changes its time and the System Log ingestion scope. Retention stays the owner's (it deletes archived events)."},
+    {"key": "build_evidence_package", "label": "Build evidence packages", "builtin": "deny",
+     "description": "Builds a downloadable evidence package of this environment's archive for an audit period. The package holds people-level rows (names, email addresses, IP addresses and what they did), is not encrypted and is not signed. Also needs View archived reports."},
 )
 SHARED_CAPABILITY_KEYS = tuple(c["key"] for c in SHARED_CAPABILITIES)
 SHARED_PERMISSION_VALUES = ("allow", "deny")

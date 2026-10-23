@@ -19,7 +19,7 @@ OTHER = "00uOTHER"
 BUILT_IN_DEFAULTS = {
     "view_archive": "allow", "live_read": "allow", "tenant_write": "deny",
     "import_csv": "deny", "reset_watermark": "allow",
-    "sync_now": "deny", "sync_settings": "deny",
+    "sync_now": "deny", "sync_settings": "deny", "build_evidence_package": "deny",
 }
 
 
