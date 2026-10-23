@@ -313,6 +313,9 @@ export interface ComplianceReportDef {
   /** 5.53.0: the controls this report is mapped to; older servers omit both fields. */
   controls?: ComplianceControlMapping[]
   mapping_status?: 'proposed' | 'auditor-reviewed'
+  /** 5.53.0: plain-text note on what the report shows and how rows are chosen, and its known limits. */
+  methodology?: string
+  known_limits?: string[]
   description: string
   event_types: string[]
   count?: number

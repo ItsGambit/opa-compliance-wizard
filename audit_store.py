@@ -164,7 +164,7 @@ COMPLIANCE_REPORTS = {
     "jit_access_requests": {
         "label": "JIT Access Requests",
         "description": (
-            "Access-request lifecycle (create/update/resolve/expire) -- proves an access request was "
+            "Access-request lifecycle (create/update/resolve/expire) -- shows an access request was "
             "made and resolved. Known limitation, confirmed live 2026-09-30 against a real denied "
             "request: Okta's own System Log does not capture the actual approve/deny DECISION anywhere "
             "on the resolve event (debugContext.debugData.decisions is always the literal string \"[]\", "
@@ -190,7 +190,7 @@ COMPLIANCE_REPORTS = {
     },
     "pam_jit_access": {
         "label": "PAM JIT Access (Checkout/Checkin)",
-        "description": "Zero Standing Privileges evidence — resource checkout and checkin.",
+        "description": "Resource checkout and checkin.",
     },
     "pam_sessions": {
         "label": "PAM Sessions",
@@ -210,11 +210,11 @@ COMPLIANCE_REPORTS = {
     },
     "device_management": {
         "label": "Device Management",
-        "description": "Okta-managed device enrollment and user association -- device-trust evidence, separate from OPA client enrollment above. Known gap: only enrollment/activation/user-add are covered; suspend/unsuspend/deactivate/delete exist per Okta's own device-lifecycle docs but have no live-confirmed eventType yet (see COMPLIANCE_EVENT_TYPES comment). See also the Access Explorer's Resources tab for the current live device inventory.",
+        "description": "Okta-managed device enrollment and user association -- device registration record, separate from OPA client enrollment above. Known gap: only enrollment/activation/user-add are covered; suspend/unsuspend/deactivate/delete exist per Okta's own device-lifecycle docs but have no live-confirmed eventType yet (see COMPLIANCE_EVENT_TYPES comment). See also the Access Explorer's Resources tab for the current live device inventory.",
     },
     "ad_sync_activity": {
         "label": "Active Directory Sync Activity",
-        "description": "Recurring, automated Active Directory account discovery -- evidence that AD-vaulted accounts stay in sync with the domain.",
+        "description": "Recurring, automated Active Directory account discovery -- shows that discovery runs completed.",
     },
     "credential_rotation": {
         "label": "Credential Rotation",
@@ -244,9 +244,13 @@ def load_control_catalogue(path=None):
     return data
 
 
+def report_catalogue_entry(report_key):
+    return load_control_catalogue()["reports"][report_key]
+
+
 def report_controls(report_key):
     """The report's mapped controls, in catalogue order ([{framework, id, status}, ...])."""
-    return list(load_control_catalogue()["reports"][report_key]["controls"])
+    return list(report_catalogue_entry(report_key)["controls"])
 
 
 def report_control(report_key):
@@ -266,7 +270,8 @@ def list_reports():
     mapped control)."""
     return [
         {"key": key, "event_types": _event_types_for_report(key), **meta,
-         "control": report_control(key), "controls": report_controls(key), "mapping_status": report_mapping_status(key)}
+         "control": report_control(key), "controls": report_controls(key), "mapping_status": report_mapping_status(key),
+         "methodology": report_catalogue_entry(key)["methodology"], "known_limits": list(report_catalogue_entry(key)["known_limits"])}
         for key, meta in COMPLIANCE_REPORTS.items()
     ]
 

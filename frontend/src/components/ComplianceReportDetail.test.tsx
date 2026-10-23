@@ -37,6 +37,20 @@ describe('ComplianceReportDetail', () => {
     expect(screen.getByText('Suggested by this project; not reviewed by an auditor.')).toBeTruthy()
   })
 
+  it('shows the methodology under "How this is calculated" and the known limits in view', () => {
+    vi.mocked(runReport).mockResolvedValue({ rows: [], total: 0, truncated: false } as never)
+    const mapped = {
+      ...def, controls: [{ framework: 'soc2', id: 'CC6.1', status: 'proposed' }], mapping_status: 'proposed',
+      methodology: 'What it shows: MFA events.', known_limits: ['Revocations are not part of this report.', 'Second limit.'],
+    } as ComplianceReportDef
+    renderWithClient(<ComplianceReportDetail def={mapped} environment="dev" onBack={() => {}} />)
+    expect(screen.getByText('How this is calculated')).toBeTruthy()
+    expect(screen.getByText('What it shows: MFA events.')).toBeTruthy()
+    expect(screen.getByText('Known limits')).toBeTruthy()
+    expect(screen.getByText('Revocations are not part of this report.')).toBeTruthy()
+    expect(screen.getByText('Second limit.')).toBeTruthy()
+  })
+
   it('shows no mapping block when an older server sends no controls', () => {
     vi.mocked(runReport).mockResolvedValue({ rows: [], total: 0, truncated: false } as never)
     renderWithClient(<ComplianceReportDetail def={def} environment="dev" onBack={() => {}} />)

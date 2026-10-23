@@ -34,6 +34,20 @@ function MappedControls({ def }: { def: ComplianceReportDef }) {
         ))}
       </div>
       {!reviewed && <p className="mt-1">Suggested by this project; not reviewed by an auditor.</p>}
+      {def.methodology && (
+        <details className="mt-2">
+          <summary className="cursor-pointer">How this is calculated</summary>
+          <p className="mt-1.5">{def.methodology}</p>
+        </details>
+      )}
+      {def.known_limits && def.known_limits.length > 0 && (
+        <div className="mt-2">
+          <div className="font-medium text-text">Known limits</div>
+          <ul className="list-disc pl-5 mt-0.5">
+            {def.known_limits.map(l => <li key={l}>{l}</li>)}
+          </ul>
+        </div>
+      )}
     </div>
   )
 }

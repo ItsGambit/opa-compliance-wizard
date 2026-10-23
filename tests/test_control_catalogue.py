@@ -88,7 +88,22 @@ def test_list_reports_carries_controls_status_and_derived_grouping():
         assert reports[key]["control"] == "CC6"
         assert [c["id"] for c in reports[key]["controls"]] == ["CC6.1"]
     assert reports["policy_modifications"]["control"] == "CC8"
+    assert [c["id"] for c in reports["device_management"]["controls"]] == ["CC6.1"]
+    assert [c["id"] for c in reports["ad_sync_activity"]["controls"]] == ["CC7.2"]
+    assert [c["id"] for c in reports["threat_detection"]["controls"]] == ["CC7.2", "CC6.6"]
+    for r in reports.values():
+        assert r["methodology"].strip() and r["known_limits"]
     assert reports["pam_policy_modifications"]["control"] == "CC8"
+
+
+def test_catalogue_and_descriptions_make_no_overclaims():
+    text = open(CATALOGUE, encoding="utf-8").read().lower()
+    for phrase in ("proves", "evidence that", "zero standing", "moved from", "owner's decision", "live-confirmed"):
+        assert phrase not in text, phrase
+    for key, meta in audit_store.COMPLIANCE_REPORTS.items():
+        d = meta["description"].lower()
+        for phrase in ("proves", "evidence that", "zero standing", "device-trust evidence"):
+            assert phrase not in d, (key, phrase)
 
 
 def test_catalogue_ships_in_the_release():
