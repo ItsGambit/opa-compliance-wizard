@@ -353,6 +353,21 @@ def test_ordinary_routes_drop_client_sent_step_up_headers(served):
     assert "x-auth-action-id" not in lowered and "x-nginx-stepup-location" not in lowered
 
 
+# 5.53.0: the Settings unlock rides the existing routes. Its status and environment reads go through `location /` (no step-up
+# marker), and the login-session cookie reaches the backend, because the unlock is bound to a hash of it.
+def test_settings_reads_pass_through_with_the_session_cookie_and_without_the_step_up_marker(served):
+    request, rec, _ = served
+    for path in ("/api/settings/status", "/api/settings/environments"):
+        resp = request(path, {"Cookie": "opa_wizard_session=good", "X-Nginx-Stepup-Location": "guess"})
+        assert resp.status == 200
+        sent, headers = rec.backend_requests[-1]
+        lowered = {k.lower(): v for k, v in headers.items()}
+        assert sent == path
+        assert "x-nginx-stepup-location" not in lowered
+        assert "opa_wizard_session=good" in lowered.get("cookie", "")
+        assert lowered["x-nginx-proxy-secret"]
+
+
 # 5.43.0: the gate's issuer reaches the backend from the gate only.
 def test_the_gates_issuer_replaces_a_client_sent_one(served):
     request, rec, _ = served
@@ -479,6 +494,10 @@ def test_second_site_refuses_the_whole_backend_admin_routes(served_second, metho
     ("DELETE", "/api/environments/dev?id=aaaaaaaa-0000-4000-8000-000000000001"),  # what the UI sends
     ("GET", "/api/environments?purge_archive=1"),                                  # only a DELETE purges
     ("POST", "/api/environments/dev/sync/start"),
+    ("GET", "/api/settings/status"),            # 5.53.0: the Settings unlock works from an additional gate's site
+    ("GET", "/api/settings/environments"),
+    ("POST", "/api/settings/unlock"),
+    ("POST", "/api/settings/lock"),
     ("POST", "/api/environment_changes/save"),  # needs the step-up -> /login redirect, not a 403
 ])
 def test_second_site_still_serves_everything_else(served_second, method, path):

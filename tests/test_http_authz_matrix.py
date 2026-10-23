@@ -2371,3 +2371,25 @@ def test_the_session_fingerprint_is_a_hash_of_the_opaque_cookie(matrix_server, m
     assert one != serve._session_fingerprint({"Cookie": f"{SESSION_COOKIE_NAME}=abc.def.ghj"})
     for missing in ({}, {"Cookie": ""}, {"Cookie": "a=1"}, {"Cookie": f"{SESSION_COOKIE_NAME}="}):
         assert serve._session_fingerprint(missing) is None
+
+
+def test_the_public_list_carries_an_opaque_scope_that_follows_the_connection_settings(matrix_server):
+    """The list no longer carries the OPA domain, team or Okta URL, so the browser drops cached tenant data after an edit by
+    watching this token: it changes with those settings (not with the key id), and reveals none of them."""
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+
+    def scope():
+        rows = requests.get(base_url + "/api/environments", headers=_who(OWNER_A), timeout=10).json()["environments"]
+        return next(r for r in rows if r["id"] == env_id)["scope"]
+
+    first = scope()
+    assert len(first) == 16 and scope() == first
+    for secret_value in ("a.example.com", "https://a.example.com"):
+        assert secret_value not in first
+    engine.upsert_environment("dev", {"base_domain": "a.example.com", "team_name": "t", "key_id": "rotated", "key_secret": "s",
+                                      "okta_url": "https://a.example.com"}, owner=OWNER_A, environment_id=env_id)
+    assert scope() == first                                      # a rotated API key keeps the page
+    engine.upsert_environment("dev", {"base_domain": "a.example.com", "team_name": "another-team", "key_id": "rotated", "key_secret": "s",
+                                      "okta_url": "https://a.example.com"}, owner=OWNER_A, environment_id=env_id)
+    assert scope() != first                                      # another tenant drops it

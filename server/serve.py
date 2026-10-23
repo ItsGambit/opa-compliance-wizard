@@ -2167,6 +2167,16 @@ class StrictBindHTTPServer(ThreadingHTTPServer):
 
 # 5.53.0: the entry fields only the Settings unlock may read (see GET /api/settings/environments).
 ENV_CONFIG_FIELDS = ("base_domain", "team_name", "key_id", "okta_url", "has_okta_token", "sync_schedule")
+# A random per-process key: the `scope` token below is only ever compared with an earlier copy of itself.
+_SCOPE_TOKEN_KEY = os.urandom(32)
+
+
+def _connection_scope(meta):
+    """An opaque token that changes when the settings deciding WHICH tenant an environment reaches (OPA domain, team, Okta URL)
+    change, so the browser can drop cached tenant data after such an edit without being told the settings themselves
+    (5.53.0). A keyed hash with a per-process key: it reveals nothing about the values and changes at a restart."""
+    text = "\n".join(str(meta.get(field, "")) for field in ("base_domain", "team_name", "okta_url"))
+    return hmac.new(_SCOPE_TOKEN_KEY, text.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
 
 
 def _public_entry(environment_id, name, meta, requesting_owner, full=True):
@@ -2188,6 +2198,7 @@ def _public_entry(environment_id, name, meta, requesting_owner, full=True):
         "name": name,
         "shared": bool(meta.get("shared", False)),
         "is_own": meta.get("owner") == requesting_owner,
+        "scope": _connection_scope(meta),
     }
     if full:  # 5.53.0: the configuration fields are for the Settings unlock only (ENV_CONFIG_FIELDS)
         entry.update({
