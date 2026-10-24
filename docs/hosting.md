@@ -844,6 +844,8 @@ to be a quiet backdoor.
 
 ---
 
+A login gate configured only through a systemd drop-in (not the shared settings file) looks unconfigured to the upgrade preflight's check for an unset gate (see the README, "Upgrading"); finish the gate setup in the settings file, or run the refresh command it names.
+
 ## Uninstalling
 
 `sudo bash get-ocw.sh --uninstall --keep-data` (or `sudo server/install.sh --uninstall --keep-data` from the installed release) stops and

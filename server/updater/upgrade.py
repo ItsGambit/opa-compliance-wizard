@@ -110,25 +110,39 @@ def updater_activator_version():
     opt = opt_dir()
     if not opt:
         return None
-    try:
-        text = (opt / "updater" / "ocw_activate.py").read_text(encoding="utf-8", errors="replace")[:200000]
-    except OSError:
-        return None
-    m = re.search(r'^ACTIVATOR_VERSION = "([^"]+)"', text, re.M)
-    return m.group(1) if m else None
+    # Since 5.47.0 <updater>/ocw_activate.py is a fixed launcher (no version in it); the code is the file the `current` link points to.
+    # A layout from before the launcher has the activator itself at the top level.
+    for path in (opt / "updater" / "current" / "ocw_activate.py", opt / "updater" / "ocw_activate.py"):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")[:200000]
+        except OSError:
+            continue
+        m = re.search(r'^ACTIVATOR_VERSION = "([^"]+)"', text, re.M)
+        if m:
+            return m.group(1)
+    return None
 
 
 GATE_FIX_MIN_ACTIVATOR = (5, 53, 0)
 GATE_REFRESH_COMMAND = "sudo bash get-ocw.sh --refresh-updater --version 5.53.0"
 
 
-def _systemctl_ok(*args):
-    """True/False for a quiet `systemctl` query, None when it cannot be asked (no systemctl, no answer in time)."""
+def _unit_state(verb, unit):
+    """`systemctl is-enabled|is-active <unit>` read as True, False or None (doubt: no systemctl, no bus, no answer, an unfamiliar state).
+    Only the plain answers count: is-active exit 3 with "inactive"/"failed", is-enabled "disabled". Other output is doubt."""
     try:
-        return subprocess.run(["systemctl", *args], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                              timeout=5, check=False).returncode == 0
+        r = subprocess.run(["systemctl", verb, unit], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           timeout=5, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
+    word = r.stdout.decode("utf-8", "replace").strip().split("\n")[0].strip() if r.stdout else ""
+    if verb == "is-active":
+        if r.returncode == 0:
+            return True if word == "active" or not word else None
+        return False if r.returncode == 3 and word in ("inactive", "failed") else None
+    if word in ("enabled", "enabled-runtime", "static", "alias"):
+        return True
+    return False if word == "disabled" else None
 
 
 def unset_gate_with_old_activator():
@@ -144,7 +158,7 @@ def unset_gate_with_old_activator():
         return False   # a server fronted by something else has no main gate unit
     if (os.environ.get("OKTA_ORG_URL") or "").strip():
         return False
-    return _systemctl_ok("is-enabled", "--quiet", unit) is False and _systemctl_ok("is-active", "--quiet", unit) is False
+    return _unit_state("is-enabled", unit) is False and _unit_state("is-active", unit) is False
 
 
 def updater_state():

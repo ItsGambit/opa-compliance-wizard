@@ -101,7 +101,7 @@ def hazard(tmp_path, monkeypatch):
     monkeypatch.delenv("OKTA_ORG_URL", raising=False)
     monkeypatch.setattr(upgrade, "updater_activator_version", lambda: "5.52.0")
     state = {"is-enabled": False, "is-active": False}
-    monkeypatch.setattr(upgrade, "_systemctl_ok", lambda *a: state[a[0]])
+    monkeypatch.setattr(upgrade, "_unit_state", lambda verb, unit: state[verb])
     return state, unit_dir
 
 
@@ -177,3 +177,103 @@ def test_uninstall_leaves_a_cache_that_is_a_link_or_not_named_ocw_updater(world)
     assert world.fresh().returncode == 0
     p = world.run("--uninstall", "--keep-data", "--yes", extra_env={"OCW_UPDATER_CACHE_DIR": str(other)})
     assert p.returncode == 0 and other.exists()
+
+
+def test_a_disabled_but_running_gate_that_dies_after_the_restart_fails_the_health_check_and_rolls_back(m):
+    set_gate(m, False, True)                      # running, though not enabled
+    orig = m.host._start_unit
+
+    def start(unit):
+        ok = orig(unit)
+        if unit == GATE and uf._installed(m.opt_current()) == "5.47.0":      # the new release kills it
+            m.host.units[GATE].update(ActiveState="inactive", NRestarts="1")
+        return ok
+    m.host._start_unit = start
+    up, result = run_apply(m, cid="upg-aaaa0f04")
+    assert result == "rolled_back" and m.read_state()["reason_code"] == "health_unit"
+    assert GATE in up.units() and os.readlink(m.opt / "current") == "releases/5.46.0"
+
+
+def test_the_skip_note_is_logged_again_for_each_new_run(m, capsys):
+    set_gate(m, False, False)
+    up = m.updater()
+    up.units()
+    up.begin_run()
+    up.units()
+    assert capsys.readouterr().out.count("installed but disabled and not running") == 2
+
+
+# --- the activator version is read from the real layout -----------------------------------------------------------------------
+def _lay_out(opt, version_line='ACTIVATOR_VERSION = "5.52.0"\n', with_launcher=True):
+    lib = opt / "updater" / "lib" / "install-20260101"
+    lib.mkdir(parents=True)
+    (lib / "ocw_activate.py").write_text("# the activator\n" + version_line)
+    (opt / "updater" / "current").symlink_to("lib/install-20260101")
+    if with_launcher:
+        (opt / "updater" / "ocw_activate.py").write_text("# the fixed launcher: follows the `current` link\n")
+
+
+def test_the_version_is_read_through_the_current_link_behind_the_launcher(tmp_path, monkeypatch):
+    opt = tmp_path / "opt"
+    _lay_out(opt)
+    monkeypatch.setenv("OCW_OPT_DIR", str(opt))
+    assert upgrade.updater_activator_version() == "5.52.0"
+
+
+def test_the_version_of_a_layout_from_before_the_launcher_is_read_from_the_top_level_file(tmp_path, monkeypatch):
+    opt = tmp_path / "opt"
+    (opt / "updater").mkdir(parents=True)
+    (opt / "updater" / "ocw_activate.py").write_text('ACTIVATOR_VERSION = "5.46.0"\n')
+    monkeypatch.setenv("OCW_OPT_DIR", str(opt))
+    assert upgrade.updater_activator_version() == "5.46.0"
+
+
+def test_the_preflight_refuses_on_a_real_on_disk_layout_without_patching_the_version(tmp_path, monkeypatch):
+    opt = tmp_path / "opt"
+    _lay_out(opt)
+    unit_dir = tmp_path / "units"
+    unit_dir.mkdir()
+    (unit_dir / f"{GATE}.service").write_text("[Service]\n")
+    monkeypatch.setenv("OCW_OPT_DIR", str(opt))
+    monkeypatch.setenv("OCW_UNIT_DIR", str(unit_dir))
+    monkeypatch.delenv("OKTA_ORG_URL", raising=False)
+    monkeypatch.setattr(upgrade, "_unit_state", lambda verb, unit: False)
+    items = _preflight()
+    assert items["gate_not_set_up"]["ok"] is False
+
+
+# --- systemctl answers: only the plain ones are certain -----------------------------------------------------------------------
+class _R:
+    def __init__(self, rc, out):
+        self.returncode, self.stdout = rc, out.encode()
+
+
+@pytest.mark.parametrize("verb,rc,out,want", [
+    ("is-active", 0, "active\n", True), ("is-active", 3, "inactive\n", False), ("is-active", 3, "failed\n", False),
+    ("is-active", 3, "activating\n", None), ("is-active", 1, "", None), ("is-active", 4, "", None), ("is-active", 1, "Failed to connect to bus\n", None),
+    ("is-enabled", 1, "disabled\n", False), ("is-enabled", 0, "enabled\n", True), ("is-enabled", 0, "enabled-runtime\n", True),
+    ("is-enabled", 0, "static\n", True), ("is-enabled", 0, "alias\n", True), ("is-enabled", 1, "", None),
+    ("is-enabled", 1, "masked\n", None), ("is-enabled", 1, "Failed to connect to bus\n", None)])
+def test_unit_state_reads_only_plain_answers(monkeypatch, verb, rc, out, want):
+    monkeypatch.setattr(upgrade.subprocess, "run", lambda *a, **k: _R(rc, out))
+    assert upgrade._unit_state(verb, GATE) is want
+
+
+def test_unit_state_is_doubt_when_systemctl_is_missing_or_hangs(monkeypatch):
+    def boom(*a, **k):
+        raise FileNotFoundError("systemctl")
+    monkeypatch.setattr(upgrade.subprocess, "run", boom)
+    assert upgrade._unit_state("is-active", GATE) is None
+    def hang(*a, **k):
+        raise upgrade.subprocess.TimeoutExpired("systemctl", 5)
+    monkeypatch.setattr(upgrade.subprocess, "run", hang)
+    assert upgrade._unit_state("is-enabled", GATE) is None
+
+
+def test_no_bus_does_not_refuse(hazard, monkeypatch):
+    monkeypatch.undo()                              # the real _unit_state, with systemctl answering "no bus" for both
+    monkeypatch.setenv("OCW_UNIT_DIR", str(hazard[1]))
+    monkeypatch.delenv("OKTA_ORG_URL", raising=False)
+    monkeypatch.setattr(upgrade, "updater_activator_version", lambda: "5.52.0")
+    monkeypatch.setattr(upgrade.subprocess, "run", lambda *a, **k: _R(1, "Failed to connect to bus: No such file or directory\n"))
+    assert "gate_not_set_up" not in _preflight()

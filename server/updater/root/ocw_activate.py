@@ -613,6 +613,7 @@ class Updater:
         self.t0 = host.now()
         self._secrets = None
         self._gate_skip_logged = set()
+        self._run_units = None   # the units of this run, fixed at its first restart (see restart_all)
 
     # faults / kills
     def fault(self, name):
@@ -676,7 +677,16 @@ class Updater:
             log("WARN", f"could not remove the maintenance page: {exc.strerror}")
 
     # --- units ----------------------------------------------------------------------------------
+    def begin_run(self):
+        """A new apply / resume / rollback / restore: forget the unit list and the skip notes of any earlier one."""
+        self._run_units = None
+        self._gate_skip_logged = set()
+
     def units(self):
+        """The units of the run once its first restart has fixed them, else the live list."""
+        return list(self._run_units) if self._run_units is not None else self.live_units()
+
+    def live_units(self):
         c = self.cfg
         units = [c.backend_service]
         if self.host.unit_exists(c.gate_service):  # a server fronted by something else has no main gate unit
@@ -1440,6 +1450,10 @@ class Updater:
         self.host.switch_symlink(c.current, os.path.join("releases", version))
 
     def restart_all(self, label):
+        # Fixed here, before anything is restarted, and reused by the health checks, the rollback and the finish: a gate that is
+        # running (but disabled) is restarted AND checked even if the new release kills it, and a gate that was skipped stays skipped.
+        if self._run_units is None:
+            self._run_units = self.live_units()
         self._pids_before = {u: self.host.unit_prop(u, "MainPID") for u in self.units()}
         failed = []
         for u in self.units():
@@ -1574,6 +1588,7 @@ class Updater:
     # --- the whole apply ------------------------------------------------------------------------------
     def apply(self, req):
         c = self.cfg
+        self.begin_run()
         _cid[0] = req.get("correlation_id")
         try:
             self.validate_request(req, True)
@@ -2093,6 +2108,7 @@ class Updater:
     # --- resume after a crash / power loss ------------------------------------------------------------------------------
     def resume(self):
         c = self.cfg
+        self.begin_run()
         st = read_json(c.state_path)
         if not st or st.get("result") is not None or not st.get("step"):
             return None
@@ -2150,6 +2166,7 @@ class Updater:
     # --- operator actions --------------------------------------------------------------------------------------------------
     def rollback_action(self, actor):
         c = self.cfg
+        self.begin_run()
         cid = "upg-" + uuid.uuid4().hex[:8]
         _cid[0] = cid
         cur, prev = installed_version(c), link_version(c.previous)
@@ -2173,6 +2190,7 @@ class Updater:
         """Put the pre-upgrade copy of the last upgrade back. A request through the inbox names the copy the administrator was
         shown (`expect_backup`) and is refused if the copy this would restore is another one, or if anything is in flight."""
         c = self.cfg
+        self.begin_run()
         if expect_backup is not None and self.in_flight():
             raise StepFailed("in_flight", "another upgrade is in progress")
         hist = [h for h in self._history_lines() if h.get("backup") and h.get("action") == "apply"]
