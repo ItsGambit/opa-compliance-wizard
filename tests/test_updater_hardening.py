@@ -657,6 +657,13 @@ def test_requires_install_sh_is_a_real_comparison_with_the_previous_tag(tmp_path
     assert tool._requires_install_sh(repo, changed, "1.1.0") is True
 
 
+def test_requires_install_sh_is_true_when_the_marker_names_this_release_and_false_above_it(tmp_path):
+    tool, repo, state = _git_repo(tmp_path, {"5.52.0": {}})
+    marked = dict(state, **{"server/install.sh": 'OCW_INSTALL_SH_REQUIRED_SINCE="5.53.0"\n'})
+    assert tool._requires_install_sh(repo, _files(marked), "5.53.0") is True       # a 5.47.0 updater then refuses with needs_install_sh
+    assert tool._requires_install_sh(repo, _files(marked), "5.54.0") is False      # a later release with no unit change does not
+
+
 def _git_repo(tmp_path, tags):
     """A real git repo with one commit per entry of `tags` ({version: {file: text}}), each tagged vX."""
     tool = _release_tool()
