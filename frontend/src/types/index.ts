@@ -60,12 +60,15 @@ export interface SettingsEnvironment extends Environment {
   okta_url: string
   has_okta_token: boolean
   sync_schedule: SyncSchedule
+  /** 5.53.0: the stored "Who can build evidence packages" choice (owners and admins only). */
+  evidence_builders?: EvidenceBuilders
 }
 
 // ── Shared-environment permissions (5.42.0) ──────────────────────────────
 
 export type SharedCapabilityKey =
   | 'view_archive' | 'live_read' | 'tenant_write' | 'import_csv' | 'reset_watermark' | 'sync_now' | 'sync_settings'
+  | 'build_evidence_package'
 
 export type PermissionValue = 'allow' | 'deny'
 /** A stored setting: "inherit" is the absence of one. */
@@ -699,7 +702,12 @@ export interface EnvironmentFormValues {
   key_secret: string
   okta_url: string
   okta_api_token: string
+  /** 5.53.0: who may build evidence packages from this environment's archive: its owner only, or its owner and the people it is
+   * shared with. A required choice in the form (preselected "owner"); a server older than 5.53.0 ignores it. */
+  evidence_builders?: EvidenceBuilders
 }
+
+export type EvidenceBuilders = 'owner' | 'shared'
 
 export interface ResourceGroup {
   id: string
@@ -1797,4 +1805,101 @@ export interface NamedPeopleList {
   snapshot: SnapshotSummary | null
   note?: string
   people: (CrossCheckRow & { footprint?: { groups?: number; policies?: number; resources?: number } | null; okta_status_changed?: string | null; access_effective?: boolean | null })[] | SodOverlap[] | { actor_id: string; login: string | null; signins: number; mfa_success: number; phishing_resistant_share: number | null; sms_voice: number; mfa_failed: number; by_class: Record<string, number> }[]
+}
+
+
+// ── Evidence package (5.53.0) ────────────────────────────────────────────
+
+/** UTC calendar dates, inclusive (YYYY-MM-DD). */
+export interface EvidencePeriod {
+  start: string
+  end: string
+}
+
+export interface EvidenceControlRow {
+  framework: string
+  control_id: string
+  mapping_status: 'proposed' | 'auditor-reviewed'
+  reports: string[]
+  rows: number
+  status: 'events_present' | 'zero_events_in_period'
+}
+
+/** The coverage check of a period: states as counts and date ranges, never colour alone. */
+export interface EvidenceCoverage {
+  period: EvidencePeriod
+  days: number
+  has_coverage: boolean
+  coverage_pct: number
+  covered_days: number
+  counts: {
+    covered_with_events: number
+    covered_zero_events: number
+    not_covered: number
+    pruned_by_retention: number
+    before_archive: number
+    after_data_as_of: number
+  }
+  gap_days_total: number
+  gap_ranges: [string, string][]
+  gap_ranges_total: number
+  zero_days_total: number
+  zero_ranges: [string, string][]
+  zero_ranges_total: number
+  pruned_days_total: number
+  pruned_ranges: [string, string][]
+  pruned_ranges_total: number
+  before_archive_days: number
+  after_data_as_of_days: number
+  needs_acknowledgement: boolean
+  archive_start_date: string | null
+  data_as_of: string | null
+  pruned_basis: string
+  limits: string[]
+  events_in_period: number
+  chain_head: string | null
+  controls: EvidenceControlRow[]
+}
+
+export interface EvidenceJobResult {
+  sha256: string
+  bytes: number
+  chain_head: string | null
+  events: number
+  report_rows: number
+  coverage_pct: number
+  gap_days: number
+  zero_days: number
+  pruned_days: number
+  built_at: string
+  seconds: number
+  data_as_of: string | null
+  verifier_sha256: string
+  filename: string
+}
+
+export interface EvidenceJob {
+  job_id: string
+  status: 'running' | 'done' | 'error' | 'expired'
+  stage: string
+  progress: number
+  environment: string
+  period: EvidencePeriod
+  gaps_acknowledged: boolean
+  started_at: string
+  finished_at: string | null
+  expires_at: string | null
+  seconds_left: number | null
+  window_seconds: number
+  error: string | null
+  reason: string | null
+  result?: EvidenceJobResult
+}
+
+/** The answer to starting a build in local mode, or after the approved save in hosted mode. */
+export interface EvidenceJobStarted {
+  job_id: string
+  status: 'running'
+  environment: string
+  period: EvidencePeriod
 }

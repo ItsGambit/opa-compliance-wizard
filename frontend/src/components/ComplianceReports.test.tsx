@@ -39,27 +39,15 @@ describe('ComplianceReports', () => {
     expect((await screen.findAllByText('events, all time')).length).toBe(2)
   })
 
-  it('Export all downloads nothing if any report failed, and names the failures', async () => {
+  it('"Export all (CSV)" is gone: the entry point is a link to the Evidence package page (5.53.0)', async () => {
     vi.mocked(fetchReportDefs).mockResolvedValue({ reports: DEFS as never })
-    vi.mocked(runReport).mockImplementation(async key => {
-      if (key === 'provisioning') throw new Error('502 upstream')
-      return { rows: [], total: 0, truncated: false } as never
-    })
-    renderWithClient(<ComplianceReports selectedReport={null} onSelectReport={() => {}} />)
+    const open = vi.fn()
+    renderWithClient(<ComplianceReports selectedReport={null} onSelectReport={() => {}} onOpenEvidencePackage={open} />)
     await screen.findAllByText('events, all time')
-    fireEvent.click(screen.getByRole('button', { name: /Export all/ }))
-    await waitFor(() => expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({ title: 'Export failed — nothing was downloaded', description: expect.stringContaining('Provisioning (502 upstream)') })))
-    expect(exportSections).not.toHaveBeenCalled()
-  })
-
-  it('Export all writes one file when every report loaded', async () => {
-    vi.mocked(fetchReportDefs).mockResolvedValue({ reports: DEFS as never })
-    vi.mocked(runReport).mockResolvedValue({ rows: [], total: 0, truncated: false } as never)
-    renderWithClient(<ComplianceReports selectedReport={null} onSelectReport={() => {}} />)
-    await screen.findAllByText('events, all time')
-    fireEvent.click(screen.getByRole('button', { name: /Export all/ }))
-    await waitFor(() => expect(exportSections).toHaveBeenCalledTimes(1))
-    expect(vi.mocked(exportSections).mock.calls[0][2]).toBe('opa-compliance-reports-all')
+    expect(screen.queryByRole('button', { name: /Export all/ })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /Build an evidence package/ }))
+    expect(open).toHaveBeenCalledTimes(1)
+    expect(runReport).not.toHaveBeenCalled()
   })
 
   it('a card export failure is a toast, and the button is busy while it runs', async () => {
@@ -92,31 +80,6 @@ describe('ComplianceReports', () => {
     expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({ title: 'Exported "MFA"', description: expect.stringContaining('4,812 events') }))
     expect(toastSpy).not.toHaveBeenCalledWith(expect.objectContaining({ title: expect.stringContaining('incomplete') }))
     expect(runReport).not.toHaveBeenCalled()      // nothing is written from a capped list
-    expect(exportSections).not.toHaveBeenCalled()
-  })
-
-  it('Export all writes nothing and says why, before any file, when a report list is cut at the limit', async () => {
-    vi.mocked(fetchReportDefs).mockResolvedValue({ reports: DEFS as never })
-    vi.mocked(runReport).mockImplementation(async key => (
-      key === 'provisioning' ? { rows: new Array(1000).fill({}), total: 4812, truncated: true } : { rows: [], total: 0, truncated: false }) as never)
-    renderWithClient(<ComplianceReports selectedReport={null} onSelectReport={() => {}} />)
-    await screen.findAllByText('events, all time')
-    fireEvent.click(screen.getByRole('button', { name: /Export all/ }))
-    await waitFor(() => expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({
-      title: 'Export all stopped — nothing was downloaded',
-      description: expect.stringContaining('Provisioning has 4,812 events and only 1,000 can be listed here'),
-      variant: 'error',
-    })))
-    expect(exportSections).not.toHaveBeenCalled()
-  })
-
-  it('Export all shows an error when the request itself fails', async () => {
-    vi.mocked(fetchReportDefs).mockResolvedValue({ reports: DEFS as never })
-    vi.mocked(runReport).mockImplementation(() => { throw new Error('offline') })
-    renderWithClient(<ComplianceReports selectedReport={null} onSelectReport={() => {}} />)
-    await screen.findAllByText('events, all time')
-    fireEvent.click(screen.getByRole('button', { name: /Export all/ }))
-    await waitFor(() => expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({ title: 'Export failed — nothing was downloaded', description: 'offline', variant: 'error' })))
     expect(exportSections).not.toHaveBeenCalled()
   })
 

@@ -133,6 +133,16 @@ ROUTES = {
     ("GET", "path == '/api/access/model'"): Route("GET", "/api/access/model", "session", None, 200, caps=('live_read',)),
     ("GET", "path == '/api/access/bootstrap/status'"): Route("GET", "/api/access/bootstrap/status", "session", None, 200, caps=('live_read',)),
     ("GET", "path == '/api/access/bootstrap/result'"): Route("GET", "/api/access/bootstrap/result", "session", None, 200, caps=('live_read',)),
+    # 5.53.0: evidence packages. prepare: names the environment in the query and checks view_archive AND build_evidence_package
+    # (409: this fixture's "dev" has no archive coverage; the step-up test below seeds one). Status and download are bound to the
+    # person who built the package (a job id of anyone else's, or an unknown one, is a 404 for every caller).
+    ("POST", "path == '/api/evidence_packages/prepare'"):
+        Route("POST", "/api/evidence_packages/prepare?environment=dev", "env", {"start": "2020-03-01", "end": "2020-03-05"}, 409,
+              caps=('view_archive', 'build_evidence_package'), stepup='evidence_package.build'),
+    ("GET", "path.startswith('/api/evidence_packages/') and path.endswith('/download')"):
+        Route("GET", "/api/evidence_packages/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/download", "open", None, 404),
+    ("GET", "path.startswith('/api/evidence_packages/')"):
+        Route("GET", "/api/evidence_packages/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "open", None, 404),
     ("GET", "path == '/api/csv_files'"): Route("GET", "/api/csv_files", "open", None, 200),
     ("GET", "path == '/api/csv'"): Route("GET", "/api/csv?file=folders_template.csv", "open", None, 200),
     ("GET", "path == '/api/audit_log'"): Route("GET", "/api/audit_log", "admin", None, 200),
@@ -341,6 +351,10 @@ def matrix_server(tmp_audit_store, tmp_environments_file, fake_keyring, tmp_audi
     monkeypatch.setattr(serve, "_run_sync_job", lambda *a, **k: started.append(("sync", a)))
     monkeypatch.setattr(serve, "_run_access_job", lambda *a, **k: started.append(("access", a)))
     monkeypatch.setattr(serve, "_run_capture_job", lambda *a, **k: started.append(("capture", a)))  # 5.50.0
+    # 5.53.0: an evidence build's worker never runs here (the routes' own checks and the job table do); packages go to a temp folder.
+    monkeypatch.setattr(serve, "_run_evidence_build", lambda *a, **k: started.append(("evidence", a)))
+    monkeypatch.setattr(serve._evidence, "_dir_fn", lambda: str(tmp_path / "packages"))
+    serve._evidence.reset()
     with serve._sessions_lock:
         serve._seen_owners.clear()
         serve._recorded_identities.clear()  # 5.43.0: each test starts with a fresh DB
@@ -359,6 +373,7 @@ def matrix_server(tmp_audit_store, tmp_environments_file, fake_keyring, tmp_audi
         except requests.exceptions.ConnectionError:
             time.sleep(0.1)
     yield base_url, serve
+    serve._evidence.reset()
     server_instance.shutdown()
     server_instance.server_close()
     with serve._sessions_lock:
@@ -1132,15 +1147,11 @@ def test_every_environment_route_declares_its_capability():
             assert not caps, (key, caps)
 
 
-NAME_ONLY_ACTION_TYPES = {"evidence_package.build"}
-
-
 def test_every_environment_change_type_has_a_route_and_an_executor():
     import server.serve as serve
 
     used = {r.stepup for r in ROUTES.values() if r.stepup}
-    # 5.53.0: evidence_package.build is registered as a name (its approval can be consumed and refused) before its route exists.
-    assert used | NAME_ONLY_ACTION_TYPES == set(serve.ENV_CHANGE_ACTION_TYPES) == set(serve._ENV_CHANGE_EXECUTORS)
+    assert used == set(serve.ENV_CHANGE_ACTION_TYPES) == set(serve._ENV_CHANGE_EXECUTORS)
 
 
 def _share_a_dev_with_b_session(serve):
@@ -1161,7 +1172,8 @@ CAP_ROUTES = [r for r in ROUTES.values() if r.caps]
 # than read from the engine (so a changed built-in default fails this
 # matrix too). 5.43.0 (SP-1, SP-2): tenant writes and CSV import are denied.
 BUILT_IN = {"view_archive": "allow", "live_read": "allow", "tenant_write": "deny", "import_csv": "deny",
-            "reset_watermark": "allow", "sync_now": "deny", "sync_settings": "deny"}
+            "reset_watermark": "allow", "sync_now": "deny", "sync_settings": "deny",
+           "build_evidence_package": "deny"}
 
 
 def test_matrix_built_ins_match_the_engine():
@@ -1570,6 +1582,11 @@ def _stepup_case(serve, route):
                                        "pending_approval": None, "last": None})
     elif route.stepup == "environment.share":
         body = {"shared": False}
+    elif route.stepup == "evidence_package.build":
+        # the owner's "dev" gets an archive that covers the sample period (fixed dates in 2020), so the build can start
+        from evidence_fixtures import seed_fixed_archive
+        seed_fixed_archive(env_id)
+        body = {"start": "2020-03-01", "end": "2020-03-05", "gaps_acknowledged": False}
     return env_id, who, admin, sample, body
 
 
@@ -2188,8 +2205,9 @@ def test_an_access_control_save_renews_and_a_refused_one_does_not(matrix_server,
 
 
 def _outside_action(monkeypatch, name):
-    """A pending approval of an action type outside SETTINGS_RENEWING_ACTION_TYPES. evidence_package.build is only a name in
-    this work package (its executor answers 501); the test-only type has a real executor that succeeds."""
+    """A pending approval of an action type outside SETTINGS_RENEWING_ACTION_TYPES. The approval of evidence_package.build here
+    carries no environment, so its executor refuses it (400) after the approval was consumed; the test-only type has a real
+    executor that succeeds. A real build approval is driven end to end in test_evidence_package_routes_5530.py."""
     import server.serve as serve
 
     if name == "test.only":
@@ -2206,14 +2224,14 @@ def test_an_approval_outside_the_renewal_list_never_creates_or_extends_an_unlock
     assert name not in serve.SETTINGS_RENEWING_ACTION_TYPES
     aid = _outside_action(monkeypatch, name)
     done = _save(base_url, ADMIN, aid, admin=True)
-    assert done.status_code == (501 if name == "evidence_package.build" else 200), done.text
+    assert done.status_code == (400 if name == "evidence_package.build" else 200), done.text
     assert _unlock_rows() == []                                      # created nothing
     assert requests.get(base_url + "/api/access_control", headers=_who(ADMIN, admin=True), timeout=10).status_code == 403
     # With a window already open its expiry is left exactly as it was.
     _unlock(serve, ADMIN, ttl=120)
     before = _unlock_rows()
     aid = _outside_action(monkeypatch, name)
-    assert _save(base_url, ADMIN, aid, admin=True).status_code in (200, 501)
+    assert _save(base_url, ADMIN, aid, admin=True).status_code in (200, 400)
     assert _unlock_rows() == before
     assert not any(e["details"].get("settings_unlock_renewed") for e in _audit_entries(tmp_audit_log))
 

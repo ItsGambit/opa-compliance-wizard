@@ -48,6 +48,7 @@ const CAPABILITY_VERBS: Record<SharedCapabilityKey, string> = {
   reset_watermark: 'reset its sync watermark',
   sync_now: 'run its sync',
   sync_settings: 'change its sync settings',
+  build_evidence_package: 'build evidence packages from its archive',
 }
 
 /** 5.51.0: why Refresh / Sync now is off for this viewer ('' when it is on). A refresh reads OPA (live reads) and runs the sync, so it needs both. */

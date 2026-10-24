@@ -151,7 +151,7 @@ describe('EnvironmentManagerDialog -- step-up MFA (5.42.0)', () => {
     const deny = { value: 'deny', source: 'default' } as const
     const shared = env('s', 'team', {
       is_own: false, shared: true,
-      permissions: { view_archive: allow, live_read: allow, tenant_write: deny, import_csv: allow, reset_watermark: allow, sync_now: deny, sync_settings: deny },
+      permissions: { view_archive: allow, live_read: allow, tenant_write: deny, import_csv: allow, reset_watermark: allow, sync_now: deny, sync_settings: deny, build_evidence_package: deny },
     })
     await renderDialog({ environments: [shared], active: null, active_id: null })
     expect(screen.getByText(/Not allowed for shared users: changes in OPA \/ Okta, Sync now, sync settings/)).toBeTruthy()

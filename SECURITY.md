@@ -161,9 +161,47 @@ updater never runs the application's Python. A re-check of the installed
 packages against their pip `RECORD` hashes after installation is planned for
 5.54.0.
 
+### The evidence package verifier's sha256
+
+Each release publishes the sha256 of `tools/verify_evidence_package.py` in three places outside any evidence package: the signed
+`manifest.json` of the release (field `verifier_sha256`, covered by the release signature), the release notes, and the project's
+signing-key page. To check a copy, compute its sha256 (`sha256sum`, `shasum -a 256`, `Get-FileHash`) and compare it with the
+signed manifest's value, which you can read after verifying the release as described above, and with the other two. The cover
+sheet of a package and the copy inside it are conveniences: they come from the same place as the package. No value is written
+in this repository.
+
 ## Evidence packages
 
-Limits are described when the feature ships (5.53.0).
+An evidence package (5.53.0) is one zip of the archived events of an audit period, with report files, the archive's hash
+chain as it stood when the package was built, and the data an auditor needs to check it offline
+(`docs/evidence-package-format.md`, `docs/evidence-package.md`). What it is, and what it is not:
+
+- **It holds personal data.** Names, email addresses, IP addresses, places and what people did, exactly as the System Log
+  recorded them. It is **not encrypted**. Whoever has the file has the data. Send it only to the people who need it, over a
+  channel you trust, and delete your copies when the audit is over.
+- **It is not signed, and the hashes are unkeyed.** Anyone who can rewrite the whole package, or the archive it was built
+  from, and recompute every hash can produce a package that passes the check. Nothing in the package proves who built it. The
+  server's build log (the `evidence_package.build`, `.build_finished` and `.downloaded` entries of the Audit Log and the
+  journal: who, when, the period, row counts, the package's sha256 and the chain head, never row content) is the only
+  independent record: compare the zip's sha256 and the chain head, both printed by the verifier, with it.
+- **What the verifier shows.** `tools/verify_evidence_package.py` (one file, Python standard library only) detects
+  accidental or partial change to a package, and checks the exported events against the archive's hash chain as it stood at
+  build time. It does not show who produced the events, that the archive was never altered by someone who could rewrite it,
+  or that `events.ndjson` holds every event of the period (the completeness statement is the builder's own). Events with no
+  seal, legacy and snapshot manifests, and report rows with no `event_uuid` are listed as not verified, never counted as
+  verified. Get the verifier's sha256 from the signed release, its notes or the signing-key page (see "The evidence package verifier's sha256" under Release signing keys), not from the package.
+- **Who can build one.** The environment's owner always can. Other people who see the environment need both *View archived
+  reports* and *Build evidence packages* (denied by default; the environment form asks who may). Permission is checked when
+  a build starts, on every status read and on every download. On a hosted server a build needs a fresh MFA, as every
+  configuration change does; that approval is its own type and never opens or extends the Settings and Updates window, and
+  the Settings approval cannot start a build. A package is available only to the person who built it (their sign-in
+  session), for 15 minutes after it is finished; then the file is deleted. Packages are written to
+  `<data folder>/packages/` (folder 0700, file 0600), deleted when the server starts, and never included in a support bundle.
+- **Not covered.** A package that has been downloaded is outside this server's control.
+- **Additional login gates.** Building and downloading packages there is intended. The control is the capability: a per-user
+  grant for that gate's issuer, or the environment-wide setting. "Owner and people this environment is shared with" allows every
+  person who sees the environment, through any gate. To keep packages to the main gate, leave the environment setting at owner
+  only and grant per user.
 
 ## Supported versions
 

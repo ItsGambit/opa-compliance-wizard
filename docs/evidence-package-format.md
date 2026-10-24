@@ -32,7 +32,7 @@ In short: the verifier detects accidental or partial change to the package, and 
 
 The verifier is `tools/verify_evidence_package.py`, one file, Python standard library only. Where to get it, most trusted first:
 
-1. **The sha256 in the release notes and on the signing-key page.** Both are outside the package. This is the authoritative value.
+1. **The sha256 in the signed release (`manifest.json`, field `verifier_sha256`), in its release notes and on the signing-key page.** All are outside the package. This is the authoritative value.
 2. **The signed release tarball** of the OPA Compliance Wizard contains the verifier. Verify the release as the README describes, then take the file from it.
 3. **The value on the package's cover sheet and the copy inside the package** (`tools/verify_evidence_package.py` inside the zip, listed in `package-manifest.json` like every file) are conveniences only. They come from the same place as the package, so they prove nothing about themselves.
 
@@ -77,7 +77,7 @@ Entries are ASCII names built from fixed keys. Order in the zip is as listed; th
 | `tools/verify_evidence_package.py` | convenience copy of the verifier; listed in `package-manifest.json` like every file; not a trusted source (see above) |
 | `chain/manifests.ndjson` | every manifest record of the environment, first to head, in chain order |
 | `chain/seals.ndjson` | for each manifest holding an event of the period, its sealed entries |
-| `completeness.json` | the builder's statement of rows, scope, counts, coverage and pruned days |
+| `completeness.json` | the builder's statement of rows, scope, counts, coverage and pruned days (`pruned_basis` says what the pruned days rest on: records the server wrote when it pruned, or, for older prunes, the server's audit log or the current retention setting; a builder without administrator rights sees only prune times and counts there, not who ran them) |
 | `what-this-tool-reads.txt` | static statement of what the tool reads |
 | `methodology/<report_key>.txt` | method notes per report |
 | `package-manifest.json` | the file list and package facts, below |
@@ -150,7 +150,7 @@ Golden values (the test suite asserts them against both the application and the 
 
 ## Limits and memory
 
-The verifier holds the uuids of the sealed entries and of the exported events in memory (about 250 bytes per event). A package of a million events needs a few hundred megabytes. Files are streamed and hashed in chunks.
+The verifier holds the uuids of the sealed entries and of the exported events in memory (about 250 bytes per event). The verifier needs about 650 MB of memory per million events (streaming it is planned for 5.54.0). Files are streamed and hashed in chunks.
 
 ## Versioning
 

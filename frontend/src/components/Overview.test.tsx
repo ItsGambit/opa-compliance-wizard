@@ -41,6 +41,16 @@ describe('OverviewPage', () => {
     expect(screen.getByRole('region', { name: 'Evidence readiness' })).toBeTruthy()
   })
 
+  it('the evidence card links to the Evidence package page (5.53.0) in place of Export all reports', async () => {
+    const open = vi.fn()
+    renderWithClient(<OverviewPage onOpenReports={vi.fn()} onOpenEvidencePackage={open} />)
+    const card = await screen.findByRole('region', { name: 'Evidence readiness' })
+    fireEvent.click(within(card).getByRole('button', { name: 'Build evidence package' }))
+    expect(open).toHaveBeenCalledTimes(1)
+    expect(within(card).queryByRole('button', { name: 'Export all reports' })).toBeNull()
+    expect(within(card).getByText(/not encrypted and is not signed/)).toBeTruthy()
+  })
+
   it('a count opens the named list in a drawer (fetched only then) and says it is audited', async () => {
     vi.mocked(fetchOverview).mockResolvedValue(overview({ tiles: { ...overview().tiles, left_okta: { people: 3, accounts: 1, state: 'ok', effective_known: true } } }))
     vi.mocked(fetchPeopleList).mockResolvedValue({ list: 'c1', state: 'ok', message: null, snapshot: null, people: [

@@ -392,6 +392,21 @@ class Snapshot:
                 raise EvidenceError("a stored event holds a line break and cannot be written as one line")
             yield line + b"\n"
 
+    def estimate_event_bytes(self, sample=500):
+        """Rough size of events.ndjson for the period, in bytes: the period's event count times the average raw_json
+        length of the newest `sample` events of the period (a bounded read through the published index). Used by the
+        packer for its free-space check, never for a statement about the archive."""
+        def make():
+            n = self.events_in_period()
+            if not n:
+                return 0
+            row = self._conn.execute(
+                "SELECT AVG(l) FROM (SELECT LENGTH(raw_json) AS l FROM events INDEXED BY idx_events_env_published "
+                "WHERE environment_id = ? AND published >= ? AND published < ? ORDER BY published DESC LIMIT ?)",
+                (self.environment_id, *self._range(), sample)).fetchone()
+            return int(n * ((row[0] or 0) + 1))
+        return self._cached("estimate_event_bytes", make)
+
     # -- counts ---------------------------------------------------------------
     def event_type_counts(self):
         """{event_type: rows in the period} for every curated event type (zero included), from the covering index."""

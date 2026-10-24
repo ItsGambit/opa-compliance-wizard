@@ -114,9 +114,16 @@ outcome (success/failure/denied) column, which is the shape most audit
 evidence requests are written around. Every report supports
 **Export CSV** (via the same export mechanism used throughout the rest
 of this tool) both from its detail view and directly from its card on
-the picker screen (hover to reveal the export icon) — there's also a
-single **Export all reports** button at the top of the picker for
-pulling the entire evidence set in one pass.
+the picker screen (hover to reveal the export icon). To hand an auditor
+the whole period at once, **Build an evidence package…** (5.53.0, replacing
+the picker's "Export all (CSV)" button; the Overview's evidence card has
+the same button) opens the **Evidence package** page: pick SOC 2 (proposed
+mapping), a UTC period, read the coverage check (gap, zero-event, pruned
+and before-the-archive days, written as text; gap days need an explicit
+confirmation), preview the control matrix and build one zip with the
+events, report files, the archive's hash chain and a checking program an
+auditor runs offline. A package holds people's names and activity and is
+not encrypted or signed; see [evidence-package.md](evidence-package.md).
 
 **Getting data into the archive — the sync settings dialog**
 (**Environments** in the sidebar → the environment's row → sync settings,
