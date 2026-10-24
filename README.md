@@ -280,6 +280,8 @@ banner asks for MFA as well. A computer running without a login gate (local mode
 upgrade itself needs nothing from you and changes no nginx or service file; an additional login gate's site generated before
 5.42.0 must be regenerated first (see [docs/hosting.md](docs/hosting.md), "Opening Settings and Updates needs a fresh MFA too").
 
+**Before upgrading to 5.53.0 from 5.52.0 or older:** the upgrade is run by the updater already on the server, which fails (and cannot roll back) when the main login gate is installed but not set up yet, as a fresh one-line install is until the Okta setup is done. If your server's login gate is installed but not yet set up (a fresh one-line install before Okta setup), run `sudo bash get-ocw.sh --refresh-updater --version 5.53.0` from the 5.53.0 release first, or finish the gate setup, then upgrade. The Updates page's preflight shows this as "The login gate is installed but not set up yet" when it applies.
+
 **Nothing else changes for you unless you choose it.** Upgrading changes no other
 behaviour of an existing install by itself: the update check is **off**, `server/deploy.sh` and `--ref`
 keep working in place (with a note that the install can move to the upgrade layout), and no

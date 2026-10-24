@@ -102,6 +102,7 @@ NGINX_ENABLED_DIR="${OCW_NGINX_ENABLED_DIR:-/etc/nginx/sites-enabled}"
 NGINX_SSL_DIR="${OCW_NGINX_SSL_DIR:-/etc/nginx/ssl}"
 SESSION_KEY_FILE="${OCW_SESSION_KEY_FILE:-/etc/opa-secrets-wizard-session.key}"
 UPDATER_ENV="${OCW_UPDATER_ENV:-/etc/ocw-updater.env}"
+UPDATER_CACHE_DIR="${OCW_UPDATER_CACHE_DIR:-/var/cache/ocw-updater}"   # the staging unit's CacheDirectory= (pip's cache), owned by the staging account
 UPDATER_USER="ocw-updater"
 TESTING="${OCW_INSTALL_TEST:-}"
 
@@ -254,10 +255,19 @@ safe_remove_tree() { # safe_remove_tree <dir>
   if [ -L "$_d" ]; then rm -f -- "$_d"; elif [ -e "$_d" ]; then rm -rf -- "$_d"; fi
 }
 
+updater_cache_is_ours() { # the staging unit's pip cache: a real directory named ocw-updater, owned by the staging account (or root), at a path safe to remove
+  local _d="$UPDATER_CACHE_DIR"
+  [ -d "$_d" ] && [ ! -L "$_d" ] || return 1
+  [ "$(basename -- "$_d")" = "ocw-updater" ] || return 1
+  ( check_removable "$_d" ) >/dev/null 2>&1 || return 1
+  [ -n "$TESTING" ] && return 0
+  [ -n "$(find "$_d" -maxdepth 0 \( -user "$UPDATER_USER" -o -user root \) 2>/dev/null)" ]
+}
+
 uninstall_keep_data() {
   [ -n "$KEEP_DATA" ] || die "--uninstall needs --keep-data: this release removes the software only; removing the data is a manual step (docs/hosting.md, Uninstalling)"
   local _plain_units="ocw-upgrade.path ocw-upgrade.service ocw-upgrade-due.timer ocw-upgrade-due.service ocw-stage@.service"
-  local _ours="" _u _f _wd _gates _site _enabled _kept_site="" _upd_home _app_acct _removed_link=""
+  local _ours="" _u _f _wd _gates _site _enabled _kept_site="" _upd_home _app_acct _removed_link="" _cache_ours=""
   for _u in opa-compliance-wizard opa-secrets-wizard opa-auth-gate; do
     _f="$UNIT_DIR/$_u.service"
     [ -f "$_f" ] || continue
@@ -290,6 +300,8 @@ uninstall_keep_data() {
   fi
   check_removable "$_upd_home"
   plan "$_upd_home (the downloads of the staging account) and the account $UPDATER_USER"
+  _cache_ours=""
+  if updater_cache_is_ours; then _cache_ours=1; plan "$UPDATER_CACHE_DIR (the staging account's pip cache)"; fi
   if [ -n "$_gates" ]; then
     plan "NOT the nginx site $_site: additional login gates ($_gates) reuse its rate-limit zone; remove them first (setup-second-gate.sh)"
     _kept_site=1
@@ -344,6 +356,7 @@ uninstall_keep_data() {
   note "==> Removing the installed software"
   safe_remove_tree "$OPT_DIR"
   safe_remove_tree "$_upd_home"
+  if [ -n "$_cache_ours" ]; then safe_remove_tree "$UPDATER_CACHE_DIR"; fi   # decided before the account was removed: its owner is then no longer a name
   if id "$UPDATER_USER" >/dev/null 2>&1 && command -v userdel >/dev/null 2>&1; then
     userdel "$UPDATER_USER" >/dev/null 2>&1 || note "NOTE: could not remove the account $UPDATER_USER; remove it with 'userdel $UPDATER_USER'"
   fi

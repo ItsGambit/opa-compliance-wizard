@@ -847,7 +847,7 @@ to be a quiet backdoor.
 ## Uninstalling
 
 `sudo bash get-ocw.sh --uninstall --keep-data` (or `sudo server/install.sh --uninstall --keep-data` from the installed release) stops and
-removes the services, the `ocw-updater` command, `/opt/opa-compliance-wizard`, the staging account and its downloads, and the nginx
+removes the services, the `ocw-updater` command, `/opt/opa-compliance-wizard`, the staging account, its downloads and its pip cache (`/var/cache/ocw-updater`), and the nginx
 site (it keeps the site while an additional login gate exists, because those sites reuse its rate-limit zone), after you type
 `UNINSTALL`. It **keeps** everything that holds your data or settings, so installing again finds them:
 

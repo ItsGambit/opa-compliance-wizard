@@ -66,6 +66,9 @@ class SystemHost:
     def unit_enabled(self, unit):
         return self.systemctl("is-enabled", "--quiet", unit)[0] == 0
 
+    def unit_active(self, unit):
+        return self.systemctl("is-active", "--quiet", unit)[0] == 0
+
     def restart(self, unit):
         rc, out = self.systemctl("restart", unit, timeout=180)
         return rc == 0, out

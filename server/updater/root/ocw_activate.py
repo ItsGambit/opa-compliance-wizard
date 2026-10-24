@@ -63,7 +63,7 @@ import ocw_bundle  # noqa: E402
 import ocw_host  # noqa: E402
 import ocw_trust  # noqa: E402
 
-ACTIVATOR_VERSION = "5.52.0"
+ACTIVATOR_VERSION = "5.53.0"
 STEP_ORDER = ["validated", "downloaded", "staged", "preflight", "backup", "switching", "restarting", "health_check", "completed"]
 STEP_LABEL = {"validated": "Received and validated", "downloaded": "Downloaded", "staged": "Verified and staged",
               "preflight": "Preflight", "backup": "Backup", "switching": "Switching", "restarting": "Restarting",
@@ -612,6 +612,7 @@ class Updater:
         self.st = None
         self.t0 = host.now()
         self._secrets = None
+        self._gate_skip_logged = set()
 
     # faults / kills
     def fault(self, name):
@@ -679,7 +680,14 @@ class Updater:
         c = self.cfg
         units = [c.backend_service]
         if self.host.unit_exists(c.gate_service):  # a server fronted by something else has no main gate unit
-            units.append(c.gate_service)
+            # 5.53.0: a gate that is installed but disabled and not running (a fresh install before the login setup) is neither
+            # restarted nor health-checked: without its Okta settings it would crash-loop and fail the upgrade and its rollback.
+            # extra_gate_units() already lists only enabled gates, so the same rule holds for them.
+            if self.host.unit_enabled(c.gate_service) or self.host.unit_active(c.gate_service):
+                units.append(c.gate_service)
+            elif c.gate_service not in self._gate_skip_logged:
+                self._gate_skip_logged.add(c.gate_service)
+                log("INFO", f"{c.gate_service} is installed but disabled and not running (login not set up yet): not restarted, not health-checked")
         units += self.host.extra_gate_units()
         if self.host.unit_exists("opa-host-status") and self.host.unit_enabled("opa-host-status"):
             units.append("opa-host-status")

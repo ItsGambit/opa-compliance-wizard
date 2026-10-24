@@ -30,6 +30,7 @@ import re
 import shutil
 import sqlite3
 import stat
+import subprocess
 import sys
 import threading
 import uuid
@@ -115,6 +116,35 @@ def updater_activator_version():
         return None
     m = re.search(r'^ACTIVATOR_VERSION = "([^"]+)"', text, re.M)
     return m.group(1) if m else None
+
+
+GATE_FIX_MIN_ACTIVATOR = (5, 53, 0)
+GATE_REFRESH_COMMAND = "sudo bash get-ocw.sh --refresh-updater --version 5.53.0"
+
+
+def _systemctl_ok(*args):
+    """True/False for a quiet `systemctl` query, None when it cannot be asked (no systemctl, no answer in time)."""
+    try:
+        return subprocess.run(["systemctl", *args], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=5, check=False).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def unset_gate_with_old_activator():
+    """5.53.0: True when the installed activator is older than 5.53.0 AND the main login gate's unit is installed but neither
+    enabled nor running AND the login is not configured (no OKTA_ORG_URL): the state a one-line install is left in until Okta
+    setup. Such an activator restarts that gate and health-checks it; it crash-loops, so the upgrade fails and its rollback
+    fails too. Any doubt (activator unknown, systemctl unanswered) answers False: only a certain hazard refuses."""
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)$", str(updater_activator_version() or ""))
+    if not m or tuple(int(x) for x in m.groups()) >= GATE_FIX_MIN_ACTIVATOR:
+        return False
+    unit = "opa-auth-gate"
+    if not (Path(os.environ.get("OCW_UNIT_DIR") or "/etc/systemd/system") / f"{unit}.service").is_file():
+        return False   # a server fronted by something else has no main gate unit
+    if (os.environ.get("OKTA_ORG_URL") or "").strip():
+        return False
+    return _systemctl_ok("is-enabled", "--quiet", unit) is False and _systemctl_ok("is-active", "--quiet", unit) is False
 
 
 def updater_state():
@@ -384,6 +414,12 @@ def preflight(manifest, size, ctx, now):
     busy = bool(run) and run.get("result") is None and bool(run.get("step"))
     if busy:
         items.append({"id": "in_flight", "ok": False, "text": "Another upgrade is in progress."})
+    if unset_gate_with_old_activator():
+        items.append({"id": "gate_not_set_up", "ok": False,
+                      "text": "The login gate is installed but not set up yet (disabled, no Okta settings), and this server's updater is older than "
+                              "5.53.0: it would restart the gate, the gate would fail to start, and the upgrade and its automatic rollback would both fail. "
+                              f"Run `{GATE_REFRESH_COMMAND}` on the server first (it refreshes the updater and touches no data), or finish the "
+                              "gate setup, then upgrade."})
     st = updater_state()
     if st["ready"]:
         act = st["activator"]
