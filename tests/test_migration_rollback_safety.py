@@ -42,7 +42,7 @@ def test_release_tool_writes_the_declarations_into_the_manifest_and_refuses_an_u
     migrations, expected = tool._migrations_from(files)
     assert expected == max(audit_store.MIGRATIONS) and [m["version"] for m in migrations] == sorted(audit_store.MIGRATIONS)
     assert [m["rollback_safe"] for m in migrations if m["version"] == 4] == [False]
-    assert tool._activator_version(files) == "5.52.0"
+    assert tool._activator_version(files) == "5.53.0"
     bad = dict(files, **{"server/schema_migrations.json": (0o644, json.dumps({"migrations": {"1": {"since": "5.29.0", "rollback_safe": True}}}).encode())})
     with pytest.raises(tool.ReleaseError, match="does not declare"):
         tool._migrations_from(bad)

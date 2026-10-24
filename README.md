@@ -280,6 +280,8 @@ banner asks for MFA as well. A computer running without a login gate (local mode
 upgrade itself needs nothing from you and changes no nginx or service file; an additional login gate's site generated before
 5.42.0 must be regenerated first (see [docs/hosting.md](docs/hosting.md), "Opening Settings and Updates needs a fresh MFA too").
 
+**Before upgrading to 5.53.0, every existing server needs one command.** On a server installed with `get-ocw.sh`, run `sudo bash get-ocw.sh --refresh-updater --version 5.53.0`; on a server with a checkout, unpack the 5.53.0 release and run `sudo bash server/install.sh --refresh-updater` from it. The old updater refuses 5.53.0 until you run it; nothing is changed until then. The command refreshes the updater, the units and the `ocw-updater` command and touches no data. (Why: an updater older than 5.53.0 fails the upgrade, and its rollback, on a server whose login gate is installed but not set up yet.) The Updates page's preflight also names it when a server's login gate is not set up.
+
 **Nothing else changes for you unless you choose it.** Upgrading changes no other
 behaviour of an existing install by itself: the update check is **off**, `server/deploy.sh` and `--ref`
 keep working in place (with a note that the install can move to the upgrade layout), and no

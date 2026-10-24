@@ -229,7 +229,14 @@ def _differs_from_tag(repo, files, tag, names):
 def _requires_install_sh(repo, files, version):
     """True when a systemd UNIT file differs from the previous tag's. This is the field a 5.47.0 updater understands (it
     refuses whenever it is true, and nothing it does can fix that), so it is true only when a stale unit could break the
-    service: a changed wrapper or install.sh alone is covered by `install_sh_min_version` for updaters that know it."""
+    service: a changed wrapper or install.sh alone is covered by `install_sh_min_version` for updaters that know it.
+    It is also true when the install.sh marker names this very release (5.53.0): an existing install must re-run install.sh,
+    and a 5.47.0 updater, which ignores `install_sh_min_version`, then refuses with its own needs_install_sh message."""
+    try:
+        if _install_sh_marker(files, version) == version:
+            return True
+    except ReleaseError:
+        pass   # a missing, malformed or too-new marker stops the build in _install_sh_min_version, with its own message
     prev = _previous_tag(repo, version)
     if prev is None:
         return any(n in files for n in UNIT_FILES)

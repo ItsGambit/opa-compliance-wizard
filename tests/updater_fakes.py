@@ -162,6 +162,8 @@ class FakeHost(ocw_host.SystemHost):
             return (0, "") if name in self.units else (1, "")
         if cmd == "is-enabled":
             return (0, "") if self.units.get(name, {}).get("enabled") else (1, "")
+        if cmd == "is-active":
+            return (0, "") if self.units.get(name, {}).get("ActiveState") == "active" else (3, "")
         if cmd == "list-unit-files":
             lines = "".join(f"{u}.service enabled enabled\n" for u in sorted(self.units) if u.startswith("opa-auth-gate-"))
             return 0, lines

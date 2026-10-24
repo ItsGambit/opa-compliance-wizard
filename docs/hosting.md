@@ -238,7 +238,7 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
      `/etc/nginx/sites-available/opa-<name>` (`OCW_NGINX_SITES_DIR` if they live elsewhere);
    * the unit files may be indented (systemd allows it): `install.sh` edits them either way and stops before changing anything if
      `WorkingDirectory=` (or, for the backend unit, `ProtectSystem=` / `ProtectHome=`) is missing;
-   * after a release that changes the units or `install.sh`, the updater asks for `sudo server/install.sh --refresh-updater` (README, "Upgrading");
+   * after a release that changes the units or `install.sh`, the updater asks for `sudo server/install.sh --refresh-updater` (or `sudo bash get-ocw.sh --refresh-updater --version X.Y.Z` on a server installed with get-ocw.sh) (README, "Upgrading");
    * the units `ocw-stage@.service` (unprivileged staging; optional proxy settings in `/etc/ocw-updater.env`), `ocw-upgrade.path` and
      `ocw-upgrade.service` (root: activate, roll back, resume at boot) are documented in the README ("Upgrading").
 
@@ -844,10 +844,12 @@ to be a quiet backdoor.
 
 ---
 
+A login gate configured only through a systemd drop-in (not the shared settings file) looks unconfigured to the upgrade preflight's check for an unset gate (see the README, "Upgrading"); finish the gate setup in the settings file, or run the refresh command it names.
+
 ## Uninstalling
 
 `sudo bash get-ocw.sh --uninstall --keep-data` (or `sudo server/install.sh --uninstall --keep-data` from the installed release) stops and
-removes the services, the `ocw-updater` command, `/opt/opa-compliance-wizard`, the staging account and its downloads, and the nginx
+removes the services, the `ocw-updater` command, `/opt/opa-compliance-wizard`, the staging account, its downloads and its pip cache (`/var/cache/ocw-updater`), and the nginx
 site (it keeps the site while an additional login gate exists, because those sites reuse its rate-limit zone), after you type
 `UNINSTALL`. It **keeps** everything that holds your data or settings, so installing again finds them:
 
