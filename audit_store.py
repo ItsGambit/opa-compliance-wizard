@@ -63,7 +63,7 @@ COMPLIANCE_EVENT_TYPES = {
     # CC7 -- System Operations
     "security.request.blocked": "threat_detection",
     "security.protected_action.attempt": "threat_detection",
-    # CC8 -- Change Management
+    # CC6 -- Access Controls (API tokens moved here from CC8 in 5.53.0; see server/control_catalogue.json)
     "system.api_token.create": "api_token_lifecycle",
     "system.api_token.revoke": "api_token_lifecycle",
     "policy.rule.add": "policy_modifications",
@@ -143,34 +143,28 @@ INGESTION_SCOPES = ("curated", "all")
 COMPLIANCE_REPORTS = {
     "mfa_enforcement": {
         "label": "MFA Enforcement",
-        "control": "CC6",
         "description": "Every MFA challenge (success and abandoned) plus the sign-on policy evaluation that gates it.",
     },
     "session_activity": {
         "label": "Session Activity",
-        "control": "CC7",
         "description": "Successful sign-ins to Okta across all apps.",
     },
     "provisioning": {
         "label": "Provisioning & De-provisioning",
-        "control": "CC6",
         "description": "User lifecycle create/deactivate events.",
     },
     "role_group_changes": {
         "label": "Role/Group Changes",
-        "control": "CC6",
         "description": "Group membership add/remove — RBAC drift over time.",
     },
     "admin_privilege_grants": {
         "label": "Admin Privilege Grants",
-        "control": "CC6",
         "description": "Super-admin / role assignment changes.",
     },
     "jit_access_requests": {
         "label": "JIT Access Requests",
-        "control": "CC6",
         "description": (
-            "Access-request lifecycle (create/update/resolve/expire) -- proves an access request was "
+            "Access-request lifecycle (create/update/resolve/expire) -- shows an access request was "
             "made and resolved. Known limitation, confirmed live 2026-09-30 against a real denied "
             "request: Okta's own System Log does not capture the actual approve/deny DECISION anywhere "
             "on the resolve event (debugContext.debugData.decisions is always the literal string \"[]\", "
@@ -180,62 +174,50 @@ COMPLIANCE_REPORTS = {
     },
     "threat_detection": {
         "label": "Threat Detection",
-        "control": "CC7",
         "description": "Blocked requests and protected-action attempts flagged by Okta's own security controls.",
     },
     "api_token_lifecycle": {
         "label": "API Token Lifecycle",
-        "control": "CC8",
         "description": "Service-account API token create/revoke.",
     },
     "policy_modifications": {
         "label": "Policy Modifications",
-        "control": "CC8",
         "description": "Global Okta sign-on/security policy rule and mapping changes.",
     },
     "pam_secrets": {
         "label": "PAM Secrets",
-        "control": "CC6",
         "description": "Vaulted secret and secret-folder create/update/delete/reveal.",
     },
     "pam_jit_access": {
         "label": "PAM JIT Access (Checkout/Checkin)",
-        "control": "CC6",
-        "description": "Zero Standing Privileges evidence — resource checkout and checkin.",
+        "description": "Resource checkout and checkin.",
     },
     "pam_sessions": {
         "label": "PAM Sessions",
-        "control": "CC7",
         "description": "Credential issuance and SSH logins to privileged servers. Note: SSH login actor is the OS-level username, not the Okta identity — correlate with a nearby credential-issuance row to attribute a session to a real person.",
     },
     "pam_credential_reveals": {
         "label": "PAM Credential Reveals",
-        "control": "CC6",
         "description": "Service-account/shared-credential password reveals. The resource column names the account family (SaaS app, Okta, Database, Active Directory, Server). For a per-account roster with status and full history of SaaS/Okta service accounts, see the Service Accounts dashboard.",
     },
     "pam_policy_modifications": {
         "label": "PAM Policy Modifications",
-        "control": "CC8",
         "description": "OPA security policy create/update.",
     },
     "pam_client_enrollment": {
         "label": "Client Enrollment",
-        "control": "CC6",
         "description": "A user's local OPA client (laptop/workstation) enrolling to connect to privileged resources. See also the Access Explorer's Resources tab for the current live roster of enrolled clients.",
     },
     "device_management": {
         "label": "Device Management",
-        "control": "CC6",
-        "description": "Okta-managed device enrollment and user association -- device-trust evidence, separate from OPA client enrollment above. Known gap: only enrollment/activation/user-add are covered; suspend/unsuspend/deactivate/delete exist per Okta's own device-lifecycle docs but have no live-confirmed eventType yet (see COMPLIANCE_EVENT_TYPES comment). See also the Access Explorer's Resources tab for the current live device inventory.",
+        "description": "Okta-managed device enrollment and user association -- device registration record, separate from OPA client enrollment above. Known gap: only enrollment/activation/user-add are covered; suspend/unsuspend/deactivate/delete exist per Okta's own device-lifecycle docs but have no live-confirmed eventType yet (see COMPLIANCE_EVENT_TYPES comment). See also the Access Explorer's Resources tab for the current live device inventory.",
     },
     "ad_sync_activity": {
         "label": "Active Directory Sync Activity",
-        "control": "CC7",
-        "description": "Recurring, automated Active Directory account discovery -- evidence that AD-vaulted accounts stay in sync with the domain.",
+        "description": "Recurring, automated Active Directory account discovery -- shows that discovery runs completed.",
     },
     "credential_rotation": {
         "label": "Credential Rotation",
-        "control": "CC8",
         "description": "Service-account password rotation lifecycle (scheduled and manual). The resource column names the account family (SaaS app, Okta, Database, Active Directory); the outcome column is the real result (SUCCESS / FAILURE / DEFERRED). For per-account rotation totals on SaaS/Okta service accounts, see the Service Accounts dashboard.",
     },
 }
@@ -245,12 +227,51 @@ def _event_types_for_report(report_key):
     return [et for et, key in COMPLIANCE_EVENT_TYPES.items() if key == report_key]
 
 
+CONTROL_CATALOGUE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server", "control_catalogue.json")
+_CONTROL_CATALOGUE = None
+
+
+def load_control_catalogue(path=None):
+    """5.53.0: the control catalogue (framework mappings, methodology notes and known limits per report) is versioned data
+    in server/control_catalogue.json, not code. Cached after the first read of the default file."""
+    global _CONTROL_CATALOGUE
+    if path is None and _CONTROL_CATALOGUE is not None:
+        return _CONTROL_CATALOGUE
+    with open(path or CONTROL_CATALOGUE_PATH, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if path is None:
+        _CONTROL_CATALOGUE = data
+    return data
+
+
+def report_catalogue_entry(report_key):
+    return load_control_catalogue()["reports"][report_key]
+
+
+def report_controls(report_key):
+    """The report's mapped controls, in catalogue order ([{framework, id, status}, ...])."""
+    return list(report_catalogue_entry(report_key)["controls"])
+
+
+def report_control(report_key):
+    """Coarse grouping ('CC6', 'CC7', 'CC8') derived from the first mapped control ('CC6.1' -> 'CC6')."""
+    return report_controls(report_key)[0]["id"].split(".")[0]
+
+
+def report_mapping_status(report_key):
+    """'proposed' unless every mapped control is auditor-reviewed. Nothing is auditor-reviewed in 5.53.0."""
+    statuses = {c["status"] for c in report_controls(report_key)}
+    return "auditor-reviewed" if statuses == {"auditor-reviewed"} else "proposed"
+
+
 def list_reports():
-    """Returns every report definition plus its derived event_types list --
-    the frontend's report picker renders directly from this, grouped by
-    `control`."""
+    """Returns every report definition plus its derived event_types list, its mapped controls and mapping status
+    -- the frontend's report picker renders directly from this, grouped by `control` (derived from the first
+    mapped control)."""
     return [
-        {"key": key, "event_types": _event_types_for_report(key), **meta}
+        {"key": key, "event_types": _event_types_for_report(key), **meta,
+         "control": report_control(key), "controls": report_controls(key), "mapping_status": report_mapping_status(key),
+         "methodology": report_catalogue_entry(key)["methodology"], "known_limits": list(report_catalogue_entry(key)["known_limits"])}
         for key, meta in COMPLIANCE_REPORTS.items()
     ]
 
@@ -948,6 +969,94 @@ def _migration_011_opa_model_cache(conn):
         conn.execute("ALTER TABLE sync_state ADD COLUMN last_refresh_json TEXT")
 
 
+def _migration_012_settings_unlocks(conn):
+    """5.53.0: opening Settings and Updates needs a fresh MFA on a hosted server. One row per (user, gate, login session) records
+    that the user passed it and until when. Additive and rollback-safe: older code never reads the table."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS settings_unlocks (
+            actor_sub   TEXT NOT NULL,
+            issuer      TEXT NOT NULL DEFAULT '',
+            session_fp  TEXT NOT NULL,
+            action_id   TEXT NOT NULL,
+            unlocked_at TEXT NOT NULL,
+            expires_at  TEXT NOT NULL,
+            PRIMARY KEY (actor_sub, issuer, session_fp)
+        );
+        CREATE INDEX IF NOT EXISTS idx_settings_unlocks_expires ON settings_unlocks (expires_at);
+    """)
+
+
+def _migration_013_sync_runs_and_prune_history(conn):
+    """5.53.0: the archive records each sync, import and prune, so an evidence package's coverage statements rest on
+    records and not on inference. sync_runs: one row per sync or CSV import (started, finished, outcome, the window it
+    read, rows stored). prune_history: one row per retention prune that deleted rows. Additive and rollback-safe: older
+    code never reads either table. No foreign keys (evidence, like the other archive tables). Not pruned by anything yet."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS sync_runs (
+            id INTEGER PRIMARY KEY,
+            environment_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            outcome TEXT,
+            window_since TEXT,
+            window_until TEXT,
+            rows INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_sync_runs_env_started ON sync_runs (environment_id, started_at);
+        CREATE TABLE IF NOT EXISTS prune_history (
+            id INTEGER PRIMARY KEY,
+            environment_id TEXT NOT NULL,
+            pruned_at TEXT NOT NULL,
+            cutoff TEXT NOT NULL,
+            rows_pruned INTEGER NOT NULL,
+            scope TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_prune_history_env_pruned ON prune_history (environment_id, pruned_at);
+    """)
+
+
+def _now_iso():
+    return _iso_ms(datetime.now(timezone.utc))
+
+
+def _run_start(environment_id, kind):
+    """Records the start of a sync or import; returns the row id, or None when it could not be written (recording
+    must never stop an ingestion: the run then simply has no record and counts for nothing)."""
+    try:
+        conn = _get_connection()
+        with _db_lock:
+            cur = conn.execute("INSERT INTO sync_runs (environment_id, kind, started_at) VALUES (?, ?, ?)",
+                               (environment_id, kind, _now_iso()))
+            conn.commit()
+            return cur.lastrowid
+    except sqlite3.Error:
+        return None
+
+
+def _run_finish(run_id, outcome, window_since=None, window_until=None, rows=None):
+    """outcome: ok | failed | stopped. A run that never reaches this (a killed process) keeps a NULL outcome and
+    never counts as coverage."""
+    if run_id is None:
+        return
+    try:
+        conn = _get_connection()
+        with _db_lock:
+            conn.execute("UPDATE sync_runs SET finished_at = ?, outcome = ?, window_since = ?, window_until = ?, rows = ? WHERE id = ?",
+                         (_now_iso(), outcome, window_since, window_until, rows, run_id))
+            conn.commit()
+    except sqlite3.Error:
+        pass
+
+
+def _record_prune(environment_id, cutoff, rows_pruned, scope):
+    """Caller holds _db_lock and commits. Written in the same transaction as the delete when it can be."""
+    if rows_pruned and cutoff:
+        conn = _get_connection()
+        conn.execute("INSERT INTO prune_history (environment_id, pruned_at, cutoff, rows_pruned, scope) VALUES (?, ?, ?, ?, ?)",
+                     (environment_id, _now_iso(), cutoff, rows_pruned, scope))
+
+
 MIGRATIONS = {
     1: _migration_001_unified_schema,
     2: _migration_002_ingestion_manifests,
@@ -960,6 +1069,8 @@ MIGRATIONS = {
     9: _migration_009_shared_permission_grants_and_known_identities,
     10: _migration_010_snapshots_polling_sync_and_correlation,
     11: _migration_011_opa_model_cache,
+    12: _migration_012_settings_unlocks,
+    13: _migration_013_sync_runs_and_prune_history,
 }
 
 # DATA-08: migration 4 needs ALTER TABLE ... DROP COLUMN (SQLite 3.35.0,
@@ -1039,6 +1150,7 @@ def init_db():
     reflag_curated_rows()
     backfill_correlation_columns()
     _cleanup_expired_pending_admin_actions()
+    _cleanup_expired_settings_unlocks()
     _cleanup_retired_secrets_log_cache()
 
 
@@ -2380,6 +2492,133 @@ def _cleanup_expired_pending_admin_actions():
         conn.commit()
 
 
+# ---------------------------------------------------------------------------
+# Settings unlock (5.53.0, migration 012). A row says: this user, signed in through this gate, in this login session,
+# passed a fresh MFA and may read Settings and Updates until expires_at. All times are UTC ISO strings written here.
+# ---------------------------------------------------------------------------
+
+def _unlock_iso(moment):
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _unlock_key(actor_sub, issuer, session_fp):
+    return (str(actor_sub or ""), str(issuer or ""), str(session_fp or ""))
+
+
+def upsert_settings_unlock(actor_sub, issuer, session_fp, action_id, ttl_seconds, now=None):
+    """Creates or replaces the unlock for this user, gate and session. Returns (unlocked_at, expires_at) as ISO strings.
+    Refuses an empty subject or session fingerprint (fails closed)."""
+    key = _unlock_key(actor_sub, issuer, session_fp)
+    if not key[0] or not key[2]:
+        raise ValueError("an unlock needs a subject and a session fingerprint")
+    now = now or datetime.now(timezone.utc)
+    unlocked_at, expires_at = _unlock_iso(now), _unlock_iso(now + timedelta(seconds=ttl_seconds))
+    conn = _get_connection()
+    with _db_lock:
+        try:
+            conn.execute("DELETE FROM settings_unlocks WHERE expires_at < ?", (unlocked_at,))
+            conn.execute(
+                """INSERT INTO settings_unlocks (actor_sub, issuer, session_fp, action_id, unlocked_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (actor_sub, issuer, session_fp) DO UPDATE SET
+                     action_id = excluded.action_id, unlocked_at = excluded.unlocked_at, expires_at = excluded.expires_at""",
+                (*key, str(action_id or ""), unlocked_at, expires_at),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return unlocked_at, expires_at
+
+
+def renew_settings_unlock(actor_sub, issuer, session_fp, action_id, ttl_seconds, now=None):
+    """A completed write that passed its own fresh MFA restarts the window (an upsert, so a save after expiry opens it
+    again). Same arguments and result as upsert_settings_unlock."""
+    return upsert_settings_unlock(actor_sub, issuer, session_fp, action_id, ttl_seconds, now=now)
+
+
+def settings_unlock_active(actor_sub, issuer, session_fp, now=None, delete_expired=True):
+    """The unlock row as a dict if unlocked_at <= now < expires_at, else None. An expired row is deleted on the way out (unless
+    `delete_expired` is False: the status poll must leave it for the first refused request to record the expiry); a row whose
+    unlocked_at is in the future (the clock went back) is refused and left alone."""
+    key = _unlock_key(actor_sub, issuer, session_fp)
+    if not key[0] or not key[2]:
+        return None
+    now_iso = _unlock_iso(now or datetime.now(timezone.utc))
+    conn = _get_connection()
+    with _db_lock:
+        row = conn.execute(
+            "SELECT * FROM settings_unlocks WHERE actor_sub = ? AND issuer = ? AND session_fp = ?", key
+        ).fetchone()
+        if row is None:
+            return None
+        if row["expires_at"] <= now_iso:
+            if delete_expired:
+                conn.execute(
+                    "DELETE FROM settings_unlocks WHERE actor_sub = ? AND issuer = ? AND session_fp = ?", key
+                )
+                conn.commit()
+            return None
+        if row["unlocked_at"] > now_iso:
+            return None
+        return dict(row)
+
+
+def take_expired_settings_unlock(actor_sub, issuer, session_fp, now=None):
+    """If this key's row has expired, deletes it and returns it (once: a second caller gets None), so the first refused request
+    after expiry can record `settings.locked`. A live row is left alone."""
+    key = _unlock_key(actor_sub, issuer, session_fp)
+    now_iso = _unlock_iso(now or datetime.now(timezone.utc))
+    conn = _get_connection()
+    with _db_lock:
+        row = conn.execute(
+            "SELECT * FROM settings_unlocks WHERE actor_sub = ? AND issuer = ? AND session_fp = ?", key
+        ).fetchone()
+        if row is None or row["expires_at"] > now_iso:
+            return None
+        conn.execute("DELETE FROM settings_unlocks WHERE actor_sub = ? AND issuer = ? AND session_fp = ?", key)
+        conn.commit()
+    return dict(row)
+
+
+def delete_settings_unlock(actor_sub, issuer, session_fp):
+    """Ends the window now. Returns the deleted row as a dict, or None if there was none."""
+    key = _unlock_key(actor_sub, issuer, session_fp)
+    conn = _get_connection()
+    with _db_lock:
+        row = conn.execute(
+            "SELECT * FROM settings_unlocks WHERE actor_sub = ? AND issuer = ? AND session_fp = ?", key
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute("DELETE FROM settings_unlocks WHERE actor_sub = ? AND issuer = ? AND session_fp = ?", key)
+        conn.commit()
+    return dict(row)
+
+
+def list_settings_unlocks():
+    """Every unlock row (expired ones included), for the operator's break-glass listing. Holds no secrets."""
+    conn = _get_connection()
+    with _db_lock:
+        return [dict(r) for r in conn.execute("SELECT * FROM settings_unlocks ORDER BY unlocked_at").fetchall()]
+
+
+def clear_settings_unlocks():
+    """Deletes every unlock row. Returns how many there were."""
+    conn = _get_connection()
+    with _db_lock:
+        n = conn.execute("DELETE FROM settings_unlocks").rowcount
+        conn.commit()
+    return n
+
+
+def _cleanup_expired_settings_unlocks():
+    conn = _get_connection()
+    with _db_lock:
+        conn.execute("DELETE FROM settings_unlocks WHERE expires_at < ?", (_unlock_iso(datetime.now(timezone.utc)),))
+        conn.commit()
+
+
 def is_first_sync(environment_id):
     conn = _get_connection()
     row = conn.execute(
@@ -2595,6 +2834,25 @@ def _read_poll_cursor(conn, environment_id):
 
 
 def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, on_progress=None):
+    """Pulls System Log events (see _sync_okta_events_impl) and records the run in sync_runs: started before anything
+    can fail, finished with ok (complete), stopped (a Stop or deadline) or failed (anything else, including an
+    exception, which is re-raised). The window recorded is the one asked of Okta: `since` as the manifest has it
+    (None when the run resumed from its saved cursor) and the `until` the manifest names."""
+    if ingestion_scope not in INGESTION_SCOPES:
+        raise ValueError(f"ingestion_scope must be one of {INGESTION_SCOPES}")
+    run_id = _run_start(environment_id, "sync")
+    info = {}
+    try:
+        result = _sync_okta_events_impl(okta_client, environment_id, ingestion_scope, since=since, on_progress=on_progress, _info=info)
+    except BaseException:
+        _run_finish(run_id, "failed", info.get("since"), info.get("until"), info.get("rows"))
+        raise
+    outcome = "ok" if result.get("complete") else ("stopped" if result.get("cancelled") else "failed")
+    _run_finish(run_id, outcome, result.get("since"), info.get("until"), result.get("inserted"))
+    return result
+
+
+def _sync_okta_events_impl(okta_client, environment_id, ingestion_scope, since=None, on_progress=None, _info=None):
     """Pulls System Log events from the real Okta API and archives them.
 
     Two modes (5.50.0, from Okta's System Log query guide):
@@ -2763,6 +3021,8 @@ def sync_okta_events(okta_client, environment_id, ingestion_scope, since=None, o
         return _seal(until)
 
     def _result(complete, chain_head, error=None):
+        if _info is not None:
+            _info["until"] = _iso_ms(safe_now_dt)
         out = {
             "inserted": total_inserted, "scanned": total_scanned, "since": original_since, "chunks": chunks,
             "complete": complete, "incomplete_chunks": incomplete_chunks, "chain_head": chain_head,
@@ -2982,8 +3242,17 @@ def import_from_csv(csv_path, environment_id, ingestion_scope, on_progress=None)
     if on_progress:
         on_progress("read_csv", "done", f"{len(rows)} row(s) read")
 
-    inserted, _max_published, new_entries = _insert_rows(conn, environment_id, rows, ingestion_scope)
-    chain_head = _record_ingestion_manifest(conn, environment_id, "csv_import", None, None, new_entries)
+    stamps = [r[2] for r in rows if r[2]]
+    run_id = _run_start(environment_id, "import")
+    try:
+        inserted, _max_published, new_entries = _insert_rows(conn, environment_id, rows, ingestion_scope)
+        chain_head = _record_ingestion_manifest(conn, environment_id, "csv_import", None, None, new_entries)
+    except BaseException:
+        _run_finish(run_id, "failed")
+        raise
+    # the range of the file's rows, half-open: [oldest, newest + 1 ms)
+    import_until = _iso_ms(datetime.fromisoformat(max(stamps).replace("Z", "+00:00")) + timedelta(milliseconds=1)) if stamps else None
+    _run_finish(run_id, "ok", min(stamps) if stamps else None, import_until, inserted)
 
     # DATA-03 (external review, 2026-10-05): a CSV import no longer
     # touches last_synced_at at all. The live-sync watermark describes
@@ -3062,6 +3331,7 @@ def prune_events(environment_id, retention_days=None, max_size_mb=None):
                     (environment_id, cutoff),
                 )
                 pruned_total += cur.rowcount
+                _record_prune(environment_id, cutoff, cur.rowcount, "retention")
                 # 5.50.0: the per-person weekly sign-in rows follow the events they were counted from (weeks that ended before
                 # the cutoff go; the all-people totals hold no names and stay). Snapshots are not touched: they are curated.
                 conn.execute("DELETE FROM mfa_week_user WHERE environment_id = ? AND week < ?", (environment_id, _week_monday(cutoff)))
@@ -3074,6 +3344,8 @@ def prune_events(environment_id, retention_days=None, max_size_mb=None):
         max_bytes = max_size_mb * 1024 * 1024
         step_days = 1
         pruned_any_by_size = False
+        size_pruned = 0
+        size_cutoff = None
 
         # DATA-12 (external review, 2026-10-05): the cap is measured
         # against THIS environment's own stored payload (the UTF-8 BYTES of
@@ -3123,6 +3395,8 @@ def prune_events(environment_id, retention_days=None, max_size_mb=None):
                         (environment_id, step_cutoff),
                     )
                     pruned_total += cur.rowcount
+                    size_pruned += cur.rowcount
+                    size_cutoff = step_cutoff
                     conn.commit()
                 except Exception:
                     conn.rollback()
@@ -3136,6 +3410,8 @@ def prune_events(environment_id, retention_days=None, max_size_mb=None):
         # its duration, so no writer should be mid-transaction when it runs.
         if pruned_any_by_size:
             with _db_lock:
+                _record_prune(environment_id, size_cutoff, size_pruned, "size")
+                conn.commit()
                 conn.execute("VACUUM")
 
     return {"pruned": pruned_total, "cutoff": cutoff}
@@ -3185,7 +3461,7 @@ def list_orphaned_archives():
 
 
 # Every table holding one environment's archive, in purge order (children first).
-ARCHIVE_TABLES = ("event_targets", "events", "sync_state", "config_snapshot_items", "config_snapshots", "mfa_week_user", "mfa_week_totals", "mfa_agg_state", "manifest_entries", "chain_heads", "ingestion_manifests", "opa_model_cache")
+ARCHIVE_TABLES = ("event_targets", "events", "sync_state", "config_snapshot_items", "config_snapshots", "mfa_week_user", "mfa_week_totals", "mfa_agg_state", "manifest_entries", "chain_heads", "ingestion_manifests", "opa_model_cache", "sync_runs", "prune_history")
 
 
 def archive_has_rows(environment_id):

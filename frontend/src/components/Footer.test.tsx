@@ -1,22 +1,20 @@
 /** UI-07 / 5.42.0: Sync now on a shared environment follows what an admin allows shared users. */
 import { fireEvent, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { fetchEnvironments, fetchRefreshStatus, fetchSyncStatus, fetchUpgradeStatus, fetchVersion, fetchWhoami, startRefresh, startSync } from '../api/client'
+import { fetchEnvironments, fetchRefreshStatus, fetchSyncStatus, fetchUpgradeNotice, fetchVersion, fetchWhoami, startRefresh, startSync } from '../api/client'
 import type { RefreshStatus } from '../types'
 import { renderWithClient } from '../test/renderWithClient'
 import type { Environment } from '../types'
-import { makeStatus, NEWER } from '../test/upgradeFixtures'
 import * as toasts from '../hooks/useToast'
 import { Footer } from './Footer'
 
 vi.mock('../api/client', () => ({
-  fetchEnvironments: vi.fn(), fetchSyncStatus: vi.fn(), fetchVersion: vi.fn(), fetchWhoami: vi.fn(), fetchUpgradeStatus: vi.fn(), startSync: vi.fn(), isSessionExpiredError: () => false, onSessionRestored: () => () => {},
+  fetchEnvironments: vi.fn(), fetchSyncStatus: vi.fn(), fetchVersion: vi.fn(), fetchWhoami: vi.fn(), fetchUpgradeNotice: vi.fn(), startSync: vi.fn(), isSessionExpiredError: () => false, onSessionRestored: () => () => {},
   fetchRefreshStatus: vi.fn(), startRefresh: vi.fn(),
 }))
 
 const env = (o: Partial<Environment>): Environment => ({
-  id: 'e1', name: 'team', base_domain: '', team_name: '', key_id: '', okta_url: '', has_okta_token: true,
-  sync_schedule: {} as Environment['sync_schedule'], shared: true, is_own: false, addressable: true, ...o,
+  id: 'e1', name: 'team', shared: true, is_own: false, addressable: true, ...o,
 })
 
 const IDLE: RefreshStatus = {
@@ -30,6 +28,7 @@ beforeEach(() => {
   vi.mocked(startRefresh).mockResolvedValue({ started: true, already_running: false, job_id: 'j1' })
   vi.mocked(fetchVersion).mockResolvedValue({ version: '5.40.7' })
   vi.mocked(fetchWhoami).mockResolvedValue({ email: 'a@example.com', is_local: false, is_admin: false })
+  vi.mocked(fetchUpgradeNotice).mockResolvedValue({ kind: 'none' })
   vi.mocked(fetchSyncStatus).mockResolvedValue({ status: 'idle', steps: [], error: null, sync_state: null, is_first_sync: false })
 })
 
@@ -128,18 +127,19 @@ describe('Footer', () => {
     expect(await screen.findByText(/Last sync: never/)).toBeTruthy()
   })
 
-  it('tells an admin about a newer release (only when the opt-in check found one)', async () => {
+  it('tells an admin about a newer release from the notice (so it works while Updates is locked)', async () => {
     vi.mocked(fetchEnvironments).mockResolvedValue({ environments: [env({ is_own: true, shared: false })], active: 'team', active_id: 'e1' })
     vi.mocked(fetchWhoami).mockResolvedValue({ email: 'a@example.com', is_local: false, is_admin: true, can_admin: true })
-    vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({ ...NEWER, installed_version: '5.40.7' }))
+    vi.mocked(fetchUpgradeNotice).mockResolvedValue({ kind: 'none', update_available: '5.48.0', revocation: null, run: null })
     renderWithClient(<Footer />)
     expect(await screen.findByText('Update available: v5.48.0')).toBeTruthy()
   })
 
-  it('a non-admin is never asked about updates', async () => {
+  it('a non-admin is never told about updates', async () => {
     vi.mocked(fetchEnvironments).mockResolvedValue({ environments: [env({ is_own: true, shared: false })], active: 'team', active_id: 'e1' })
+    vi.mocked(fetchUpgradeNotice).mockResolvedValue({ kind: 'none', update_available: '5.48.0' })
     renderWithClient(<Footer />)
     await screen.findByRole('button', { name: /Sync now/ })
-    expect(fetchUpgradeStatus).not.toHaveBeenCalled()
+    expect(screen.queryByText(/Update available/)).toBeNull()
   })
 })

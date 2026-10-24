@@ -1,6 +1,6 @@
 /** FE-05 / FE-07 / FE-15: the fetch wrapper. */
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, SessionExpiredError, activateEnvironment, fetchEnvironments, onSessionExpired, saveAccessControl, saveBanner } from './client'
+import { ApiError, SessionExpiredError, activateEnvironment, fetchEnvironments, fetchReportCsv, onSessionExpired, saveAccessControl, saveBanner } from './client'
 
 function mockFetch(response: Partial<Response> & { json?: () => Promise<unknown> }) {
   const fn = vi.fn().mockResolvedValue({ ok: false, status: 200, type: 'basic', json: async () => ({}), ...response })
@@ -74,5 +74,20 @@ describe('apiFetch', () => {
     await activateEnvironment('dev', 'id-1')
     expect(fetch.mock.calls[0][0]).toBe('/api/environments/dev/activate')
     expect(JSON.parse(fetch.mock.calls[0][1].body)).toEqual({ id: 'id-1' })
+  })
+})
+
+describe('fetchReportCsv (5.53.0)', () => {
+  it('asks the report export route for the range, and returns the file and the server row count', async () => {
+    const blob = new Blob(['a,b'])
+    const fetch = mockFetch({ ok: true, headers: new Headers({ 'X-Report-Rows': '1250' }), blob: async () => blob } as never)
+    const out = await fetchReportCsv('my env', 'session_activity', '2026-01-01', '2026-03-31')
+    expect(fetch.mock.calls[0][0]).toBe('/api/environments/my%20env/reports/session_activity/export.csv?since=2026-01-01&until=2026-03-31')
+    expect(out).toEqual({ blob, rows: 1250 })
+  })
+
+  it('throws the server\'s reason, with no file', async () => {
+    mockFetch({ ok: false, status: 400, json: async () => ({ error: 'The end date is in the future (dates are UTC)' }) })
+    await expect(fetchReportCsv('dev', 'session_activity', '2026-01-01', '2999-01-01')).rejects.toMatchObject({ message: 'The end date is in the future (dates are UTC)', status: 400 })
   })
 })

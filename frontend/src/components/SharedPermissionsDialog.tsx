@@ -10,6 +10,8 @@ import { beginStepUp } from '../utils/stepUp'
 import { DialogCloseButton } from './DialogCloseButton'
 import { ErrorNotice } from './ErrorNotice'
 import { PermissionSettingsList } from './PermissionSettingsList'
+import { SettingsGate } from './SettingsGate'
+import { useRegisterSettingsDraft } from './settingsDraft'
 
 interface Props {
   open: boolean
@@ -24,6 +26,27 @@ interface Props {
  * override these in the Environments dialog. Saving needs a fresh MFA
  * approval behind the hosted login gate. */
 export function SharedPermissionsDialog({ open, onOpenChange, draft }: Props) {
+  return (
+    <Dialog.Root open={open} onOpenChange={onOpenChange}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
+        <Dialog.Content className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[34rem] max-h-[85vh] overflow-y-auto p-5">
+          <div className="flex items-center justify-between mb-2">
+            <Dialog.Title className="text-sm font-semibold text-text">Shared permissions</Dialog.Title>
+            <DialogCloseButton />
+          </div>
+          {/* 5.53.0: reading these settings needs the Settings unlock (MFA behind the hosted login gate). */}
+          <SettingsGate area="settings" reopen="shared_permissions" what="Shared permissions" onNotNow={() => onOpenChange(false)}>
+            <SharedPermissionsBody onOpenChange={onOpenChange} draft={draft} />
+          </SettingsGate>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  )
+}
+
+function SharedPermissionsBody({ onOpenChange, draft }: Pick<Props, 'onOpenChange' | 'draft'>) {
+  const open = true
   const queryClient = useQueryClient()
   const { data, isLoading, isError, error, refetch, isFetching } = useSharedPermissions(open)
   const [settings, setSettings] = useState<Partial<Record<SharedCapabilityKey, PermissionSetting>>>({})
@@ -52,6 +75,7 @@ export function SharedPermissionsDialog({ open, onOpenChange, draft }: Props) {
 
   const changes = data ? changedSettings(stored(), settings) : {}
   const hasChanges = Object.keys(changes).length > 0
+  useRegisterSettingsDraft('shared_permissions', () => (hasChanges ? { permissionsDraft: { settings } } : null))
 
   const save = useMutation({
     mutationFn: () => saveSharedPermissions(changes),
@@ -72,14 +96,7 @@ export function SharedPermissionsDialog({ open, onOpenChange, draft }: Props) {
   })
 
   return (
-    <Dialog.Root open={open} onOpenChange={onOpenChange}>
-      <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
-        <Dialog.Content className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[34rem] max-h-[85vh] overflow-y-auto p-5">
-          <div className="flex items-center justify-between mb-2">
-            <Dialog.Title className="text-sm font-semibold text-text">Shared permissions</Dialog.Title>
-            <DialogCloseButton />
-          </div>
+    <>
           <Dialog.Description className="text-xs text-text-dim mb-4 leading-relaxed">
             What a user may do with an environment that another user owns and has shared. Shared users act with the
             owner's stored credentials. Owners are never limited by these settings, and they still decide whether to
@@ -113,8 +130,6 @@ export function SharedPermissionsDialog({ open, onOpenChange, draft }: Props) {
               Verify &amp; Save
             </button>
           </div>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
+    </>
   )
 }

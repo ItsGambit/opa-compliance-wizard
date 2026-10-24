@@ -14,7 +14,7 @@ export interface ExportSection {
 // treats a leading `'` as "force this cell to text", stripping the
 // apostrophe itself from the displayed value) and does not change what
 // a plain-text/CSV-aware reader sees.
-function neutralizeFormula(value: string): string {
+export function neutralizeFormula(value: string): string {
   return /^[=+\-@\t\r]/.test(value) ? `'${value}` : value
 }
 
@@ -75,7 +75,10 @@ export function toMarkdown(sections: ExportSection[]): string {
 }
 
 export function downloadTextFile(filename: string, content: string, mimeType: string): void {
-  const blob = new Blob([content], { type: mimeType })
+  downloadBlob(filename, new Blob([content], { type: mimeType }))
+}
+
+export function downloadBlob(filename: string, blob: Blob): void {
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url

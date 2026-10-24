@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Evidence package cover sheet</title>
+<style>
+  body { font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; margin: 2rem auto; max-width: 52rem; padding: 0 1rem; color: #1b1f24; background: #fff; }
+  h1 { font-size: 1.5rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.1rem; margin: 1.75rem 0 .5rem; border-bottom: 1px solid #c9d1d9; padding-bottom: .25rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; vertical-align: top; padding: .3rem .6rem .3rem 0; border-bottom: 1px solid #e3e7eb; }
+  th { font-weight: 600; width: 14rem; }
+  td.num, th.num { text-align: right; }
+  code { font: 13px ui-monospace, Menlo, Consolas, monospace; word-break: break-all; }
+  .note { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; padding: .6rem .8rem; }
+  @media (prefers-color-scheme: dark) {
+    body { color: #e6edf3; background: #0d1117; }
+    h2 { border-color: #30363d; }
+    th, td { border-color: #21262d; }
+    .note { background: #161b22; border-color: #30363d; }
+  }
+</style>
+</head>
+<body>
+<h1>Evidence package</h1>
+<p>Built by the OPA Compliance Wizard, an independent project that is not affiliated with Okta. SOC 2 groupings in this package are <strong>proposed</strong>: not reviewed by an auditor.</p>
+
+<h2>The package</h2>
+<table>
+<tr><th>Environment label</th><td>@@ENVIRONMENT@@</td></tr>
+<tr><th>Period (UTC dates, both included)</th><td>@@PERIOD_START@@ to @@PERIOD_END@@</td></tr>
+<tr><th>Built at (UTC)</th><td>@@BUILT_AT@@</td></tr>
+<tr><th>Built by</th><td>@@BUILDER@@</td></tr>
+<tr><th>Application version</th><td>@@APP_VERSION@@</td></tr>
+<tr><th>Data as of (UTC)</th><td>@@DATA_AS_OF@@ (last successful sync; later events are not included)</td></tr>
+<tr><th>Archive starts (UTC date)</th><td>@@ARCHIVE_START@@</td></tr>
+<tr><th>Events in the period</th><td>@@EVENT_COUNT@@</td></tr>
+<tr><th>Chain head</th><td><code>@@CHAIN_HEAD@@</code></td></tr>
+</table>
+
+<h2>Coverage of the period</h2>
+<table>
+<tr><th>Days in the period</th><td>@@DAYS_TOTAL@@</td></tr>
+<tr><th>Coverage</th><td>@@COVERAGE_PCT@@ percent of the days (covered with events, covered with no events, or pruned by retention)</td></tr>
+<tr><th>Covered, with events</th><td>@@DAYS_WITH_EVENTS@@</td></tr>
+<tr><th>Covered, zero events</th><td>@@DAYS_ZERO@@</td></tr>
+<tr><th>Pruned by retention</th><td>@@DAYS_PRUNED@@</td></tr>
+<tr><th>Gap days (not covered)</th><td>@@DAYS_GAP@@</td></tr>
+<tr><th>Before the archive began</th><td>@@DAYS_BEFORE@@</td></tr>
+<tr><th>After the data-as-of time</th><td>@@DAYS_AFTER@@</td></tr>
+</table>
+<p>@@GAP_TEXT@@</p>
+
+<h2>Control matrix (proposed mapping)</h2>
+<table>
+<tr><th>Criterion</th><th>Reports</th><th class="num">Rows in the period</th><th>Mapping</th></tr>
+@@MATRIX_ROWS@@
+</table>
+
+<h2>Checking this package</h2>
+<p>Run the checking program on the zip file, with Python 3, without unpacking it: <code>python3 -I verify_evidence_package.py &lt;package file name&gt;.zip</code>. Read <code>README-FOR-AUDITORS.txt</code> for the steps.</p>
+<table>
+<tr><th>sha256 of the checking program shipped with this build</th><td><code>@@VERIFIER_SHA256@@</code></td></tr>
+</table>
+<p class="note">This value and the copy of the program inside the package came from the same place as the package and prove nothing about themselves. The authoritative sha256 is in the signed release and its release notes and on the project's signing-key page: compare the sha256 of the program you run with that value. The check detects accidental or partial change and compares the exported events with the archive's hash chain as it stood when the package was built. Hashes are unkeyed and the package is not signed; it does not show who produced the events. The server's own build log is the independent record: compare the zip's sha256 and the chain head with it.</p>
+<p class="note">This package holds personal data (names, email addresses, IP addresses and activity) and is not encrypted.</p>
+</body>
+</html>

@@ -214,6 +214,18 @@ def missing_denies(text):
             if not re.search(rf"(?<![A-Za-z0-9_$])location\s+{re.escape(p)}\s*\{{\s*return\s+403\s*;\s*\}}", structure)]
 
 
+def lacks_step_up_location(text):
+    """True when an existing generated site has no `location = /api/environment_changes/save` that runs
+    `auth_request /verify_stepup` (a site generated before 5.42.0). Every approved change, and since 5.53.0 the MFA that opens
+    Settings and Updates, is finished there; without it the site fails closed ("step_up_unavailable") and its users cannot
+    unlock Settings or change anything. Comments and quoted strings are ignored. Read-only."""
+    for _path, block in _location_blocks(text):
+        structure = _structure(block)
+        if re.match(r"\s*location\s*=\s*/api/environment_changes/save\s*\{", structure):
+            return not re.search(r"(?<![A-Za-z0-9_$])auth_request\s+/verify_stepup\s*;", structure)
+    return True
+
+
 def site_params(text):
     """(gate port, listen address, host) of an existing generated site, so it can be generated again the same way."""
     structure = _structure(text)
@@ -294,10 +306,12 @@ def build(main_site, gate_port, listen, host, name, allow_public_listen=False):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] in ("--check", "--params"):
+    if len(sys.argv) == 3 and sys.argv[1] in ("--check", "--params", "--check-step-up"):
         try:
             with open(sys.argv[2], encoding="utf-8") as fh:
                 site_text = fh.read()
+            if sys.argv[1] == "--check-step-up":
+                raise SystemExit(1 if lacks_step_up_location(site_text) else 0)
             if sys.argv[1] == "--check":
                 missing = missing_denies(site_text)
                 print("\n".join(missing))

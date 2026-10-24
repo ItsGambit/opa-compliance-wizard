@@ -6,9 +6,9 @@ this doc covers what each part of the dashboard actually does.
 
 ## Interactive Dashboard
 
-A local React app + Python backend (same stack as the
-`okta-privilege-dashboard` project: React 19 + Vite + TypeScript +
-Tailwind v4 + Radix UI + TanStack Query). **No credentials are needed
+A local React app + Python backend (the frontend is React 19 + Vite +
+TypeScript + Tailwind v4 + Radix UI + TanStack Query; the backend is
+Python with SQLite, served by `server/serve.py`). **No credentials are needed
 to launch it** — see "Environments" below.
 
 **First-time setup** (optional -- the launcher offers to do it):
@@ -53,8 +53,9 @@ shows a **setup screen** asking for a label (e.g. `dev`) and:
 
 Saving tests the connection immediately and, once it succeeds, unlocks
 the rest of the dashboard. You can save **multiple named
-environments** and switch between them via the **gear icon** in the
-header, which opens a manager to activate / edit / delete saved
+environments** and switch between them via the **Environments** item at
+the bottom of the sidebar (or the **Environment** button with the chevron
+in the page header), which opens a manager to activate / edit / delete saved
 environments. Editing always shows both secret fields blank — leave
 blank to keep the existing value, or type a new one to rotate it.
 Deleting the active environment locks the dashboard again until
@@ -70,7 +71,7 @@ without you needing to know Okta's System Log event-type names or write
 a single query.
 
 **Why this exists, in plain terms:** Okta's own System Log only keeps
-90 days of history. Most audits (SOC 2, SOX, ISO 27001) cover a
+90 days of history. Most audits (SOC 2 and others) cover a
 12-month period. Without something standing between "Okta's 90-day
 window" and "your auditor's 12-month ask," you simply can't produce
 the evidence — no amount of clicking around the Okta Admin Console
@@ -78,20 +79,33 @@ fixes that gap. This dashboard closes it by continuously archiving
 System Log events into a local, indefinitely-retained store (SQLite —
 see [Hosting on a server](hosting.md#hosting-on-a-server-optional) for why that
 choice, not a bigger database, is the right one here), then serving
-16 pre-built reports on top of that archive.
+pre-built reports on top of that archive.
 
-**The 16 reports, grouped by SOC 2 Trust Services Criteria** (each maps
+**The reports, grouped by SOC 2 Trust Services Criteria** (each maps
 to a specific, live-verified set of real Okta/OPA event types — nothing
-here is a guess or a report card that will silently always read zero):
+here is a guess or a report card that will silently always read zero).
+The grouping is a **proposed** mapping to SOC 2 criteria CC6, CC7 and CC8; it
+is not a statement that any control is met. ISO 27001 and SOX are planned,
+not mapped yet:
 
 - **CC6 — Access Controls:** MFA Enforcement, Provisioning &
   De-provisioning, Role/Group Changes, Admin Privilege Grants, JIT
-  Access Requests, PAM Secrets, PAM JIT Access (Checkout/Checkin), PAM
-  Credential Reveals, Client Enrollment, Device Management
+  Access Requests, API Token Lifecycle, PAM Secrets, PAM JIT Access
+  (Checkout/Checkin), PAM Credential Reveals, Client Enrollment, Device
+  Management, Credential Rotation
 - **CC7 — System Operations:** Session Activity, Threat Detection, PAM
   Sessions, Active Directory Sync Activity
-- **CC8 — Change Management:** API Token Lifecycle, Policy
-  Modifications, PAM Policy Modifications, Credential Rotation
+- **CC8 — Change Management:** Policy Modifications, PAM Policy
+  Modifications
+
+The mappings live in a versioned data file, `server/control_catalogue.json`,
+which ships with each release. For every report it names the specific SOC 2
+criteria (for example CC6.1), a plain-text methodology note (what the report
+shows and does not show, and how rows are chosen) and its known limits. Every
+mapping is labelled **Proposed**: it is suggested by this project and has not
+been reviewed by an auditor, and the report's detail view says so next to the
+criteria it lists. The three groups above come from the first criterion
+listed for each report.
 
 Click any report card to open its detail view: a date-range filter and
 a results table in the **four-field audit standard** — **User**,
@@ -100,23 +114,30 @@ outcome (success/failure/denied) column, which is the shape most audit
 evidence requests are written around. Every report supports
 **Export CSV** (via the same export mechanism used throughout the rest
 of this tool) both from its detail view and directly from its card on
-the picker screen (hover to reveal the export icon) — there's also a
-single **Export all reports** button at the top of the picker for
-pulling the entire evidence set in one pass.
+the picker screen (hover to reveal the export icon). To hand an auditor
+the whole period at once, **Build an evidence package…** (5.53.0, replacing
+the picker's "Export all (CSV)" button; the Overview's evidence card has
+the same button) opens the **Evidence package** page: pick SOC 2 (proposed
+mapping), a UTC period, read the coverage check (gap, zero-event, pruned
+and before-the-archive days, written as text; gap days need an explicit
+confirmation), preview the control matrix and build one zip with the
+events, report files, the archive's hash chain and a checking program an
+auditor runs offline. A package holds people's names and activity and is
+not encrypted or signed; see [evidence-package.md](evidence-package.md).
 
-**Getting data into the archive — the sync settings dialog** (gear
-icon → environment row → sync settings, next to the existing local log
-retention indicator):
+**Getting data into the archive — the sync settings dialog**
+(**Environments** in the sidebar → the environment's row → sync settings,
+next to the existing local log retention indicator):
 
 - **Ingestion scope** — a real either/or choice made at the point data
   is written in, not a filter applied afterward:
-  - *Curated only* — store just the ~20 event types the 16 reports
+  - *Curated only* — store just the event types the reports
     above actually use. Smallest footprint; the right default for most
     deployments, especially larger tenants with high daily event
     volume.
   - *Everything* — store every System Log event type, for teams who
     want the full tenant history available for ad-hoc investigation
-    beyond these 16 reports. Bigger archive, same reports.
+    beyond these reports. Bigger archive, same reports.
 - **Retention** — a separate setting layered on top of whichever scope
   you picked: a time window (e.g. "keep 2 years"), a size cap, or both.
   Curated events are the evidence trail itself, so they're **never**
@@ -242,7 +263,9 @@ to `http://localhost:8766`) with `python serve.py` running separately.
 
 ### Access Explorer
 
-A second top-level tab (next to Folder Builder) for answering "who has
+A top-level sidebar item (the sidebar order is Overview, Compliance
+Reports, Access Explorer, Okta Admins, Folder Builder, then the
+admin-only Audit Log and Updates) for answering "who has
 access to what." Since 5.51.0 it opens from the **stored OPA scan**: the
 scan (`build_access_model`, run as the OPA part of the refresh job:
 `POST /api/environments/<name>/refresh` with `parts: ["opa"]`, polled via
@@ -351,7 +374,7 @@ checking that resource's own project membership. Where the selector is
 a *dynamic pattern match* instead of a specific resource — server
 labels, Active Directory accounts (a name/domain condition, or a
 specific-shared-account-by-SID shape — see "Confirmed tenant behavior"
-below, both non-resolvable), Database accounts — there's nothing to
+in [api-notes.md](api-notes.md), both non-resolvable), Database accounts — there's nothing to
 resolve to one project, so the condition itself is shown as readable
 text (e.g. "Servers labeled `system.os_type=linux`") at the
 resource-group level. (Since 5.44.5 and 5.44.6, database and Active
@@ -371,7 +394,7 @@ walk Folder Builder's "Load Current Structure" uses) for what exists
 right now, plus the project's history from the compliance archive
 above (`pam.secret.create/.update/.delete/.reveal` and
 `pam.secret_folder.create/.update/.delete` — see "Confirmed tenant
-behavior" below) for the full history, including resources that no
+behavior" in [api-notes.md](api-notes.md)) for the full history, including resources that no
 longer exist and therefore aren't in the live tree at all. A row
 absent from the live tree is only ever marked **deleted** when the
 archive actually contains a delete event for it — otherwise it's
@@ -476,7 +499,7 @@ archive) that keep the per-account rotation reads fast.
 Added in 5.50.0. Both are read from **stored snapshots** of Okta (see "Configuration snapshots" below),
 never from a live call, so "as of the audit date" and "now" are the same screen.
 
-**Okta Admins** (Compliance Reports > Okta Admins) lists who holds an administrator role in Okta, from
+**Okta Admins** (the **Okta Admins** item in the sidebar, between Access Explorer and Folder Builder) lists who holds an administrator role in Okta, from
 `GET /api/v1/iam/assignees/users` and each user's `GET /api/v1/users/{id}/roles`, with:
 
 - the role and, for the scoped standard roles, its group or app targets
@@ -514,12 +537,35 @@ re-reads and re-hashes them, so an edited, added or removed object, or a removed
 an environment's archive removes its snapshots; retention never prunes them. The same threat model as the archived
 log applies (see the integrity check's description).
 
-**Overview** (the first sidebar item, home page for administrators; archive viewers with View archive and Live read see the counts too, never the lists of names). The sources strip shows when each source was read and the **Refresh** split button runs the OPA scan, the Okta scan and the System Log sync as one job, with a progress card that shows each part's state and, for a part that failed, the reason and **Retry this part**. Everything on it is counts read from stored snapshots and the archive, stamped with its time and source; people are behind a click (drawer, audited). `GET /api/overview` returns, per block, either its numbers or its
+### Overview
+
+The **Overview** (the first sidebar item, home page for administrators; archive viewers with View archive and Live read see the counts too, never the lists of names). The sources strip shows when each source was read and the **Refresh** split button runs the OPA scan, the Okta scan and the System Log sync as one job, with a progress card that shows each part's state and, for a part that failed, the reason and **Retry this part**. Everything on it is counts read from stored snapshots and the archive, stamped with its time and source; people are behind a click (drawer, audited). `GET /api/overview` returns, per block, either its numbers or its
 state (`never_captured`, `refused`, `not_loaded`...): Okta admin role holders, OPA privileged users, separation-of-duties
 overlaps, C1 counts, OPA service accounts, archive coverage and chain status, weekly privilege grant and revoke counts,
 snapshot dates, the **inventory** (daily counts per series with first-seen date and 7- and 30-day change) and the
 weekly **sign-in and MFA** figures. `GET /api/overview/privileged` returns the people behind the privileged figures; it
 is admin-only and every read is audited. Neither is reachable through an additional login gate.
+
+### Audit Log page
+
+Administrators (and the single operator of a local run) see **Audit Log** in the sidebar: every write action
+taken in the app, newest first, from `audit_log.jsonl`. Each entry shows the action, the time, the actor, the
+client IP and user agent (shown as a dash on entries written before those were captured) and the action's own
+fields. The search box filters the entries loaded so far (action, actor, IP, details); **Load more** reads
+older ones; **Refresh** reloads. Upgrade activity appears here too (`upgrade.*` and `deploy.*` entries, written
+by the update check, the updater and `deploy.sh`), and a failed upgrade's entry carries a button to download
+its redacted support bundle (see the README, "The support bundle"). The log is a plain file with no integrity
+protection of its own; keep it in your backups ([Hosting](hosting.md#backups-and-restore)).
+
+### Updates page
+
+Administrators see **Updates** in the sidebar. It shows the installed version and the latest stable release the
+last check saw (or says the check has not run since this version was installed), the **update check** (off until an
+administrator turns it on; **Check now** is limited to once a minute and never installs anything), the upgrade
+flow on an install that uses the upgrade layout (**Upgrade now** or **Schedule…**, a confirmation screen, an MFA
+approval, live progress, the result, rollback and restore), the upgrade history, the pre-upgrade backups the
+updater holds, and **Release signing keys** (the pinned keys, their status and any revocation). All of it is
+described in the README under "Upgrading"; key handling is in [SECURITY.md](../SECURITY.md#release-signing-keys).
 
 ### Policy assignment (Folder Builder)
 

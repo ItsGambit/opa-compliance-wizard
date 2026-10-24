@@ -74,6 +74,12 @@ ROUTES = {
     ("GET", "path == '/api/whoami'"): Route("GET", "/api/whoami", "open", None, 200),
     ("GET", "path == '/api/environments'"): Route("GET", "/api/environments", "open", None, 200),
     ("GET", "path == '/api/banner'"): Route("GET", "/api/banner", "open", None, 200),
+    # 5.53.0: the Settings/Updates MFA unlock. status/lock only touch the caller's own window; unlock is one step-up change
+    # type (per user, so "open"); the full environment list is behind the unlock, scoped like the public list.
+    ("GET", "path == '/api/settings/status'"): Route("GET", "/api/settings/status", "open", None, 200),
+    ("GET", "path == '/api/settings/environments'"): Route("GET", "/api/settings/environments", "open", None, 200),
+    ("POST", "path == '/api/settings/unlock'"): Route("POST", "/api/settings/unlock", "open", {}, 200, stepup="settings.unlock"),
+    ("POST", "path == '/api/settings/lock'"): Route("POST", "/api/settings/lock", "open", {}, 200),
     # 5.51.0: the combined Refresh job's progress (a read of the job's own state, counts and wording only).
     ("GET", "path.startswith('/api/environments/') and path.endswith('/refresh/status')"):
         Route("GET", "/api/environments/dev/refresh/status", "env", None, 200, caps=('live_read',)),
@@ -82,6 +88,9 @@ ROUTES = {
     ("GET", "path.startswith('/api/environments/') and path.endswith('/integrity')"):
         Route("GET", "/api/environments/dev/integrity", "env", None, 200, caps=('view_archive',)),
     # 5.50.0: Okta Admins report, cross-checks, chained snapshots, the executive overview.
+    # 5.53.0: one report's events for a period as a complete CSV; the permission of viewing the report.
+    ("GET", "path.startswith('/api/environments/') and path.endswith('/export.csv')"):
+        Route("GET", "/api/environments/dev/reports/session_activity/export.csv?since=2026-01-01&until=2026-01-31", "env", None, 200, caps=('view_archive',)),
     ("GET", "path.startswith('/api/environments/') and path.endswith('/okta_admins')"):
         Route("GET", "/api/environments/dev/okta_admins", "env", None, 200, caps=('view_archive', 'live_read')),
     ("GET", "path.startswith('/api/environments/') and path.endswith('/cross_checks')"):
@@ -124,6 +133,16 @@ ROUTES = {
     ("GET", "path == '/api/access/model'"): Route("GET", "/api/access/model", "session", None, 200, caps=('live_read',)),
     ("GET", "path == '/api/access/bootstrap/status'"): Route("GET", "/api/access/bootstrap/status", "session", None, 200, caps=('live_read',)),
     ("GET", "path == '/api/access/bootstrap/result'"): Route("GET", "/api/access/bootstrap/result", "session", None, 200, caps=('live_read',)),
+    # 5.53.0: evidence packages. prepare: names the environment in the query and checks view_archive AND build_evidence_package
+    # (409: this fixture's "dev" has no archive coverage; the step-up test below seeds one). Status and download are bound to the
+    # person who built the package (a job id of anyone else's, or an unknown one, is a 404 for every caller).
+    ("POST", "path == '/api/evidence_packages/prepare'"):
+        Route("POST", "/api/evidence_packages/prepare?environment=dev", "env", {"start": "2020-03-01", "end": "2020-03-05"}, 409,
+              caps=('view_archive', 'build_evidence_package'), stepup='evidence_package.build'),
+    ("GET", "path.startswith('/api/evidence_packages/') and path.endswith('/download')"):
+        Route("GET", "/api/evidence_packages/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/download", "open", None, 404),
+    ("GET", "path.startswith('/api/evidence_packages/')"):
+        Route("GET", "/api/evidence_packages/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "open", None, 404),
     ("GET", "path == '/api/csv_files'"): Route("GET", "/api/csv_files", "open", None, 200),
     ("GET", "path == '/api/csv'"): Route("GET", "/api/csv?file=folders_template.csv", "open", None, 200),
     ("GET", "path == '/api/audit_log'"): Route("GET", "/api/audit_log", "admin", None, 200),
@@ -143,7 +162,8 @@ ROUTES = {
     ("GET", "path == '/api/upgrade/notice'"): Route("GET", "/api/upgrade/notice", "open", None, 200),
     ("GET", "path == '/api/shared_permissions'"): Route("GET", "/api/shared_permissions", "admin", None, 200),
     ("POST", "path == '/api/banner'"):
-        Route("POST", "/api/banner", "admin", {"enabled": True, "message": "Maintenance tonight", "variant": "info"}, 200),
+        Route("POST", "/api/banner", "admin", {"enabled": True, "message": "Maintenance tonight", "variant": "info"}, 200,
+              stepup="banner.update"),
     ("POST", "path == '/api/access_control/prepare'"):
         Route("POST", "/api/access_control/prepare", "admin",
               {"admin_group_id": "00gADMINS", "user_group_id": "00gUSERS", "restrict_login": False}, 200),
@@ -331,6 +351,10 @@ def matrix_server(tmp_audit_store, tmp_environments_file, fake_keyring, tmp_audi
     monkeypatch.setattr(serve, "_run_sync_job", lambda *a, **k: started.append(("sync", a)))
     monkeypatch.setattr(serve, "_run_access_job", lambda *a, **k: started.append(("access", a)))
     monkeypatch.setattr(serve, "_run_capture_job", lambda *a, **k: started.append(("capture", a)))  # 5.50.0
+    # 5.53.0: an evidence build's worker never runs here (the routes' own checks and the job table do); packages go to a temp folder.
+    monkeypatch.setattr(serve, "_run_evidence_build", lambda *a, **k: started.append(("evidence", a)))
+    monkeypatch.setattr(serve._evidence, "_dir_fn", lambda: str(tmp_path / "packages"))
+    serve._evidence.reset()
     with serve._sessions_lock:
         serve._seen_owners.clear()
         serve._recorded_identities.clear()  # 5.43.0: each test starts with a fresh DB
@@ -349,6 +373,7 @@ def matrix_server(tmp_audit_store, tmp_environments_file, fake_keyring, tmp_audi
         except requests.exceptions.ConnectionError:
             time.sleep(0.1)
     yield base_url, serve
+    serve._evidence.reset()
     server_instance.shutdown()
     server_instance.server_close()
     with serve._sessions_lock:
@@ -359,8 +384,20 @@ def matrix_server(tmp_audit_store, tmp_environments_file, fake_keyring, tmp_audi
 REAL_JOB_BODIES = {}  # the unpatched job functions, for tests that run one synchronously
 
 
-def _who(sub, admin=False):
-    return {"X-Nginx-Proxy-Secret": SECRET, "X-Auth-Sub": sub, "X-Auth-Is-Admin": "true" if admin else "false"}
+SESSION_COOKIE_NAME = "opa_wizard_session"
+
+
+def _who(sub, admin=False, session=None):
+    """Headers as nginx forwards them. The cookie stands in for the gate's login-session cookie (its value is opaque to the
+    application, which only hashes it for the Settings unlock)."""
+    return {"X-Nginx-Proxy-Secret": SECRET, "X-Auth-Sub": sub, "X-Auth-Is-Admin": "true" if admin else "false",
+            "Cookie": f"{SESSION_COOKIE_NAME}={session or 'session-of-' + sub}"}
+
+
+def _unlock(serve, sub, session=None, issuer="", ttl=600):
+    """Opens the Settings unlock for this user's (default) session the way a completed MFA does, without the round trip."""
+    fingerprint = serve._session_fingerprint({"Cookie": f"{SESSION_COOKIE_NAME}={session or 'session-of-' + sub}"})
+    return audit_store.upsert_settings_unlock(sub, issuer, fingerprint, "test-action", ttl)
 
 
 def _call(base_url, method, sample, body=None, headers=None):
@@ -419,6 +456,14 @@ def test_hosted_mode_refuses_every_non_public_route_without_a_verified_identity(
 # Admin-only routes
 # ---------------------------------------------------------------------------
 ADMIN_ROUTES = [r for r in ROUTES.values() if r.kind == "admin"]
+# 5.53.0: admin routes that also need the Settings unlock in hosted mode (reads and checks behind Settings and Updates).
+UNLOCK_GATED = {("GET", "/api/access_control"), ("GET", "/api/shared_permissions"), ("GET", "/api/archives/orphaned"),
+                ("GET", "/api/upgrade/status"), ("GET", "/api/upgrade/bundle"), ("POST", "/api/upgrade/preview"),
+                ("POST", "/api/upgrade/check")}
+
+
+def _is_unlock_gated(route):
+    return (route.method, route.sample.split("?")[0]) in UNLOCK_GATED
 
 
 @pytest.mark.parametrize("hosted", [False, True], ids=["local-mode", "hosted-mode"])
@@ -429,6 +474,12 @@ def test_admin_routes_refuse_non_admins_and_admit_admins(matrix_server, monkeypa
         monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
     refused = _call(base_url, route.method, route.sample, route.body, _who(OWNER_B))
     assert refused.status_code == 403, refused.text
+    if hosted and _is_unlock_gated(route):
+        locked = _call(base_url, route.method, route.sample, route.body, _who(ADMIN, admin=True))
+        assert locked.status_code == 403 and locked.json() == {
+            "error": "Unlock Settings with MFA to view this.", "step_up_required": True, "scope": "settings",
+            "reason": "settings_locked"}, locked.text
+        _unlock(serve, ADMIN)
     allowed = _call(base_url, route.method, route.sample, route.body, _who(ADMIN, admin=True))
     if hosted and route.stepup:
         # 5.42.0: past the admin check, a hosted admin is sent to step-up MFA.
@@ -633,7 +684,7 @@ def _raw_post(base_url, path, headers, body=b""):
     host, port = base_url.replace("http://", "").split(":")
     with socket.create_connection((host, int(port)), timeout=10) as conn:
         conn.settimeout(3)  # a handler stuck reading the body never answers -> socket.timeout fails the test
-        head = f"POST {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n"
+        head = f"POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n"
         head += "".join(f"{k}: {v}\r\n" for k, v in headers.items())
         conn.sendall(head.encode() + b"\r\n" + body)
         data = b""
@@ -1121,7 +1172,8 @@ CAP_ROUTES = [r for r in ROUTES.values() if r.caps]
 # than read from the engine (so a changed built-in default fails this
 # matrix too). 5.43.0 (SP-1, SP-2): tenant writes and CSV import are denied.
 BUILT_IN = {"view_archive": "allow", "live_read": "allow", "tenant_write": "deny", "import_csv": "deny",
-            "reset_watermark": "allow", "sync_now": "deny", "sync_settings": "deny"}
+            "reset_watermark": "allow", "sync_now": "deny", "sync_settings": "deny",
+           "build_evidence_package": "deny"}
 
 
 def test_matrix_built_ins_match_the_engine():
@@ -1249,7 +1301,7 @@ def test_environment_list_reports_effective_permissions(matrix_server):
     assert "permission_overrides" not in row  # admins only
     own = requests.get(base_url + "/api/environments", headers=_who(OWNER_A), timeout=10).json()["environments"][0]
     assert all(v == {"value": "allow", "source": "owner"} for v in own["permissions"].values())
-    admin_row = next(e for e in requests.get(base_url + "/api/environments", headers=_who(ADMIN, admin=True),
+    admin_row = next(e for e in requests.get(base_url + "/api/settings/environments", headers=_who(ADMIN, admin=True),
                                              timeout=10).json()["environments"] if e["id"] == env_id)
     assert admin_row["permission_overrides"] == {"sync_now": "allow"}
 
@@ -1362,7 +1414,7 @@ def test_environment_list_shows_the_callers_own_exception(matrix_server):
     assert "permission_grants" not in rows["environments"][0]
     rows = requests.get(base_url + "/api/environments", headers=_as_user(OWNER_B, WORK_ISS), timeout=10).json()
     assert rows["environments"][0]["permissions"]["sync_now"] == {"value": "deny", "source": "built_in"}
-    admin_row = next(e for e in requests.get(base_url + "/api/environments", headers=_who(ADMIN, admin=True),
+    admin_row = next(e for e in requests.get(base_url + "/api/settings/environments", headers=_who(ADMIN, admin=True),
                                              timeout=10).json()["environments"] if e["id"] == env_id)
     # Grants (other users' e-mails) are not in the list: it is reachable from
     # an additional gate's site, /api/shared_permissions is not (SP-5).
@@ -1520,7 +1572,7 @@ def _stepup_case(serve, route):
         conn.execute("INSERT INTO sync_state (environment_id, total_events_ingested) VALUES (?, 0)", (ORPHAN,))
         conn.commit()
         who, admin = ADMIN, True
-    elif route.stepup in ("shared_permissions.update", "upgrade.settings"):
+    elif route.stepup in ("shared_permissions.update", "upgrade.settings", "banner.update"):
         who, admin = ADMIN, True
     elif route.stepup == "upgrade.request":
         who, admin = ADMIN, True
@@ -1530,6 +1582,11 @@ def _stepup_case(serve, route):
                                        "pending_approval": None, "last": None})
     elif route.stepup == "environment.share":
         body = {"shared": False}
+    elif route.stepup == "evidence_package.build":
+        # the owner's "dev" gets an archive that covers the sample period (fixed dates in 2020), so the build can start
+        from evidence_fixtures import seed_fixed_archive
+        seed_fixed_archive(env_id)
+        body = {"start": "2020-03-01", "end": "2020-03-05", "gaps_acknowledged": False}
     return env_id, who, admin, sample, body
 
 
@@ -1574,7 +1631,8 @@ def test_every_environment_change_needs_a_step_up_bound_to_it(matrix_server, mon
     assert done.json()["step_up_verified"] is True and done.json()["action"] == route.stepup
     entry = [json.loads(line) for line in open(tmp_audit_log, encoding="utf-8") if line.strip()][-1]
     # (upgrade.request logs the specific event of its kind: upgrade.cancelled, upgrade.scheduled, upgrade.requested ...)
-    assert entry["action"] == route.stepup or (route.stepup == "upgrade.request" and entry["action"] == "upgrade.cancelled")
+    assert entry["action"] == route.stepup or (route.stepup == "upgrade.request" and entry["action"] == "upgrade.cancelled") \
+        or (route.stepup == "settings.unlock" and entry["action"] == "settings.unlocked")
     assert entry["details"]["step_up_verified"] is True
     # Single use: a replay of the same approval is refused.
     replay = _stepup(base_url, who, action_id, admin=admin)
@@ -1919,3 +1977,503 @@ def test_a_stored_action_must_match_its_rows_type(matrix_server, monkeypatch):
         {"action": "archive.purge", "params": {"archive_id": ORPHAN}, "secret_fields": []}, 60)
     resp = _stepup(base_url, OWNER_A, aid)
     assert resp.status_code == 403 and resp.json()["reason"] == "action_type_mismatch"
+
+
+# ---------------------------------------------------------------------------
+# 5.53.0: MFA to open Settings and Updates (the Settings unlock)
+# ---------------------------------------------------------------------------
+LOCKED_BODY = {"error": "Unlock Settings with MFA to view this.", "step_up_required": True, "scope": "settings",
+               "reason": "settings_locked"}
+# Every read behind the unlock: (method, sample, body). Admin-only ones also refuse a non-admin first.
+UNLOCK_READS = [
+    ("GET", "/api/access_control", None), ("GET", "/api/shared_permissions", None), ("GET", "/api/archives/orphaned", None),
+    ("GET", "/api/upgrade/status", None),
+    ("GET", "/api/upgrade/bundle?name=ocw-support-1.0.0-to-1.0.1-20260101T000000Z-ab12.tar.gz", None),
+    ("POST", "/api/upgrade/preview", {}), ("POST", "/api/upgrade/check", {}),
+]
+
+
+def _audit_entries(path):
+    if not Path(path).exists():
+        return []
+    return [json.loads(line) for line in open(path, encoding="utf-8") if line.strip()]
+
+
+def _hosted(serve, monkeypatch):
+    monkeypatch.setattr(serve, "DEPLOYMENT_MODE", "hosted")
+
+
+def _save(base_url, who, action_id, admin=False, session=None, location=True):
+    headers = {**_who(who, admin=admin, session=session), "X-Auth-Action-Id": action_id}
+    if location:
+        headers["X-Nginx-Stepup-Location"] = SECRET
+    return requests.post(base_url + "/api/environment_changes/save", json={}, headers=headers, timeout=10)
+
+
+def _unlock_rows():
+    return audit_store.list_settings_unlocks()
+
+
+def test_every_read_behind_settings_answers_the_locked_body_and_leaks_nothing(matrix_server, monkeypatch):
+    base_url, serve = matrix_server
+    _share_a_dev_with_b_session(serve)
+    _hosted(serve, monkeypatch)
+    for method, sample, body in UNLOCK_READS:
+        # A non-admin keeps the existing admin message: never a hint to unlock.
+        refused = _call(base_url, method, sample, body, _who(OWNER_B))
+        assert refused.status_code == 403 and "Admin access required" in refused.json()["error"], (sample, refused.text)
+        assert "step_up_required" not in refused.json()
+        locked = _call(base_url, method, sample, body, _who(ADMIN, admin=True))
+        assert locked.status_code == 403 and locked.json() == LOCKED_BODY, (sample, locked.text)
+    locked = _call(base_url, "GET", "/api/settings/environments", None, _who(OWNER_A))
+    assert locked.status_code == 403 and locked.json() == LOCKED_BODY
+    assert _unlock_rows() == []
+
+
+def test_the_unlock_is_per_session_and_per_issuer(matrix_server, monkeypatch):
+    base_url, serve = matrix_server
+    _hosted(serve, monkeypatch)
+    _unlock(serve, ADMIN)
+    ok = requests.get(base_url + "/api/access_control", headers=_who(ADMIN, admin=True), timeout=10)
+    assert ok.status_code == 200
+    # Another login session of the same user (a new sign-in) is locked.
+    other = requests.get(base_url + "/api/access_control", headers=_who(ADMIN, admin=True, session="a-newer-session"), timeout=10)
+    assert other.status_code == 403 and other.json() == LOCKED_BODY
+    # The same session reaching the app through a gate that vouches for an issuer is a different key.
+    issued = requests.get(base_url + "/api/access_control", headers={**_who(ADMIN, admin=True), "X-Auth-Issuer": PERSONAL_ISS,
+                                                                     "X-Nginx-Issuer-Forwarded": SECRET}, timeout=10)
+    assert issued.status_code == 403
+    # No session cookie at all (a local process that knows the proxy secret) fails closed.
+    bare = {k: v for k, v in _who(ADMIN, admin=True).items() if k != "Cookie"}
+    assert requests.get(base_url + "/api/access_control", headers=bare, timeout=10).status_code == 403
+    assert requests.post(base_url + "/api/settings/unlock", json={}, headers=bare, timeout=10).status_code == 403
+    # Another user presenting the same cookie value does not inherit it.
+    shared_cookie = _who("00uOTHERADMIN", admin=True, session="session-of-" + ADMIN)
+    assert requests.get(base_url + "/api/access_control", headers=shared_cookie, timeout=10).status_code == 403
+
+
+def test_the_full_unlock_loop_over_http(matrix_server, monkeypatch, tmp_audit_log):
+    base_url, serve = matrix_server
+    _hosted(serve, monkeypatch)
+    me = _who(ADMIN, admin=True)
+    assert requests.get(base_url + "/api/access_control", headers=me, timeout=10).status_code == 403
+    prepared = requests.post(base_url + "/api/settings/unlock", json={}, headers=me, timeout=10)
+    assert prepared.status_code == 202 and prepared.json()["action"] == "settings.unlock"
+    action_id = prepared.json()["action_id"]
+    assert _unlock_rows() == []                                   # nothing is open until the MFA is spent
+    assert _save(base_url, ADMIN, action_id, admin=True, location=False).json()["reason"] == "step_up_unavailable"
+    other = _save(base_url, "00uOTHERADMIN", action_id, admin=True)
+    assert other.status_code == 403 and other.json()["reason"] == "actor_mismatch"
+    changed = _save(base_url, ADMIN, action_id, admin=True, session="signed-in-again")
+    assert changed.status_code == 409 and changed.json()["reason"] == "session_changed"
+    assert _unlock_rows() == []
+    # (that attempt consumed its approval; a fresh one succeeds)
+    action_id = requests.post(base_url + "/api/settings/unlock", json={}, headers=me, timeout=10).json()["action_id"]
+    done = _save(base_url, ADMIN, action_id, admin=True)
+    assert done.status_code == 200, done.text
+    body = done.json()
+    assert body["action"] == "settings.unlock" and body["step_up_verified"] is True and body["seconds_left"] == 600
+    assert len(_unlock_rows()) == 1 and _unlock_rows()[0]["actor_sub"] == ADMIN and _unlock_rows()[0]["action_id"] == action_id
+    entry = [e for e in _audit_entries(tmp_audit_log) if e["action"] == "settings.unlocked"][-1]
+    assert entry["details"]["scope"] == "settings" and entry["details"]["ttl_seconds"] == 600
+    assert entry["details"]["step_up_verified"] is True and entry["details"]["action_id"] == action_id
+    for method, sample, payload in UNLOCK_READS:
+        resp = _call(base_url, method, sample, payload, me)
+        assert resp.json() != LOCKED_BODY, sample
+    assert requests.get(base_url + "/api/access_control", headers=me, timeout=10).status_code == 200
+    replay = _save(base_url, ADMIN, action_id, admin=True)
+    assert replay.status_code == 409 and replay.json()["reason"] == "already_consumed"
+    status = requests.get(base_url + "/api/settings/status", headers=me, timeout=10).json()
+    assert status["mode"] == "hosted" and status["mfa"] is True and status["unlocked"] is True
+    assert 590 <= status["seconds_left"] <= 600 and status["local_notice"] is None
+
+
+def test_an_unlock_works_for_a_non_admin_user_without_granting_any_right(matrix_server, monkeypatch):
+    base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    _hosted(serve, monkeypatch)
+    aid = requests.post(base_url + "/api/settings/unlock", json={}, headers=_who(OWNER_B), timeout=10).json()["action_id"]
+    assert _save(base_url, OWNER_B, aid).status_code == 200
+    mine = requests.get(base_url + "/api/settings/environments", headers=_who(OWNER_B), timeout=10)
+    assert mine.status_code == 200 and [e["id"] for e in mine.json()["environments"]] == [env_id]
+    for method, sample, payload in UNLOCK_READS:
+        resp = _call(base_url, method, sample, payload, _who(OWNER_B))
+        assert resp.status_code == 403 and "Admin access required" in resp.json()["error"], sample
+
+
+def test_expiry_closes_the_reads_and_is_recorded_once(matrix_server, monkeypatch, tmp_audit_log):
+    base_url, serve = matrix_server
+    _hosted(serve, monkeypatch)
+    _unlock(serve, ADMIN)
+    me = _who(ADMIN, admin=True)
+    assert requests.get(base_url + "/api/access_control", headers=me, timeout=10).status_code == 200
+    conn = audit_store._get_connection()
+    conn.execute("UPDATE settings_unlocks SET expires_at = '2000-01-01T00:00:00.000Z', unlocked_at = '1999-12-31T23:50:00.000Z'")
+    conn.commit()
+    # the countdown's status poll sees the lapse without erasing the evidence of it
+    assert requests.get(base_url + "/api/settings/status", headers=me, timeout=10).json()["unlocked"] is False
+    for _ in range(3):
+        resp = requests.get(base_url + "/api/access_control", headers=me, timeout=10)
+        assert resp.status_code == 403 and resp.json() == LOCKED_BODY
+    locked = [e for e in _audit_entries(tmp_audit_log) if e["action"] == "settings.locked"]
+    assert len(locked) == 1 and locked[0]["details"]["reason"] == "expired"
+    assert locked[0]["details"]["expired_at"] == "2000-01-01T00:00:00.000Z"
+
+
+def test_lock_now_ends_the_window_and_is_recorded(matrix_server, monkeypatch, tmp_audit_log):
+    base_url, serve = matrix_server
+    _hosted(serve, monkeypatch)
+    _unlock(serve, ADMIN)
+    _unlock(serve, "00uOTHERADMIN")
+    me = _who(ADMIN, admin=True)
+    assert requests.post(base_url + "/api/settings/lock", json={}, headers=me, timeout=10).status_code == 200
+    assert requests.get(base_url + "/api/access_control", headers=me, timeout=10).status_code == 403
+    assert [r["actor_sub"] for r in _unlock_rows()] == ["00uOTHERADMIN"]      # only the caller's own window
+    locked = [e for e in _audit_entries(tmp_audit_log) if e["action"] == "settings.locked"]
+    assert len(locked) == 1 and locked[0]["details"]["reason"] == "manual"
+    # Locking when nothing is open records nothing more.
+    assert requests.post(base_url + "/api/settings/lock", json={}, headers=me, timeout=10).status_code == 200
+    assert len([e for e in _audit_entries(tmp_audit_log) if e["action"] == "settings.locked"]) == 1
+
+
+def test_the_renewal_list_is_the_ten_of_5_52_0_plus_access_control_and_banner():
+    import server.serve as serve
+
+    assert serve.SETTINGS_RENEWING_ACTION_TYPES == (
+        "environment.upsert", "environment.share", "environment.delete", "sync_schedule.update", "sync.reset_watermark",
+        "sync.import_csv", "archive.purge", "shared_permissions.update", "upgrade.settings", "upgrade.request",
+        "access_control.update", "banner.update")
+    assert "settings.unlock" not in serve.SETTINGS_RENEWING_ACTION_TYPES
+    assert "evidence_package.build" not in serve.SETTINGS_RENEWING_ACTION_TYPES
+    assert isinstance(serve.SETTINGS_RENEWING_ACTION_TYPES, tuple)
+    assert serve.SETTINGS_UNLOCK_TTL_SECONDS == 600
+
+
+_RENEWING_TYPES = ("environment.upsert", "environment.share", "environment.delete", "sync_schedule.update", "sync.reset_watermark",
+                   "sync.import_csv", "archive.purge", "shared_permissions.update", "upgrade.settings", "upgrade.request",
+                   "banner.update")
+RENEWING = [r for r in STEPUP_ROUTES if r.stepup in _RENEWING_TYPES]
+
+
+def test_every_renewing_type_with_a_route_is_covered_by_the_renewal_test():
+    assert {r.stepup for r in RENEWING} == set(_RENEWING_TYPES)
+
+
+@pytest.mark.parametrize("route", RENEWING, ids=[f"{r.method} {r.sample}" for r in RENEWING])
+def test_a_completed_change_renews_the_unlock_and_says_so(matrix_server, monkeypatch, tmp_audit_log, route):
+    base_url, serve = matrix_server
+    _env_id, who, admin, sample, body = _stepup_case(serve, route)
+    _hosted(serve, monkeypatch)
+    action_id = _prepare(base_url, route.method, sample, body, who, admin=admin)
+    assert _unlock_rows() == []
+    assert _save(base_url, who, action_id, admin=admin).status_code == 200
+    rows = _unlock_rows()
+    assert len(rows) == 1 and rows[0]["actor_sub"] == who and rows[0]["action_id"] == action_id
+    entries = [e for e in _audit_entries(tmp_audit_log) if e["action"] != "settings.unlocked"]
+    assert entries[-1]["details"]["settings_unlock_renewed"] is True
+
+
+def test_a_renewal_moves_the_expiry_on(matrix_server, monkeypatch):
+    base_url, serve = matrix_server
+    _share_a_dev_with_b_session(serve)
+    _hosted(serve, monkeypatch)
+    _unlock(serve, OWNER_A, ttl=30)
+    short = _unlock_rows()[0]["expires_at"]
+    aid = _prepare(base_url, "POST", "/api/environments/dev/share", {"shared": False}, OWNER_A)
+    assert _save(base_url, OWNER_A, aid).status_code == 200
+    assert _unlock_rows()[0]["expires_at"] > short
+
+
+def test_an_access_control_save_renews_and_a_refused_one_does_not(matrix_server, monkeypatch, tmp_audit_log):
+    base_url, serve = matrix_server
+    _hosted(serve, monkeypatch)
+    me = _who(ADMIN, admin=True)
+    cfg = {"admin_group_id": "00gADMINS", "user_group_id": "00gUSERS", "restrict_login": False}
+    aid = requests.post(base_url + "/api/access_control/prepare", json=cfg, headers=me, timeout=10).json()["action_id"]
+    assert _unlock_rows() == []
+    resp = requests.post(base_url + "/api/access_control/save", json={}, headers={**me, "X-Auth-Action-Id": aid}, timeout=10)
+    assert resp.status_code == 200, resp.text
+    assert len(_unlock_rows()) == 1
+    entry = [e for e in _audit_entries(tmp_audit_log) if e["action"] == "access_control.update"][-1]
+    assert entry["details"]["settings_unlock_renewed"] is True and entry["details"]["step_up_verified"] is True
+    # Refused (wrong actor): nothing renews.
+    audit_store.clear_settings_unlocks()
+    aid = requests.post(base_url + "/api/access_control/prepare", json=cfg, headers=me, timeout=10).json()["action_id"]
+    other = requests.post(base_url + "/api/access_control/save", json={},
+                          headers={**_who("00uOTHERADMIN", admin=True), "X-Auth-Action-Id": aid}, timeout=10)
+    assert other.status_code == 403 and _unlock_rows() == []
+
+
+def _outside_action(monkeypatch, name):
+    """A pending approval of an action type outside SETTINGS_RENEWING_ACTION_TYPES. The approval of evidence_package.build here
+    carries no environment, so its executor refuses it (400) after the approval was consumed; the test-only type has a real
+    executor that succeeds. A real build approval is driven end to end in test_evidence_package_routes_5530.py."""
+    import server.serve as serve
+
+    if name == "test.only":
+        monkeypatch.setattr(serve, "ENV_CHANGE_ACTION_TYPES", (*serve.ENV_CHANGE_ACTION_TYPES, "test.only"))
+        monkeypatch.setitem(serve._ENV_CHANGE_EXECUTORS, "test.only", "_exec_test_only")
+        monkeypatch.setattr(serve.Handler, "_exec_test_only", lambda self, p, dry_run, via_step_up: (200, {"ok": True}), raising=False)
+    return audit_store.create_pending_admin_action(ADMIN, name, {"action": name, "params": {}, "secret_fields": []}, 900)
+
+
+@pytest.mark.parametrize("name", ["evidence_package.build", "test.only"])
+def test_an_approval_outside_the_renewal_list_never_creates_or_extends_an_unlock(matrix_server, monkeypatch, tmp_audit_log, name):
+    base_url, serve = matrix_server
+    _hosted(serve, monkeypatch)
+    assert name not in serve.SETTINGS_RENEWING_ACTION_TYPES
+    aid = _outside_action(monkeypatch, name)
+    done = _save(base_url, ADMIN, aid, admin=True)
+    assert done.status_code == (400 if name == "evidence_package.build" else 200), done.text
+    assert _unlock_rows() == []                                      # created nothing
+    assert requests.get(base_url + "/api/access_control", headers=_who(ADMIN, admin=True), timeout=10).status_code == 403
+    # With a window already open its expiry is left exactly as it was.
+    _unlock(serve, ADMIN, ttl=120)
+    before = _unlock_rows()
+    aid = _outside_action(monkeypatch, name)
+    assert _save(base_url, ADMIN, aid, admin=True).status_code in (200, 400)
+    assert _unlock_rows() == before
+    assert not any(e["details"].get("settings_unlock_renewed") for e in _audit_entries(tmp_audit_log))
+
+
+def test_an_unlock_approval_never_authorises_a_save_or_a_build(matrix_server, monkeypatch, tmp_audit_log):
+    base_url, serve = matrix_server
+    _hosted(serve, monkeypatch)
+    me = _who(ADMIN, admin=True)
+    cfg_before = engine.get_access_control_config()
+    # Not at the Access Control save...
+    aid = requests.post(base_url + "/api/settings/unlock", json={}, headers=me, timeout=10).json()["action_id"]
+    resp = requests.post(base_url + "/api/access_control/save", json={"admin_group_id": "00gEVIL"},
+                         headers={**me, "X-Auth-Action-Id": aid}, timeout=10)
+    assert resp.status_code == 403 and resp.json()["reason"] == "action_type_mismatch"
+    assert engine.get_access_control_config() == cfg_before and _unlock_rows() == []
+    # ...and a stored request that names another action than the row's type is refused at the generic save.
+    forged = audit_store.create_pending_admin_action(
+        ADMIN, "settings.unlock", {"action": "banner.update", "params": {"body": {"enabled": True, "message": "x"}}}, 900)
+    resp = _save(base_url, ADMIN, forged, admin=True)
+    assert resp.status_code == 403 and resp.json()["reason"] == "action_type_mismatch"
+    assert engine.get_banner_config()["enabled"] is False
+    # An approval of another type is not an unlock either: the unlock executor runs only from its own type.
+    other = audit_store.create_pending_admin_action(ADMIN, "evidence_package.build", {"action": "settings.unlock", "params": {}}, 900)
+    resp = _save(base_url, ADMIN, other, admin=True)
+    assert resp.status_code == 403 and _unlock_rows() == []
+    assert not [e for e in _audit_entries(tmp_audit_log) if e["action"] == "settings.unlocked"]
+
+
+def test_the_banner_changes_only_after_its_approval(matrix_server, monkeypatch, tmp_audit_log):
+    base_url, serve = matrix_server
+    _hosted(serve, monkeypatch)
+    me = _who(ADMIN, admin=True)
+    new = {"enabled": True, "message": "Planned work tonight", "variant": "info", "dismissible": True}
+    before = engine.get_banner_config()
+    assert requests.post(base_url + "/api/banner", json=new, headers=_who(OWNER_B), timeout=10).status_code == 403
+    prepared = requests.post(base_url + "/api/banner", json=new, headers=me, timeout=10)
+    assert prepared.status_code == 202 and prepared.json()["action"] == "banner.update"
+    assert engine.get_banner_config() == before
+    # A bad value is refused before any MFA is asked for.
+    for bad in ({"enabled": True, "message": "  "}, {"message": 5}, {"variant": "nope", "message": "x"}):
+        assert requests.post(base_url + "/api/banner", json=bad, headers=me, timeout=10).status_code == 400
+    done = _save(base_url, ADMIN, prepared.json()["action_id"], admin=True)
+    assert done.status_code == 200 and engine.get_banner_config() == {**before, **new}
+    entry = [e for e in _audit_entries(tmp_audit_log) if e["action"] == "banner.update"][-1]
+    assert entry["details"]["step_up_verified"] is True and entry["details"]["message"] == "Planned work tonight"
+
+
+def test_local_mode_has_no_unlock_and_says_so_once_per_area(matrix_server, tmp_audit_log):
+    base_url, serve = matrix_server
+    serve._local_access_logged.clear()
+    for method, sample, payload in UNLOCK_READS:
+        resp = _call(base_url, method, sample, payload, {})
+        assert resp.json() != LOCKED_BODY, sample
+    assert audit_store.list_settings_unlocks() == []
+    resp = requests.post(base_url + "/api/settings/unlock", json={}, timeout=10)
+    assert resp.status_code == 200 and resp.json() == {"mode": "local", "mfa": False}
+    assert audit_store.list_settings_unlocks() == []
+    status = requests.get(base_url + "/api/settings/status?area=updates", timeout=10).json()
+    assert status["mode"] == "local" and status["mfa"] is False and status["unlocked"] is True
+    assert status["local_notice"].startswith("No MFA in local mode.")
+    for _ in range(3):
+        requests.get(base_url + "/api/settings/status?area=updates", timeout=10)
+    requests.get(base_url + "/api/settings/status?area=settings", timeout=10)
+    requests.get(base_url + "/api/settings/status?area=nonsense", timeout=10)
+    requests.get(base_url + "/api/settings/status", timeout=10)
+    logged = [e for e in _audit_entries(tmp_audit_log) if e["action"] == "settings.access_without_mfa_local"]
+    assert [e["details"]["area"] for e in logged] == ["updates", "settings"]
+    assert all(e["details"] == {"area": e["details"]["area"], "mode": "local", "mfa": False} for e in logged)
+    assert all(e["actor_sub"] is None and e["actor_email"] is None for e in logged)
+    # Ten minutes later the same area is recorded again.
+    serve._local_access_logged["updates"] -= serve.LOCAL_ACCESS_AUDIT_INTERVAL_SECONDS + 1
+    requests.get(base_url + "/api/settings/status?area=updates", timeout=10)
+    assert len([e for e in _audit_entries(tmp_audit_log) if e["action"] == "settings.access_without_mfa_local"]) == 3
+
+
+def test_hosted_mode_never_takes_the_local_path(matrix_server, monkeypatch, tmp_audit_log):
+    base_url, serve = matrix_server
+    _hosted(serve, monkeypatch)
+    serve._local_access_logged.clear()
+    for headers in ({}, {"X-Auth-Is-Admin": "true"}, {"X-Nginx-Proxy-Secret": SECRET, "X-Auth-Is-Admin": "true"},
+                    {"X-Nginx-Proxy-Secret": SECRET, "X-Nginx-Stepup-Location": SECRET}):
+        for path in ("/api/settings/status?area=updates", "/api/access_control", "/api/settings/environments"):
+            assert requests.get(base_url + path, headers=headers, timeout=10).status_code == 401, (headers, path)
+        assert requests.post(base_url + "/api/settings/unlock", json={}, headers=headers, timeout=10).status_code == 401
+    # A genuine user with every forged marker still sees the hosted answer, never the local notice or a free unlock.
+    forged = {**_who(ADMIN, admin=True), "X-Nginx-Stepup-Location": SECRET, "X-Auth-Action-Id": "a" * 43}
+    status = requests.get(base_url + "/api/settings/status?area=settings", headers=forged, timeout=10).json()
+    assert status["mode"] == "hosted" and status["mfa"] is True and status["unlocked"] is False and status["local_notice"] is None
+    assert requests.get(base_url + "/api/access_control", headers=forged, timeout=10).json() == LOCKED_BODY
+    assert requests.post(base_url + "/api/settings/unlock", json={}, headers=forged, timeout=10).status_code == 202
+    assert _unlock_rows() == []
+    assert not [e for e in _audit_entries(tmp_audit_log) if e["action"] == "settings.access_without_mfa_local"]
+
+
+def test_the_public_environment_list_drops_the_configuration_fields(matrix_server, monkeypatch):
+    base_url, serve = matrix_server
+    env_id = _share_a_dev_with_b_session(serve)
+    engine.upsert_environment("b-private", {"base_domain": "b.example.com", "team_name": "t", "key_id": "kb",
+                                            "key_secret": "s"}, owner=OWNER_B)
+    gone = {"base_domain", "team_name", "key_id", "okta_url", "has_okta_token", "sync_schedule", "permission_overrides"}
+    for who in (_who(OWNER_B), _who(OWNER_A), _who(ADMIN, admin=True), {}):
+        rows = requests.get(base_url + "/api/environments", headers=who, timeout=10).json()["environments"]
+        assert rows and all(not (gone & set(r)) for r in rows), rows
+        assert {"id", "name", "shared", "is_own", "addressable"} <= set(rows[0])
+    # The full list keeps today's fields and today's scoping.
+    _hosted(serve, monkeypatch)
+    _unlock(serve, OWNER_A)
+    _unlock(serve, OWNER_B)
+    _unlock(serve, ADMIN)
+    full_a = requests.get(base_url + "/api/settings/environments", headers=_who(OWNER_A), timeout=10).json()["environments"]
+    assert [e["name"] for e in full_a] == ["dev"]
+    assert {"base_domain", "team_name", "key_id", "okta_url", "has_okta_token", "sync_schedule"} <= set(full_a[0])
+    assert full_a[0]["has_okta_token"] is True and "permission_overrides" not in full_a[0]
+    full_b = requests.get(base_url + "/api/settings/environments", headers=_who(OWNER_B), timeout=10).json()["environments"]
+    assert sorted(e["name"] for e in full_b) == ["b-private", "dev"]
+    engine.set_environment_shared("dev", OWNER_A, False)                        # owner B never sees owner A's private row
+    full_b = requests.get(base_url + "/api/settings/environments", headers=_who(OWNER_B), timeout=10).json()["environments"]
+    assert [e["name"] for e in full_b] == ["b-private"]
+    full_admin = requests.get(base_url + "/api/settings/environments", headers=_who(ADMIN, admin=True), timeout=10).json()["environments"]
+    assert env_id in {e["id"] for e in full_admin}
+    assert all("permission_overrides" in e for e in full_admin)
+
+
+def test_the_upgrade_notice_key_sets_are_pinned(matrix_server, monkeypatch):
+    base_url, serve = matrix_server
+    _hosted(serve, monkeypatch)
+    plain = requests.get(base_url + "/api/upgrade/notice", headers=_who(OWNER_B), timeout=10).json()
+    assert set(plain) == {"kind"}
+    admin = requests.get(base_url + "/api/upgrade/notice", headers=_who(ADMIN, admin=True), timeout=10).json()
+    assert set(admin) == {"kind", "update_available", "revocation", "run"}
+    assert admin["update_available"] is None and admin["revocation"] is None
+    for forbidden in ("settings", "keys", "signing_keys", "backups", "history", "schedule"):
+        assert forbidden not in admin and forbidden not in plain
+
+
+def test_the_nested_notice_run_and_revocation_key_sets_are_pinned(matrix_server, monkeypatch, tmp_path):
+    """What the admin notice carries while Updates is locked: progress and the banner's summary, never the backup's name, step
+    details, failure text or the rest of a revocation history entry."""
+    import json as _json
+
+    base_url, serve = matrix_server
+    _hosted(serve, monkeypatch)
+    upgrade_dir = tmp_path / "upgrade"
+    upgrade_dir.mkdir()
+    monkeypatch.setenv("OPA_UPGRADE_DIR", str(upgrade_dir))
+    (upgrade_dir / "state.json").write_text(_json.dumps({
+        "correlation_id": "upg-00000001", "action": "apply", "version_from": "5.52.0", "version_to": "5.53.0", "step": "switching",
+        "result": None, "started_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:01:00Z",
+        "backup": {"name": "audit_store-pre-5.53.0.db", "size": 123, "integrity": "ok", "path": "/x"},
+        "steps_done": [{"step": "validated", "detail": {"note": "internal"}}],
+        "health": [{"id": "unit", "ok": True, "detail": "internal check text"}], "failure": {"detail": "internal text"},
+        "reason_text": "internal reason", "next_step": "internal next", "bundle": {"name": "ocw-support-x.tar.gz"},
+        "manifest": {"migrations": []}, "sha256": "a" * 64, "requested_by": "someone"}))
+    real_status = serve.update_service.status
+    monkeypatch.setattr(serve.update_service, "status", lambda *a, **k: {**real_status(*a, **k), "revocation": {
+        "serial": 2, "issued_at": "2026-01-01T00:00:00Z", "applied_at": "2026-01-02T00:00:00Z", "reason": "r", "advisory_url": None,
+        "revoked": ["AA"], "added": ["BB"], "signed_by": "CC", "source": "release_assets", "keys_blob": ["secret-shaped"], "raw": {"x": 1}}})
+    admin = requests.get(base_url + "/api/upgrade/notice", headers=_who(ADMIN, admin=True), timeout=10).json()
+    assert set(admin["run"]) == set(serve.NOTICE_RUN_FIELDS) | {"backup", "steps_done", "health"}
+    assert admin["run"]["backup"] == {"size": 123, "integrity": "ok"}
+    # progress only: step names and times, check ids and pass or fail; the step's detail stays behind the unlock
+    assert admin["run"]["steps_done"] == [{"step": "validated", "at": None, "seconds": None}]
+    assert admin["run"]["health"] == [{"id": "unit", "ok": True}]
+    assert set(admin["revocation"]) == set(serve.NOTICE_REVOCATION_FIELDS)
+    text = _json.dumps(admin)
+    for leaked in ("audit_store-pre", "internal", "ocw-support", "keys_blob", "someone", "a" * 64):
+        assert leaked not in text
+
+
+def test_a_refused_recheck_does_not_renew_the_unlock(matrix_server, monkeypatch, tmp_audit_log):
+    """The approval is spent either way, but only a change that was applied restarts the Settings unlock."""
+    base_url, serve = matrix_server
+    _share_a_dev_with_b_session(serve)
+    _hosted(serve, monkeypatch)
+    # Environments change: the environment is gone by the time the approval comes back (re-check refuses).
+    aid = _prepare(base_url, "POST", "/api/environments/dev/share", {"shared": False}, OWNER_A)
+    engine.delete_environment("dev", owner=OWNER_A)
+    refused = _save(base_url, OWNER_A, aid)
+    assert refused.status_code >= 400, refused.text
+    assert _unlock_rows() == []
+    assert not any(e["details"].get("settings_unlock_renewed") for e in _audit_entries(tmp_audit_log))
+    # Access control: the write itself fails.
+    me = _who(ADMIN, admin=True)
+    cfg = {"admin_group_id": "00gADMINS", "user_group_id": "00gUSERS", "restrict_login": False}
+    aid = requests.post(base_url + "/api/access_control/prepare", json=cfg, headers=me, timeout=10).json()["action_id"]
+
+    def boom(*a, **k):
+        raise ValueError("write refused")
+
+    monkeypatch.setattr(engine, "set_access_control_config", boom)
+    resp = requests.post(base_url + "/api/access_control/save", json={}, headers={**me, "X-Auth-Action-Id": aid}, timeout=10)
+    assert resp.status_code >= 400
+    assert _unlock_rows() == []
+    assert not any(e["details"].get("settings_unlock_renewed") for e in _audit_entries(tmp_audit_log))
+
+
+def test_every_gated_route_calls_the_unlock_check_after_its_admin_check():
+    """The mutation a review would try: delete _require_settings_unlock from one route. Behaviour is covered above; this pins
+    the source shape, including that the admin check comes first."""
+    nodes = _route_if_nodes()
+    gated = [("GET", "path == '/api/access_control'"), ("GET", "path == '/api/shared_permissions'"),
+             ("GET", "path == '/api/archives/orphaned'"), ("GET", "path == '/api/upgrade/status'"),
+             ("GET", "path == '/api/upgrade/bundle'"), ("POST", "path == '/api/upgrade/preview'"),
+             ("POST", "path == '/api/upgrade/check'"), ("GET", "path == '/api/settings/environments'")]
+    for key in gated:
+        src = ast.unparse(nodes[key])
+        assert "self._require_settings_unlock()" in src, key
+        if key[1] != "path == '/api/settings/environments'":
+            assert src.index("_can_admin(") < src.index("_require_settings_unlock()"), key
+    ungated = [k for k, n in nodes.items() if "_require_settings_unlock" in ast.unparse(n)]
+    assert sorted(ungated) == sorted(gated)
+
+
+def test_the_session_fingerprint_is_a_hash_of_the_opaque_cookie(matrix_server, monkeypatch):
+    _base_url, serve = matrix_server
+    assert serve._session_fingerprint({"Cookie": "x=1"}) == "local"                  # local mode: no gate, no cookie
+    _hosted(serve, monkeypatch)
+    one = serve._session_fingerprint({"Cookie": f"a=1; {SESSION_COOKIE_NAME}=abc.def.ghi; b=2"})
+    assert one and len(one) == 32 and one != "abc.def.ghi" and int(one, 16) >= 0
+    assert one == serve._session_fingerprint({"Cookie": f"{SESSION_COOKIE_NAME}=abc.def.ghi"})
+    assert one != serve._session_fingerprint({"Cookie": f"{SESSION_COOKIE_NAME}=abc.def.ghj"})
+    for missing in ({}, {"Cookie": ""}, {"Cookie": "a=1"}, {"Cookie": f"{SESSION_COOKIE_NAME}="}):
+        assert serve._session_fingerprint(missing) is None
+
+
+def test_the_public_list_carries_an_opaque_scope_that_follows_the_connection_settings(matrix_server):
+    """The list no longer carries the OPA domain, team or Okta URL, so the browser drops cached tenant data after an edit by
+    watching this token: it changes with those settings (not with the key id), and reveals none of them."""
+    base_url, serve = matrix_server
+    env_id = _seed_owner_a_with_session(serve)
+
+    def scope():
+        rows = requests.get(base_url + "/api/environments", headers=_who(OWNER_A), timeout=10).json()["environments"]
+        return next(r for r in rows if r["id"] == env_id)["scope"]
+
+    first = scope()
+    assert len(first) == 16 and scope() == first
+    for secret_value in ("a.example.com", "https://a.example.com"):
+        assert secret_value not in first
+    engine.upsert_environment("dev", {"base_domain": "a.example.com", "team_name": "t", "key_id": "rotated", "key_secret": "s",
+                                      "okta_url": "https://a.example.com"}, owner=OWNER_A, environment_id=env_id)
+    assert scope() == first                                      # a rotated API key keeps the page
+    engine.upsert_environment("dev", {"base_domain": "a.example.com", "team_name": "another-team", "key_id": "rotated", "key_secret": "s",
+                                      "okta_url": "https://a.example.com"}, owner=OWNER_A, environment_id=env_id)
+    assert scope() != first                                      # another tenant drops it

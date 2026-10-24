@@ -268,7 +268,7 @@ def paragraph(ctx):
 def evidence_readiness(now, archive, okta_snapshot_at):
     groups = {}
     for key, meta in audit_store.COMPLIANCE_REPORTS.items():
-        groups.setdefault(meta["control"], []).append(meta["label"])
+        groups.setdefault(audit_store.report_control(key), []).append(meta["label"])
     names = {"CC6": "Access controls", "CC7": "System operations", "CC8": "Change management"}
     rows = [{"group": f"{c} {names.get(c, '')}".strip(), "reports": labels, "built_from": "Archive", "current_through": archive.get("newest")}
             for c, labels in sorted(groups.items())]

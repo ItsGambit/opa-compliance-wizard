@@ -20,7 +20,8 @@
 #
 #   sudo bash get-ocw.sh --dry-run             the whole plan after a real download and verification; nothing is changed
 #   sudo bash get-ocw.sh --version 5.52.0      a specific release (default: the latest stable one)
-#   sudo bash get-ocw.sh --from-dir DIR        no internet: DIR holds ocw-X.Y.Z.tar.gz, .minisig and (optional) revocation.json
+#   sudo bash get-ocw.sh --from-dir DIR        no internet: DIR holds ocw-X.Y.Z.tar.gz, .minisig and (optional) revocation.json,
+#                                              or the offline bundle ocw-X.Y.Z-offline.tar.gz (its packages are used too)
 #   sudo bash get-ocw.sh --uninstall --keep-data   remove the software, keep every data file
 #
 # Options (no option ever takes a secret):
@@ -62,6 +63,7 @@ OCW_MAX_MANIFEST=4194304
 
 LOG_FILE=""
 WORK_DIR=""
+WHEEL_DIR="" # the offline bundle's packages, unpacked outside the root-only work directory (pip runs as another user)
 DRY_RUN=""
 KEEP_WORK=""
 TESTING="${OCW_INSTALL_TEST:-}"
@@ -79,11 +81,14 @@ say_err() {
 refuse() { say_err "refused: $*"; exit 2; }
 fail() { say_err "failed: $*"; exit 3; }
 
-cleanup() { # the work directory goes after every run (done, refused, failed or interrupted) unless --keep-work or --dry-run; the log stays
+cleanup() { # the work directory (and the offline bundle's packages beside it) go after every run (done, refused, failed or interrupted) unless --keep-work or --dry-run; the log stays
   local _rc=$?
   trap - EXIT
   if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ] && [ -z "$KEEP_WORK" ] && [ -z "$DRY_RUN" ]; then
     rm -rf -- "$WORK_DIR"
+  fi
+  if [ -n "$WHEEL_DIR" ] && [ -d "$WHEEL_DIR" ] && [ -z "$KEEP_WORK" ] && [ -z "$DRY_RUN" ]; then
+    rm -rf -- "$WHEEL_DIR"
   fi
   if [ -n "$LOG_FILE" ] && [ "$_rc" -ne 0 ]; then say_err "Log: $LOG_FILE"; fi
   exit "$_rc"
@@ -328,29 +333,71 @@ resolve_and_download() {
   REVOCATION_CHECKED="yes"
   if [ -n "$FROM_DIR" ]; then
     [ -d "$FROM_DIR" ] || refuse "--from-dir $FROM_DIR is not a directory. Nothing was changed."
-    local _found=0 _f
+    local _found=0 _bundles=0 _f _bundle="" _bv _tv=""
     for _f in "$FROM_DIR"/ocw-*.tar.gz; do
       [ -e "$_f" ] || continue
       case "$(basename -- "$_f")" in
+        ocw-[0-9]*.[0-9]*.[0-9]*-offline.tar.gz) _bundles=$((_bundles + 1)); _bundle="$_f"; continue ;;
         ocw-[0-9]*.[0-9]*.[0-9]*.tar.gz) ;;
         *) continue ;;
       esac
-      case "$(basename -- "$_f")" in *-offline.tar.gz) continue ;; esac
       _found=$((_found + 1))
       _src="$_f"
     done
-    [ "$_found" -eq 1 ] || refuse "--from-dir needs exactly one ocw-X.Y.Z.tar.gz in $FROM_DIR (found $_found). Nothing was changed. The offline bundle is not accepted here yet: bring the three release files."
-    _v="$(basename -- "$_src")"
-    _v="${_v#ocw-}"
-    _v="${_v%.tar.gz}"
-    check_version_format "$_v"
-    if [ -n "$VERSION" ] && [ "$VERSION" != "$_v" ]; then refuse "--version $VERSION does not match the file in --from-dir ($_v). Nothing was changed."; fi
-    VERSION="$_v"
-    TAR_FILE="$WORK_DIR/dl/ocw-$VERSION.tar.gz"
-    SIG_FILE="$TAR_FILE.minisig"
-    say "     reading the release files from $FROM_DIR"
-    run_verifier copy "$_src" "$TAR_FILE" --max-bytes "$OCW_MAX_TARBALL" || fail "could not read $_src. Nothing was changed."
-    run_verifier copy "$_src.minisig" "$SIG_FILE" --max-bytes "$OCW_MAX_SIG" || fail "could not read $_src.minisig (the signature file must sit next to the tarball). Nothing was changed."
+    [ "$_bundles" -le 1 ] || refuse "--from-dir holds $_bundles offline bundles (ocw-X.Y.Z-offline.tar.gz); bring exactly one. Nothing was changed."
+    if [ "$_bundles" -eq 1 ]; then
+      # the offline bundle (tools/release.py build-offline): the signed release, its signature and the Python packages.
+      # The release inside is verified like any other; the packages are installed with pip --require-hashes against the
+      # signed requirements.lock. A loose release file next to it must be the same version, and is not used.
+      _bv="$(basename -- "$_bundle")"
+      _bv="${_bv#ocw-}"
+      _bv="${_bv%-offline.tar.gz}"
+      check_version_format "$_bv"
+      if [ "$_found" -ge 1 ]; then
+        [ "$_found" -eq 1 ] || refuse "--from-dir needs exactly one ocw-X.Y.Z.tar.gz in $FROM_DIR (found $_found). Nothing was changed."
+        _tv="$(basename -- "$_src")"
+        _tv="${_tv#ocw-}"
+        _tv="${_tv%.tar.gz}"
+        [ "$_tv" = "$_bv" ] || refuse "--from-dir holds the offline bundle for $_bv and the release file for $_tv; bring one version. Nothing was changed."
+      fi
+      if [ -n "$VERSION" ] && [ "$VERSION" != "$_bv" ]; then refuse "--version $VERSION does not match the offline bundle in --from-dir ($_bv). Nothing was changed."; fi
+      VERSION="$_bv"
+      TAR_FILE="$WORK_DIR/dl/ocw-$VERSION.tar.gz"
+      SIG_FILE="$TAR_FILE.minisig"
+      say "     reading the offline bundle from $FROM_DIR"
+      # unpacking needs about the bundle's own size again in the work area: check before writing anything
+      local _bkb _free
+      _bkb=$(( $(wc -c < "$_bundle") / 1024 + 1 ))
+      _free="$(free_kb "$(dirname -- "$WORK_DIR")")"
+      case "${_free:-0}" in *[!0-9]*) _free=0 ;; esac
+      [ "${_free:-0}" -ge $(( _bkb + 262144 )) ] || refuse "not enough free disk space in $(dirname -- "$WORK_DIR") to unpack the offline bundle ($((_bkb / 1024 + 256)) MB needed, $((${_free:-0} / 1024)) MB free). Nothing was changed. Free some space and run this again."
+      if [ -z "$WHEELHOUSE" ]; then
+        WHEEL_DIR="$(mktemp -d "$(dirname -- "$WORK_DIR")/ocw-wheels.XXXXXXXX")" || fail "could not create a folder for the bundle's packages. Nothing was changed."
+        chmod 0755 "$WHEEL_DIR" # the installer's pip runs as another user and reads the packages from here; the packages are public files
+        WHEELHOUSE="$WHEEL_DIR"
+        run_verifier unbundle "$_bundle" --release-out "$WORK_DIR/dl" --wheels-out "$WHEEL_DIR" 2>"$WORK_DIR/dl/err" \
+          || { refuse "$(head -c 400 "$WORK_DIR/dl/err" 2>/dev/null) Nothing was changed."; }
+      else
+        say "     (--wheelhouse was given: its packages are used, not the bundle's)"
+        mkdir -m 0700 "$WORK_DIR/unused-wheels"
+        run_verifier unbundle "$_bundle" --release-out "$WORK_DIR/dl" --wheels-out "$WORK_DIR/unused-wheels" 2>"$WORK_DIR/dl/err" \
+          || { refuse "$(head -c 400 "$WORK_DIR/dl/err" 2>/dev/null) Nothing was changed."; }
+        rm -rf -- "$WORK_DIR/unused-wheels"
+      fi
+    else
+      [ "$_found" -eq 1 ] || refuse "--from-dir needs exactly one ocw-X.Y.Z.tar.gz (or one ocw-X.Y.Z-offline.tar.gz) in $FROM_DIR (found $_found). Nothing was changed."
+      _v="$(basename -- "$_src")"
+      _v="${_v#ocw-}"
+      _v="${_v%.tar.gz}"
+      check_version_format "$_v"
+      if [ -n "$VERSION" ] && [ "$VERSION" != "$_v" ]; then refuse "--version $VERSION does not match the file in --from-dir ($_v). Nothing was changed."; fi
+      VERSION="$_v"
+      TAR_FILE="$WORK_DIR/dl/ocw-$VERSION.tar.gz"
+      SIG_FILE="$TAR_FILE.minisig"
+      say "     reading the release files from $FROM_DIR"
+      run_verifier copy "$_src" "$TAR_FILE" --max-bytes "$OCW_MAX_TARBALL" || fail "could not read $_src. Nothing was changed."
+      run_verifier copy "$_src.minisig" "$SIG_FILE" --max-bytes "$OCW_MAX_SIG" || fail "could not read $_src.minisig (the signature file must sit next to the tarball). Nothing was changed."
+    fi
     if run_verifier copy "$FROM_DIR/revocation.json" "$WORK_DIR/dl/revocation-dir.json" --max-bytes "$OCW_MAX_JSON" 2>/dev/null; then
       REVOCATION_FILES+=("$WORK_DIR/dl/revocation-dir.json")
     else
@@ -691,7 +738,7 @@ main() {
 
   setup_sources
   # a work directory only root can enter; a stale one from a dry run is removed after a day
-  find "$_work_base" -maxdepth 1 -type d -name 'ocw-install.*' -user "$(id -un)" -mtime +0 -exec rm -rf {} + 2>/dev/null || true
+  find "$_work_base" -maxdepth 1 -type d \( -name 'ocw-install.*' -o -name 'ocw-wheels.*' \) -user "$(id -un)" -mtime +0 -exec rm -rf {} + 2>/dev/null || true
   WORK_DIR="$(mktemp -d "$_work_base/ocw-install.XXXXXXXX")" || fail "could not create a work directory in $_work_base. Nothing was changed."
   chmod 0700 "$WORK_DIR"
   mkdir -m 0700 "$WORK_DIR/verifier"

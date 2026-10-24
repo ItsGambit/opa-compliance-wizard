@@ -86,7 +86,7 @@ python tools/release.py pubkey --azure https://<vault>/keys/<name>/<version> --o
 ```
 Each prints the key-list entry (`key_id`, `alg`, `public_key`, `role`, `status`, `since`); put both into the `"keys"` of
 `server/release_keys.json` and commit. A KMS key's id is derived from the key itself (first 8 bytes of SHA-256 of the raw public key,
-shown the way minisign shows ids), so it is the same on every computer. Record the two key ids and fingerprints in `SECURITY.md`.
+shown the way minisign shows ids), so it is the same on every computer. The two key ids and fingerprints are recorded in `SECURITY.md`; update that table in the same commit whenever the key list changes.
 
 **Standby drill** (before the first release, and whenever `tools/revoke.py` or the verifier changes): sign a test revocation
 against a scratch install (a clone with a copy of the key list and a throwaway release), confirm that install now refuses a
@@ -109,7 +109,7 @@ python tools/release.py sign release-out/ocw-5.47.0.tar.gz --signer kms --kms-ke
 
 `build` exports the tag (never your working tree), builds the frontend from it (`npm ci --ignore-scripts`, `vite build`), writes
 `manifest.json` (version, commit, build time, `min_upgrade_from`, per-file sha256, changelog excerpt, downtime estimate) and a
-reproducible `.tar.gz`. `sign` makes the two KMS calls, writes `ocw-5.47.0.tar.gz.minisig` (trusted comment capped at 4000 bytes),
+reproducible `.tar.gz`. `sign` makes the four KMS calls (two for the tarball, two for `get-ocw.sh`), writes `ocw-5.47.0.tar.gz.minisig` and `get-ocw.sh.minisig` (trusted comment capped at 4000 bytes),
 and then **verifies its own output** with the app's verifier against `server/release_keys.json` and, with `--require-minisign`, with
 `minisign -V -H`; it deletes the signature and stops if either refuses. Check that the alert mailbox received exactly four Sign
 notifications before you publish. Then:
@@ -124,6 +124,10 @@ notifications before you publish. Then:
    `python tools/release.py verify ocw-5.47.0.tar.gz ocw-5.47.0.tar.gz.minisig --bootstrap get-ocw.sh --bootstrap-sig get-ocw.sh.minisig`, and
    `minisign -Vm get-ocw.sh -P <the release key's minisign line> -H` (see the README). The first re-renders `get-ocw.sh` from the
    tarball's own template, verifier and key list and compares it byte for byte, so a script that is not what the release produces is caught.
+3a. **Publish the evidence package verifier's sha256** (5.53.0). `release.py build` writes it into `manifest.json` (field
+   `verifier_sha256`, signed with the release) and into the manifest's changelog excerpt, and prints a ready-to-paste line. The
+   GitHub release notes are written by hand, so paste that line into them, and put the same value on the project's signing-key page
+   (the page the README and SECURITY.md name). Auditors compare a package's verifier with it.
 4. Never reuse a version number. A bad release is superseded by the next patch (and its notes say so).
 5. **`get-ocw.sh`, the one-line installer (5.52.0).** `release.py build` renders it next to the tarball, from the **tagged**
    `server/get-ocw.sh.in`, `server/updater/root/ocw_crypto.py`, `ocw_trust.py`, `ocw_bootstrap_verify.py` and `server/release_keys.json`
@@ -143,7 +147,7 @@ notifications before you publish. Then:
    # narrow it while testing:  --python 3.12 --platform linux-x86_64
    ```
    It checks the signature first (so sign before building it), then runs `pip download --no-deps --only-binary=:all: --require-hashes` once per Python
-   (3.9 to 3.14) and platform (linux x86-64/aarch64, macOS arm64/x86-64, Windows amd64) with the packages that `requirements.lock`'s environment markers
+   (3.9 to 3.14) and platform (linux x86-64/aarch64, macOS arm64, Windows amd64; `macos-x86_64` is left out by default because the pinned `cryptography` has no wheel for it, and `--platform macos-x86_64` still tries) with the packages that `requirements.lock`'s environment markers
    select for that target, **requires every downloaded wheel to match a hash recorded in the signed lock** (anything else stops the build), and packs the
    release, its signature, `offline.json` and the wheels. This is the only step that needs the internet (PyPI); a platform with no wheel for a locked package
    fails the build and names the package. Needs `packaging` (`pip install packaging`) on the releasing computer. Test it: unpack on a machine
@@ -165,7 +169,7 @@ release). The unit tests prove the plumbing with a fake KMS client and, where `m
 they cannot prove what the real service returns.
 
 `--min-upgrade-from` (default 5.41.0) refuses starting points the release was not tested from; `--downtime-seconds` sets the estimate.
-Migrations are listed as `[]` for now (`rollback_safe` flags arrive with the updater in a later phase).
+The manifest lists the release's real migrations, each with `since` and `rollback_safe`, read from `server/schema_migrations.json` (see "What the updater needs from a release" below).
 
 ### Changing dependencies
 
@@ -237,7 +241,7 @@ of use once the new one has shipped. Rotating the **standby** is done by a revoc
    - a GitHub release named for the serial, `revocation-<serial>` (for example `revocation-1`, marked pre-release): installs look for
      `revocation-<their applied serial + 1>` as well as the fixed `revocation` tag, because once immutable releases are on, a published
      tag can never be changed, so a fixed `revocation` tag can carry one file for ever. Use the fixed tag only for the first revocation
-     if you left it mutable (step 2 of "Publishing"), and a new `revocation-<serial>` tag for every later one;
+     if you left it mutable (step 2 of "Releasing a version"), and a new `revocation-<serial>` tag for every later one;
    - the **owner-controlled static URL** that operators set as `OPA_REVOCATION_URL` (a file you can replace at any time). **Before
      go-live** the maintainer must own this URL, serve it over https from a host that is not the repository's, and tell operators to set
      `OPA_REVOCATION_URL` (in `<install dir>/.deploy.conf` or the environment of the update check, and in `/etc/ocw-updater.env` for the

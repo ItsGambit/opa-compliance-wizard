@@ -290,6 +290,7 @@ describe('08a progress', () => {
   })
 
   it('inside the 24 h rollback window the success cards stay on top, with Check now below them', async () => {
+    vi.mocked(fetchVersion).mockResolvedValue({ version: '5.48.0' })
     vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({ installed_version: '5.48.0', upgrade: makeUpgrade({ run: makeRun(), rollback: { available: true, until: '2099-01-01T00:00:00Z', to: '5.46.0' } }) }))
     renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
     const done = (await screen.findAllByText(/Upgraded to 5.48.0/))[0]
@@ -298,6 +299,7 @@ describe('08a progress', () => {
   })
 
   it('inside the rollback window a newer release is offered, and says that upgrading ends the rollback', async () => {
+    vi.mocked(fetchVersion).mockResolvedValue({ version: '5.48.0' })
     vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({ ...NEWER, latest: { ...NEWER.latest, version: '5.49.0' }, installed_version: '5.48.0',
       upgrade: makeUpgrade({ run: makeRun(), preview: makePreview({ version: '5.49.0' }), rollback: { available: true, until: '2099-01-01T00:00:00Z', to: '5.46.0' } }) }))
     renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
@@ -311,9 +313,9 @@ describe('08a progress', () => {
     const reload = vi.fn()
     Object.defineProperty(window, 'location', { configurable: true, value: { ...window.location, reload } })
     vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({ ...NEWER, installed_version: '5.48.0', update_available: false, upgrade: makeUpgrade({ run: makeRun(), rollback: { available: true, until: '2099-01-01T00:00:00Z', to: '5.46.0' } }) }))
-    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} reloadAfterSeconds={0} />)
     await waitFor(() => expect(reload).toHaveBeenCalledTimes(1))
-    renderWithClient(<UpdatesPage onOpenKeys={() => {}} />)
+    renderWithClient(<UpdatesPage onOpenKeys={() => {}} reloadAfterSeconds={0} />)
     await screen.findAllByText(/Upgraded to 5.48.0/)
     expect(reload).toHaveBeenCalledTimes(1)
   })

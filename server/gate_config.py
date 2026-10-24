@@ -24,6 +24,9 @@ Okta org on the same server, alongside the existing one:
 import re
 from pathlib import Path
 
+# The name of the login-session cookie. Shared with serve.py (5.53.0), which hashes the opaque value to tell one login
+# session from another for the Settings unlock; it never parses or trusts the content.
+SESSION_COOKIE = "opa_wizard_session"
 DEFAULT_SESSION_KEY_PATH = "/etc/opa-secrets-wizard-session.key"
 _AUTH_SERVER_ID = re.compile(r"[A-Za-z0-9]{1,64}")
 

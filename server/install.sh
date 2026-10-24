@@ -85,9 +85,12 @@ umask 022
 # The release whose install.sh an EXISTING install needs (tools/release.py reads this line into the manifest's
 # install_sh_min_version; the updater asks for `install.sh --refresh-updater` only while the version it last recorded is older).
 # 5.50.0: the second-gate deny rules and --regenerate-second-sites, the newest change to what an existing install runs.
-# 5.52.0 added the fresh-install path, --uninstall and --log, which existing installs do not need. Bump it when an existing
+# 5.52.0 added the fresh-install path, --uninstall and --log, which existing installs do not need.
+# 5.53.0: the root updater no longer restarts or health-checks a login gate that is installed but disabled and not running;
+# an updater older than that fails the upgrade and its rollback on a server whose gate is not set up yet, and an old updater
+# cannot be fixed by the upgrade it runs, so every existing install must run --refresh-updater first. Bump it when an existing
 # install needs the new install.sh (docs/releasing.md).
-OCW_INSTALL_SH_REQUIRED_SINCE="5.50.0"
+OCW_INSTALL_SH_REQUIRED_SINCE="5.53.0"
 : "$OCW_INSTALL_SH_REQUIRED_SINCE"
 
 OPT_DIR="${OCW_OPT_DIR:-/opt/opa-compliance-wizard}"
@@ -102,6 +105,7 @@ NGINX_ENABLED_DIR="${OCW_NGINX_ENABLED_DIR:-/etc/nginx/sites-enabled}"
 NGINX_SSL_DIR="${OCW_NGINX_SSL_DIR:-/etc/nginx/ssl}"
 SESSION_KEY_FILE="${OCW_SESSION_KEY_FILE:-/etc/opa-secrets-wizard-session.key}"
 UPDATER_ENV="${OCW_UPDATER_ENV:-/etc/ocw-updater.env}"
+UPDATER_CACHE_DIR="${OCW_UPDATER_CACHE_DIR:-/var/cache/ocw-updater}"   # the staging unit's CacheDirectory= (pip's cache), owned by the staging account
 UPDATER_USER="ocw-updater"
 TESTING="${OCW_INSTALL_TEST:-}"
 
@@ -254,10 +258,19 @@ safe_remove_tree() { # safe_remove_tree <dir>
   if [ -L "$_d" ]; then rm -f -- "$_d"; elif [ -e "$_d" ]; then rm -rf -- "$_d"; fi
 }
 
+updater_cache_is_ours() { # the staging unit's pip cache: a real directory named ocw-updater, owned by the staging account (or root), at a path safe to remove
+  local _d="$UPDATER_CACHE_DIR"
+  [ -d "$_d" ] && [ ! -L "$_d" ] || return 1
+  [ "$(basename -- "$_d")" = "ocw-updater" ] || return 1
+  ( check_removable "$_d" ) >/dev/null 2>&1 || return 1
+  [ -n "$TESTING" ] && return 0
+  [ -n "$(find "$_d" -maxdepth 0 \( -user "$UPDATER_USER" -o -user root \) 2>/dev/null)" ]
+}
+
 uninstall_keep_data() {
   [ -n "$KEEP_DATA" ] || die "--uninstall needs --keep-data: this release removes the software only; removing the data is a manual step (docs/hosting.md, Uninstalling)"
   local _plain_units="ocw-upgrade.path ocw-upgrade.service ocw-upgrade-due.timer ocw-upgrade-due.service ocw-stage@.service"
-  local _ours="" _u _f _wd _gates _site _enabled _kept_site="" _upd_home _app_acct _removed_link=""
+  local _ours="" _u _f _wd _gates _site _enabled _kept_site="" _upd_home _app_acct _removed_link="" _cache_ours=""
   for _u in opa-compliance-wizard opa-secrets-wizard opa-auth-gate; do
     _f="$UNIT_DIR/$_u.service"
     [ -f "$_f" ] || continue
@@ -290,6 +303,8 @@ uninstall_keep_data() {
   fi
   check_removable "$_upd_home"
   plan "$_upd_home (the downloads of the staging account) and the account $UPDATER_USER"
+  _cache_ours=""
+  if updater_cache_is_ours; then _cache_ours=1; plan "$UPDATER_CACHE_DIR (the staging account's pip cache)"; fi
   if [ -n "$_gates" ]; then
     plan "NOT the nginx site $_site: additional login gates ($_gates) reuse its rate-limit zone; remove them first (setup-second-gate.sh)"
     _kept_site=1
@@ -344,6 +359,7 @@ uninstall_keep_data() {
   note "==> Removing the installed software"
   safe_remove_tree "$OPT_DIR"
   safe_remove_tree "$_upd_home"
+  if [ -n "$_cache_ours" ]; then safe_remove_tree "$UPDATER_CACHE_DIR"; fi   # decided before the account was removed: its owner is then no longer a name
   if id "$UPDATER_USER" >/dev/null 2>&1 && command -v userdel >/dev/null 2>&1; then
     userdel "$UPDATER_USER" >/dev/null 2>&1 || note "NOTE: could not remove the account $UPDATER_USER; remove it with 'userdel $UPDATER_USER'"
   fi
@@ -720,7 +736,9 @@ own() { # own <owner:group> <mode> <path>
   if [ -z "$TESTING" ] || command -v chown >/dev/null 2>&1; then chown "$1" "$3" 2>/dev/null || { [ -n "$TESTING" ] || die "chown $1 $3 failed"; }; fi
   chmod "$2" "$3"
 }
-mkd() { mkdir -p "$3"; own "$1" "$2" "$3"; }
+# -m applies to the leaf only (SC2174), which is intended: the leaf is born with its final mode, so there is no window with the default one
+# shellcheck disable=SC2174
+mkd() { mkdir -p -m "$2" "$3"; own "$1" "$2" "$3"; }
 render() { # render <template> <output>: fill in the __NAME__ words
   sed -e "s|__OPT_DIR__|$OPT_DIR|g" -e "s|__DATA_DIR__|$DATA_DIR|g" -e "s|__APP_USER__|$APP_USER|g" -e "s|__PYTHON3__|$PY3|g" -e "s|__ARTIFACTS_DIR__|$ARTIFACTS_DIR|g" -e "s|__ENV_FILE__|$ENV_FILE|g" \
       -e "s|__APP_DIR__|$OPT_DIR/current|g" -e "s|__APP_UID__|${APP_UID:-0}|g" -e "s|__APP_USER_HOME__|${APP_HOME:-}|g" \
@@ -752,7 +770,8 @@ fresh_prerequisites() { # what a fresh install needs from the system, checked be
 fresh_account() { # the application account, its lingering user manager, and the facts the units need
   if [ -n "$APP_WILL_CREATE" ]; then
     note "    creating the account $APP_USER (home $DATA_DIR/home, shell nologin)"
-    mkdir -p "$DATA_DIR"
+    # shellcheck disable=SC2174  # the leaf only is intended, as in mkd
+    mkdir -p -m 0750 "$DATA_DIR"
     local _grp=(--user-group)
     if getent group "$APP_USER" >/dev/null 2>&1; then _grp=(--gid "$APP_USER"); fi
     useradd "${_grp[@]}" --create-home --home-dir "$DATA_DIR/home" --shell /usr/sbin/nologin "$APP_USER" || die "could not create the account $APP_USER"

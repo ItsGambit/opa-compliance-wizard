@@ -56,6 +56,16 @@
       "since": "5.51.0",
       "rollback_safe": true,
       "description": "Adds the stored OPA scan (a replaceable copy of the Access Explorer data)"
+    },
+    "12": {
+      "since": "5.53.0",
+      "rollback_safe": true,
+      "description": "Adds the record of who unlocked Settings and Updates with MFA, and until when"
+    },
+    "13": {
+      "since": "5.53.0",
+      "rollback_safe": true,
+      "description": "Adds the record of each sync, import and retention prune, so evidence coverage rests on records"
     }
   }
 }

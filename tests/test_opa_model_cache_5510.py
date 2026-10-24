@@ -206,9 +206,13 @@ def test_environments_never_share_a_scan(db):
 
 
 def test_a_scan_built_by_another_model_shape_is_treated_as_absent(db):
-    audit_store.store_opa_model_cache(ENV, _model(), source_version="5.53.0")
+    # Derived from the running version so the test keeps working across releases: another minor version is another
+    # model shape; a different patch of the same minor shares it.
+    import create_secret_folders as engine
+    major, minor, _patch = (int(p) for p in engine.SCRIPT_VERSION.split("."))
+    audit_store.store_opa_model_cache(ENV, _model(), source_version=f"{major}.{minor + 1}.0")
     assert audit_store.load_opa_model_cache(ENV) is None and audit_store.opa_model_cache_info(ENV) is None
-    audit_store.store_opa_model_cache(ENV, _model(), source_version="5.52.7")  # a patch release shares the shape
+    audit_store.store_opa_model_cache(ENV, _model(), source_version=f"{major}.{minor}.97")  # a patch release shares the shape
     assert audit_store.load_opa_model_cache(ENV) is not None
 
 
@@ -318,7 +322,7 @@ def test_migration_eleven_upgrades_a_5_50_database_without_touching_its_data(tmp
     audit_store.record_config_snapshot(ENV, "okta_admins", [("u", {"a": 1})])
     monkeypatch.setattr(audit_store, "MIGRATIONS", full)
     audit_store.run_migrations()
-    assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 11
+    assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == max(full)
     assert conn.execute("SELECT name FROM sqlite_master WHERE name = 'opa_model_cache'").fetchone() is not None
     assert len(audit_store.list_config_snapshots(ENV)) == 1 and audit_store.verify_ingestion_chain(ENV, deep=True)["valid"]
     audit_store.run_migrations()  # idempotent

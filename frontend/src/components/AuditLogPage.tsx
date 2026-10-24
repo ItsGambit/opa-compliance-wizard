@@ -4,6 +4,8 @@ import { Download, RefreshCw, Search } from 'lucide-react'
 import { backfillMfaLogEvents, fetchAuditLog, upgradeBundleUrl } from '../api/client'
 import { toast } from '../hooks/useToast'
 import { AuditLogShiftedError, fetchAuditPage, nextAuditPageParam, type AuditPageParam } from '../utils/auditPaging'
+import { auditActionLabel } from '../utils/auditLabels'
+import { isUpgradeAction, upgradeTone } from '../utils/auditUpgrade'
 import { cellValue, formatDateTime, labelize } from '../utils/format'
 import { formatBytes } from '../utils/upgrade'
 import { takeAuditSearch } from '../utils/upgradeRequested'
@@ -205,11 +207,11 @@ export function AuditLogPage() {
             const systemLabel = entry.details?.trigger === 'ocw-updater' ? 'ocw-updater (server)'
               : ['upgrade.check', 'upgrade.missed', 'upgrade.started_by_schedule', 'upgrade.failed'].includes(entry.action) ? 'scheduler (server)'
                 : 'update check (server)'
-            const isDeployEvent = entry.action.startsWith('deploy.') || isSystemUpgradeEvent
-            const isDeployFailure = entry.action === 'deploy.failed' || entry.action === 'upgrade.verify_failed'
-              || entry.action === 'upgrade.failed' || entry.action === 'upgrade.missed'
-              || entry.action === 'upgrade.key_revocation_rejected'
-              || (entry.action === 'upgrade.check' && entry.details?.outcome === 'failed')
+            // 5.53.0: every upgrade.* entry gets the upgrade styling, whether or not an admin is behind it (a manual "Check now" or a
+            // settings change carries an actor; before this only the actor-less ones were blue). The failure set lives in utils/auditUpgrade.
+            const isDeployEvent = entry.action.startsWith('deploy.') || isUpgradeAction(entry.action)
+            const isDeployFailure = entry.action === 'deploy.failed' || (isUpgradeAction(entry.action) && upgradeTone(entry.action, entry.details) === 'failure')
+            const actionLabel = auditActionLabel(entry.action, entry.details)
             const deployBorderColor = isDeployFailure ? 'border-l-loss' : 'border-l-accent'
             const deployTextColor = isDeployFailure ? 'text-loss' : 'text-accent-text'
             return (
@@ -223,12 +225,13 @@ export function AuditLogPage() {
                 <div className="flex items-center justify-between gap-2 mb-1.5">
                   <span className={`font-medium ${isDeployEvent ? deployTextColor : 'text-text'}`}>
                     <HighlightedText text={entry.action} indices={actionMatch?.indices} />
+                    {actionLabel && <span className="font-normal text-text-faint"> · {actionLabel}</span>}
                   </span>
                   <span className="text-text-faint whitespace-nowrap">{formatDateTime(entry.timestamp)}</span>
                 </div>
                 <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[0.6875rem]">
                   <span className="section-label">Actor</span>
-                  <span className="text-text-dim">{isDeployEvent ? (isSystemUpgradeEvent ? systemLabel : 'deploy.sh (server)') : actor ?? 'local / CLI'}</span>
+                  <span className="text-text-dim">{isSystemUpgradeEvent ? systemLabel : entry.action.startsWith('deploy.') ? 'deploy.sh (server)' : actor ?? 'local / CLI'}</span>
                   {/* A server-side update event has no browser behind it: leave out the empty IP / agent rows. */}
                   {!(isSystemUpgradeEvent && !entry.client_ip && !entry.user_agent) && (
                     <>

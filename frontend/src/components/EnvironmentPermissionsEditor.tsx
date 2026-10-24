@@ -9,6 +9,7 @@ import { beginStepUp } from '../utils/stepUp'
 import { ErrorNotice } from './ErrorNotice'
 import { PermissionSettingsList } from './PermissionSettingsList'
 import { UserPermissionExceptions } from './UserPermissionExceptions'
+import { useRegisterSettingsDraft } from './settingsDraft'
 
 /** 5.42.0, admin-only: one environment's overrides of the global
  * shared-environment defaults (inherit / allow / deny per capability), with
@@ -41,6 +42,7 @@ export function EnvironmentPermissionsEditor({ env, draft, draftUser }: {
   }, [data])
 
   const changes = data ? changedSettings(stored(), settings) : {}
+  useRegisterSettingsDraft('environment_permissions', () => (Object.keys(changes).length > 0 ? { permissionsDraft: { environmentId: env.id, settings } } : null))
   const save = useMutation({
     mutationFn: () => saveSharedPermissions(changes, env.id),
     onSuccess: (resp) => {

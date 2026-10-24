@@ -675,6 +675,204 @@ def test_from_dir_needs_exactly_one_release_file_and_its_signature(bw):
     refused(bw, "--from-dir", str(d / "missing"), "--yes", "--server-name", "a.example.com", "--self-signed", fragment="is not a directory")
 
 
+# --- --from-dir with the offline bundle (tools/release.py build-offline) -------------------------------------------------------------------
+
+STUB_INSTALL_WHEELS = STUB_INSTALL.replace(
+    'echo "PWD-SCRIPT $0" >> "$STUB/install.where"\n',
+    'echo "PWD-SCRIPT $0" >> "$STUB/install.where"\n'
+    'prev=""; for a in "$@"; do if [ "$prev" = "--wheelhouse" ]; then ls "$a" > "$STUB/wheelhouse.list"; echo "$a" > "$STUB/wheelhouse.path"; '
+    'stat -c %a "$a" > "$STUB/wheelhouse.mode" 2>/dev/null || stat -f %Lp "$a" > "$STUB/wheelhouse.mode"; fi; prev="$a"; done\n')
+BUNDLE_LOCK = "# test lock\nexamplepkg==1.0.0 \\\n    --hash=sha256:%s\n" % hashlib.sha256(b"wheel:examplepkg==1.0.0").hexdigest()
+
+
+def stub_pip(argv):
+    dest = Path(argv[argv.index("-d") + 1])
+    (dest / "examplepkg-1.0.0-py3-none-any.whl").write_bytes(b"wheel:examplepkg==1.0.0")
+
+
+def real_bundle(bw, out, version="5.52.0"):
+    """A bundle built by the real tools/release.py build_offline from a release signed with the test key."""
+    import release as release_tool
+    tar, _sig = bw.publish(version, stub_install=True, extra_files={"requirements.lock": BUNDLE_LOCK, "server/install.sh": STUB_INSTALL_WHEELS})
+    keys = bw.w / "keys-for-bundle.json"
+    keys.write_bytes(bw.keys_bytes)
+    out.mkdir(parents=True, exist_ok=True)
+    bundle, _info, _digest = release_tool.build_offline(tar, out, pythons=("3.12",), platforms=("linux-x86_64",), keys_path=keys, runner=stub_pip)
+    shutil.copy(tar, out)                                                                  # build-offline's default folder holds the loose release too
+    shutil.copy(str(tar) + ".minisig", out)
+    return bundle, tar
+
+
+def hand_bundle(path, members):
+    import gzip
+    import io
+    import tarfile
+    with open(path, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0, filename="") as gz, tarfile.open(fileobj=gz, mode="w") as tar:
+        for name, data in members:
+            ti = tarfile.TarInfo(name)
+            if isinstance(data, tarfile.TarInfo):
+                tar.addfile(data)
+                continue
+            ti.size = len(data)
+            tar.addfile(ti, io.BytesIO(data))
+    return path
+
+
+def test_from_dir_accepts_the_offline_bundle_and_uses_its_packages(bw):
+    d = bw.w / "usb"
+    bundle, _tar = real_bundle(bw, d)
+    assert sorted(p.name for p in d.iterdir()) == ["ocw-5.52.0-offline.tar.gz", "ocw-5.52.0-offline.tar.gz.sha256", "ocw-5.52.0.tar.gz", "ocw-5.52.0.tar.gz.minisig"]
+    # the maintainer's output folder holds the loose release as well as the bundle: the same version is accepted
+    bw.server.requests.clear()
+    p = bw.run("--from-dir", str(d), "--yes", "--yes-no-revocation-check", "--server-name", "a.example.com", "--self-signed")
+    assert p.returncode == 0, p.stderr + p.stdout
+    assert not bw.server.requests and "reading the offline bundle" in p.stdout and "release 5.52.0: signature valid" in p.stdout
+    assert (bw.stub / "wheelhouse.list").read_text().split() == ["examplepkg-1.0.0-py3-none-any.whl"]
+    assert (bw.stub / "wheelhouse.mode").read_text().strip() == "755"
+    assert not Path((bw.stub / "wheelhouse.path").read_text().strip()).exists()          # removed with the work directory
+    assert not bw.work_dirs()
+
+
+def test_from_dir_with_only_the_bundle_and_a_revocation_file(bw):
+    d = bw.w / "usb"
+    bundle, tar = real_bundle(bw, d / "all")
+    d2 = bw.w / "bundle-only"
+    d2.mkdir()
+    shutil.copy(bundle, d2)
+    shutil.copy(bw.revocation(1, add=TestKey()), d2 / "revocation.json")
+    p = bw.run("--from-dir", str(d2), "--yes", "--server-name", "a.example.com", "--self-signed")
+    assert p.returncode == 2 and "is revoked" in p.stderr                                  # the release inside gets the same checks
+    (d2 / "revocation.json").unlink()
+    p = bw.run("--from-dir", str(d2), "--yes", "--yes-no-revocation-check", "--server-name", "a.example.com", "--self-signed")
+    assert p.returncode == 0, p.stderr + p.stdout
+    assert "no revocation.json was brought" in p.stdout
+
+
+def test_an_explicit_wheelhouse_wins_over_the_bundles_packages(bw):
+    d = bw.w / "usb"
+    bundle, _tar = real_bundle(bw, d)
+    (bw.w / "wheels" / "mine-1.0.0-py3-none-any.whl").write_bytes(b"x")
+    p = bw.run("--from-dir", str(d), "--wheelhouse", str(bw.w / "wheels"), "--yes", "--yes-no-revocation-check", "--server-name", "a.example.com", "--self-signed")
+    assert p.returncode == 0, p.stderr + p.stdout
+    assert (bw.stub / "wheelhouse.list").read_text().split() == ["mine-1.0.0-py3-none-any.whl"]
+
+
+def test_the_bundle_cases_that_are_refused(bw):
+    d = bw.w / "usb"
+    bundle, tar = real_bundle(bw, d)
+    args = ("--yes", "--yes-no-revocation-check", "--server-name", "a.example.com", "--self-signed")
+    # two loose releases next to the bundle, and a loose release of another version
+    shutil.copy(tar, d / "ocw-5.51.0.tar.gz")
+    refused(bw, "--from-dir", str(d), *args, fragment="found 2")
+    (d / "ocw-5.52.0.tar.gz").unlink()
+    refused(bw, "--from-dir", str(d), *args, fragment="bring one version")
+    (d / "ocw-5.51.0.tar.gz").unlink()
+    shutil.copy(tar, d / "ocw-5.52.0.tar.gz")
+    # two bundles
+    shutil.copy(bundle, d / "ocw-5.51.0-offline.tar.gz")
+    refused(bw, "--from-dir", str(d), *args, fragment="holds 2 offline bundles")
+    (d / "ocw-5.51.0-offline.tar.gz").unlink()
+    # --version must agree
+    refused(bw, "--from-dir", str(d), "--version", "5.51.0", *args, fragment="does not match the offline bundle")
+
+
+@pytest.mark.parametrize("name,members,fragment", [
+    ("path-escape", lambda tar, sig: [("ocw-5.52.0.tar.gz", tar), ("ocw-5.52.0.tar.gz.minisig", sig), ("../evil", b"x")], "unexpected file"),
+    ("nested-wheel-path", lambda tar, sig: [("ocw-5.52.0.tar.gz", tar), ("ocw-5.52.0.tar.gz.minisig", sig), ("wheels/a/b.whl", b"x")], "unexpected file"),
+    ("not-a-wheel", lambda tar, sig: [("ocw-5.52.0.tar.gz", tar), ("ocw-5.52.0.tar.gz.minisig", sig), ("wheels/run.sh", b"x")], "unexpected file"),
+    ("no-signature", lambda tar, sig: [("ocw-5.52.0.tar.gz", tar)], "does not contain ocw-5.52.0.tar.gz.minisig"),
+    ("duplicate", lambda tar, sig: [("ocw-5.52.0.tar.gz", tar), ("ocw-5.52.0.tar.gz", tar), ("ocw-5.52.0.tar.gz.minisig", sig)], "appears twice"),
+])
+def test_a_malformed_bundle_is_refused_before_anything_is_installed(bw, name, members, fragment):
+    tar, sig = bw.publish()
+    d = bw.w / "usb"
+    d.mkdir()
+    hand_bundle(d / "ocw-5.52.0-offline.tar.gz", members(Path(tar).read_bytes(), Path(sig).read_bytes()))
+    p = bw.run("--from-dir", str(d), "--yes", "--yes-no-revocation-check", "--server-name", "a.example.com", "--self-signed")
+    assert p.returncode == 2 and fragment in p.stderr, p.stderr
+    assert not (bw.stub / "install.args").exists() and not bw.opt.exists()
+    assert not [x for x in (bw.w / "work").iterdir()] and not bw.server.requests
+
+
+def test_a_bundle_with_a_link_in_it_is_refused(bw):
+    import tarfile
+    tar, sig = bw.publish()
+    d = bw.w / "usb"
+    d.mkdir()
+    link = tarfile.TarInfo("wheels/evil-1.0.0-py3-none-any.whl")
+    link.type, link.linkname = tarfile.SYMTYPE, "/etc/passwd"
+    hand_bundle(d / "ocw-5.52.0-offline.tar.gz", [("ocw-5.52.0.tar.gz", Path(tar).read_bytes()), ("ocw-5.52.0.tar.gz.minisig", Path(sig).read_bytes()), ("x", link)])
+    p = bw.run("--from-dir", str(d), "--yes", "--yes-no-revocation-check", "--server-name", "a.example.com", "--self-signed")
+    assert p.returncode == 2 and "link or special file" in p.stderr and not (bw.stub / "install.args").exists()
+
+
+def test_a_tampered_release_inside_the_bundle_is_still_refused(bw):
+    tar, sig = bw.publish()
+    d = bw.w / "usb"
+    d.mkdir()
+    body = bytearray(Path(tar).read_bytes())
+    body[len(body) // 2] ^= 0xFF
+    hand_bundle(d / "ocw-5.52.0-offline.tar.gz", [("ocw-5.52.0.tar.gz", bytes(body)), ("ocw-5.52.0.tar.gz.minisig", Path(sig).read_bytes())])
+    p = bw.run("--from-dir", str(d), "--yes", "--yes-no-revocation-check", "--server-name", "a.example.com", "--self-signed")
+    assert p.returncode != 0 and not (bw.stub / "install.args").exists() and not bw.opt.exists()
+
+
+def test_the_dot_slash_entry_is_refused_with_a_plain_reason(bw):
+    tar, sig = bw.publish()
+    d = bw.w / "usb"
+    d.mkdir()
+    hand_bundle(d / "ocw-5.52.0-offline.tar.gz", [("./ocw-5.52.0.tar.gz", Path(tar).read_bytes()), ("./ocw-5.52.0.tar.gz.minisig", Path(sig).read_bytes())])
+    p = bw.run("--from-dir", str(d), "--yes", "--yes-no-revocation-check", "--server-name", "a.example.com", "--self-signed")
+    assert p.returncode == 2 and "the bundle has a ./ entry; rebuild it with the project's release tool" in p.stderr, p.stderr
+
+
+def test_the_bundle_ceilings_are_realistic_for_the_real_lock():
+    """No network here, so this is an estimate, not a measurement of a real build-offline output: count the wheels the project's own
+    requirements.lock can need across every default target and price them generously: 1 MB for a pure or cffi wheel, 10 MB for a cryptography wheel (a few MB in practice) and 50 MB for the release itself."""
+    import release as release_tool
+    sys.path.insert(0, str(REPO))
+    from server.updater.root import ocw_bootstrap_verify as v
+    entries = release_tool.parse_lock((REPO / "requirements.lock").read_text(encoding="utf-8"))
+    pure, binary = set(), set()
+    for py in release_tool.OFFLINE_PYTHONS:
+        for plat in release_tool.OFFLINE_DEFAULT_PLATFORMS:
+            for e in release_tool.entries_for(entries, py, plat):
+                if e["name"] in ("cryptography", "cffi"):
+                    binary.add((e["name"], e["version"], py if e["name"] == "cffi" else "", plat))   # cffi: per Python and platform; cryptography: abi3, per platform
+                else:
+                    pure.add((e["name"], e["version"]))                 # a pure-Python wheel is one file for every target
+    worst = (len(pure) + sum(1 for b in binary if b[0] == "cffi")) * 1024 * 1024 + sum(1 for b in binary if b[0] == "cryptography") * 10 * 1024 * 1024 + 50 * 1024 * 1024
+    assert len(pure) + len(binary) < v.MAX_WHEELS
+    assert worst * 2 < v.MAX_BUNDLE_TOTAL_BYTES <= 1024 ** 3 and v.MAX_BUNDLE_BYTES <= 1024 ** 3   # at least twice the worst case in room
+    assert v.MAX_WHEEL_BYTES <= 64 * 1024 * 1024
+
+
+def test_a_bundle_is_refused_before_unpacking_when_there_is_no_room(bw):
+    d = bw.w / "usb"
+    real_bundle(bw, d)
+    bw.put_stub("df", "#!/bin/bash\necho 'Filesystem 1024-blocks Used Available Capacity Mounted'\necho 'x 1000 900 100 90% /'\n")
+    p = bw.run("--from-dir", str(d), "--yes", "--yes-no-revocation-check", "--server-name", "a.example.com", "--self-signed",
+               extra_env={"OCW_MIN_FREE_KB_TEST": "1"})
+    assert p.returncode == 2 and "not enough free disk space" in p.stderr and "unpack the offline bundle" in p.stderr, p.stderr
+    assert not (bw.stub / "install.args").exists() and not [x for x in (bw.w / "work").iterdir() if x.name.startswith("ocw-wheels")]
+
+
+def test_a_dry_run_keeps_the_packages_with_the_work_directory_and_a_later_run_sweeps_both(bw):
+    d = bw.w / "usb"
+    real_bundle(bw, d)
+    p = bw.run("--from-dir", str(d), "--dry-run", "--yes-no-revocation-check", "--server-name", "a.example.com", "--self-signed")
+    assert p.returncode == 0, p.stderr + p.stdout
+    kept = sorted(x.name for x in (bw.w / "work").iterdir())
+    assert any(n.startswith("ocw-install.") for n in kept) and any(n.startswith("ocw-wheels.") for n in kept), kept
+    # a day later both are stale: the next run removes them, then leaves its own behind (dry run) -- the old names are gone
+    old = [bw.w / "work" / n for n in kept]
+    for o in old:
+        os.utime(o, (1_000_000_000, 1_000_000_000))
+    p = bw.run("--from-dir", str(d), "--yes", "--yes-no-revocation-check", "--server-name", "a.example.com", "--self-signed")
+    assert p.returncode == 0, p.stderr + p.stdout
+    assert not any(o.exists() for o in old) and not bw.work_dirs()
+
+
 # --- uninstall --------------------------------------------------------------------------------------------------------------------------------
 
 

@@ -1,7 +1,7 @@
 /** 5.42.0: the admin's global defaults for shared environments. */
 import { fireEvent, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { fetchSharedPermissions, saveSharedPermissions } from '../api/client'
+import { fetchSettingsStatus, fetchSharedPermissions, saveSharedPermissions } from '../api/client'
 import { renderWithClient } from '../test/renderWithClient'
 import type { SharedPermissionsResponse } from '../types'
 import { beginStepUp } from '../utils/stepUp'
@@ -9,7 +9,7 @@ import { SharedPermissionsDialog } from './SharedPermissionsDialog'
 
 vi.mock('../api/client', async importOriginal => {
   const actual = await importOriginal<typeof import('../api/client')>()
-  return { ...actual, fetchSharedPermissions: vi.fn(), saveSharedPermissions: vi.fn() }
+  return { ...actual, fetchSharedPermissions: vi.fn(), saveSharedPermissions: vi.fn(), fetchSettingsStatus: vi.fn() }
 })
 vi.mock('../utils/stepUp', async importOriginal => {
   const actual = await importOriginal<typeof import('../utils/stepUp')>()
@@ -30,6 +30,7 @@ const DATA: SharedPermissionsResponse = {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  vi.mocked(fetchSettingsStatus).mockResolvedValue({ mode: 'local', mfa: false, unlocked: true, unlocked_until: null, seconds_left: 0, local_notice: 'No MFA in local mode. (test)' })
   vi.mocked(fetchSharedPermissions).mockResolvedValue(DATA)
 })
 

@@ -5,8 +5,7 @@ import { activeRow, can, canManageSync, isActiveRow, isAddressable, permissionRe
 import { usableEnvironments } from './usableEnvironments'
 
 const env = (id: string, name: string, o: Partial<Environment> = {}): Environment => ({
-  id, name, base_domain: '', team_name: '', key_id: '', okta_url: '', has_okta_token: false,
-  sync_schedule: {} as Environment['sync_schedule'], shared: false, is_own: true, ...o,
+  id, name, shared: false, is_own: true, ...o,
 })
 
 describe('environment rows', () => {
@@ -37,7 +36,7 @@ describe('environment rows', () => {
     expect(canManageSync(env('f', 'team', { is_own: false, shared: true, addressable: true }))).toBe(false)
     const allow = { value: 'allow', source: 'override' } as const
     const deny = { value: 'deny', source: 'built_in' } as const
-    const perms = { view_archive: allow, live_read: allow, tenant_write: allow, import_csv: allow, reset_watermark: allow, sync_now: deny, sync_settings: deny }
+    const perms = { view_archive: allow, live_read: allow, tenant_write: allow, import_csv: allow, reset_watermark: allow, sync_now: deny, sync_settings: deny, build_evidence_package: deny }
     expect(canManageSync(env('g', 'team', { is_own: false, shared: true, permissions: perms }))).toBe(false)
     expect(canManageSync(env('g', 'team', { is_own: false, shared: true, permissions: { ...perms, sync_now: allow } }))).toBe(true)
     // never on a row the name-keyed routes don't reach (UI-07), nor another owner's private row (admin view)
@@ -49,7 +48,7 @@ describe('environment rows', () => {
     const deny = { value: 'deny', source: 'default' } as const
     const shared = env('s', 'team', {
       is_own: false, shared: true,
-      permissions: { view_archive: deny, live_read: deny, tenant_write: deny, import_csv: deny, reset_watermark: deny, sync_now: deny, sync_settings: deny },
+      permissions: { view_archive: deny, live_read: deny, tenant_write: deny, import_csv: deny, reset_watermark: deny, sync_now: deny, sync_settings: deny, build_evidence_package: deny },
     })
     expect(can(shared, 'live_read')).toBe(false)
     expect(permissionReason(shared, 'tenant_write')).toMatch(/hasn't allowed shared users to make changes/)
@@ -71,12 +70,15 @@ describe('environment rows', () => {
 describe('environmentScopeKey', () => {
   it('changes when the active environment is reconnected to another team, not only on a switch', async () => {
     const { environmentScopeKey } = await import('./environmentRows')
-    const base = env('a', 'prod', { addressable: true, team_name: 'team-1' })
+    // 5.53.0: the list no longer carries the connection settings; the server's opaque `scope` token stands for them.
+    const base = env('a', 'prod', { addressable: true, scope: 'token-1' })
     const before = environmentScopeKey({ environments: [base], active: 'prod', active_id: 'a' })
-    const after = environmentScopeKey({ environments: [{ ...base, team_name: 'team-2' }], active: 'prod', active_id: 'a' })
+    const after = environmentScopeKey({ environments: [{ ...base, scope: 'token-2' }], active: 'prod', active_id: 'a' })
     expect(before).not.toBe(after)
     expect(environmentScopeKey(undefined)).toBeUndefined()
-    // rotating the API key of the same team keeps the page
-    expect(environmentScopeKey({ environments: [{ ...base, key_id: 'new-key' }], active: 'prod', active_id: 'a' })).toBe(before)
+    // an unchanged token (a rotated API key of the same team never changes it) keeps the page
+    expect(environmentScopeKey({ environments: [{ ...base }], active: 'prod', active_id: 'a' })).toBe(before)
+    // and a switch to another environment still changes the key
+    expect(environmentScopeKey({ environments: [base, env('b', 'dev', { scope: 'token-1' })], active: 'dev', active_id: 'b' })).not.toBe(before)
   })
 })

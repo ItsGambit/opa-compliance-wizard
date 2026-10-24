@@ -3,9 +3,8 @@ import { ArrowLeft } from 'lucide-react'
 import { useReport } from '../api/hooks'
 import { useReportDateRange } from '../hooks/useReportDateRange'
 import type { ComplianceReportDef, ComplianceReportRow } from '../types'
-import { complianceReportExportSections } from '../utils/exportSections'
 import { DateRangeFields } from './DateRangeFields'
-import { ExportButtons } from './ExportButtons'
+import { ReportExportButtons } from './ReportExportButtons'
 import { ReportRowsTable } from './ReportRowsTable'
 
 interface Props {
@@ -15,6 +14,42 @@ interface Props {
 }
 
 const CONTROL_LABEL: Record<string, string> = { CC6: 'CC6', CC7: 'CC7', CC8: 'CC8' }
+
+const FRAMEWORK_LABEL: Record<string, string> = { soc2: 'SOC 2' }
+
+/** The controls this report is mapped to. The label and sentence say what the mapping is, in text, not only colour. */
+function MappedControls({ def }: { def: ComplianceReportDef }) {
+  const controls = def.controls ?? []
+  if (controls.length === 0) return null
+  const reviewed = def.mapping_status === 'auditor-reviewed'
+  return (
+    <div className="mt-2 text-xs text-text-faint" data-testid="mapped-controls">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="font-medium text-text">{reviewed ? 'Auditor-reviewed mapping' : 'Proposed mapping'}</span>
+        {controls.map(c => (
+          <span key={`${c.framework}:${c.id}`} className="font-mono text-[0.6875rem] border border-border rounded px-1.5 py-0.5">
+            {FRAMEWORK_LABEL[c.framework] ?? c.framework} {c.id}
+          </span>
+        ))}
+      </div>
+      {!reviewed && <p className="mt-1">Suggested by this project; not reviewed by an auditor.</p>}
+      {def.methodology && (
+        <details className="mt-2">
+          <summary className="cursor-pointer">How this is calculated</summary>
+          <p className="mt-1.5">{def.methodology}</p>
+        </details>
+      )}
+      {def.known_limits && def.known_limits.length > 0 && (
+        <div className="mt-2">
+          <div className="font-medium text-text">Known limits</div>
+          <ul className="list-disc pl-5 mt-0.5">
+            {def.known_limits.map(l => <li key={l}>{l}</li>)}
+          </ul>
+        </div>
+      )}
+    </div>
+  )
+}
 
 export function ComplianceReportDetail({ def, environment, onBack }: Props) {
   const dateRange = useReportDateRange()
@@ -47,7 +82,9 @@ export function ComplianceReportDetail({ def, environment, onBack }: Props) {
         <button type="button" className="btn-secondary text-xs" onClick={onBack}>
           <ArrowLeft size={12} /> Back to reports
         </button>
-        <ExportButtons sections={complianceReportExportSections(def.label, filteredRows)} filenameBase={`opa-report-${def.key}`}
+        <ReportExportButtons
+          environment={environment} reportKey={def.key} reportLabel={def.label} range={dateRange.range}
+          rows={rows} filteredRows={filteredRows} total={data?.total} truncated={data?.truncated}
           disabledReason={isPlaceholderData ? 'Loading the new date range…' : isError ? 'The report did not load' : undefined}
         />
       </div>
@@ -60,6 +97,7 @@ export function ComplianceReportDetail({ def, environment, onBack }: Props) {
           </span>
         </h2>
         <p className="text-xs text-text-faint mt-1">{def.description}</p>
+        <MappedControls def={def} />
       </div>
 
       <DateRangeFields range={dateRange} idPrefix={`report-${def.key}`} />
@@ -75,6 +113,7 @@ export function ComplianceReportDetail({ def, environment, onBack }: Props) {
         onFilteredRowsChange={setFilteredRows}
         total={data?.total}
         truncated={data?.truncated}
+        completeCsvAbove
       />
     </div>
   )

@@ -961,7 +961,9 @@ def test_routes_answer_503_when_the_credential_store_is_locked(matrix_server, mo
         raise engine.CredentialStoreUnavailable("The OS credential store could not be read (KeyringLocked).")
 
     monkeypatch.setattr(engine, "keyring_get", locked)
-    resp = _call(base_url, "GET", "/api/environments", headers=_who(OWNER_A))
+    # 5.53.0: the list every screen reads no longer looks at the credential store; the Settings list (token flag) does.
+    assert _call(base_url, "GET", "/api/environments", headers=_who(OWNER_A)).status_code == 200
+    resp = _call(base_url, "GET", "/api/settings/environments", headers=_who(OWNER_A))
     assert resp.status_code == 503 and "credential store" in resp.json()["error"]
 
 

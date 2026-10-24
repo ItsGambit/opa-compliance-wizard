@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { useEnvironments, useUpgradeStatus, useWhoami } from './api/hooks'
+import { useEnvironments, useUpgradeNotice, useWhoami } from './api/hooks'
 import { isSessionExpiredError, saveAccessControl, saveEnvironmentChange, type ApiError } from './api/client'
 import { useHashRoute } from './hooks/useHashRoute'
 import { toast } from './hooks/useToast'
@@ -24,6 +24,7 @@ import { ServiceAccountsDashboard } from './components/ServiceAccountsDashboard'
 import { OktaAdminsReport } from './components/OktaAdminsReport'
 import { OverviewPage } from './components/Overview'
 import { CrossChecks } from './components/CrossChecks'
+import { EvidencePackage, type EvidenceResume } from './components/EvidencePackage'
 import { REPORTS_SUB_TABS, SideNav } from './components/SideNav'
 import { UserMenu } from './components/UserMenu'
 import { UpgradeNoticeBanner } from './components/UpgradeNoticeBanner'
@@ -32,9 +33,10 @@ import { UpdatesPage, type UpdatesHeader } from './components/UpdatesPage'
 import { UpdateKeysPage } from './components/UpdateKeysPage'
 import { activeRow, can, environmentScopeKey } from './utils/environmentRows'
 import { canAdminFrom } from './utils/whoami'
+import { SettingsGate } from './components/SettingsGate'
 import { SharedPermissionsDialog } from './components/SharedPermissionsDialog'
 import { SharedEnvironmentNotice } from './components/SharedEnvironmentNotice'
-import { clearPendingStepUp, readPendingStepUp, stepUpReturnAction, type PendingStepUp } from './utils/stepUp'
+import { clearPendingStepUp, readPendingStepUp, restoreFromUnlock, stepUpReturnAction, type PendingStepUp } from './utils/stepUp'
 
 // Every navigable view is a hash route (see utils/route.ts) so the browser
 // keeps a history entry per in-app navigation -- the mouse back button on
@@ -62,6 +64,9 @@ export default function App() {
   // 5.42.0: an Environments change whose step-up approval didn't complete --
   // its screen reopens with the user's input (see utils/stepUp.ts).
   const [restore, setRestore] = useState<Extract<PendingStepUp, { kind: 'environment_change' }> | null>(null)
+  // 5.53.0: an evidence package build that went through the MFA step-up: the inputs the person had, and the build the approved
+  // save started (or why it did not start). The Evidence package page picks it up.
+  const [evidenceResume, setEvidenceResume] = useState<EvidenceResume | null>(null)
   const { data: environments, isLoading: environmentsLoading } = useEnvironments()
   const { data: whoami } = useWhoami()
   // UI-06: the Audit Log and banner settings follow what the server will
@@ -71,7 +76,8 @@ export default function App() {
   const activeEnvRow = activeRow(environments)
   const canViewOverview = canAdmin || (!!activeEnvRow && can(activeEnvRow, 'view_archive') && can(activeEnvRow, 'live_read'))
   const isConfigured = !!environments?.active
-  const { data: upgradeStatus } = useUpgradeStatus(canAdmin)
+  // 5.53.0: the Updates badge reads the notice (administrators get the newer version with it), so it works while Updates is locked.
+  const { data: upgradeNotice } = useUpgradeNotice()
   const queryClient = useQueryClient()
   // 5.50.0: the Overview is the home page for administrators; everyone else lands on Compliance Reports.
   useEffect(() => {
@@ -125,6 +131,44 @@ export default function App() {
     },
   })
 
+  // 5.53.0: the MFA that opens Settings or Updates was approved at the gate. It is finished by the same save route as every other
+  // approved change, but it changes no setting: the server only records that this sign-in may read Settings for a short window.
+  const finishSettingsUnlock = useMutation({
+    mutationFn: (_pending: Extract<PendingStepUp, { kind: 'settings_unlock' }>) => saveEnvironmentChange(),
+    onSuccess: (_resp, pending) => {
+      clearPendingStepUp()
+      toast({
+        title: 'Settings unlocked for 10 minutes',
+        description: `Approved via step-up MFA at ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. Every save still asks again.`,
+        variant: 'success',
+      })
+      queryClient.invalidateQueries({ queryKey: ['settings_status'] })
+      queryClient.invalidateQueries({ queryKey: ['audit_log'] })
+      // The Updates page is a route: it is still there, and now opens. A dialog reopens with the user's input put back.
+      if (pending.reopen === 'updates') setActiveTab('updates')
+      setRestore(restoreFromUnlock(pending))
+    },
+    onError: (err: ApiError, pending) => {
+      clearPendingStepUp()
+      const reason = err.body?.reason
+      toast({
+        title: 'Settings not unlocked',
+        description: reason === 'step_up_unavailable'
+          ? "This site cannot unlock Settings: its nginx configuration predates the step-up location. An operator must regenerate the site."
+          : isSessionExpiredError(err as unknown) || reason === 'expired'
+            ? 'The MFA approval expired before Settings opened. Nothing changed; unlock again.'
+            : reason === 'session_changed'
+              ? 'You signed in again while approving. Nothing changed; unlock again.'
+              : reason === 'already_consumed' || reason === 'not_found'
+                ? 'This approval was already used or abandoned. Nothing changed; unlock again.'
+                : err.message,
+        variant: 'error',
+      })
+      if (pending.reopen === 'updates') setActiveTab('updates')
+      setRestore(restoreFromUnlock(pending))     // nothing was unlocked, but nothing typed is lost either
+    },
+  })
+
   // 5.42.0: the same finish step for an Environments change (create, edit,
   // delete, share, sync settings, CSV import, watermark reset, archive purge,
   // shared permissions) -- the server runs the request it stored before the
@@ -152,7 +196,7 @@ export default function App() {
           description: `Approved via step-up MFA at ${new Date().toLocaleString()}.`, variant: 'success',
         })
         setActiveTab('updates')
-        for (const key of ['upgrade_status', 'upgrade_notice', 'audit_log']) queryClient.invalidateQueries({ queryKey: [key] })
+        for (const key of ['upgrade_status', 'upgrade_notice', 'settings_status', 'audit_log']) queryClient.invalidateQueries({ queryKey: [key] })
         return
       }
       const active = typeof resp.active === 'string' ? resp.active : null
@@ -161,7 +205,7 @@ export default function App() {
         description: 'Approved via step-up MFA.',
         variant: 'success',
       })
-      for (const key of ['environments', 'shared_permissions', 'orphaned_archives', 'audit_log', 'sync_status', 'upgrade_status']) {
+      for (const key of ['environments', 'settings_environments', 'settings_status', 'banner', 'shared_permissions', 'orphaned_archives', 'audit_log', 'sync_status', 'upgrade_status']) {
         queryClient.invalidateQueries({ queryKey: [key] })
       }
     },
@@ -189,6 +233,21 @@ export default function App() {
     },
   })
 
+  const finishEvidencePackage = useMutation({
+    mutationFn: (_inputs: EvidenceResume) => saveEnvironmentChange(),
+    onSuccess: (resp, inputs) => setEvidenceResume({ ...inputs, jobId: String(resp.job_id) }),
+    onError: (err: ApiError, inputs) => {
+      const reason = err.body?.reason
+      setEvidenceResume({
+        ...inputs,
+        error: isSessionExpiredError(err as unknown) || reason === 'expired'
+          ? 'The MFA approval expired before the build started.'
+          : reason === 'already_consumed' || reason === 'not_found' ? 'This approval was already used or abandoned.' : err.message,
+      })
+      toast({ title: 'Evidence package not built', description: err.message, variant: 'error' })
+    },
+  })
+
   useEffect(() => {
     const url = new URL(window.location.href)
     const returned = url.searchParams.get('stepup_complete') === '1'
@@ -198,6 +257,33 @@ export default function App() {
     }
     const pending = readPendingStepUp(Date.now(), returned)
     const next = stepUpReturnAction(returned, pending)
+    if (pending?.kind === 'settings_unlock') {
+      if (next === 'finish_settings_unlock') {
+        finishSettingsUnlock.mutate(pending)
+      } else {
+        // Back without finishing the MFA step (cancelled at Okta, or the tab was reopened): nothing was unlocked.
+        clearPendingStepUp()
+        toast({ title: 'Settings not unlocked', description: 'The MFA step was not completed. Nothing changed.', variant: 'error' })
+        if (pending.reopen === 'updates') setActiveTab('updates')
+        setRestore(restoreFromUnlock(pending))
+      }
+      return
+    }
+    if (pending?.kind === 'evidence_package') {
+      // 5.53.0: the MFA approval of an evidence package build. It is finished by the same save route as every approved change,
+      // never mistaken for the Access Control save, and it never opens Settings. The Evidence package page gets the period and the
+      // acknowledgement back, with the build (or the reason there is none).
+      clearPendingStepUp()
+      const base = { environmentId: pending.environmentId, period: pending.period, gapsAcknowledged: pending.gapsAcknowledged }
+      navigate({ tab: 'reports', reportsSubTab: 'evidence_package' })
+      if (next === 'finish_evidence_package') {
+        finishEvidencePackage.mutate(base)
+      } else {
+        setEvidenceResume(base)
+        toast({ title: 'Evidence package not built', description: 'The MFA step was not completed, so nothing was built. Your choices are restored.', variant: 'error' })
+      }
+      return
+    }
     if (pending?.kind === 'environment_change') {
       if (next === 'finish_environment_change') {
         finishEnvironmentChange.mutate(pending)
@@ -227,6 +313,8 @@ export default function App() {
   useEffect(() => {
     if (!restore) return
     if (restore.reopen === 'updates') { setActiveTab('updates'); setRestore(null) }
+    else if (restore.reopen === 'banner') setBannerOpen(true)
+    else if (restore.reopen === 'access_control') setAccessControlOpen(true)
     else if (restore.reopen === 'orphaned_archives') setOrphansOpen(true)
     else if (restore.reopen === 'shared_permissions') setSharedPermissionsOpen(true)
     else setEnvironmentsOpen(true)
@@ -277,7 +365,7 @@ export default function App() {
           onOpenAbout={() => setAboutOpen(true)}
           onOpenOrphanedArchives={() => setOrphansOpen(true)}
           onOpenSharedPermissions={() => setSharedPermissionsOpen(true)}
-          updateCount={upgradeStatus?.check.enabled && upgradeStatus.update_available ? 1 : 0}
+          updateCount={canAdmin && upgradeNotice?.update_available ? 1 : 0}
         />
 
         <EnvironmentScope scopeKey={scopeKey}>
@@ -293,6 +381,7 @@ export default function App() {
                 {activeTab === 'reports' && reportsSubTab === 'service_accounts' && 'Service Accounts Dashboard'}
                 {activeTab === 'reports' && reportsSubTab === 'okta_admins' && 'Okta Admins'}
                 {activeTab === 'reports' && reportsSubTab === 'cross_checks' && 'Cross-checks'}
+                {activeTab === 'reports' && reportsSubTab === 'evidence_package' && 'Evidence package'}
                 {activeTab === 'access' && 'Access Explorer'}
                 {activeTab === 'builder' && 'Folder Builder'}
                 {activeTab === 'audit_log' && 'Audit Log'}
@@ -303,7 +392,7 @@ export default function App() {
                 {activeTab === 'overview' &&
                   'Okta and OPA privileged access in one place: who can change the gate, who can open the vault, who holds both, and whether the evidence behind it is complete. Counts of people open the list behind them. Home page for administrators and archive viewers; other users land on Compliance Reports.'}
                 {activeTab === 'reports' && reportsSubTab === 'browse' &&
-                  'Audit evidence for SOC 2 / SOX / ISO 27001 and similar frameworks, generated from OPA + core Okta audit history.'}
+                  'Audit evidence with a proposed SOC 2 mapping (other frameworks are planned), generated from OPA + core Okta audit history.'}
                 {activeTab === 'reports' && reportsSubTab === 'secrets_access' &&
                   'See who created, updated, retrieved, or deleted each secret and folder in a resource group/project.'}
                 {activeTab === 'reports' && reportsSubTab === 'service_accounts' &&
@@ -312,6 +401,8 @@ export default function App() {
                   'Who holds an administrator role in Okta, as of any date there is a snapshot for, and which of them also hold an OPA admin role.'}
                 {activeTab === 'reports' && reportsSubTab === 'cross_checks' &&
                   'Questions only a tool that sees both Okta and OPA can answer. Candidates for review, not findings.'}
+                {activeTab === 'reports' && reportsSubTab === 'evidence_package' &&
+                  'A zip of the archived events of an audit period, grouped under proposed SOC 2 criteria, with the data an auditor needs to check it offline.'}
                 {activeTab === 'access' &&
                   'Who can reach what in OPA: resource groups, projects, resources, policies, relationships, users and groups, resolved from the stored OPA scan. Live lookups (last accessed, resource evidence) say so where they appear.'}
                 {activeTab === 'builder' &&
@@ -340,10 +431,15 @@ export default function App() {
           <SharedEnvironmentNotice />
 
           {activeTab === 'overview' && canViewOverview && <OverviewPage onOpenReports={() => navigate({ tab: 'reports', reportsSubTab: 'browse' })}
+            onOpenEvidencePackage={() => navigate({ tab: 'reports', reportsSubTab: 'evidence_package' })}
             onOpenOktaAdmins={() => navigate({ tab: 'reports', reportsSubTab: 'okta_admins' })} onOpenAccessUsers={() => navigate({ tab: 'access', accessSubTab: 'users' })}
             onOpenServiceAccounts={() => navigate({ tab: 'reports', reportsSubTab: 'service_accounts' })} onOpenEnvironments={() => setEnvironmentsOpen(true)} />}
           {activeTab === 'reports' && reportsSubTab === 'browse' && (
-            <ComplianceReports selectedReport={route.reportKey} onSelectReport={key => navigate({ tab: 'reports', reportsSubTab: 'browse', reportKey: key })} />
+            <ComplianceReports selectedReport={route.reportKey} onSelectReport={key => navigate({ tab: 'reports', reportsSubTab: 'browse', reportKey: key })}
+              onOpenEvidencePackage={() => navigate({ tab: 'reports', reportsSubTab: 'evidence_package' })} />
+          )}
+          {activeTab === 'reports' && reportsSubTab === 'evidence_package' && (
+            <EvidencePackage resume={evidenceResume} onResumeConsumed={() => setEvidenceResume(null)} />
           )}
           {activeTab === 'reports' && reportsSubTab === 'secrets_access' && <SecretsAccessDashboard />}
           {activeTab === 'reports' && reportsSubTab === 'service_accounts' && <ServiceAccountsDashboard />}
@@ -352,8 +448,17 @@ export default function App() {
           {activeTab === 'access' && <AccessExplorer subTab={accessSubTab} onOpenEnvironments={() => setEnvironmentsOpen(true)} canAdmin={canAdmin} />}
           {activeTab === 'builder' && <FolderBuilder />}
           {activeTab === 'audit_log' && canAdmin && <AuditLogPage />}
-          {activeTab === 'updates' && canAdmin && <UpdatesPage onOpenKeys={() => setActiveTab('update_keys')} onHeader={setUpdatesHeader} />}
-          {activeTab === 'update_keys' && canAdmin && <UpdateKeysPage onBack={() => setActiveTab('updates')} />}
+          {/* 5.53.0: Updates (and its signing-key page) open after the Settings unlock: MFA first behind the hosted login gate. */}
+          {activeTab === 'updates' && canAdmin && (
+            <SettingsGate area="updates" reopen="updates" what="Updates" onNotNow={() => navigate({ tab: 'overview' })}>
+              <UpdatesPage onOpenKeys={() => setActiveTab('update_keys')} onHeader={setUpdatesHeader} />
+            </SettingsGate>
+          )}
+          {activeTab === 'update_keys' && canAdmin && (
+            <SettingsGate area="updates" reopen="updates" what="Updates" onNotNow={() => navigate({ tab: 'overview' })}>
+              <UpdateKeysPage onBack={() => setActiveTab('updates')} />
+            </SettingsGate>
+          )}
 
           <Footer />
         </main>
@@ -362,12 +467,11 @@ export default function App() {
       </div>
 
       <EnvironmentManagerDialog
-        data={environments}
         open={environmentsOpen}
         onOpenChange={next => { setEnvironmentsOpen(next); if (!next) setRestore(null) }}
         isAdmin={whoami?.is_admin}
         canAdmin={canAdmin}
-        restore={restore && restore.reopen !== 'orphaned_archives' && restore.reopen !== 'shared_permissions' && restore.reopen !== 'updates' ? restore : null}
+        restore={restore && restore.reopen !== 'orphaned_archives' && restore.reopen !== 'shared_permissions' && restore.reopen !== 'updates' && restore.reopen !== 'banner' && restore.reopen !== 'access_control' ? restore : null}
       />
       {canAdmin && <OrphanedArchivesDialog open={orphansOpen} onOpenChange={next => { setOrphansOpen(next); if (!next) setRestore(null) }} />}
       {canAdmin && (
@@ -377,8 +481,8 @@ export default function App() {
           draft={restore?.permissionsDraft && !restore.permissionsDraft.environmentId ? restore.permissionsDraft.settings : undefined}
         />
       )}
-      <BannerSettingsDialog open={bannerOpen} onOpenChange={setBannerOpen} />
-      <AccessControlDialog open={accessControlOpen} onOpenChange={setAccessControlOpen} />
+      <BannerSettingsDialog open={bannerOpen} onOpenChange={next => { setBannerOpen(next); if (!next) setRestore(null) }} draft={restore?.bannerDraft} />
+      <AccessControlDialog open={accessControlOpen} onOpenChange={next => { setAccessControlOpen(next); if (!next) setRestore(null) }} draft={restore?.accessControlDraft} />
       <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} dataLocationNotice={whoami?.data_location_notice} />
     </div>
   )

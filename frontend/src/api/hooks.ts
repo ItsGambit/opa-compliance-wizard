@@ -15,6 +15,8 @@ import {
   fetchSecretsAccessReport,
   fetchServiceAccount,
   fetchServiceAccountsReport,
+  fetchSettingsEnvironments,
+  fetchSettingsStatus,
   fetchSharedPermissions,
   fetchSyncStatus,
   fetchAuditLog,
@@ -26,6 +28,7 @@ import {
   fetchPeopleList,
   fetchUpgradeNotice,
   fetchUpgradeStatus,
+  isSettingsLockedError,
   fetchUserResourceAccess,
   fetchVersion,
   fetchWhoami,
@@ -46,6 +49,32 @@ export function useEnvironments() {
   })
 }
 
+/** 5.53.0: the environment list WITH its configuration (OPA domain, team, key id, Okta URL, sync schedule). Server-side it needs
+ * the Settings unlock, so it is only asked for from inside an unlocked Settings screen. */
+export function useSettingsEnvironments(enabled = true) {
+  return useQuery({
+    queryKey: ['settings_environments'],
+    queryFn: fetchSettingsEnvironments,
+    enabled,
+    refetchOnWindowFocus: true,
+    staleTime: 0,
+  })
+}
+
+/** 5.53.0: where this sign-in stands with the Settings unlock. `area` makes a local-mode server record the opening. Polled
+ * gently so a lock from another tab, or a save that renewed the window, shows up; the countdown itself runs in the browser
+ * from `seconds_left` (the browser never compares its clock with the server's). */
+export function useSettingsStatus(area: 'settings' | 'updates', enabled = true) {
+  return useQuery({
+    queryKey: ['settings_status', area],
+    queryFn: () => fetchSettingsStatus(area),
+    enabled,
+    staleTime: 0,
+    refetchOnWindowFocus: true,
+    refetchInterval: 30_000,
+  })
+}
+
 /** 5.46.0: the update-check status. Admin-only on the server, so it is only
  * asked for when the caller can admin; refreshed gently (the check itself
  * runs once a day on the server). */
@@ -58,18 +87,23 @@ export function useUpgradeStatus(enabled: boolean, pollMs?: number) {
     // 5.48.0: while an upgrade is starting or running the page polls (2 s). The server restarts underneath it, so a failed
     // poll is not retried here (the next tick is the retry) and the last good answer stays on screen.
     refetchInterval: pollMs ?? 10 * 60_000,
-    ...(pollMs ? { retry: false, refetchIntervalInBackground: true } : {}),
+    ...(pollMs ? { retry: false, refetchIntervalInBackground: true } : {
+      // 5.53.0: a locked answer is final (retrying it only keeps the page on "Loading…"); anything else gets the usual few tries.
+      retry: (count: number, err: unknown) => !isSettingsLockedError(err) && count < 3,
+    }),
   })
 }
 
 /** 5.48.0: the one-line upgrade banner for every signed-in user (scheduled / running / failed; admins also "available"). */
-export function useUpgradeNotice() {
+export function useUpgradeNotice(pollMs?: number) {
   return useQuery({
     queryKey: ['upgrade_notice'],
     queryFn: fetchUpgradeNotice,
     refetchOnWindowFocus: true,
-    staleTime: 30_000,
-    refetchInterval: 60_000,
+    staleTime: pollMs ? 0 : 30_000,
+    // 5.53.0: the Updates page asks every 2 s while an upgrade runs, so its step list keeps moving when the status is locked.
+    refetchInterval: pollMs ?? 60_000,
+    ...(pollMs ? { retry: false, refetchIntervalInBackground: true } : {}),
   })
 }
 

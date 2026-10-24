@@ -7,14 +7,39 @@ import { useAccessControl } from '../api/hooks'
 import { prepareAccessControl } from '../api/client'
 import type { AccessControlConfig } from '../types'
 import { beginStepUp } from '../utils/stepUp'
+import { SettingsGate } from './SettingsGate'
+import { useRegisterSettingsDraft } from './settingsDraft'
 
 interface Props {
   open: boolean
   onOpenChange: (open: boolean) => void
+  /** Input restored after a Settings unlock (or an approval that did not complete). */
+  draft?: AccessControlConfig
 }
 
-export function AccessControlDialog({ open, onOpenChange: setOpen }: Props) {
-  const { data: config } = useAccessControl(open)
+/** 5.53.0: the dialog opens with the Settings unlock gate (hosted mode asks for MFA before anything is read); the form and its
+ * request live in the body, which is only mounted once the gate lets it through. */
+export function AccessControlDialog({ open, onOpenChange: setOpen, draft }: Props) {
+  return (
+    <Dialog.Root open={open} onOpenChange={setOpen}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
+        <Dialog.Content aria-describedby={undefined} className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[28rem] p-5">
+          <div className="flex items-center justify-between mb-3">
+            <Dialog.Title className="text-sm font-semibold text-text">Access control</Dialog.Title>
+            <DialogCloseButton />
+          </div>
+          <SettingsGate area="settings" reopen="access_control" what="Access control" onNotNow={() => setOpen(false)}>
+            <AccessControlBody draft={draft} />
+          </SettingsGate>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  )
+}
+
+function AccessControlBody({ draft }: { draft?: AccessControlConfig }) {
+  const { data: config } = useAccessControl(true)
 
   const [adminGroupId, setAdminGroupId] = useState('')
   const [userGroupId, setUserGroupId] = useState('')
@@ -24,12 +49,17 @@ export function AccessControlDialog({ open, onOpenChange: setOpen }: Props) {
   // reasoning as BannerSettingsDialog -- a second admin's more recent edit
   // isn't silently clobbered by whatever this browser happened to have open.
   useEffect(() => {
-    if (open && config) {
-      setAdminGroupId(config.admin_group_id ?? '')
-      setUserGroupId(config.user_group_id ?? '')
-      setRestrictLogin(config.restrict_login)
+    const source = draft ?? config
+    if (source) {
+      setAdminGroupId(source.admin_group_id ?? '')
+      setUserGroupId(source.user_group_id ?? '')
+      setRestrictLogin(source.restrict_login)
     }
-  }, [open, config])
+  }, [config, draft])
+  // Kept across a Settings unlock (the gate asks for it only when the user unlocks).
+  useRegisterSettingsDraft('access_control', () => ({
+    accessControlDraft: { admin_group_id: adminGroupId.trim() || null, user_group_id: userGroupId.trim() || null, restrict_login: restrictLogin },
+  }))
 
   // Phase 3: validates+stores the proposed config server-side (keyed by
   // an opaque action_id) BEFORE ever leaving this page -- the browser
@@ -65,15 +95,7 @@ export function AccessControlDialog({ open, onOpenChange: setOpen }: Props) {
   }
 
   return (
-    <Dialog.Root open={open} onOpenChange={setOpen}>
-      <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
-        <Dialog.Content aria-describedby={undefined} className="card fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100vw-2rem)] sm:w-[28rem] p-5">
-          <div className="flex items-center justify-between mb-3">
-            <Dialog.Title className="text-sm font-semibold text-text">Access control</Dialog.Title>
-            <DialogCloseButton />
-          </div>
-
+    <>
           <p className="text-xs text-text-faint mb-4">
             Okta group IDs (not names — find each group in the Okta Admin Console,
             the ID is in the URL) that control who can use this dashboard and who
@@ -135,8 +157,6 @@ export function AccessControlDialog({ open, onOpenChange: setOpen }: Props) {
               Verify &amp; Save
             </button>
           </div>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
+    </>
   )
 }

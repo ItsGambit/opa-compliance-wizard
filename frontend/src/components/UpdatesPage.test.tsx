@@ -218,8 +218,8 @@ describe('Keys page (artboard 12)', () => {
 
 describe('The one banner (artboards 03, 07, 08a, 10 and 12)', () => {
   it('available for admins, dismissible; a revocation (red) takes the place of it and stays; one banner at a time', async () => {
-    vi.mocked(fetchUpgradeStatus).mockResolvedValue({ ...makeStatus({ ...NEWER }), revocation: REVOKED.revocation })
-    vi.mocked(fetchUpgradeNotice).mockResolvedValue({ kind: 'available', version: '5.48.0' })
+    // 5.53.0: the revocation comes with the notice (so it shows while Updates is locked), not from the Updates status.
+    vi.mocked(fetchUpgradeNotice).mockResolvedValue({ kind: 'available', version: '5.48.0', update_available: '5.48.0', revocation: REVOKED.revocation })
     const open = vi.fn()
     renderWithClient(<UpgradeNoticeBanner canAdmin onOpenUpdates={open} />)
     expect((await screen.findByRole('alert')).textContent).toContain('revoked')
@@ -229,7 +229,6 @@ describe('The one banner (artboards 03, 07, 08a, 10 and 12)', () => {
   })
 
   it('available, in the mockup words, when there is no revocation; dismissed for the session', async () => {
-    vi.mocked(fetchUpgradeStatus).mockResolvedValue(makeStatus({ ...NEWER }))
     vi.mocked(fetchUpgradeNotice).mockResolvedValue({ kind: 'available', version: '5.48.0' })
     renderWithClient(<UpgradeNoticeBanner canAdmin onOpenUpdates={() => {}} />)
     expect(await screen.findByText('Version 5.48.0 of OPA Compliance Wizard is available. Admins can review and upgrade from the Updates page.')).toBeTruthy()
@@ -238,14 +237,13 @@ describe('The one banner (artboards 03, 07, 08a, 10 and 12)', () => {
   })
 
   it('a running or failed upgrade beats a revocation notice', async () => {
-    vi.mocked(fetchUpgradeStatus).mockResolvedValue({ ...makeStatus({ ...NEWER }), revocation: REVOKED.revocation })
-    vi.mocked(fetchUpgradeNotice).mockResolvedValue({ kind: 'running', version: '5.48.0', started_at: '2026-10-21T02:30:00Z' })
+    vi.mocked(fetchUpgradeNotice).mockResolvedValue({ kind: 'running', version: '5.48.0', started_at: '2026-10-21T02:30:00Z', revocation: REVOKED.revocation })
     renderWithClient(<UpgradeNoticeBanner canAdmin onOpenUpdates={() => {}} />)
     expect(await screen.findByText(/Upgrade to 5.48.0 in progress/)).toBeTruthy()
     expect(screen.queryByText(/revoked/)).toBeNull()
   })
 
-  it('no status request for non-admins, and nothing when there is nothing to say', async () => {
+  it('never asks for the Updates status (it is locked behind MFA), and shows nothing when there is nothing to say', async () => {
     vi.mocked(fetchUpgradeNotice).mockResolvedValue({ kind: 'none' })
     const r = renderWithClient(<UpgradeNoticeBanner canAdmin={false} />)
     await waitFor(() => expect(fetchUpgradeNotice).toHaveBeenCalled())
@@ -301,7 +299,7 @@ describe('Navigation and brand', () => {
 })
 
 describe('Audit log rows for update events (artboard 11)', () => {
-  it('system events get the accent border and no empty IP/agent rows; failures are red; human rows are plain', async () => {
+  it('every upgrade event gets the accent border; system ones have no empty IP/agent rows; failures are red', async () => {
     vi.mocked(fetchAuditLog).mockResolvedValue({ entries: [
       { timestamp: '2026-10-20T12:00:00Z', actor_email: null, actor_sub: null, action: 'upgrade.check', details: { outcome: 'failed', result: 'failed: network', correlation_id: 'upd-1' } },
       { timestamp: '2026-10-20T11:00:00Z', actor_email: null, actor_sub: null, action: 'upgrade.key_revoked', details: { revoked: ['AA'], correlation_id: 'upd-2' } },
@@ -310,7 +308,7 @@ describe('Audit log rows for update events (artboard 11)', () => {
     const { container } = renderWithClient(<AuditLogPage />)
     await screen.findByText('upgrade.key_revoked')
     expect(container.querySelectorAll('.border-l-loss')).toHaveLength(1)
-    expect(container.querySelectorAll('.border-l-accent')).toHaveLength(1)
+    expect(container.querySelectorAll('.border-l-accent')).toHaveLength(2)   // 5.53.0: an admin's settings row is an upgrade event too
     expect(screen.getByText('scheduler (server)')).toBeTruthy()
     expect(screen.getByText('update check (server)')).toBeTruthy()
     expect(screen.getAllByText('Client IP')).toHaveLength(1)           // only the human row shows it

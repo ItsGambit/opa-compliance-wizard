@@ -138,7 +138,7 @@ function AdminsTable({ results }: { results: { item: OktaAdminRow; matches: { ke
 interface HistoryKind { kind: string; title: string; blurb: string; file: string; readLabel: string; refusedLabel: string }
 const ADMINS_HISTORY: HistoryKind = {
   kind: 'okta_admins', title: 'Snapshot history', file: 'opa-okta-admins-snapshot', readLabel: 'read', refusedLabel: 'refused by Okta',
-  blurb: 'Every capture is stored and sealed into the same tamper-evident chain as the archived log, and is never deleted by retention. The Integrity check (deep) verifies them. A refused or failed capture is recorded too.',
+  blurb: 'Every capture is stored and sealed into the same hash chain as the archived log, and is never deleted by retention. The Integrity check (deep) verifies them. A refused or failed capture is recorded too.',
 }
 // 5.51.0: one sealed record of who could reach what in OPA per day, taken from the scan the refresh just read.
 const ACCESS_STATE_HISTORY: HistoryKind = {

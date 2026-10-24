@@ -1,0 +1,32 @@
+WHAT THIS TOOL READS
+
+The OPA Compliance Wizard reads from two sources, with the credentials the
+environment's owner saved in it. It is an independent project and is not
+affiliated with Okta.
+
+1. The Okta System Log, through the Okta API, with an API token saved by the
+   environment's owner. The System Log carries the events of Okta Privileged
+   Access as well as the organization's own. The tool copies the events into a
+   local archive so they stay available after Okta's own retention period. Which
+   event types are kept is chosen by the environment's ingestion scope: either
+   only the event types the reports use (the curated set) or every event. The
+   scope of this environment is stated in completeness.json.
+
+2. Okta Privileged Access (read), through its API, with a service-user key
+   saved by the environment's owner: the structure of resource groups,
+   projects, folders, policies and users, for the screens that show who can
+   reach what. The report files in this package are built from archived System
+   Log events only.
+
+The package holds no credential: not the API token or service-user key saved in
+the tool, and no secret values or passwords. Okta System Log events can name a user, an email address, an IP address
+and a place; those appear in this package exactly as the archive holds them.
+
+What this package is built from: only the local archive of this environment,
+read at one moment (one read transaction), so the parts of the package agree
+with each other. Nothing is fetched from Okta or from Okta Privileged Access
+when a package is built.
+
+The tool does not test an access token's permissions up front: each screen says
+what it could not read. This package makes no statement about the scope of any
+token.

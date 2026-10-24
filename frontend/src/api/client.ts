@@ -18,6 +18,8 @@ import type {
   CsvRow,
   EnvironmentFormValues,
   EnvironmentsResponse,
+  SettingsEnvironmentsResponse,
+  SettingsStatus,
   GrantUser,
   ExecuteResponse,
   FolderSecurityPolicy,
@@ -51,6 +53,10 @@ import type {
   RefreshPartName,
   RefreshStartResponse,
   RefreshStatus,
+  EvidenceCoverage,
+  EvidenceJob,
+  EvidenceJobStarted,
+  EvidencePeriod,
 } from '../types'
 
 /** Thrown for any non-2xx answer from the API. `status` lets callers (and
@@ -118,7 +124,7 @@ interface ApiFetchOptions {
   notifySessionExpired?: boolean
 }
 
-async function apiFetch<T>(path: string, init?: RequestInit, { notifySessionExpired = true }: ApiFetchOptions = {}): Promise<T> {
+async function apiRequest(path: string, init?: RequestInit, { notifySessionExpired = true }: ApiFetchOptions = {}): Promise<Response> {
   // Content-Type only when there is a body to describe (FE-15).
   const headers: Record<string, string> = init?.body != null ? { 'Content-Type': 'application/json' } : {}
   const res = await fetch(path, {
@@ -146,11 +152,46 @@ async function apiFetch<T>(path: string, init?: RequestInit, { notifySessionExpi
   if (!res.ok) {
     throw new ApiError(body?.error || `Request failed with status ${res.status}`, res.status, body ?? undefined)
   }
+  return res
+}
+
+async function apiFetch<T>(path: string, init?: RequestInit, options: ApiFetchOptions = {}): Promise<T> {
+  const res = await apiRequest(path, init, options)
   return res.json() as Promise<T>
 }
 
 export function fetchEnvironments(): Promise<EnvironmentsResponse> {
   return apiFetch('/api/environments')
+}
+
+// ── Settings and Updates unlock (5.53.0) ─────────────────────────────────
+// Behind the hosted login gate, reading Access control, Shared permissions, Orphaned archives, the environment details and
+// the Updates page needs a fresh MFA, then stays open for a short window. Local mode has no MFA and says so.
+
+/** The environment list with its configuration (OPA domain, team, key id, Okta URL, sync schedule). Needs the unlock. */
+export function fetchSettingsEnvironments(): Promise<SettingsEnvironmentsResponse> {
+  return apiFetch('/api/settings/environments')
+}
+
+/** Where the caller stands: hosted/local, unlocked or not, seconds left. In local mode `area` makes the server record the opening. */
+export function fetchSettingsStatus(area?: 'settings' | 'updates'): Promise<SettingsStatus> {
+  return apiFetch(`/api/settings/status${area ? `?area=${area}` : ''}`)
+}
+
+/** Asks for the MFA that opens Settings: hosted mode answers 202 StepUpRequired (hand it to beginStepUp); local mode answers
+ * 200 {mode: 'local'} at once. */
+export function startSettingsUnlock(): Promise<StepUpRequired | { mode: 'local'; mfa: false }> {
+  return apiFetch('/api/settings/unlock', { method: 'POST', body: JSON.stringify({}) })
+}
+
+/** Ends the caller's own unlock now. */
+export function lockSettings(): Promise<{ locked: true }> {
+  return apiFetch('/api/settings/lock', { method: 'POST', body: JSON.stringify({}) })
+}
+
+/** True for the server's "unlock Settings first" answer (403 with reason settings_locked). Never a session expiry. */
+export function isSettingsLockedError(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 403 && err.body?.reason === 'settings_locked'
 }
 
 // can_admin (UI-06): whether the admin-only routes will serve THIS caller --
@@ -169,7 +210,9 @@ export function fetchBanner(): Promise<BannerConfig> {
   return apiFetch('/api/banner')
 }
 
-export function saveBanner(config: BannerConfig): Promise<BannerConfig> {
+/** 5.53.0: the banner is an org-wide message, so in hosted mode the save answers 202 StepUpRequired first (like every
+ * other setting); local mode applies at once. */
+export function saveBanner(config: BannerConfig): Promise<BannerConfig | StepUpRequired> {
   return apiFetch('/api/banner', { method: 'POST', body: JSON.stringify(config) })
 }
 
@@ -520,6 +563,24 @@ export function runReport(
   return apiFetch(`/api/reports/${encodeURIComponent(reportKey)}${qs ? `?${qs}` : ''}`)
 }
 
+/** One report's events for a UTC period as a complete CSV (5.53.0): the server writes every event of the range, with no
+ * row cap, from one consistent read of the archive. `since` and `until` are UTC calendar days (YYYY-MM-DD), inclusive.
+ * `rows` is the server's own count of data rows (null if the header is missing); the caller saves the blob. */
+export async function fetchReportCsv(
+  environment: string,
+  reportKey: string,
+  since: string,
+  until: string
+): Promise<{ blob: Blob; rows: number | null }> {
+  const qs = new URLSearchParams({ since, until })
+  const res = await apiRequest(
+    `/api/environments/${encodeURIComponent(environment)}/reports/${encodeURIComponent(reportKey)}/export.csv?${qs.toString()}`
+  )
+  const header = res.headers.get('X-Report-Rows')
+  const rows = header !== null && /^\d+$/.test(header) ? Number(header) : null
+  return { blob: await res.blob(), rows }
+}
+
 /** The Resources tab's per-resource drill-down -- every compliance report
  * row about one specific resource (server/AD account/DB account/gateway/
  * etc.), scoped by that resource's own real id AND/OR its exact display
@@ -690,4 +751,37 @@ export function fetchPeopleList(environment: string, list: NamedPeopleList['list
   const params = new URLSearchParams({ environment, list })
   if (asOf) params.set('as_of', asOf)
   return apiFetch(`/api/overview/people?${params.toString()}`)
+}
+
+
+// ── Evidence package (5.53.0) ────────────────────────────────────────────
+
+function evidencePrepareUrl(environment: string): string {
+  return `/api/evidence_packages/prepare?environment=${encodeURIComponent(environment)}`
+}
+
+/** The coverage check of a period: gap, zero-event, pruned and before-archive days, and the control matrix preview. Starts nothing. */
+export function checkEvidencePackage(environment: string, period: EvidencePeriod, environmentId?: string): Promise<EvidenceCoverage> {
+  return apiFetch(evidencePrepareUrl(environment), {
+    method: 'POST', body: JSON.stringify({ ...period, environment_id: environmentId, check_only: true }),
+  })
+}
+
+/** Starts a build. Local mode answers 202 with the job; hosted mode answers 202 StepUpRequired first (nothing is built until the
+ * MFA approval returns and the save runs). The server refuses unacknowledged gap days and a period with no coverage. */
+export function prepareEvidencePackage(
+  environment: string, period: EvidencePeriod, gapsAcknowledged: boolean, environmentId?: string,
+): Promise<EvidenceJobStarted | StepUpRequired> {
+  return apiFetch(evidencePrepareUrl(environment), {
+    method: 'POST', body: JSON.stringify({ ...period, gaps_acknowledged: gapsAcknowledged, environment_id: environmentId }),
+  })
+}
+
+export function fetchEvidencePackage(jobId: string): Promise<EvidenceJob> {
+  return apiFetch(`/api/evidence_packages/${encodeURIComponent(jobId)}`)
+}
+
+/** A plain GET with the session cookie; the server answers an attachment, repeatable for 15 minutes. */
+export function evidencePackageDownloadUrl(jobId: string): string {
+  return `/api/evidence_packages/${encodeURIComponent(jobId)}/download`
 }

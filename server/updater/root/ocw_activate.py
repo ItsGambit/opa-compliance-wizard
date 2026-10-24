@@ -63,7 +63,7 @@ import ocw_bundle  # noqa: E402
 import ocw_host  # noqa: E402
 import ocw_trust  # noqa: E402
 
-ACTIVATOR_VERSION = "5.52.0"
+ACTIVATOR_VERSION = "5.53.0"
 STEP_ORDER = ["validated", "downloaded", "staged", "preflight", "backup", "switching", "restarting", "health_check", "completed"]
 STEP_LABEL = {"validated": "Received and validated", "downloaded": "Downloaded", "staged": "Verified and staged",
               "preflight": "Preflight", "backup": "Backup", "switching": "Switching", "restarting": "Restarting",
@@ -612,6 +612,8 @@ class Updater:
         self.st = None
         self.t0 = host.now()
         self._secrets = None
+        self._gate_skip_logged = set()
+        self._run_units = None   # the units of this run, fixed at its first restart (see restart_all)
 
     # faults / kills
     def fault(self, name):
@@ -675,11 +677,27 @@ class Updater:
             log("WARN", f"could not remove the maintenance page: {exc.strerror}")
 
     # --- units ----------------------------------------------------------------------------------
+    def begin_run(self):
+        """A new apply / resume / rollback / restore: forget the unit list and the skip notes of any earlier one."""
+        self._run_units = None
+        self._gate_skip_logged = set()
+
     def units(self):
+        """The units of the run once its first restart has fixed them, else the live list."""
+        return list(self._run_units) if self._run_units is not None else self.live_units()
+
+    def live_units(self):
         c = self.cfg
         units = [c.backend_service]
         if self.host.unit_exists(c.gate_service):  # a server fronted by something else has no main gate unit
-            units.append(c.gate_service)
+            # 5.53.0: a gate that is installed but disabled and not running (a fresh install before the login setup) is neither
+            # restarted nor health-checked: without its Okta settings it would crash-loop and fail the upgrade and its rollback.
+            # extra_gate_units() already lists only enabled gates, so the same rule holds for them.
+            if self.host.unit_enabled(c.gate_service) or self.host.unit_active(c.gate_service):
+                units.append(c.gate_service)
+            elif c.gate_service not in self._gate_skip_logged:
+                self._gate_skip_logged.add(c.gate_service)
+                log("INFO", f"{c.gate_service} is installed but disabled and not running (login not set up yet): not restarted, not health-checked")
         units += self.host.extra_gate_units()
         if self.host.unit_exists("opa-host-status") and self.host.unit_enabled("opa-host-status"):
             units.append("opa-host-status")
@@ -1126,8 +1144,53 @@ class Updater:
         raise StepFailed("needs_install_sh", f"{ver} needs the systemd units, the ocw-updater command or server/install.sh from release {need} or newer, "
                                              f"and install.sh {recorded} on this server. Unpack the release file for {ver} that you downloaded "
                                              "(not the copy in the staging directory) and run `sudo server/install.sh --refresh-updater` from "
-                                             "that unpacked directory; it refreshes the units, the command and the updater, records the version "
-                                             "and touches no data. Then apply this release again.", "staged")
+                                             "that unpacked directory (on a server installed with get-ocw.sh, run "
+                                             f"`sudo bash get-ocw.sh --refresh-updater --version {ver}` instead); it refreshes the units, the command and "
+                                             "the updater, records the version and touches no data. Then apply this release again.", "staged")
+
+    def _second_gate_sites_where(self, lacks):
+        """The names of the additional login gates' generated nginx sites (read-only, like check_second_gate_sites) whose
+        active text (comments dropped) satisfies `lacks`. Never raises."""
+        found = []
+        try:
+            directory = self.cfg.second_gate_sites_dir
+            main = os.path.basename(self.cfg.nginx_site)
+            for name in sorted(os.listdir(directory)):
+                if not name.startswith("opa-") or name == main:
+                    continue
+                try:
+                    fd = open_regular(os.path.join(directory, name))
+                    with os.fdopen(fd, "rb") as fh:
+                        raw = fh.read(1 << 20)
+                except OSError:
+                    continue
+                text = raw.decode("utf-8", "replace")
+                if "# OPA auth gate '" not in text[:600]:
+                    continue    # not a site setup-second-gate.sh generated
+                active = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+                if lacks(active):
+                    found.append(name[:60])
+        except OSError:
+            return []
+        return found
+
+    def check_second_gate_step_up(self):
+        """Read-only (5.53.0). A generated second-gate site needs the step-up location (`location = /api/environment_changes/save`
+        with `auth_request /verify_stepup`): every approved change and the MFA that opens Settings and Updates are finished
+        there. A site generated before 5.42.0 has none and fails closed, so its users cannot unlock Settings. Warns and writes
+        an audit entry; never rewrites a site (`install.sh --regenerate-second-sites` does). Returns the site names."""
+        def lacks(active):
+            return not re.search(r"location\s*=\s*/api/environment_changes/save\s*\{[^}]*?auth_request\s+/verify_stepup\s*;", active, re.S)
+        found = self._second_gate_sites_where(lacks)
+        if found:
+            msg = ("the nginx site of an additional login gate has no step-up location, so its users cannot unlock Settings or approve "
+                   "changes: " + ", ".join(found) + ". Run `sudo server/install.sh --regenerate-second-sites` from the installed release.")
+            log("WARN", msg)
+            try:
+                self.audit("upgrade.step", {"step": "second_gate_site_without_step_up", "sites": found, "detail": msg[:300]})
+            except OSError as exc:
+                log("WARN", f"could not write the audit entry: {exc.strerror}")
+        return found
 
     def check_second_gate_sites(self):
         """Read-only. The nginx site of an additional login gate (setup-second-gate.sh) must answer 403 on /api/upgrade, or an
@@ -1194,12 +1257,15 @@ class Updater:
         if self.st["manifest"].get("nginx_template_changed"):
             self.nginx_prepare()
         unprotected = self.check_second_gate_sites()
+        without_step_up = self.check_second_gate_step_up()
         self.st["schema_before"] = snap.get("schema_version")
         self.st["chain_heads_before"] = snap.get("chain_heads") or {}
         self.st["preflight"] = {"free_opt_mb": free_opt // 2**20, "free_data_mb": free_data // 2**20, "sync_waited_s": waited,
                                 "nginx_template_changed": bool(self.st["manifest"].get("nginx_template_changed"))}
         if unprotected:
             self.st["preflight"]["second_gate_sites_without_upgrade_deny"] = unprotected
+        if without_step_up:
+            self.st["preflight"]["second_gate_sites_without_step_up"] = without_step_up
         # baseline for "not worse than before"
         status, body = self.host.http_get(c.backend_port, "/healthz")
         self.st["baseline"] = {"healthz": _healthz_status(body) if status == 200 else None}
@@ -1385,6 +1451,10 @@ class Updater:
         self.host.switch_symlink(c.current, os.path.join("releases", version))
 
     def restart_all(self, label):
+        # Fixed here, before anything is restarted, and reused by the health checks, the rollback and the finish: a gate that is
+        # running (but disabled) is restarted AND checked even if the new release kills it, and a gate that was skipped stays skipped.
+        if self._run_units is None:
+            self._run_units = self.live_units()
         self._pids_before = {u: self.host.unit_prop(u, "MainPID") for u in self.units()}
         failed = []
         for u in self.units():
@@ -1519,6 +1589,7 @@ class Updater:
     # --- the whole apply ------------------------------------------------------------------------------
     def apply(self, req):
         c = self.cfg
+        self.begin_run()
         _cid[0] = req.get("correlation_id")
         try:
             self.validate_request(req, True)
@@ -2038,6 +2109,7 @@ class Updater:
     # --- resume after a crash / power loss ------------------------------------------------------------------------------
     def resume(self):
         c = self.cfg
+        self.begin_run()
         st = read_json(c.state_path)
         if not st or st.get("result") is not None or not st.get("step"):
             return None
@@ -2095,6 +2167,7 @@ class Updater:
     # --- operator actions --------------------------------------------------------------------------------------------------
     def rollback_action(self, actor):
         c = self.cfg
+        self.begin_run()
         cid = "upg-" + uuid.uuid4().hex[:8]
         _cid[0] = cid
         cur, prev = installed_version(c), link_version(c.previous)
@@ -2118,6 +2191,7 @@ class Updater:
         """Put the pre-upgrade copy of the last upgrade back. A request through the inbox names the copy the administrator was
         shown (`expect_backup`) and is refused if the copy this would restore is another one, or if anything is in flight."""
         c = self.cfg
+        self.begin_run()
         if expect_backup is not None and self.in_flight():
             raise StepFailed("in_flight", "another upgrade is in progress")
         hist = [h for h in self._history_lines() if h.get("backup") and h.get("action") == "apply"]

@@ -49,3 +49,36 @@ describe('upgrade events', () => {
     expect(screen.getByText('scheduler (server)')).toBeTruthy()
   })
 })
+
+describe('upgrade event styling (5.53.0)', () => {
+  const edge = (action: string) => screen.getByText(action).closest('.card') as HTMLElement
+
+  it('upgrade.check is blue like the other upgrade rows, with or without an admin behind it', async () => {
+    vi.mocked(fetchAuditLog).mockResolvedValue({ entries: [
+      E('upgrade.check', { outcome: 'up_to_date' }, 'admin@example.com', '2026-10-21T02:34:00Z'),
+      E('upgrade.completed', { trigger: 'ocw-updater' }, null, '2026-10-21T02:33:00Z'),
+      E('upgrade.settings', { frequency: 'daily' }, 'admin@example.com', '2026-10-21T02:32:00Z'),
+    ] })
+    renderWithClient(<AuditLogPage />)
+    await screen.findByText('upgrade.check')
+    for (const a of ['upgrade.check', 'upgrade.completed', 'upgrade.settings']) {
+      expect(edge(a).className).toContain('border-l-accent')
+      expect(edge(a).className).not.toContain('border-l-loss')
+    }
+    expect(screen.getByText(/update check$/)).toBeTruthy()                 // the label carries the meaning
+    expect(screen.getAllByText('admin@example.com').length).toBe(2)         // an admin's row still names the admin
+  })
+
+  it('a failed check and a failed upgrade are red and say so in words', async () => {
+    vi.mocked(fetchAuditLog).mockResolvedValue({ entries: [
+      E('upgrade.check', { outcome: 'failed' }, 'admin@example.com', '2026-10-21T02:34:00Z'),
+      E('upgrade.local_failed', {}, null, '2026-10-21T02:33:00Z'),
+    ] })
+    renderWithClient(<AuditLogPage />)
+    await screen.findByText('upgrade.check')
+    expect(edge('upgrade.check').className).toContain('border-l-loss')
+    expect(edge('upgrade.local_failed').className).toContain('border-l-loss')
+    expect(screen.getByText(/update check failed/)).toBeTruthy()
+    expect(screen.getByText(/local upgrade failed/)).toBeTruthy()
+  })
+})

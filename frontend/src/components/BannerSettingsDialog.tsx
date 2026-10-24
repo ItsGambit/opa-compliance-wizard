@@ -2,10 +2,11 @@ import { useEffect, useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { DialogCloseButton } from './DialogCloseButton'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { saveBanner } from '../api/client'
+import { isStepUpRequired, saveBanner } from '../api/client'
 import { useBanner } from '../api/hooks'
 import { toast } from '../hooks/useToast'
-import type { BannerVariant } from '../types'
+import type { BannerConfig, BannerVariant } from '../types'
+import { beginStepUp } from '../utils/stepUp'
 
 const VARIANTS: { value: BannerVariant; label: string }[] = [
   { value: 'info', label: 'Info (blue)' },
@@ -16,9 +17,11 @@ const VARIANTS: { value: BannerVariant; label: string }[] = [
 interface Props {
   open: boolean
   onOpenChange: (open: boolean) => void
+  /** 5.53.0: input restored after an MFA approval that didn't complete. */
+  draft?: BannerConfig
 }
 
-export function BannerSettingsDialog({ open, onOpenChange: setOpen }: Props) {
+export function BannerSettingsDialog({ open, onOpenChange: setOpen, draft }: Props) {
   const { data: banner } = useBanner()
   const queryClient = useQueryClient()
 
@@ -38,18 +41,27 @@ export function BannerSettingsDialog({ open, onOpenChange: setOpen }: Props) {
       seeded.current = false
       return
     }
-    if (banner && !seeded.current) {
+    const source = draft ?? banner
+    if (source && !seeded.current) {
       seeded.current = true
-      setEnabled(banner.enabled)
-      setMessage(banner.message)
-      setVariant(banner.variant)
-      setDismissible(banner.dismissible)
+      setEnabled(source.enabled)
+      setMessage(source.message)
+      setVariant(source.variant)
+      setDismissible(source.dismissible)
     }
-  }, [open, banner])
+  }, [open, banner, draft])
 
   const saveMutation = useMutation({
     mutationFn: () => saveBanner({ enabled, message, variant, dismissible }),
-    onSuccess: () => {
+    onSuccess: resp => {
+      if (isStepUpRequired(resp)) {
+        // 5.53.0: the banner reaches every user, so in hosted mode saving it needs a fresh MFA approval first.
+        beginStepUp(resp.action_id, {
+          kind: 'environment_change', action: resp.action, label: 'Announcement banner', startedAt: Date.now(),
+          bannerDraft: { enabled, message, variant, dismissible }, reopen: 'banner',
+        })
+        return
+      }
       toast({ title: enabled ? 'Banner published' : 'Banner disabled', variant: 'success' })
       queryClient.invalidateQueries({ queryKey: ['banner'] })
       setOpen(false)
@@ -69,7 +81,8 @@ export function BannerSettingsDialog({ open, onOpenChange: setOpen }: Props) {
 
           <p className="text-xs text-text-faint mb-4">
             Shown at the top of every page for everyone using this dashboard — for
-            planned maintenance, a known incident, or any org-wide notice.
+            planned maintenance, a known incident, or any org-wide notice. Saving
+            needs a fresh MFA approval.
           </p>
 
           <div className="flex flex-col gap-3">

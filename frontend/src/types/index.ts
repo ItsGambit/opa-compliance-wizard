@@ -23,12 +23,6 @@ export interface Environment {
   // possible -- see EnvironmentManagerDialog.tsx.
   id: string
   name: string
-  base_domain: string
-  team_name: string
-  key_id: string
-  okta_url: string
-  has_okta_token: boolean
-  sync_schedule: SyncSchedule
   // Per-user environment scoping (server-hosted, logged-in deployments only --
   // both are always true for a local/standalone run, since there's only ever
   // one unscoped owner). `shared` = visible to every other logged-in user;
@@ -52,12 +46,29 @@ export interface Environment {
   /** 5.42.0, admins only: this environment's stored overrides (a capability
    * absent here inherits the global default). */
   permission_overrides?: Partial<Record<SharedCapabilityKey, PermissionValue>>
+  /** 5.53.0: an opaque token that changes when this environment's connection settings (OPA domain, team, Okta URL) change.
+   * The list every screen reads no longer carries those settings, so the tenant scope (UI-05) keys on this instead. */
+  scope?: string
+}
+
+/** 5.53.0: an environment as the Settings screens read it (GET /api/settings/environments, after the MFA unlock): the
+ * switcher's row plus its non-secret configuration. */
+export interface SettingsEnvironment extends Environment {
+  base_domain: string
+  team_name: string
+  key_id: string
+  okta_url: string
+  has_okta_token: boolean
+  sync_schedule: SyncSchedule
+  /** 5.53.0: the stored "Who can build evidence packages" choice (owners and admins only). */
+  evidence_builders?: EvidenceBuilders
 }
 
 // ── Shared-environment permissions (5.42.0) ──────────────────────────────
 
 export type SharedCapabilityKey =
   | 'view_archive' | 'live_read' | 'tenant_write' | 'import_csv' | 'reset_watermark' | 'sync_now' | 'sync_settings'
+  | 'build_evidence_package'
 
 export type PermissionValue = 'allow' | 'deny'
 /** A stored setting: "inherit" is the absence of one. */
@@ -135,6 +146,21 @@ export interface EnvironmentsResponse {
   /** 5.40.7 (UI-07): the active environment's id -- compare rows by this,
    * never by name (an admin sees several owners' same-named rows). */
   active_id?: string | null
+}
+
+export interface SettingsEnvironmentsResponse extends Omit<EnvironmentsResponse, 'environments'> {
+  environments: SettingsEnvironment[]
+}
+
+/** 5.53.0: GET /api/settings/status. Hosted: whether this sign-in has passed the MFA that opens Settings and Updates, and
+ * how long is left (computed by the server; the browser never compares its clock with the server's). Local mode: no MFA. */
+export interface SettingsStatus {
+  mode: 'hosted' | 'local'
+  mfa: boolean
+  unlocked: boolean
+  unlocked_until: string | null
+  seconds_left: number
+  local_notice: string | null
 }
 
 /** One archive left behind by a deleted environment (DATA-12). */
@@ -276,10 +302,23 @@ export interface AuditLogEntry {
 
 export type ComplianceControl = 'CC6' | 'CC7' | 'CC8'
 
+/** 5.53.0: one mapped control from the server's control catalogue. */
+export interface ComplianceControlMapping {
+  framework: string
+  id: string
+  status: 'proposed' | 'auditor-reviewed'
+}
+
 export interface ComplianceReportDef {
   key: string
   label: string
   control: ComplianceControl
+  /** 5.53.0: the controls this report is mapped to; older servers omit both fields. */
+  controls?: ComplianceControlMapping[]
+  mapping_status?: 'proposed' | 'auditor-reviewed'
+  /** 5.53.0: plain-text note on what the report shows and how rows are chosen, and its known limits. */
+  methodology?: string
+  known_limits?: string[]
   description: string
   event_types: string[]
   count?: number
@@ -574,7 +613,37 @@ export interface UpgradeView {
 }
 
 /** The one-line banner every signed-in user may see (GET /api/upgrade/notice). */
-export type UpgradeNotice =
+export type UpgradeNotice = UpgradeNoticeBase & UpgradeNoticeAdminExtras
+
+/** 5.53.0: what administrators also get from the notice, so the Updates badge, the key-revocation banner and the progress
+ * card work while Updates is locked. Never settings, keys or backups. */
+export interface UpgradeNoticeAdminExtras {
+  update_available?: string | null
+  revocation?: UpgradeRevocation | null
+  run?: UpgradeNoticeRun | null
+}
+
+/** The upgrade run as the notice carries it (server NOTICE_RUN_FIELDS): progress only, no step details, check text or failure text. */
+export interface UpgradeNoticeRun {
+  correlation_id: string | null
+  action: string | null
+  version_from: string | null
+  version_to: string | null
+  step: string | null
+  result: UpgradeRun['result']
+  reason_code: string | null
+  failed_step: string | null
+  started_at: string | null
+  updated_at: string | null
+  seconds: number | null
+  rolled_back_to: string | null
+  step_started_at: string | null
+  backup?: { size: number | null; integrity: string | null } | null
+  steps_done?: { step: string; at: string; seconds: number }[] | null
+  health?: { id: string; ok: boolean }[] | null
+}
+
+export type UpgradeNoticeBase =
   | { kind: 'none' }
   | { kind: 'available'; version: string }
   | { kind: 'scheduled'; version: string; when_utc: string; downtime_estimate_seconds: number | null }
@@ -633,7 +702,12 @@ export interface EnvironmentFormValues {
   key_secret: string
   okta_url: string
   okta_api_token: string
+  /** 5.53.0: who may build evidence packages from this environment's archive: its owner only, or its owner and the people it is
+   * shared with. A required choice in the form (preselected "owner"); a server older than 5.53.0 ignores it. */
+  evidence_builders?: EvidenceBuilders
 }
+
+export type EvidenceBuilders = 'owner' | 'shared'
 
 export interface ResourceGroup {
   id: string
@@ -735,6 +809,9 @@ export interface ApiErrorBody {
    * "already_consumed"; audit-log backfill "busy"; 5.42.0
    * "shared_permission_denied", "secrets_expired", "step_up_unavailable"). */
   reason?: string
+  /** 5.53.0: a "settings_locked" refusal (403) names the scope that needs the MFA unlock. */
+  scope?: string
+  step_up_required?: boolean
   /** 5.52.0: a "busy_other_parts" refusal (409): the parts the running refresh is still working on, and the parts that were asked for. */
   running?: string[]
   missing?: string[]
@@ -1728,4 +1805,101 @@ export interface NamedPeopleList {
   snapshot: SnapshotSummary | null
   note?: string
   people: (CrossCheckRow & { footprint?: { groups?: number; policies?: number; resources?: number } | null; okta_status_changed?: string | null; access_effective?: boolean | null })[] | SodOverlap[] | { actor_id: string; login: string | null; signins: number; mfa_success: number; phishing_resistant_share: number | null; sms_voice: number; mfa_failed: number; by_class: Record<string, number> }[]
+}
+
+
+// ── Evidence package (5.53.0) ────────────────────────────────────────────
+
+/** UTC calendar dates, inclusive (YYYY-MM-DD). */
+export interface EvidencePeriod {
+  start: string
+  end: string
+}
+
+export interface EvidenceControlRow {
+  framework: string
+  control_id: string
+  mapping_status: 'proposed' | 'auditor-reviewed'
+  reports: string[]
+  rows: number
+  status: 'events_present' | 'zero_events_in_period'
+}
+
+/** The coverage check of a period: states as counts and date ranges, never colour alone. */
+export interface EvidenceCoverage {
+  period: EvidencePeriod
+  days: number
+  has_coverage: boolean
+  coverage_pct: number
+  covered_days: number
+  counts: {
+    covered_with_events: number
+    covered_zero_events: number
+    not_covered: number
+    pruned_by_retention: number
+    before_archive: number
+    after_data_as_of: number
+  }
+  gap_days_total: number
+  gap_ranges: [string, string][]
+  gap_ranges_total: number
+  zero_days_total: number
+  zero_ranges: [string, string][]
+  zero_ranges_total: number
+  pruned_days_total: number
+  pruned_ranges: [string, string][]
+  pruned_ranges_total: number
+  before_archive_days: number
+  after_data_as_of_days: number
+  needs_acknowledgement: boolean
+  archive_start_date: string | null
+  data_as_of: string | null
+  pruned_basis: string
+  limits: string[]
+  events_in_period: number
+  chain_head: string | null
+  controls: EvidenceControlRow[]
+}
+
+export interface EvidenceJobResult {
+  sha256: string
+  bytes: number
+  chain_head: string | null
+  events: number
+  report_rows: number
+  coverage_pct: number
+  gap_days: number
+  zero_days: number
+  pruned_days: number
+  built_at: string
+  seconds: number
+  data_as_of: string | null
+  verifier_sha256: string
+  filename: string
+}
+
+export interface EvidenceJob {
+  job_id: string
+  status: 'running' | 'done' | 'error' | 'expired'
+  stage: string
+  progress: number
+  environment: string
+  period: EvidencePeriod
+  gaps_acknowledged: boolean
+  started_at: string
+  finished_at: string | null
+  expires_at: string | null
+  seconds_left: number | null
+  window_seconds: number
+  error: string | null
+  reason: string | null
+  result?: EvidenceJobResult
+}
+
+/** The answer to starting a build in local mode, or after the approved save in hosted mode. */
+export interface EvidenceJobStarted {
+  job_id: string
+  status: 'running'
+  environment: string
+  period: EvidencePeriod
 }

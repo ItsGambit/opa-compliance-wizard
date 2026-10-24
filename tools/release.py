@@ -229,7 +229,14 @@ def _differs_from_tag(repo, files, tag, names):
 def _requires_install_sh(repo, files, version):
     """True when a systemd UNIT file differs from the previous tag's. This is the field a 5.47.0 updater understands (it
     refuses whenever it is true, and nothing it does can fix that), so it is true only when a stale unit could break the
-    service: a changed wrapper or install.sh alone is covered by `install_sh_min_version` for updaters that know it."""
+    service: a changed wrapper or install.sh alone is covered by `install_sh_min_version` for updaters that know it.
+    It is also true when the install.sh marker names this very release (5.53.0): an existing install must re-run install.sh,
+    and a 5.47.0 updater, which ignores `install_sh_min_version`, then refuses with its own needs_install_sh message."""
+    try:
+        if _install_sh_marker(files, version) == version:
+            return True
+    except ReleaseError:
+        pass   # a missing, malformed or too-new marker stops the build in _install_sh_min_version, with its own message
     prev = _previous_tag(repo, version)
     if prev is None:
         return any(n in files for n in UNIT_FILES)
@@ -308,6 +315,12 @@ def build_release(version, repo=REPO, out_dir=None, frontend_dist=None, min_upgr
         raise ReleaseError(f"{tag} has no server/release_keys.json")
     keylib.parse_key_list_bytes(files["server/release_keys.json"][1])  # must be a valid list
     excerpt = changelog_excerpt(files["CHANGELOG.md"][1].decode("utf-8"), version)
+    # 5.53.0: the evidence package verifier's sha256 is the trust anchor an auditor compares the copy in a package with. It is
+    # computed from the exported tag tree, written into the signed manifest and into the notes text, and published with the release.
+    verifier = files.get(VERIFIER_PATH)
+    verifier_sha256 = hashlib.sha256(verifier[1]).hexdigest() if verifier else None
+    if verifier_sha256:
+        excerpt = excerpt.rstrip() + "\n\n" + verifier_notes_line(verifier_sha256)
     if any(n.startswith("frontend/dist/") for n in files):
         raise ReleaseError("frontend/dist is tracked in git; it must not be (it is built into the release)")
     dist = _read_dist(frontend_dist) if frontend_dist else _build_frontend(files)
@@ -346,6 +359,7 @@ def build_release(version, repo=REPO, out_dir=None, frontend_dist=None, min_upgr
         # sha256 of this release's get-ocw.sh (the one-line installer, rendered from the tagged template, verifier and key
         # list; `verify --bootstrap` re-renders it from the tarball and compares). None for a tree without the template.
         "bootstrap_sha256": hashlib.sha256(bootstrap).hexdigest() if bootstrap is not None else None,
+        "verifier_sha256": verifier_sha256,
         "changelog_excerpt": excerpt,
         "files": {name: hashlib.sha256(data).hexdigest() for name, (_m, data) in sorted(files.items())},
     }
@@ -369,6 +383,12 @@ def build_release(version, repo=REPO, out_dir=None, frontend_dist=None, min_upgr
 
 
 BOOTSTRAP_NAME = "get-ocw.sh"
+VERIFIER_PATH = "tools/verify_evidence_package.py"
+
+
+def verifier_notes_line(sha256):
+    """The line that goes into the release notes and onto the signing-key page (docs/releasing.md)."""
+    return f"Evidence package verifier ({VERIFIER_PATH}) sha256: {sha256}"
 
 
 def _bootstrap_for(version, files):
@@ -395,6 +415,9 @@ def cmd_build(a):
     print(f"Built {tar_path} ({len(manifest['files'])} files, commit {manifest['commit'][:12]})")
     if manifest.get("bootstrap_sha256"):
         print(f"Rendered {tar_path.parent / BOOTSTRAP_NAME} (sha256 {manifest['bootstrap_sha256'][:12]}...)")
+    if manifest.get("verifier_sha256"):
+        print("Paste into the GitHub release notes and publish on the signing-key page (the notes are written by hand):\n  "
+              + verifier_notes_line(manifest["verifier_sha256"]))
     print(f"Next: {sign_hint(tar_path)}")
 
 

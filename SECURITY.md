@@ -15,8 +15,50 @@ Include, if you can:
   wrong")
 - Steps to reproduce it
 - The version/commit you tested against
-- Whether it requires a specific deployment mode (local-only vs. hosted
-  behind nginx + Okta login) to be exploitable
+- Whether it requires a specific deployment mode to be exploitable (see
+  [Deployment modes](#deployment-modes) below)
+
+**Never put a secret, a token, a key, or a customer's data in a report.**
+If a failed upgrade is part of what you are reporting, attach the
+**support bundle** the updater builds (see below), not raw logs or files
+from the server.
+
+### The support bundle
+
+When an upgrade fails, the updater builds a redacted bundle
+(`ocw-support-<from>-to-<to>-<time>-<id>.tar.gz`, at most 5 MB) before anyone
+asks. An administrator can download it from the Audit Log entry of the failed
+upgrade, or from a shell with `sudo ocw-updater bundle`
+(`--include-hosts` keeps host and environment names, which are otherwise
+redacted). Attach it to the private advisory above. **Nothing is ever sent
+automatically.** What it holds and what it never holds (the environment
+file, the keyring, the session key, the archive, request bodies, cookies) is
+listed in the README under "The support bundle". Read it before you attach it.
+
+## Deployment modes
+
+What a report is about depends on how the tool runs. Four situations exist,
+and the first two are the application itself; the last two are code that
+runs as `root`:
+
+- **Local only.** `python launch.py` on one computer. The server binds
+  `127.0.0.1`, there is no sign-in, and credentials live in the operating
+  system's keyring.
+- **Hosted.** The backend behind nginx and an Okta login gate
+  (`server/auth_gate.py`) on a server, for a team. The gate, the proxy
+  secret and the per-user environments are the security-sensitive parts.
+- **The root-run updater (5.47.0 and later).** On the upgrade layout, a small
+  updater written in the Python standard library runs as `root`, stages a
+  signed release as an unprivileged account, switches versions, health-checks
+  and rolls back. The web application cannot write its own code; it asks the
+  updater through an inbox. Files under `server/updater/root/` and
+  `server/nginx_bake.py` are root code.
+- **The root installer (5.52.0).** `server/install.sh` and the one-line
+  installer `get-ocw.sh` run as `root` on a fresh or an existing server: they
+  create the application account, write the settings file with generated
+  secrets, the login gate's session key and the nginx site, and install the
+  release. `get-ocw.sh` verifies the release's signature before it unpacks
+  anything (see "Release signing keys" below).
 
 ## What to expect
 
@@ -36,6 +78,130 @@ against the real code before being fixed — see
 you're evaluating this for a production tenant, especially a hosted
 multi-user deployment, factor that in — see the main
 [README](README.md)'s "Project status" section for the full framing.
+
+Two things deserve the most caution:
+
+- **The installer** (`server/install.sh`, `server/get-ocw.sh.in`) has had no
+  independent audit. It runs as root, so read its plan (`--dry-run`) before
+  you accept it.
+- **The updater's root files** (`server/updater/root/`) run as root. They are
+  not reviewed like the rest of the application: a change to them is reviewed
+  as code that runs as root (see [docs/releasing.md](docs/releasing.md)), and
+  you should do the same before you trust a fork.
+
+## Release signing keys
+
+Every release is signed. The project holds two keys in different places: a
+**release** key that signs releases, and a **standby** key (a different kind of
+key, in a different cloud) that can only sign a *revocation*. Both are public
+information and are pinned in `server/release_keys.json`, which ships inside
+every release. The fingerprint below is the SHA-256 of the key as listed in
+that file (the raw public key for the release key, the DER public key for the
+standby), base64-decoded.
+
+| Role | Algorithm | Key id | Fingerprint (SHA-256) | Since |
+|---|---|---|---|---|
+| Release | Ed25519 (minisign format) | `88DFB54FC6C0E819` | `19e8c0c64fb5df88b977a6c2e9c90fcf7840803b96fcf5b3ee8c20e5a483d4c9` | 5.46.0 |
+| Standby (revocations only) | ECDSA P-256 (ES256) | `76A2D96A6B0FAAAD` | `76a2d96a6b0faaad21196a08e926817fe08070b7ba717fbcd99eaffa624aeccf` | 5.46.0 |
+
+The release key's minisign public key line is
+`RWQZ6MDGT7XfiNw30FMcGZ/sL1IZFaHr+f7So4QAvmFg77qt3/Fcr2Ka`. Each key id is derived
+from the key itself: it is the first 8 bytes of the fingerprint (shown
+byte-reversed for the release key, the way minisign shows ids).
+
+**Check the key against a second source.** The values above are published in
+this repository, so on their own they are only as trustworthy as the repository
+and the account behind it. The same key ids are published on a page the project
+controls outside GitHub: <https://apps.ruchir.pw/keys/opa-compliance-wizard>
+(plain text: `/keys/opa-compliance-wizard.txt`). Before a first install, check
+that the key id there matches the one here and in the installer's output. If
+they differ, stop and report it privately.
+
+### How to verify a release
+
+Download the release file (`ocw-X.Y.Z.tar.gz`) and its signature
+(`ocw-X.Y.Z.tar.gz.minisig`), then either:
+
+```bash
+# the project's own verifier (Python standard library, works offline)
+python -m server.updater.verify ocw-X.Y.Z.tar.gz ocw-X.Y.Z.tar.gz.minisig --installed-version none
+
+# or the reference tool, with the minisign line above (-H: prehashed signatures)
+minisign -Vm ocw-X.Y.Z.tar.gz -P RWQZ6MDGT7XfiNw30FMcGZ/sL1IZFaHr+f7So4QAvmFg77qt3/Fcr2Ka -H
+```
+
+The project's verifier also checks the version, the file name, the manifest of
+every file inside and that the key is a current release key; prefer it. The
+same minisign check works for `get-ocw.sh` and `get-ocw.sh.minisig`. The
+updater and `get-ocw.sh` run this verification for you before anything is
+unpacked or installed. More detail: README, "Verify a download by hand".
+
+### If a signing key is compromised
+
+If the release key is lost or stolen, the maintainer signs a `revocation.json`
+with the standby key that revokes it and installs a new release key, and
+publishes a security advisory. It is published as an asset of a GitHub release
+(`revocation`, or `revocation-<serial>` for later ones) and, optionally, at an
+owner-controlled static URL (`OPA_REVOCATION_URL`), so one outage or one
+compromised account cannot hide it. A server with the update check on applies
+it by itself; otherwise apply it by hand (README, "If the signing key is
+compromised"; maintainers: [docs/releasing.md](docs/releasing.md), "If the
+release key is compromised"). If you think your own copy of the keys is wrong,
+compare the key ids with the advisory over a second channel before applying
+anything. A stolen standby key is as serious as a stolen release key and has no
+automatic recovery: the advisory would tell you to re-pin a new key by hand.
+
+### Documented residual: installed Python packages
+
+The signed manifest covers every file of the release, but **not the Python
+packages installed into the release's virtual environment.** They are
+installed with `pip --require-hashes` from the signed lock file, the release
+tree is owned by root and read-only to the application, and the root-run
+updater never runs the application's Python. A re-check of the installed
+packages against their pip `RECORD` hashes after installation is planned for
+5.54.0.
+
+### The evidence package verifier's sha256
+
+Each release publishes the sha256 of `tools/verify_evidence_package.py` in three places outside any evidence package: the signed
+`manifest.json` of the release (field `verifier_sha256`, covered by the release signature), the release notes, and the project's
+signing-key page. To check a copy, compute its sha256 (`sha256sum`, `shasum -a 256`, `Get-FileHash`) and compare it with the
+signed manifest's value, which you can read after verifying the release as described above, and with the other two. The cover
+sheet of a package and the copy inside it are conveniences: they come from the same place as the package. No value is written
+in this repository.
+
+## Evidence packages
+
+An evidence package (5.53.0) is one zip of the archived events of an audit period, with report files, the archive's hash
+chain as it stood when the package was built, and the data an auditor needs to check it offline
+(`docs/evidence-package-format.md`, `docs/evidence-package.md`). What it is, and what it is not:
+
+- **It holds personal data.** Names, email addresses, IP addresses, places and what people did, exactly as the System Log
+  recorded them. It is **not encrypted**. Whoever has the file has the data. Send it only to the people who need it, over a
+  channel you trust, and delete your copies when the audit is over.
+- **It is not signed, and the hashes are unkeyed.** Anyone who can rewrite the whole package, or the archive it was built
+  from, and recompute every hash can produce a package that passes the check. Nothing in the package proves who built it. The
+  server's build log (the `evidence_package.build`, `.build_finished` and `.downloaded` entries of the Audit Log and the
+  journal: who, when, the period, row counts, the package's sha256 and the chain head, never row content) is the only
+  independent record: compare the zip's sha256 and the chain head, both printed by the verifier, with it.
+- **What the verifier shows.** `tools/verify_evidence_package.py` (one file, Python standard library only) detects
+  accidental or partial change to a package, and checks the exported events against the archive's hash chain as it stood at
+  build time. It does not show who produced the events, that the archive was never altered by someone who could rewrite it,
+  or that `events.ndjson` holds every event of the period (the completeness statement is the builder's own). Events with no
+  seal, legacy and snapshot manifests, and report rows with no `event_uuid` are listed as not verified, never counted as
+  verified. Get the verifier's sha256 from the signed release, its notes or the signing-key page (see "The evidence package verifier's sha256" under Release signing keys), not from the package.
+- **Who can build one.** The environment's owner always can. Other people who see the environment need both *View archived
+  reports* and *Build evidence packages* (denied by default; the environment form asks who may). Permission is checked when
+  a build starts, on every status read and on every download. On a hosted server a build needs a fresh MFA, as every
+  configuration change does; that approval is its own type and never opens or extends the Settings and Updates window, and
+  the Settings approval cannot start a build. A package is available only to the person who built it (their sign-in
+  session), for 15 minutes after it is finished; then the file is deleted. Packages are written to
+  `<data folder>/packages/` (folder 0700, file 0600), deleted when the server starts, and never included in a support bundle.
+- **Not covered.** A package that has been downloaded is outside this server's control.
+- **Additional login gates.** Building and downloading packages there is intended. The control is the capability: a per-user
+  grant for that gate's issuer, or the environment-wide setting. "Owner and people this environment is shared with" allows every
+  person who sees the environment, through any gate. To keep packages to the main gate, leave the environment setting at owner
+  only and grant per user.
 
 ## Supported versions
 

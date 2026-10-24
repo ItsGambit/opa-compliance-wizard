@@ -238,7 +238,7 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
      `/etc/nginx/sites-available/opa-<name>` (`OCW_NGINX_SITES_DIR` if they live elsewhere);
    * the unit files may be indented (systemd allows it): `install.sh` edits them either way and stops before changing anything if
      `WorkingDirectory=` (or, for the backend unit, `ProtectSystem=` / `ProtectHome=`) is missing;
-   * after a release that changes the units or `install.sh`, the updater asks for `sudo server/install.sh --refresh-updater` (README, "Upgrading");
+   * after a release that changes the units or `install.sh`, the updater asks for `sudo server/install.sh --refresh-updater` (or `sudo bash get-ocw.sh --refresh-updater --version X.Y.Z` on a server installed with get-ocw.sh) (README, "Upgrading");
    * the units `ocw-stage@.service` (unprivileged staging; optional proxy settings in `/etc/ocw-updater.env`), `ocw-upgrade.path` and
      `ocw-upgrade.service` (root: activate, roll back, resume at boot) are documented in the README ("Upgrading").
 
@@ -406,25 +406,128 @@ What it may print, and why:
   by `deploy.sh` before 5.36.0 (it holds an old copy of the proxy secret;
   remove it).
 
-**Backing up and restoring the archive.** `audit_store.db` is the only
-copy of evidence older than Okta's 90-day System Log retention, and it
-is a WAL-mode SQLite database: a plain `cp` while the server is writing
-can miss the newest events (they live in `audit_store.db-wal` until a
-checkpoint) or produce an inconsistent file. Use SQLite's own online
-backup instead, which is safe while the app runs:
+### Evidence packages on the server (5.53.0)
+
+An evidence package is built from the archive by a background job and written to `packages/` in the data directory
+(`/var/lib/opa-compliance-wizard/packages` on the installer's layout): the folder is `0700`, each package sits in its own
+folder as a `0600` file, and the whole thing belongs to the application account.
+
+| | |
+|---|---|
+| Lifetime | A package is kept for **15 minutes** after it is finished (the download window), then its folder is deleted. Everything under `packages/` is also deleted when the application starts, so a restart or an upgrade never leaves one behind. A failed build deletes its half-written file at once. |
+| Disk | Allow **free space on the data volume** of about half of the estimated uncompressed size of the period's events, plus 256 MB; the build checks this first and refuses with the numbers if there is not enough. The estimate covers the events only: the report files add more (they compress well, so the rule leaves room). A sync running at the same time can still use space; a disk that fills mid-build fails the build with a plain message and removes the file. A full year of 1,000,000 events produced a package of about 115 MB (built in about 40 seconds, using under 70 MB of memory; the auditor's check of it used about 650 MB). A hard limit of 2 GiB applies to the finished zip (`OPA_EVIDENCE_MAX_BYTES` changes it); a build that would exceed it fails and the person is told to choose a shorter period. |
+| Concurrency | One build at a time on the whole server (a second asks to try again in a few minutes). |
+| Upgrades | The upgrade preflight refuses while a build runs, **and while a finished package is still inside its 15 minutes** ("a package is waiting to be downloaded (until HH:MM UTC)"), because the restart an upgrade needs deletes finished packages. A scheduled upgrade waits for a running build only as long as it waits for a sync (10 minutes), then goes ahead; a restart at any time (an upgrade, a crash, `systemctl restart`) deletes the packages still in their window. |
+| Backups | Not part of the backup set: do not back up `packages/` (the tar command below excludes it). A package is a copy of data that is in the archive. |
+| Support bundles | Never included: the bundle holds only the upgrade's own summary, journal lines and audit entries. |
+| Uninstall | `--uninstall --keep-data` keeps the data directory; if it was run during the 15 minutes a package may be in it. Delete `packages/` yourself when you remove the data. |
+| Where the record is | The Audit Log and the journal: `evidence_package.build` (who, from which address, which environment and period, whether gaps were acknowledged, local mode or MFA), `.build_finished` (rows, bytes, duration, sha256, chain head) or `.build_failed`, and one `.downloaded` for every fetch. Never row content. |
+
+Behind nginx a download is an ordinary proxied response; the template is unchanged. nginx buffers a large response to a temporary
+file (its `proxy_max_temp_file_size`, 1 GB by default) and then passes the rest on synchronously, which is fine for a package
+within the size limit.
+
+### Backups and restore
+
+The archive, the audit log and the stored credentials exist nowhere else, and
+`audit_store.db` is the only copy of evidence older than Okta's 90-day System
+Log retention. The paths below are those of a server made by the installer (the
+upgrade layout); on an older in-home install the same files sit in the install
+folder and the keyring in the application account's `~/.local/share/keyrings`.
+
+**The backup set.**
+
+| What | Where (defaults) | If you lose it | How to copy |
+|---|---|---|---|
+| The archive: events, sealed manifests, the environments (the `app_environments` table: names, base domain, team, key id, Okta URL), sync schedules, the stored OPA scan, Okta snapshots | `/var/lib/opa-compliance-wizard/audit_store.db` (and `audit_store.db-wal`, `-shm` beside it; or the path `OPA_AUDIT_DB_PATH` names) | Evidence older than 90 days is gone for good | SQLite's online backup only (below). A plain `cp` while the server writes can miss the newest events (they live in the `-wal` file until a checkpoint) or give an inconsistent file |
+| The audit log of write actions | `/var/lib/opa-compliance-wizard/audit_log.jsonl` (`.audit_log.jsonl.lock` is only a lock: do not copy it) | The record of who changed what is gone | Copy after the database. It is appended to; the file has no integrity protection of its own |
+| Access control, announcement banner | `/var/lib/opa-compliance-wizard/access_control.json`, `banner_config.json` | The admin group and sign-in restriction, and the banner, are reset | Plain copy |
+| Key list and revocations this install has learned | `/var/lib/opa-compliance-wizard/release_keys.local.json` | A published key revocation has to be applied again (README, "If the signing key is compromised") | Plain copy |
+| The credentials: each environment's OPA key secret and Okta API token, the Okta client secret and the admin-check token | The application account's login keyring: `/var/lib/opa-compliance-wizard/home/.local/share/keyrings/` | Every credential has to be entered again | Copy the directory (it changes only when someone saves a credential; copy again after you change one) |
+| The settings and the three generated secrets, **including `KEYRING_UNLOCK_PASSWORD`**, which opens the keyring above | `/etc/opa-compliance-wizard.env` (mode 0600, owned by the application account) | The restored keyring cannot be opened; you would enter every credential again | Plain copy, kept with the keyring but guarded as strictly as a password: the two together open every environment's credentials |
+| The login gate's session key | `/etc/opa-secrets-wizard-session.key` (root, group-readable) | A new 32-byte key works, but every session ends and everyone signs in again | Plain copy |
+| The nginx site (it carries the proxy secret, which must equal `NGINX_PROXY_SECRET`) and the TLS certificate and key | `/etc/nginx/sites-available/opa-secrets-wizard`, `/etc/nginx/ssl/opa-secrets-wizard.crt` and `.key` | Make the site again with the installer, and the certificate again | Plain copy |
+| Each additional login gate (`setup-second-gate.sh`) | `/etc/opa-compliance-wizard-<name>.env`, the folder `/etc/opa-auth-gate-<name>/` (its session key), `/etc/nginx/sites-available/opa-<name>` | That gate has to be set up again | Plain copy |
+| Older installs only | `environments.json`, `update_check.json` in the data directory | `environments.json` was imported into the database and deleted by an older release; `update_check.json` is re-made by the next check | Plain copy if present |
+
+Not needed: `/opt/opa-compliance-wizard` (the installed releases and the root-owned
+updater: install the release again), the `upgrade/` folder of the data directory (the updater's own
+pre-upgrade copies and bundles; large; not a substitute for the backup above), the `packages/` folder
+(evidence packages are temporary; see "Evidence packages on the server") and
+`/var/lib/ocw-updater` (downloads).
+
+A backup holds people's names and e-mails (the archive) and secrets (the keyring, the settings
+file): keep it on an encrypted disk or encrypt it, and give it the same access list as the
+server.
+
+**Taking a backup** (as a user with `sudo`; `ocw` is the application account, and `sqlite3` the
+command-line tool, `sudo apt-get install sqlite3`). The database is copied as the application
+account so SQLite's `-wal` and `-shm` files keep their owner:
 
 ```bash
-sqlite3 /home/<app-user>/opa-compliance-wizard/audit_store.db ".backup '/backups/audit_store-$(date +%F).db'"
+B=/var/backups/opa-compliance-wizard/$(date +%F)
+sudo install -d -o ocw -g ocw -m 0700 /var/backups/opa-compliance-wizard "$B"
+sudo -u ocw sqlite3 /var/lib/opa-compliance-wizard/audit_store.db ".backup '$B/audit_store.db'"
+sudo tar -C /var/lib/opa-compliance-wizard -czpf "$B/data-files.tar.gz" \
+  --exclude=./upgrade --exclude=./packages --exclude=./audit_store.db --exclude='./audit_store.db-*' --exclude=./.audit_log.jsonl.lock .
+sudo tar -czpf "$B/etc-files.tar.gz" /etc/opa-compliance-wizard.env /etc/opa-secrets-wizard-session.key \
+  /etc/nginx/sites-available/opa-secrets-wizard /etc/nginx/ssl/opa-secrets-wizard.crt /etc/nginx/ssl/opa-secrets-wizard.key
+sudo sh -c 'chmod 0600 "$1"/*' _ "$B"
 ```
 
-(or `VACUUM INTO '/backups/audit_store-YYYY-MM-DD.db'` for a compacted
-copy). To restore: stop the service, move the current `audit_store.db`,
-`-wal` and `-shm` files aside, copy the backup into place, make sure it
-is owned by the app user with mode `0600`, start the service, then run
-`sqlite3 audit_store.db "PRAGMA integrity_check"` and call each
-environment's integrity check (`GET /api/environments/<name>/integrity`;
-the admin-only `?deep=1` additionally re-hashes every sealed curated
-event). Evidence chain v2 is on by default since 5.40.4. For manifests
+The second command is SQLite's online backup, safe while the app runs (`VACUUM INTO '<file>'`
+makes a compacted copy instead). The first `tar` takes the audit log, the access-control and banner files,
+`release_keys.local.json` and the whole `home/` folder with the keyring. Add the files of any
+additional login gate to the second `tar`. Then move `$B` off the server.
+
+**Restore drill.** Do it once on a spare server before you need it. Restore into the same
+release or a newer one: the app migrates the database forward when it starts. (Restoring into an older
+release than the backup came from is a different matter: see "Rolling back past 5.40.4" below.)
+
+1. **A new server only.** Install as in the README ("Installing on a server") with the same
+   `--server-name`. That leaves a working backend, an empty archive and newly generated secrets.
+2. Stop the services: `sudo systemctl stop opa-compliance-wizard opa-auth-gate` (and every
+   `opa-auth-gate-<name>` you run).
+3. Put the current files aside rather than deleting them:
+   `sudo mkdir /root/ocw-before-restore && sudo mv /var/lib/opa-compliance-wizard/audit_store.db* /var/lib/opa-compliance-wizard/home /root/ocw-before-restore/`.
+4. Restore the data files and the database, then the ownership and modes:
+
+   ```bash
+   B=<the backup folder>
+   sudo tar -C /var/lib/opa-compliance-wizard -xzpf "$B/data-files.tar.gz"
+   sudo install -o ocw -g ocw -m 0600 "$B/audit_store.db" /var/lib/opa-compliance-wizard/audit_store.db
+   sudo chown -R ocw:ocw /var/lib/opa-compliance-wizard/home
+   sudo chown ocw:ocw /var/lib/opa-compliance-wizard/*.json*
+   sudo chmod 0700 /var/lib/opa-compliance-wizard/home
+   ```
+5. Restore the settings, the session key, the nginx site and the certificate together, so the proxy
+   secret in the site and in the settings file are the same ones:
+   `sudo tar -C / -xzpf "$B/etc-files.tar.gz"`, then check the modes the installer sets:
+   `sudo chown ocw:ocw /etc/opa-compliance-wizard.env && sudo chmod 0600 /etc/opa-compliance-wizard.env`
+   (`/etc/opa-secrets-wizard-session.key` is root-owned with the application group and mode 0640, the site
+   0640 with that group, the TLS key 0600). Then `sudo nginx -t && sudo systemctl reload nginx`.
+6. Check the database before anything uses it:
+   `sudo -u ocw sqlite3 /var/lib/opa-compliance-wizard/audit_store.db "PRAGMA integrity_check"` must print `ok`.
+7. Start: `sudo systemctl start opa-compliance-wizard opa-auth-gate` (the gate only if it was enabled before).
+8. **Check the restore.**
+   - `systemctl is-active opa-compliance-wizard` says `active`, and
+     `curl -s http://127.0.0.1:8766/api/version` answers with the version.
+   - `curl -s https://<your-host>/healthz` (add `-k` for a temporary self-signed certificate) answers
+     `"status": "ok"`: the active environment's stored credentials can be read back and the archive is reachable.
+     `"degraded"` names the failing check (a keyring that does not open usually means the settings file and the
+     keyring come from different backups).
+   - In the app, **Environments** lists your environments; open one and run **Sync now**. It continues from the
+     last event in the restored archive, so only events still inside Okta's 90-day window can fill the gap since the backup.
+   - Run the integrity check on each environment (below), and compare its `head_hash` with the last
+     `evidence_chain.sealed` entry in the restored `audit_log.jsonl`.
+   - Sign in from a private window to see the login gate works.
+9. Apply any key revocation published since the backup, if the project has published one (README).
+   Delete `/root/ocw-before-restore` once you are satisfied.
+
+**Checking the archive afterwards.** Each environment's integrity check
+(`GET /api/environments/<name>/integrity`; the admin-only `?deep=1` additionally re-hashes every
+sealed curated event).
+Evidence chain v2 is on by default since 5.40.4. For manifests
 written from then on, an edited or deleted manifest and (with `?deep=1`)
 an edited or deleted curated event show as a broken chain; for the whole
 chain, v1 and v2, manifests removed from the end after the upgrade show
@@ -522,7 +625,7 @@ next to it (5.40.6). If an entry cannot be written (disk full, read-only
 file), the action it describes has already happened, so it is not turned
 into an error: the journal gets an `Audit log append FAILED` line with the
 action, the actor's id and the time. The file has no rotation and no
-tamper evidence of its own; keep it in your backups. Running the CLI or `launch.py` directly (no
+integrity protection of its own; keep it in your backups. Running the CLI or `launch.py` directly (no
 login gate in front of them at all) is entirely unaffected by any of
 this -- there's exactly one shared, unscoped environment list, matching
 this tool's original single-user design.
@@ -592,6 +695,70 @@ trip asks for them again. Activating an environment, Sync now and
 read-only views are not gated. **Local mode** has no login gate and no
 identity provider to step up with, so there these changes apply at once,
 as before.
+
+**Opening Settings and Updates needs a fresh MFA too (5.53.0).** Behind
+the login gate, the Access control, Shared permissions, Orphaned archives
+and Environments screens (the environment details: OPA domain, team, key
+ID, Okta URL, sync schedule) and the whole Updates page, including its
+signing-key page and the support-bundle download, show nothing until you
+pass the same step-up. The screen offers **Continue with Okta**; the
+browser goes through the gate's `/step-up` and comes back to
+`/api/environment_changes/save` as `settings.unlock`, whose only effect
+is a row in `settings_unlocks` (migration 012) that says *this person, in
+this login session, through this gate* may read Settings until it
+expires **10 minutes** later. The server checks that row on every
+protected request (a refused read answers `403` with `"scope":
+"settings"` and `"reason": "settings_locked"`); the browser only explains
+it, with a countdown and a **Lock now** link. Every save and every
+upgrade still asks for its own fresh MFA, and a completed save of the
+kinds listed in the changelog (every Environments change, the Access
+control save, the announcement banner, the update settings and upgrade
+requests) also restarts the 10 minutes, because it just proved the same
+thing. The approval of a Settings unlock can open Settings and nothing
+else, and no other approval, such as an evidence package build,
+opens or extends it. The window belongs to one sign-in: signing out and
+in again, or another person, starts locked. A restart of the application
+(an upgrade) keeps it. The announcement banner is also a step-up change
+now. The list every screen uses to switch environments no longer carries
+the OPA domain, team, key ID, Okta URL or sync schedule; those come with
+the unlock. The audit log records `settings.unlocked`, `settings.locked`
+(`reason`: `manual`, `expired` when the first refused request after
+expiry notices it, or `operator`) and, in local mode,
+`settings.access_without_mfa_local`. **Local mode** has no login gate and
+no identity provider, so Settings and Updates open without a second
+factor there, say so in a notice, and record each opening (at most one
+entry per area per 10 minutes). An additional login gate's nginx site
+generated before 5.42.0 has no step-up location, so its users cannot
+unlock Settings (or approve any change): `setup-second-gate.sh` and the
+updater's pre-upgrade checks warn about such a site, and
+`sudo bash <install>/current/server/install.sh --regenerate-second-sites`
+repairs it. The audit log page itself is not behind the unlock.
+
+**Locked out of Settings (break-glass).** The unlock only guards *reading*
+Settings and Updates in the browser; the people who run the server keep
+every tool they had. If Okta or the second factor is unavailable, the
+browser cannot open Settings, Access control or Updates until it is back,
+by design (every save and upgrade would need the same MFA anyway), and
+nothing else is affected: reports, the Overview and the Audit Log keep
+working. Root on the host can still upgrade, roll back and restore with
+`sudo ocw-updater ...` (it does not use the browser), and can change the
+Okta group IDs by editing `access_control.json` in the data directory
+(the gate reads it at each login). To end **every open Settings and
+Updates window now** (for example after a suspected stolen session), run
+the application's own command as the application account, then check the
+Audit Log for the `settings.locked` entry with `"reason": "operator"`:
+
+```bash
+sudo runuser -u <application account> -- env OPA_DATA_DIR=/var/lib/opa-compliance-wizard \
+  /opt/opa-compliance-wizard/current/.venv/bin/python -m server.updater settings-unlocks list
+sudo runuser -u <application account> -- env OPA_DATA_DIR=/var/lib/opa-compliance-wizard \
+  /opt/opa-compliance-wizard/current/.venv/bin/python -m server.updater settings-unlocks clear --confirm CLEAR
+```
+
+Clearing only removes access: nobody can read Settings again until they
+pass a new MFA, and it can never open one. There is no command that opens
+a window without MFA, on purpose. (`ocw-updater` does not forward this
+command yet; use the form above.)
 
 **Admin access.** Members of one designated Okta group get full admin
 rights across the whole dashboard: every environment becomes visible and
@@ -677,10 +844,12 @@ to be a quiet backdoor.
 
 ---
 
+A login gate configured only through a systemd drop-in (not the shared settings file) looks unconfigured to the upgrade preflight's check for an unset gate (see the README, "Upgrading"); finish the gate setup in the settings file, or run the refresh command it names.
+
 ## Uninstalling
 
 `sudo bash get-ocw.sh --uninstall --keep-data` (or `sudo server/install.sh --uninstall --keep-data` from the installed release) stops and
-removes the services, the `ocw-updater` command, `/opt/opa-compliance-wizard`, the staging account and its downloads, and the nginx
+removes the services, the `ocw-updater` command, `/opt/opa-compliance-wizard`, the staging account, its downloads and its pip cache (`/var/cache/ocw-updater`), and the nginx
 site (it keeps the site while an additional login gate exists, because those sites reuse its rate-limit zone), after you type
 `UNINSTALL`. It **keeps** everything that holds your data or settings, so installing again finds them:
 
@@ -690,6 +859,9 @@ site (it keeps the site while an additional login gate exists, because those sit
 | The settings file (with the generated secrets) and the login gate's session key | `/etc/opa-compliance-wizard.env`, `/etc/opa-secrets-wizard-session.key` |
 | The TLS certificate and key | `/etc/nginx/ssl/opa-secrets-wizard.crt` and `.key` |
 | The application account, the distribution packages, every `*.migrated-*` file and the directory of a legacy install | `ocw` (`userdel`), `apt` |
+
+An evidence package built in the last 15 minutes may still be in `packages/` under the data directory; it is temporary and holds
+personal data, so delete that folder together with the rest when you remove the data.
 
 **Removing the data too is a manual step**, on purpose: it deletes the only copy of evidence that may be older than Okta's own log
 retention. Make a backup first (see "Backing up and restoring the archive"), then remove the paths above yourself when you are sure.
@@ -789,12 +961,18 @@ and data: a second `auth_gate.py` instance with its own settings, and an
 nginx site per hostname. The first gate, its env file and nginx site are
 untouched.
 
-**Set it up with `server/setup-second-gate.sh`** (5.38.1), as the app user:
+**Set it up with `server/setup-second-gate.sh`** (5.38.1), as the app user. On a server
+made by the installer, run it from the installed release
+(`/opt/opa-compliance-wizard/current/server/setup-second-gate.sh`); on an older in-home install it is in your
+checkout. The script uses the account that runs it as the new gate's account (it owns the new settings file and
+key folder) and calls `sudo` itself, so that account needs `sudo`; the application account the installer
+creates (`ocw`) has no login shell, and the script has not been adapted to it, so check the plan it prints
+before you accept:
 
 ```bash
 mkdir -p ~/.opa-setup && chmod 700 ~/.opa-setup
 # put the new Okta app's client secret in ~/.opa-setup/<name>-client-secret (chmod 600)
-bash ~/opa-secrets-folders/server/setup-second-gate.sh \
+bash /opt/opa-compliance-wizard/current/server/setup-second-gate.sh \
   --name <name> --org-url https://<org or custom domain> --auth-server org \
   --client-id <Okta client id> --admin-group <Okta group id> --origin https://<hostname> \
   [--port 8768] [--listen 127.0.0.1:8080] [--allow-public-listen] [--tunnel]
@@ -867,10 +1045,12 @@ reachable through that site (above).
 **The generated site is a snapshot.** It is built once from the live main
 site and `deploy.sh` never updates it, so changes to the main template
 (e.g. 5.40.5's security headers and sign-in rate limit) reach an additional
-gate's site only when you rebuild it: remove
-`/etc/nginx/sites-available/opa-<name>` and `/etc/nginx/sites-enabled/opa-<name>`
-and re-run the same `setup-second-gate.sh` command (every other step is
-skipped). Behind a tunnel every request reaches nginx from `127.0.0.1`, so
+gate's site only when you rebuild it: run
+`sudo bash /opt/opa-compliance-wizard/current/server/install.sh --regenerate-second-sites`
+(5.50.0+). It rebuilds the nginx site of every additional login gate (`opa-auth-gate-*`) from the live main site
+with this release's deny rules, runs `nginx -t` first and puts the old site back if nginx refuses it. (Before
+5.50.0 the way was to remove `/etc/nginx/sites-available/opa-<name>` and `/etc/nginx/sites-enabled/opa-<name>` and
+re-run the same `setup-second-gate.sh` command; every other step is skipped.) Behind a tunnel every request reaches nginx from `127.0.0.1`, so
 the per-address sign-in rate limit is shared by everyone using that site.
 
 ## Host status for monitoring (optional, 5.39.0+)
@@ -880,7 +1060,7 @@ the per-address sign-in rate limit is shared by everyone using that site.
 pending apt updates (security counted separately), reboot-required, the app's version and an
 overall `state` (`ok` / `warn` / `down`). It holds no secrets and takes no input.
 
-    bash server/setup-host-status.sh --services "nginx opa-secrets-wizard opa-auth-gate cloudflared"
+    bash server/setup-host-status.sh --services "nginx opa-compliance-wizard opa-auth-gate cloudflared"
 
 Publish it only behind an access gate. With a Cloudflare Tunnel, add an ingress rule for your
 hostname with path `^/__status$` → `http://127.0.0.1:8790` **above** the hostname's main rule, with

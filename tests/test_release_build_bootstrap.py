@@ -235,3 +235,25 @@ def test_verify_re_renders_from_the_tarball_and_checks_the_signature(tagged, tmp
     other.write_bytes(b"#!/bin/bash\n")
     with pytest.raises(Exception):
         tool.verify_bootstrap_signature(other, boot_sig, keylib.effective_from(keylib.load_key_list(keys_path)))
+
+
+def test_the_manifest_and_the_notes_carry_the_evidence_verifier_sha256(tagged, tmp_path):
+    tool = load_tool()
+    repo, dist, _k, _s = tagged
+    verifier = repo / "tools" / "verify_evidence_package.py"
+    verifier.parent.mkdir(exist_ok=True)
+    verifier.write_bytes((REPO / "tools" / "verify_evidence_package.py").read_bytes())
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+    for cmd in (["add", "."], ["commit", "-q", "-m", "verifier"], ["tag", "-f", "v5.52.0"]):
+        subprocess.run(["git", "-C", str(repo), *cmd], check=True, env=env, capture_output=True)
+    _tar, manifest = tool.build_release("5.52.0", repo, tmp_path / "o", dist, built_at="2026-05-01T00:00:00Z")
+    want = hashlib.sha256(verifier.read_bytes()).hexdigest()
+    assert manifest["verifier_sha256"] == want == manifest["files"]["tools/verify_evidence_package.py"]
+    assert tool.verifier_notes_line(want) in manifest["changelog_excerpt"]
+    assert json.loads((tmp_path / "o" / "manifest.json").read_text())["verifier_sha256"] == want
+
+
+def test_a_tree_without_the_verifier_has_no_verifier_sha256(tagged, tmp_path):
+    tool = load_tool()
+    _tar, manifest = build(tool, tagged, tmp_path / "o")
+    assert manifest["verifier_sha256"] is None and "verifier" not in manifest["changelog_excerpt"]

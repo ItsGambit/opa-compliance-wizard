@@ -50,10 +50,46 @@ if NGINX is None and os.environ.get("OPA_REQUIRE_NGINX_TESTS") == "1":  # set in
 pytestmark = pytest.mark.skipif(NGINX is None, reason="nginx binary not available")
 
 
+_ISSUED_PORTS = set()
+
+
 def _free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    """A loopback port nobody is listening on. The port is released before nginx binds it, so never hand the same
+    number out twice in one run (the OS may reuse a just-closed ephemeral port for the next call)."""
+    for _ in range(50):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        if port not in _ISSUED_PORTS:
+            _ISSUED_PORTS.add(port)
+            return port
+    raise RuntimeError("could not find an unused loopback port")
+
+
+def _start_nginx(prefix, conf, ports, timeout=30):
+    """Starts nginx and waits until every given port accepts a connection. Fails loudly, with nginx's own error
+    output, if it exits early or never listens -- a test that goes on against a server that is not up gives a
+    refused connection that looks like a product bug (the old wait gave up silently after 10 s)."""
+    proc = subprocess.Popen([NGINX, "-p", str(prefix), "-c", str(conf), "-e", str(prefix / "logs" / "e.log")],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    deadline = time.time() + timeout
+    pending = list(ports)
+    while pending:
+        if proc.poll() is not None:
+            err = proc.stderr.read().decode(errors="replace")
+            log = prefix / "logs" / "e.log"
+            raise AssertionError(f"nginx exited with {proc.returncode} before listening: {err} "
+                                 f"{log.read_text() if log.exists() else ''}")
+        try:
+            socket.create_connection(("127.0.0.1", pending[0]), timeout=0.5).close()
+            pending.pop(0)
+        except OSError:
+            if time.time() > deadline:
+                proc.terminate()
+                proc.wait(timeout=10)
+                raise AssertionError(f"nginx did not listen on port {pending[0]} within {timeout} s")
+            time.sleep(0.05)
+    return proc
 
 
 def _self_signed(tmp):
@@ -224,15 +260,7 @@ def served(tmp_path):
                           backend=backend.server_address[1], gate=gate.server_address[1])
     conf = _write_config(tmp_path, site)
     assert _nginx_t(conf, tmp_path).returncode == 0
-    proc = subprocess.Popen([NGINX, "-p", str(tmp_path), "-c", str(conf), "-e", str(tmp_path / "logs" / "e.log")],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        try:
-            socket.create_connection(("127.0.0.1", https_port), timeout=0.2).close()
-            break
-        except OSError:
-            time.sleep(0.05)
+    proc = _start_nginx(tmp_path, conf, [http_port, https_port])
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -353,6 +381,21 @@ def test_ordinary_routes_drop_client_sent_step_up_headers(served):
     assert "x-auth-action-id" not in lowered and "x-nginx-stepup-location" not in lowered
 
 
+# 5.53.0: the Settings unlock rides the existing routes. Its status and environment reads go through `location /` (no step-up
+# marker), and the login-session cookie reaches the backend, because the unlock is bound to a hash of it.
+def test_settings_reads_pass_through_with_the_session_cookie_and_without_the_step_up_marker(served):
+    request, rec, _ = served
+    for path in ("/api/settings/status", "/api/settings/environments"):
+        resp = request(path, {"Cookie": "opa_wizard_session=good", "X-Nginx-Stepup-Location": "guess"})
+        assert resp.status == 200
+        sent, headers = rec.backend_requests[-1]
+        lowered = {k.lower(): v for k, v in headers.items()}
+        assert sent == path
+        assert "x-nginx-stepup-location" not in lowered
+        assert "opa_wizard_session=good" in lowered.get("cookie", "")
+        assert lowered["x-nginx-proxy-secret"]
+
+
 # 5.43.0: the gate's issuer reaches the backend from the gate only.
 def test_the_gates_issuer_replaces_a_client_sent_one(served):
     request, rec, _ = served
@@ -419,15 +462,7 @@ def served_second(tmp_path):
     second = second.replace("127.0.0.1:8766", f"127.0.0.1:{backend.server_address[1]}")
     conf = _write_config(tmp_path, main, [second])
     assert _nginx_t(conf, tmp_path).returncode == 0
-    proc = subprocess.Popen([NGINX, "-p", str(tmp_path), "-c", str(conf), "-e", str(tmp_path / "logs" / "e.log")],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        try:
-            socket.create_connection(("127.0.0.1", second_port), timeout=0.2).close()
-            break
-        except OSError:
-            time.sleep(0.05)
+    proc = _start_nginx(tmp_path, conf, [second_port])
 
     def request(method, path):
         conn = http.client.HTTPConnection("127.0.0.1", second_port, timeout=10)
@@ -479,6 +514,10 @@ def test_second_site_refuses_the_whole_backend_admin_routes(served_second, metho
     ("DELETE", "/api/environments/dev?id=aaaaaaaa-0000-4000-8000-000000000001"),  # what the UI sends
     ("GET", "/api/environments?purge_archive=1"),                                  # only a DELETE purges
     ("POST", "/api/environments/dev/sync/start"),
+    ("GET", "/api/settings/status"),            # 5.53.0: the Settings unlock works from an additional gate's site
+    ("GET", "/api/settings/environments"),
+    ("POST", "/api/settings/unlock"),
+    ("POST", "/api/settings/lock"),
     ("POST", "/api/environment_changes/save"),  # needs the step-up -> /login redirect, not a 403
 ])
 def test_second_site_still_serves_everything_else(served_second, method, path):

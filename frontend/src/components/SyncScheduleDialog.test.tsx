@@ -4,7 +4,7 @@ import { fireEvent, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { fetchCsvFiles, fetchIntegrity, fetchSyncStatus, fetchWhoami } from '../api/client'
 import { renderWithClient } from '../test/renderWithClient'
-import type { Environment } from '../types'
+import type { SettingsEnvironment } from '../types'
 import { SyncScheduleDialog } from './SyncScheduleDialog'
 
 vi.mock('../api/client', () => ({
@@ -15,7 +15,7 @@ vi.mock('../api/client', () => ({
 const env = {
   id: 'e1', name: 'dev', base_domain: '', team_name: '', key_id: '', okta_url: '', has_okta_token: true, shared: false, is_own: true,
   sync_schedule: { enabled: false, run_time: '02:00', ingestion_scope: 'curated', retention_days: null, retention_max_size_mb: null },
-} as Environment
+} as SettingsEnvironment
 
 beforeEach(() => {
   vi.clearAllMocks()

@@ -12,6 +12,7 @@ import {
   Megaphone,
   Menu,
   Moon,
+  PackageCheck,
   PanelLeftClose,
   PanelLeftOpen,
   Search,
@@ -79,6 +80,7 @@ export const REPORTS_SUB_TABS = [
   { value: 'service_accounts', label: 'Service Accounts' },
   { value: 'okta_admins', label: 'Okta Admins' },
   { value: 'cross_checks', label: 'Cross-checks' },
+  { value: 'evidence_package', label: 'Evidence package' },
 ]
 
 interface Props {
@@ -350,7 +352,7 @@ export function SideNav({
                   key={sub.value}
                   active={reportsSubTab === sub.value}
                   label={sub.label}
-                  icon={sub.value === 'secrets_access' ? KeyRound : sub.value === 'service_accounts' ? UserCog : sub.value === 'okta_admins' ? ShieldCheck : sub.value === 'cross_checks' ? ListChecks : undefined}
+                  icon={sub.value === 'secrets_access' ? KeyRound : sub.value === 'service_accounts' ? UserCog : sub.value === 'okta_admins' ? ShieldCheck : sub.value === 'cross_checks' ? ListChecks : sub.value === 'evidence_package' ? PackageCheck : undefined}
                   onClick={() => { onReportsSubTabChange(sub.value); closeDrawer() }}
                 />
               ))}

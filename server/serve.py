@@ -22,6 +22,7 @@ saves it via POST /api/environments.
 
 import argparse
 import contextlib
+import errno
 import csv as _csv
 import hashlib
 import hmac
@@ -46,13 +47,23 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 import create_secret_folders as engine  # noqa: E402
 from server import refresh_jobs as rj  # noqa: E402
+from server import evidence_jobs  # noqa: E402
 from server.updater import service as update_service  # noqa: E402
 from server.updater import upgrade as upgrade_service  # noqa: E402
+from server.gate_config import SESSION_COOKIE  # noqa: E402
 
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 # 5.47.0: user-saved folder templates and execution records live with the data
 # files when OPA_DATA_DIR is set (the /var/lib layout; the code directory is
 # read-only to this process there). Unset = the project directory, as always.
+EXPORT_MIN_FREE_BYTES = 256 * 1024 * 1024  # a report export is refused (507) below this much free space
+
+
+def _free_bytes(path):
+    import shutil
+    return shutil.disk_usage(path).free
+
+
 def _csv_dir():
     return Path(os.environ["OPA_DATA_DIR"]) if os.environ.get("OPA_DATA_DIR") else PROJECT_ROOT
 
@@ -189,6 +200,31 @@ ENV_CHANGE_ACTION_TYPES = (
     "environment.upsert", "environment.share", "environment.delete",
     "sync_schedule.update", "sync.reset_watermark", "sync.import_csv",
     "archive.purge", "shared_permissions.update", "upgrade.settings", "upgrade.request",
+    # 5.53.0: the announcement banner is an org-wide message, so saving it needs a fresh MFA like the rest.
+    "banner.update",
+    # 5.53.0: opening Settings and Updates needs a fresh MFA; the approval only ever creates the unlock (see
+    # SETTINGS_RENEWING_ACTION_TYPES for what may extend it).
+    "settings.unlock",
+    # 5.53.0: the evidence package build. Its approval starts one build and never touches the Settings unlock (it is not in
+    # SETTINGS_RENEWING_ACTION_TYPES).
+    "evidence_package.build",
+)
+
+# 5.53.0: how long a Settings/Updates unlock lasts after the MFA that opened it. An application constant that matches the
+# identity provider's own 10-minute re-authentication policy by decision; it is not read from the provider (the step-up
+# always forces a fresh sign-in, so the provider asks regardless).
+SETTINGS_UNLOCK_TTL_SECONDS = 10 * 60
+
+# 5.53.0: the action types whose completed approval renews the caller's Settings unlock, because they just passed a fresh
+# MFA for the same user in the same session. An explicit tuple on purpose: a new action type never renews anything until it
+# is added HERE deliberately. `settings.unlock` is not in it (it only creates the window) and neither is
+# `evidence_package.build` (a build approval must never open or extend Settings). The first ten are the
+# ENV_CHANGE_ACTION_TYPES of 5.52.0.
+SETTINGS_RENEWING_ACTION_TYPES = (
+    "environment.upsert", "environment.share", "environment.delete",
+    "sync_schedule.update", "sync.reset_watermark", "sync.import_csv",
+    "archive.purge", "shared_permissions.update", "upgrade.settings", "upgrade.request",
+    "access_control.update", "banner.update",
 )
 
 # The environment form's two secrets never go into pending_admin_actions
@@ -206,7 +242,9 @@ MAX_PENDING_ENV_SECRETS = 1024
 MAX_OPEN_ENV_CHANGES_PER_USER = 20
 # The environment form's fields are the only ones stored for a save, each
 # capped (a secret this long is not a real API key or token).
-ENV_FORM_FIELDS = ("id", "name", "base_domain", "team_name", "key_id", "okta_url", "key_secret", "okta_api_token")
+# 5.53.0: "evidence_builders" is the form's "Who can build evidence packages" choice: "owner" or "shared" (stored as the
+# environment's build_evidence_package permission override).
+ENV_FORM_FIELDS = ("id", "name", "base_domain", "team_name", "key_id", "okta_url", "key_secret", "okta_api_token", "evidence_builders")
 MAX_ENV_FIELD_CHARS = 4096
 _pending_env_secrets_lock = threading.Lock()
 _pending_env_secrets = {}  # action_id -> (expires_monotonic, {field: value})
@@ -258,6 +296,83 @@ def _request_passed_stepup_location(headers):
     if not isinstance(presented, str):
         return False
     return hmac.compare_digest(presented.encode("utf-8"), NGINX_PROXY_SECRET.encode("utf-8"))
+
+
+NOTICE_RUN_FIELDS = ("correlation_id", "action", "version_from", "version_to", "step", "result", "reason_code", "failed_step",
+                     "started_at", "updated_at", "seconds", "rolled_back_to", "step_started_at")
+NOTICE_REVOCATION_FIELDS = ("serial", "issued_at", "applied_at", "reason", "advisory_url", "revoked", "added", "signed_by", "source")
+
+
+def _notice_run(run):
+    """The upgrade run as the notice shows it to administrators: progress only. The backup's file name, the steps' details and
+    the failure text stay on the Updates page (behind the unlock)."""
+    if not isinstance(run, dict):
+        return None
+    out = {k: run.get(k) for k in NOTICE_RUN_FIELDS}
+    backup = run.get("backup")
+    if isinstance(backup, dict):
+        out["backup"] = {"size": backup.get("size"), "integrity": backup.get("integrity")}
+    # 5.53.0: the step list and the health checks as progress only (names, times, pass or fail), so the Updates page can keep
+    # showing the steps while its own status is locked or the server restarts. No step details, no check text.
+    steps = run.get("steps_done")
+    out["steps_done"] = [{"step": str(s.get("step"))[:40], "at": s.get("at"), "seconds": s.get("seconds")}
+                         for s in steps[:20] if isinstance(s, dict)] if isinstance(steps, list) else None
+    health = run.get("health")
+    out["health"] = [{"id": str(h.get("id"))[:40], "ok": bool(h.get("ok"))}
+                     for h in health[:20] if isinstance(h, dict)] if isinstance(health, list) else None
+    return out
+
+
+def _notice_revocation(rev):
+    """The recent key revocation as the banner needs it, nothing else of the history entry."""
+    if not isinstance(rev, dict):
+        return None
+    return {k: rev.get(k) for k in NOTICE_REVOCATION_FIELDS}
+
+
+def _session_fingerprint(headers):
+    """5.53.0: tells one login session from another for the Settings unlock. sha256 of the gate's opaque session cookie value
+    (first 32 hex characters); this process never parses or trusts the cookie's content, it only hashes the string the gate
+    minted. The session token is minted once per sign-in and not rotated, so the value is stable across the MFA round trip and
+    changes at every sign-out and sign-in. Local mode has no gate and no cookie: "local". None in hosted mode when the cookie
+    is absent or unreadable, which makes every unlock check fail closed."""
+    if not _step_up_required_for_changes():
+        return "local"
+    raw = headers.get("Cookie")
+    if not isinstance(raw, str) or not raw:
+        return None
+    import http.cookies
+    jar = http.cookies.SimpleCookie()
+    try:
+        jar.load(raw)
+    except http.cookies.CookieError:
+        return None
+    morsel = jar.get(SESSION_COOKIE)
+    if morsel is None or not morsel.value:
+        return None
+    return hashlib.sha256(morsel.value.encode("utf-8", "replace")).hexdigest()[:32]
+
+
+LOCAL_MODE_NOTICE = (
+    "No MFA in local mode. This computer runs the wizard without a login gate or identity provider, so Settings and "
+    "Updates open without a second factor. Anyone who can use this computer as you can change these settings. Each "
+    "opening is recorded in the Audit Log."
+)
+SETTINGS_AREAS = ("settings", "updates")
+LOCAL_ACCESS_AUDIT_INTERVAL_SECONDS = 10 * 60
+_local_access_logged = {}  # area -> time.monotonic() of the last audit entry in this process
+_local_access_lock = threading.Lock()
+
+
+def _local_access_due(area):
+    """True at most once per area per 10 minutes per process (the first opening, then one line per window)."""
+    now = time.monotonic()
+    with _local_access_lock:
+        last = _local_access_logged.get(area)
+        if last is not None and now - last < LOCAL_ACCESS_AUDIT_INTERVAL_SECONDS:
+            return False
+        _local_access_logged[area] = now
+        return True
 
 
 def _shared_permission_message(capability):
@@ -803,6 +918,101 @@ def _policy_write_lock(environment_id, policy_id):
 DEEP_VERIFY_WAIT_SECS = 20
 DEEP_VERIFY_RESULT_TTL_SECS = 120
 DEEP_VERIFY_ERROR_TTL_SECS = 30
+# ---------------------------------------------------------------------------
+# 5.53.0: evidence package builds. State and folder clean-up are in server/evidence_jobs.py, the zip is built by
+# evidence_package.py; this is the glue: who may build (checked again when the job starts, on every status read and on
+# every download), the worker thread, and the build log (audit log + journal).
+# ---------------------------------------------------------------------------
+_evidence = evidence_jobs.Registry(lambda: os.path.join(engine._data_dir(), "packages"))
+EVIDENCE_CAPABILITIES = ("view_archive", "build_evidence_package")
+EVIDENCE_STREAM_CHUNK = 1024 * 1024
+# The coverage check reads the archive (one count per event type, one pass over the period's days): at most this many at once
+# on the whole server, so a person with the permission cannot keep the archive busy by pressing the button; the rest are told to retry.
+EVIDENCE_CHECKS_AT_ONCE = 2
+_evidence_checks = threading.BoundedSemaphore(EVIDENCE_CHECKS_AT_ONCE)
+
+
+# A full disk, an exhausted quota or a file over the filesystem's limit all end a build the same way (EDQUOT is absent on Windows).
+_DISK_FULL_ERRNOS = tuple(getattr(errno, n) for n in ("ENOSPC", "EDQUOT", "EFBIG") if hasattr(errno, n))
+
+
+def _evidence_caller_refusal(environment_id, engine_owner, issuer):
+    """None when this caller may still build and read packages of the environment, else (status, body): 404 when the
+    environment is gone, 403 for a withdrawn permission (shared-environment capabilities, owner always passes)."""
+    exists, _owner = engine.environment_owner(environment_id)
+    # Visibility first (a private environment of someone else, or one unshared since, is "gone" for this caller), then the capabilities.
+    if not exists or not any(m.get("environment_id") == environment_id for m in engine.list_environments_for(engine_owner).values()):
+        return 404, {"error": "The environment this package was built from no longer exists or is no longer shared with you."}
+    for capability in EVIDENCE_CAPABILITIES:
+        if not engine.shared_capability_allowed(environment_id, engine_owner, capability, caller_issuer=issuer):
+            return 403, {"error": _shared_permission_message(capability), "reason": "shared_permission_denied", "capability": capability}
+    return None
+
+
+def _evidence_log(ctx, action, details, level="INFO"):
+    """The build log: one audit-log entry and one journal line. Never row content."""
+    entry = dict(details)
+    entry.setdefault("job_id", ctx.get("job_id"))
+    if ctx.get("issuer"):
+        entry["actor_issuer"] = ctx["issuer"]
+    engine.log_audit_event(ctx.get("actor_email"), ctx.get("actor_sub"), action, entry,
+                           client_ip=ctx.get("client_ip"), user_agent=ctx.get("user_agent"))
+    journal = {k: entry.get(k) for k in ("job_id", "environment_id", "period", "gaps_acknowledged", "outcome", "reason", "mode", "events",
+                                         "report_rows", "bytes", "sha256", "chain_head", "seconds")}
+    journal["actor_sub"] = ctx.get("actor_sub")
+    journal["client_ip"] = ctx.get("client_ip")
+    engine.log(level, action + " " + json.dumps({k: v for k, v in journal.items() if v is not None}, separators=(",", ":")))
+
+
+def _run_evidence_build(job_id, ctx):
+    """The worker thread of one build. Re-checks the caller's permission first, builds, and records the outcome."""
+    engine.CORRELATION_ID.set(ctx.get("correlation_id"))
+    import evidence_core
+    import evidence_package
+    started = time.monotonic()
+    base = {"environment": ctx["environment_name"], "environment_id": ctx["environment_id"], "period": ctx["period"],
+            "gaps_acknowledged": ctx["gaps_acknowledged"], "mode": ctx["mode"]}
+    try:
+        refusal = _evidence_caller_refusal(ctx["environment_id"], ctx["engine_owner"], ctx.get("issuer"))
+        if refusal:
+            _evidence.fail(job_id, "permission_withdrawn", refusal[1]["error"])
+            _evidence_log(ctx, "evidence_package.build_failed", {**base, "outcome": "refused", "reason": "permission_withdrawn"}, "WARN")
+            return
+        period = evidence_core.parse_period(ctx["period"]["start"], ctx["period"]["end"])
+        result = evidence_package.build_package(
+            _evidence.package_path(job_id), ctx["environment_id"], ctx["environment_name"], period,
+            builder=ctx.get("builder") or "unknown", app_version=engine.SCRIPT_VERSION, gaps_acknowledged=ctx["gaps_acknowledged"],
+            progress=lambda stage, fraction: _evidence.progress(job_id, stage, fraction),
+            prune_records=evidence_core.prune_records_from_audit_log(ctx["environment_name"]))
+        filename = evidence_package.download_filename(ctx["environment_name"], period, result["built_at"])
+        _evidence.finish(job_id, result, filename)
+        _evidence_log(ctx, "evidence_package.build_finished", {
+            **base, "outcome": "finished", "events": result["events"], "report_rows": result["report_rows"], "bytes": result["bytes"],
+            "sha256": result["sha256"], "chain_head": result["chain_head"], "seconds": round(time.monotonic() - started, 1),
+            "gap_days": result["gap_days"], "zero_days": result["zero_days"], "pruned_days": result["pruned_days"],
+            "coverage_pct": result["coverage_pct"], "files": result["files"]})
+    except evidence_package.PackageError as exc:
+        _evidence.fail(job_id, exc.reason, str(exc))
+        _evidence_log(ctx, "evidence_package.build_failed", {**base, "outcome": "refused" if exc.reason in (
+            "no_coverage", "gaps_unacknowledged") else "failed", "reason": exc.reason, "seconds": round(time.monotonic() - started, 1)}, "WARN")
+    except OSError as exc:
+        if exc.errno not in _DISK_FULL_ERRNOS:
+            engine.log("ERROR", f"Evidence package build {job_id[:6]} failed with {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+            _evidence.fail(job_id, "internal", "The package could not be built because of an internal error. The details are in the server log.")
+            _evidence_log(ctx, "evidence_package.build_failed", {**base, "outcome": "failed", "reason": "internal",
+                                                                  "seconds": round(time.monotonic() - started, 1)}, "ERROR")
+            return
+        # the disk, the quota or the file size limit was hit while writing (a sync running at the same time can use the space the check saw): the partial file is removed
+        _evidence.fail(job_id, "disk_space", "The disk ran out of space (or a quota was reached) while the package was being written. Free some space (or choose a shorter period) and try again.")
+        _evidence_log(ctx, "evidence_package.build_failed", {**base, "outcome": "failed", "reason": "disk_space",
+                                                              "seconds": round(time.monotonic() - started, 1)}, "WARN")
+    except Exception as exc:  # the person sees a generic sentence; the detail stays in the server log
+        engine.log("ERROR", f"Evidence package build {job_id[:6]} failed with {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+        _evidence.fail(job_id, "internal", "The package could not be built because of an internal error. The details are in the server log.")
+        _evidence_log(ctx, "evidence_package.build_failed", {**base, "outcome": "failed", "reason": "internal",
+                                                              "seconds": round(time.monotonic() - started, 1)}, "ERROR")
+
+
 _deep_verify_lock = threading.Lock()
 _deep_verify_jobs = {}  # environment_id -> {"status", "started_at", "checked_at", "finished_mono", "result", "error", "event"}
 
@@ -1954,7 +2164,8 @@ def _upgrade_context():
     except OSError:
         log_bytes = 0
     backups = upgrade_service.backups_view() or {}
-    return {"sync_running": running, "db_bytes": db_bytes, "audit_log_bytes": log_bytes, "backups_total": backups.get("total_bytes") or 0,
+    return {"sync_running": running, "evidence_build_running": _evidence.running(),
+            "evidence_package_waiting_until": _evidence.waiting_until(), "db_bytes": db_bytes, "audit_log_bytes": log_bytes, "backups_total": backups.get("total_bytes") or 0,
             "sync_hint": Handler._upgrade_sync_hint(), "run": update_service.upgrade_run()}
 
 
@@ -2094,7 +2305,21 @@ class StrictBindHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = os.name != "nt"
 
 
-def _public_entry(environment_id, name, meta, requesting_owner):
+# 5.53.0: the entry fields only the Settings unlock may read (see GET /api/settings/environments).
+ENV_CONFIG_FIELDS = ("base_domain", "team_name", "key_id", "okta_url", "has_okta_token", "sync_schedule")
+# A random per-process key: the `scope` token below is only ever compared with an earlier copy of itself.
+_SCOPE_TOKEN_KEY = os.urandom(32)
+
+
+def _connection_scope(meta):
+    """An opaque token that changes when the settings deciding WHICH tenant an environment reaches (OPA domain, team, Okta URL)
+    change, so the browser can drop cached tenant data after such an edit without being told the settings themselves
+    (5.53.0). A keyed hash with a per-process key: it reveals nothing about the values and changes at a restart."""
+    text = "\n".join(str(meta.get(field, "")) for field in ("base_domain", "team_name", "okta_url"))
+    return hmac.new(_SCOPE_TOKEN_KEY, text.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+
+
+def _public_entry(environment_id, name, meta, requesting_owner, full=True):
     """Non-secret fields only -- key_secret/okta_api_token never leave the
     keychain, let alone reach the browser. `requesting_owner` is the
     engine-layer owner (see _engine_owner) of whoever is asking, used only
@@ -2108,18 +2333,23 @@ def _public_entry(environment_id, name, meta, requesting_owner):
     engine.list_all_environments()/list_environments_for(), or inside
     meta["environment_id"] since list_environments_for now includes it),
     so this just takes it as an explicit parameter instead."""
-    return {
+    entry = {
         "id": environment_id,
         "name": name,
-        "base_domain": meta.get("base_domain", ""),
-        "team_name": meta.get("team_name", ""),
-        "key_id": meta.get("key_id", ""),
-        "okta_url": meta.get("okta_url", ""),
-        "has_okta_token": bool(engine.keyring_get(environment_id, "okta_api_token")),
         "shared": bool(meta.get("shared", False)),
         "is_own": meta.get("owner") == requesting_owner,
-        "sync_schedule": meta.get("sync_schedule", dict(engine.SYNC_SCHEDULE_DEFAULTS)),
+        "scope": _connection_scope(meta),
     }
+    if full:  # 5.53.0: the configuration fields are for the Settings unlock only (ENV_CONFIG_FIELDS)
+        entry.update({
+            "base_domain": meta.get("base_domain", ""),
+            "team_name": meta.get("team_name", ""),
+            "key_id": meta.get("key_id", ""),
+            "okta_url": meta.get("okta_url", ""),
+            "has_okta_token": bool(engine.keyring_get(environment_id, "okta_api_token")),
+            "sync_schedule": meta.get("sync_schedule", dict(engine.SYNC_SCHEDULE_DEFAULTS)),
+        })
+    return entry
 
 
 def activate_environment(owner_key, name, environment_id=None):
@@ -2318,6 +2548,9 @@ _ENV_CHANGE_EXECUTORS = {
     "shared_permissions.update": "_exec_shared_permissions_update",
     "upgrade.settings": "_exec_upgrade_settings_update",
     "upgrade.request": "_exec_upgrade_request",
+    "banner.update": "_exec_banner_update",
+    "settings.unlock": "_exec_settings_unlock",
+    "evidence_package.build": "_exec_evidence_package_build",
 }
 assert set(_ENV_CHANGE_EXECUTORS) == set(ENV_CHANGE_ACTION_TYPES)
 
@@ -2365,6 +2598,13 @@ class Handler(SimpleHTTPRequestHandler):
         issuer = _issuer_from_headers(self.headers)
         if issuer:
             details = {**(details or {}), "actor_issuer": issuer}
+        pending = getattr(self, "_settings_unlock_renewal", None)
+        if pending is not None:
+            # 5.53.0: the first audit entry of an approved change is written only once the change was applied, so that is when
+            # its MFA restarts the Settings unlock (a refused re-check logs nothing and renews nothing).
+            self._settings_unlock_renewal = None
+            if self._renew_settings_unlock_after_mfa(*pending):
+                details = {**(details or {}), "settings_unlock_renewed": True}
         return engine.log_audit_event(
             actor_email, actor_sub, action, details,
             client_ip=self._request_client_ip(),
@@ -2409,6 +2649,43 @@ class Handler(SimpleHTTPRequestHandler):
             "error": f"Internal server error (reference {correlation_id}). The details are in the server log.",
             "correlation_id": correlation_id,
         })
+
+    def _allowed_hosts(self):
+        """5.53.0: the Host header values a local-mode request may carry: the
+        three loopback forms on the bound port, plus the host part of each
+        EXTRA_ALLOWED_ORIGINS entry (the existing operator override)."""
+        port = self.server.server_address[1]
+        allowed = {f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"}
+        for origin in EXTRA_ALLOWED_ORIGINS:
+            netloc = urlparse(origin).netloc.lower()
+            if netloc:
+                allowed.add(netloc)
+        return allowed
+
+    def parse_request(self):
+        """Local mode only: refuse any request whose Host is not this
+        server's own loopback name and port (DNS rebinding defence: a web
+        page on another name that resolves to 127.0.0.1 carries its own name
+        in Host). Runs after the request line and headers are parsed and
+        before any do_* handler, so it covers every method. Hosted mode is
+        unchanged (nginx sets Host)."""
+        if not super().parse_request():
+            return False
+        if DEPLOYMENT_MODE == "hosted":
+            return True
+        hosts = self.headers.get_all("Host") or []
+        if len(hosts) == 1 and hosts[0].strip().lower() in self._allowed_hosts():
+            return True
+        body = b"Misdirected request: this host name is not served here.\n"
+        self.send_response(421)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+        self.close_connection = True
+        return False
 
     def _allowed_origins(self):
         port = self.server.server_address[1]
@@ -2500,6 +2777,82 @@ class Handler(SimpleHTTPRequestHandler):
                 })
                 return True
         return False
+
+    def _report_csv_target(self, path, engine_owner):
+        """(environment name, report key, meta) for /api/environments/<name>/reports/<report_key>/export.csv, or None after
+        sending the 404. Visibility only; the route checks view_archive itself afterwards (never an existence oracle)."""
+        middle = path[len("/api/environments/"):-len("/export.csv")]
+        env_part, sep, report_key = middle.rpartition("/reports/")
+        if not (sep and env_part and report_key):
+            self._send_json(404, {"error": "Not found."})
+            return None
+        name = unquote(env_part)
+        meta = engine.list_environments_for(engine_owner).get(name)
+        if meta is None:
+            self._send_json(404, {"error": f"No environment named '{name}' visible to this user."})
+            return None
+        return name, unquote(report_key), meta
+
+    def _serve_report_csv(self, name, report_key, meta, qs):
+        """5.53.0: GET /api/environments/<name>/reports/<report_key>/export.csv?since=YYYY-MM-DD&until=YYYY-MM-DD.
+
+        Same visibility and permission as viewing the report (view_archive; not behind the Settings unlock). Every
+        event of the report in the UTC period, none dropped: the rows come from ONE evidence_core snapshot and go
+        through the same writer the evidence package uses. The file is built into a temporary file first and sent
+        with a Content-Length, so a failure while building answers with an error instead of a download that ends
+        early, and a transfer that is cut short is visible to the browser. Nothing is cached. The audit entry names
+        who, which environment and report, the range and the row count; never any event content."""
+        import audit_store
+        import evidence_core
+        import tempfile
+        if report_key not in audit_store.COMPLIANCE_REPORTS:
+            return self._send_json(404, {"error": "Unknown report."})
+        since = (qs.get("since") or [""])[0]
+        until = (qs.get("until") or [""])[0]
+        try:
+            period = evidence_core.parse_period(since, until)
+        except evidence_core.PeriodError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        # The file is built on disk in a `tmp` folder of the data directory (the archive's folder; the service's own /tmp
+        # may be memory), anonymous and removed on close. Refuse early if the disk is nearly full.
+        tmp_dir = os.path.join(os.path.dirname(audit_store._audit_db_path()), "tmp")
+        try:
+            os.makedirs(tmp_dir, mode=0o700, exist_ok=True)
+            free = _free_bytes(tmp_dir)
+        except OSError as exc:
+            engine.log("WARN", f"report csv export: temporary folder unusable: {exc}")
+            return self._send_json(507, {"error": "The server has no usable temporary space for this export."})
+        if free < EXPORT_MIN_FREE_BYTES:
+            return self._send_json(507, {"error": (
+                f"The server has only {free // (1024 * 1024)} MB of free disk space; an export needs at least "
+                f"{EXPORT_MIN_FREE_BYTES // (1024 * 1024)} MB. Free some space and try again.")})
+        try:
+            with tempfile.TemporaryFile(dir=tmp_dir) as out:
+                with evidence_core.open_snapshot(meta["environment_id"], period) as snap:
+                    rows = evidence_core.write_report_csv(out, snap.report_rows(report_key))
+                size = out.tell()
+                _o, _e, actor_email, actor_sub = self._caller()
+                self._log_audit_event(actor_email, actor_sub, "report.csv_exported", {
+                    "name": name, "report": report_key, "since": period.start.isoformat(),
+                    "until": period.end.isoformat(), "rows": rows})
+                filename = f"opa-report-{report_key}-{period.start.isoformat()}-to-{period.end.isoformat()}.csv"
+                out.seek(0)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv; charset=utf-8")
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Report-Rows", str(rows))
+                self.end_headers()
+                while True:
+                    chunk = out.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except evidence_core.EvidenceError as exc:
+            engine.log("WARN", f"report csv export: {exc}")
+            return self._send_json(409, {"error": "The archive could not be read for this export."})
 
     def _environment_from_tail(self, path, tail, engine_owner):
         """(name, meta) for /api/environments/<name><tail>, or None after sending
@@ -2663,6 +3016,9 @@ class Handler(SimpleHTTPRequestHandler):
         environment_id = payload.get("id")
         if environment_id is not None and not isinstance(environment_id, str):
             return 400, {"error": "id must be a string"}
+        evidence_builders = payload.get("evidence_builders")
+        if evidence_builders is not None and evidence_builders not in ("owner", "shared"):
+            return 400, {"error": "evidence_builders must be 'owner' or 'shared'"}
         if dry_run:
             try:
                 _n, checked_id = engine.upsert_environment(
@@ -2692,6 +3048,14 @@ class Handler(SimpleHTTPRequestHandler):
             # someone else's credentials is now explicit in the log.
             "environment_id": upserted_id, "edited_other_owner": not caller_owns_target,
         }
+        if evidence_builders is not None:
+            # 5.53.0: who may build evidence packages from this environment's archive; owners always can.
+            changed = engine.set_shared_permissions(
+                {"build_evidence_package": "allow" if evidence_builders == "shared" else "deny"},
+                environment_id=upserted_id, updated_by=actor_email or actor_sub)
+            details["evidence_builders"] = evidence_builders
+            if changed:
+                details["evidence_builders_changed"] = True
         if via_step_up:
             details["step_up_verified"] = True
         self._log_audit_event(actor_email, actor_sub, "environment.upsert", details)
@@ -3014,6 +3378,323 @@ class Handler(SimpleHTTPRequestHandler):
             details["step_up_verified"] = True
         self._log_audit_event(actor_email, actor_sub, "archive.purge", details)
         return 200, {"purged": archive_id, **counts}
+
+    def _environments_response(self, owner_key, engine_owner, local_env_name, local_env_id, full):
+        """The environment list. full=False (GET /api/environments, every signed-in user): names, ids, permissions. full=True
+        (GET /api/settings/environments, behind the Settings unlock): the configuration fields as well."""
+        is_admin = _is_admin_from_headers(self.headers)
+        if is_admin:
+            # Admins see EVERY stored environment, not just their
+            # own/shared ones -- list_all_environments() (added for
+            # the scheduler, see its own docstring) returns
+            # {environment_id: meta} across every owner.
+            #
+            # SECURITY FIX (external review, 2026-09-30): this used
+            # to unpack storage_key into a bare display name and
+            # collapse into visible[disp_name] = meta -- if two
+            # different owners each had an environment named "dev",
+            # the second one silently overwrote the first in this
+            # dict, so an admin never even SAW both, let alone
+            # could act on the right one. Now keeps every entry by
+            # its real id (unambiguous), and passes each one's TRUE
+            # display name (meta["name"], not a shared dict key)
+            # into _public_entry -- two same-named environments
+            # from different owners both survive to the response,
+            # each with its own unique `id` (see _public_entry).
+            envs = [
+                _public_entry(environment_id, meta.get("name"), meta, engine_owner, full=full)
+                for environment_id, meta in engine.list_all_environments().items()
+            ]
+        else:
+            envs = [_public_entry(m["environment_id"], n, m, engine_owner, full=full) for n, m in engine.list_environments_for(engine_owner).items()]
+        # UI-07 (external review, 2026-10-05), additive: every
+        # name-keyed route (activate, sync, reports) acts on whatever
+        # the NAME resolves to for this caller -- `addressable` says
+        # whether that is this very row, and `active_id` lets the UI
+        # mark the active row by id. Admins see other owners' rows
+        # (and shared rows their own same-named environment hides);
+        # those are not addressable by name.
+        resolves_to = {n: m["environment_id"] for n, m in engine.list_environments_for(engine_owner).items()}
+        # 5.42.0: what THIS caller may do with each row (the same
+        # resolution the routes enforce) -- the UI only mirrors it.
+        # An owner's own rows are always "allow" (source "owner").
+        # Admins also get each row's stored overrides, for the
+        # per-environment editor.
+        defaults = engine.get_shared_permission_defaults()
+        can_admin = _can_admin(owner_key, self.headers)
+        for entry in envs:
+            entry["addressable"] = resolves_to.get(entry["name"]) == entry["id"]
+            if not entry["addressable"]:
+                # Not what this caller's by-name routes reach (another
+                # owner's private row, or one hidden by the caller's
+                # own same-named environment): nothing to say.
+                pass
+            elif entry["is_own"]:
+                entry["permissions"] = {k: {"value": "allow", "source": "owner"} for k in engine.SHARED_CAPABILITY_KEYS}
+            else:
+                entry["permissions"] = engine.effective_shared_permissions(
+                    entry["id"], defaults=defaults,
+                    caller_issuer=_issuer_from_headers(self.headers), caller_subject=engine_owner)
+            if can_admin and full:
+                entry["permission_overrides"] = engine.get_shared_permission_overrides(entry["id"])
+            if full and (entry["is_own"] or can_admin):
+                # 5.53.0: the environment form's "Who can build evidence packages" choice as stored (override, else the default).
+                entry["evidence_builders"] = "shared" if engine.effective_shared_permissions(
+                    entry["id"], defaults=defaults)["build_evidence_package"]["value"] == "allow" else "owner"
+        return {"environments": envs, "active": local_env_name, "active_id": local_env_id}
+
+    def _exec_banner_update(self, params, dry_run, via_step_up):
+        """5.53.0: the org-wide announcement banner. Admin-only; in hosted mode it needs a fresh MFA approval like every other
+        configuration change (a stolen admin session could otherwise post a message to every user)."""
+        owner_key, _e, actor_email, actor_sub = self._caller()
+        if not _can_admin(owner_key, self.headers):
+            return 403, {"error": "Admin access required to change the announcement banner."}
+        payload = params.get("body") or {}
+        message = payload.get("message", "")
+        if not isinstance(message, str):
+            return 400, {"error": "message must be a string"}
+        if payload.get("variant", "warning") not in engine.BANNER_VARIANTS:
+            return 400, {"error": f"variant must be one of {', '.join(engine.BANNER_VARIANTS)}"}
+        if payload.get("enabled", False) and not message.strip():
+            return 400, {"error": "message is required when the banner is enabled"}
+        if dry_run:
+            return None, None
+        config = engine.set_banner_config(
+            payload.get("enabled", False), message, payload.get("variant", "warning"), payload.get("dismissible", True),
+        )
+        self._log_audit_event(actor_email, actor_sub, "banner.update", {**config, **({"step_up_verified": True} if via_step_up else {})})
+        return 200, config
+
+    def _exec_evidence_package_build(self, params, dry_run, via_step_up):
+        """5.53.0: builds an evidence package of one environment's archive for a period. Needs View archived reports AND
+        Build evidence packages on the environment (owners always pass). Hosted mode: POST /api/evidence_packages/prepare
+        checks everything (dry run), stores the request pinned to the environment id, period and gap acknowledgement, and the
+        MFA step-up returns to /api/environment_changes/save, which runs this again with every check repeated and starts the
+        job. Local mode starts it at once. `check_only` answers the coverage summary and starts nothing. This approval is not a
+        Settings unlock and never opens or extends one."""
+        import evidence_core
+        import evidence_package
+        name = params.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return 400, {"error": "environment is required"}
+        body = params.get("body") or {}
+        meta, refusal = self._visible_environment(name, params)
+        if refusal:
+            return refusal
+        refusal = self._shared_refusal(meta, "view_archive")
+        if refusal:
+            return refusal
+        refusal = self._shared_refusal(meta, "build_evidence_package")
+        if refusal:
+            return refusal
+        expected_id = body.get("environment_id")
+        if expected_id is not None and (not isinstance(expected_id, str) or expected_id != meta["environment_id"]):
+            return self._target_changed()
+        try:
+            period = evidence_core.parse_period(body.get("start"), body.get("end"))
+        except evidence_core.PeriodError as exc:
+            return 400, {"error": str(exc), "reason": "bad_period"}
+        gaps_ack = body.get("gaps_acknowledged") is True
+        if not _evidence_checks.acquire(blocking=False):
+            return 429, {"error": "The archive is busy with other coverage checks. Try again in a moment.", "reason": "busy"}
+        try:
+            summary = evidence_package.preview(meta["environment_id"], period,
+                                               prune_records=evidence_core.prune_records_from_audit_log(meta.get("name") or name))
+        except evidence_core.EvidenceError:
+            return 409, {"error": "This environment has no archive yet, so there is nothing to put in a package.", "reason": "no_coverage"}
+        finally:
+            _evidence_checks.release()
+        if params.get("check_only"):
+            return 200, summary
+        if not summary["has_coverage"]:
+            return 409, {"error": "The archive has no coverage at all for this period, so there is nothing to put in a package.",
+                         "reason": "no_coverage", "coverage": summary}
+        if summary["needs_acknowledgement"] and not gaps_ack:
+            return 409, {"error": "This period has days the archive did not cover. Confirm the gaps to build the package with them.",
+                         "reason": "gaps_unacknowledged", "coverage": summary}
+        actor_sub, issuer, fingerprint = self._unlock_identity()
+        if _step_up_required_for_changes() and (not actor_sub or not fingerprint):
+            return 403, {"error": "Could not tell which sign-in session this is. Sign in again.", "reason": "no_session"}
+        if dry_run:
+            return None, {"environment_id": meta["environment_id"], "start": period.start.isoformat(), "end": period.end.isoformat(),
+                          "gaps_acknowledged": gaps_ack}
+        _owner_key, engine_owner, actor_email, actor_sub = self._caller()
+        local = not _step_up_required_for_changes()
+        ctx = {
+            "environment_id": meta["environment_id"], "environment_name": meta.get("name") or name, "period": period.as_dict(),
+            "gaps_acknowledged": gaps_ack, "mode": "local mode, no MFA" if local else "hosted, MFA step-up",
+            "engine_owner": engine_owner, "actor_email": actor_email, "actor_sub": actor_sub,
+            "issuer": _issuer_from_headers(self.headers), "client_ip": self._request_client_ip(),
+            "user_agent": self.headers.get("User-Agent"), "correlation_id": engine.CORRELATION_ID.get(),
+            "builder": actor_email or actor_sub or "local operator",
+        }
+        try:
+            job_id = _evidence.start({
+                "environment_id": ctx["environment_id"], "environment_name": ctx["environment_name"], "period": ctx["period"],
+                "gaps_acknowledged": gaps_ack, "owner": actor_sub or "", "issuer": issuer, "fingerprint": fingerprint,
+                "mode": "local" if local else "hosted"})
+        except evidence_jobs.Busy as exc:
+            return 409, {"error": str(exc), "reason": exc.reason}
+        except OSError as exc:
+            engine.log("WARN", f"Evidence package not started: the packages folder cannot be used ({exc.strerror or type(exc).__name__}).")
+            return 500, {"error": "The packages folder could not be created. Check the data folder's permissions and free space.", "reason": "packages_dir"}
+        ctx["job_id"] = job_id
+        details = {"environment": ctx["environment_name"], "environment_id": ctx["environment_id"], "period": ctx["period"],
+                   "gaps_acknowledged": gaps_ack, "mode": ctx["mode"], "outcome": "started", "job_id": job_id}
+        if via_step_up:
+            details["step_up_verified"] = True
+        else:
+            details["mfa"] = "local mode, no MFA" if local else "none"
+        self._log_audit_event(actor_email, actor_sub, "evidence_package.build", details)
+        engine.log("INFO", "evidence_package.build " + json.dumps({"job_id": job_id, "environment_id": ctx["environment_id"], "period": ctx["period"],
+                                                                    "gaps_acknowledged": gaps_ack, "mode": ctx["mode"], "outcome": "started",
+                                                                    "actor_sub": actor_sub, "client_ip": ctx["client_ip"]}, separators=(",", ":")))
+        try:
+            threading.Thread(target=_run_evidence_build, args=(job_id, ctx), daemon=True, name=f"evidence-{job_id[:6]}").start()
+        except BaseException:
+            _evidence.fail(job_id, "internal", "The build could not be started.")
+            raise
+        return 202, {"job_id": job_id, "status": "running", "environment": ctx["environment_name"], "period": ctx["period"]}
+
+    def _evidence_package_request(self, job_id, download):
+        """GET /api/evidence_packages/<job_id> and .../download. The job must be this caller's own (sub, gate issuer, login
+        session, job id) or it is a 404, whatever else is true; the caller's permission on the environment is checked again
+        on every call. A download is repeatable until the window ends and every fetch is logged."""
+        if not evidence_jobs.JOB_ID_RE.match(job_id or ""):
+            return self._send_json(404, {"error": "No such package."})
+        owner_key, engine_owner, actor_email, actor_sub = self._caller()
+        sub, issuer, fingerprint = self._unlock_identity()
+        status, job, path = _evidence.open_for_download(job_id, sub, issuer, fingerprint)
+        if status == "notfound":
+            return self._send_json(404, {"error": "No such package."})
+        refusal = _evidence_caller_refusal(job["environment_id"], engine_owner, _issuer_from_headers(self.headers))
+        if refusal:
+            return self._send_json(*refusal)
+        if not download:
+            return self._send_json(200, _evidence.public(job))
+        if status == "expired":
+            return self._send_json(410, {"error": "The download window for this package has ended. The package was deleted from the server; build it again.",
+                                         "reason": "expired"})
+        if status == "notready":
+            return self._send_json(409, {"error": "This package is not finished yet.", "reason": "not_ready", "status": job["status"]})
+        result = job["result"]
+        details = {"environment": job["environment_name"], "environment_id": job["environment_id"], "period": job["period"],
+                   "sha256": result["sha256"], "bytes": result["bytes"], "chain_head": result["chain_head"], "job_id": job_id}
+        try:
+            fh = open(path, "rb")
+        except OSError:
+            return self._send_json(410, {"error": "The download window for this package has ended. Build it again.", "reason": "expired"})
+        with fh:
+            size = os.fstat(fh.fileno()).st_size
+            self._log_audit_event(actor_email, actor_sub, "evidence_package.downloaded", {**details, "outcome": "started"})
+            engine.log("INFO", "evidence_package.downloaded " + json.dumps({"job_id": job_id, "bytes": size, "sha256": result["sha256"],
+                                                                            "actor_sub": actor_sub, "client_ip": self._request_client_ip()}, separators=(",", ":")))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", f'attachment; filename="{job["filename"]}"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            sent = 0
+            try:
+                while True:
+                    block = fh.read(EVIDENCE_STREAM_CHUNK)
+                    if not block:
+                        break
+                    self.wfile.write(block)
+                    sent += len(block)
+            except OSError:
+                self.close_connection = True
+                self._log_audit_event(actor_email, actor_sub, "evidence_package.downloaded", {**details, "outcome": "aborted", "bytes_sent": sent})
+        return None
+
+    def _unlock_identity(self):
+        """(actor_sub, issuer, session fingerprint) of this request for the Settings unlock; sub or fingerprint may be None."""
+        _owner_key, _e, _em, actor_sub = self._caller()
+        return actor_sub, _issuer_from_headers(self.headers) or "", _session_fingerprint(self.headers)
+
+    def _exec_settings_unlock(self, params, dry_run, via_step_up):
+        """5.53.0: opens Settings and Updates for this user, this gate and this login session for SETTINGS_UNLOCK_TTL_SECONDS.
+        Per user, never a privilege (it checks no admin right: every protected route keeps its own). It changes no setting.
+        Local mode has no MFA: it answers at once and records nothing."""
+        if not _step_up_required_for_changes():
+            return 200, {"mode": "local", "mfa": False}
+        import audit_store
+        actor_sub, issuer, fingerprint = self._unlock_identity()
+        if not actor_sub or not fingerprint:
+            return 403, {"error": "Could not tell which sign-in session this is. Sign in again.", "reason": "no_session"}
+        if dry_run:
+            return None, None
+        if params.get("session") != fingerprint:
+            return 409, {"error": "You signed in again while approving. Nothing was unlocked; start again.",
+                         "reason": "session_changed"}
+        action_id = self.headers.get("X-Auth-Action-Id") or ""
+        unlocked_at, expires_at = audit_store.upsert_settings_unlock(
+            actor_sub, issuer, fingerprint, action_id, SETTINGS_UNLOCK_TTL_SECONDS)
+        _o, _e, actor_email, _s = self._caller()
+        self._log_audit_event(actor_email, actor_sub, "settings.unlocked", {
+            "scope": "settings", "unlocked_until": expires_at, "ttl_seconds": SETTINGS_UNLOCK_TTL_SECONDS,
+            "step_up_verified": True, "action_id": action_id})
+        return 200, {"unlocked_until": expires_at, "seconds_left": SETTINGS_UNLOCK_TTL_SECONDS}
+
+    def _require_settings_unlock(self):
+        """5.53.0: True when this request may read Settings or Updates; otherwise answers 403 settings_locked and returns
+        False. Call it AFTER the route's own admin or owner check (a non-admin keeps the admin message) and BEFORE reading any
+        data. Local mode has no MFA and always passes. Branches on the process-level mode only, never on a header."""
+        if not _step_up_required_for_changes():
+            return True
+        import audit_store
+        actor_sub, issuer, fingerprint = self._unlock_identity()
+        if actor_sub and fingerprint:
+            expired = audit_store.take_expired_settings_unlock(actor_sub, issuer, fingerprint)
+            if expired:  # the first refused request after expiry records it, once (the row is deleted atomically)
+                _o, _e, actor_email, _s = self._caller()
+                self._log_audit_event(actor_email, actor_sub, "settings.locked", {
+                    "reason": "expired", "unlocked_at": expired["unlocked_at"], "expired_at": expired["expires_at"]})
+            if audit_store.settings_unlock_active(actor_sub, issuer, fingerprint):
+                return True
+        self._send_json(403, {"error": "Unlock Settings with MFA to view this.", "step_up_required": True,
+                              "scope": "settings", "reason": "settings_locked"})
+        return False
+
+    def _renew_settings_unlock_after_mfa(self, actor_sub, action_type, action_id):
+        """5.53.0: called right after a pending approval was consumed. Only the action types in
+        SETTINGS_RENEWING_ACTION_TYPES restart the caller's unlock (an upsert, so a save after expiry opens it again); any
+        other type, `settings.unlock` and `evidence_package.build` included, never creates or extends it. Returns whether it
+        renewed. Hosted mode only; fails closed without a subject or a session fingerprint."""
+        if action_type not in SETTINGS_RENEWING_ACTION_TYPES or not _step_up_required_for_changes():
+            return False
+        import audit_store
+        _sub, issuer, fingerprint = self._unlock_identity()
+        if not actor_sub or not fingerprint:
+            return False
+        audit_store.renew_settings_unlock(actor_sub, issuer, fingerprint, action_id or "", SETTINGS_UNLOCK_TTL_SECONDS)
+        return True
+
+    def _settings_status(self, qs):
+        """GET /api/settings/status: the countdown and mode for the UI. Writes nothing in hosted mode."""
+        area = (qs.get("area") or [""])[0]
+        if not _step_up_required_for_changes():
+            if area in SETTINGS_AREAS and _local_access_due(area):
+                _o, _e, actor_email, actor_sub = self._caller()
+                self._log_audit_event(actor_email, actor_sub, "settings.access_without_mfa_local",
+                                      {"area": area, "mode": "local", "mfa": False})
+            return {"mode": "local", "mfa": False, "unlocked": True, "unlocked_until": None, "seconds_left": 0,
+                    "local_notice": LOCAL_MODE_NOTICE}
+        import audit_store
+        actor_sub, issuer, fingerprint = self._unlock_identity()
+        # (a read that leaves an expired row alone: the first refused request records the expiry, see _require_settings_unlock)
+        row = audit_store.settings_unlock_active(actor_sub, issuer, fingerprint, delete_expired=False) if actor_sub and fingerprint else None
+        left = 0
+        if row:
+            try:
+                expires = datetime.strptime(row["expires_at"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+                left = max(0, int((expires - datetime.now(timezone.utc)).total_seconds()))
+            except ValueError:
+                row = None
+        return {"mode": "hosted", "mfa": True, "unlocked": bool(row), "unlocked_until": row["expires_at"] if row else None,
+                "seconds_left": left if row else 0, "local_notice": None}
 
     def _exec_upgrade_settings_update(self, params, dry_run, via_step_up):
         """5.46.0: the update check's frequency (daily / manual / off) and the share-version
@@ -3544,62 +4225,19 @@ class Handler(SimpleHTTPRequestHandler):
                 })
 
             if path == "/api/environments":
-                is_admin = _is_admin_from_headers(self.headers)
-                if is_admin:
-                    # Admins see EVERY stored environment, not just their
-                    # own/shared ones -- list_all_environments() (added for
-                    # the scheduler, see its own docstring) returns
-                    # {environment_id: meta} across every owner.
-                    #
-                    # SECURITY FIX (external review, 2026-09-30): this used
-                    # to unpack storage_key into a bare display name and
-                    # collapse into visible[disp_name] = meta -- if two
-                    # different owners each had an environment named "dev",
-                    # the second one silently overwrote the first in this
-                    # dict, so an admin never even SAW both, let alone
-                    # could act on the right one. Now keeps every entry by
-                    # its real id (unambiguous), and passes each one's TRUE
-                    # display name (meta["name"], not a shared dict key)
-                    # into _public_entry -- two same-named environments
-                    # from different owners both survive to the response,
-                    # each with its own unique `id` (see _public_entry).
-                    envs = [
-                        _public_entry(environment_id, meta.get("name"), meta, engine_owner)
-                        for environment_id, meta in engine.list_all_environments().items()
-                    ]
-                else:
-                    envs = [_public_entry(m["environment_id"], n, m, engine_owner) for n, m in engine.list_environments_for(engine_owner).items()]
-                # UI-07 (external review, 2026-10-05), additive: every
-                # name-keyed route (activate, sync, reports) acts on whatever
-                # the NAME resolves to for this caller -- `addressable` says
-                # whether that is this very row, and `active_id` lets the UI
-                # mark the active row by id. Admins see other owners' rows
-                # (and shared rows their own same-named environment hides);
-                # those are not addressable by name.
-                resolves_to = {n: m["environment_id"] for n, m in engine.list_environments_for(engine_owner).items()}
-                # 5.42.0: what THIS caller may do with each row (the same
-                # resolution the routes enforce) -- the UI only mirrors it.
-                # An owner's own rows are always "allow" (source "owner").
-                # Admins also get each row's stored overrides, for the
-                # per-environment editor.
-                defaults = engine.get_shared_permission_defaults()
-                can_admin = _can_admin(owner_key, self.headers)
-                for entry in envs:
-                    entry["addressable"] = resolves_to.get(entry["name"]) == entry["id"]
-                    if not entry["addressable"]:
-                        # Not what this caller's by-name routes reach (another
-                        # owner's private row, or one hidden by the caller's
-                        # own same-named environment): nothing to say.
-                        pass
-                    elif entry["is_own"]:
-                        entry["permissions"] = {k: {"value": "allow", "source": "owner"} for k in engine.SHARED_CAPABILITY_KEYS}
-                    else:
-                        entry["permissions"] = engine.effective_shared_permissions(
-                            entry["id"], defaults=defaults,
-                            caller_issuer=_issuer_from_headers(self.headers), caller_subject=engine_owner)
-                    if can_admin:
-                        entry["permission_overrides"] = engine.get_shared_permission_overrides(entry["id"])
-                return self._send_json(200, {"environments": envs, "active": local_env_name, "active_id": local_env_id})
+                # 5.53.0: the list every screen uses to switch environments carries names, ids and permissions only. The
+                # OPA domain, team, key id, Okta URL, token flag and sync schedule are read from /api/settings/environments
+                # after the MFA unlock.
+                return self._send_json(200, self._environments_response(owner_key, engine_owner, local_env_name, local_env_id, full=False))
+
+            if path == "/api/settings/status":
+                return self._send_json(200, self._settings_status(qs))
+
+            if path == "/api/settings/environments":
+                # 5.53.0: today's full environment entries (no secrets), same owner/admin scoping, behind the unlock.
+                if not self._require_settings_unlock():
+                    return
+                return self._send_json(200, self._environments_response(owner_key, engine_owner, local_env_name, local_env_id, full=True))
 
             if path == "/api/banner":
                 # No client/auth requirement -- this has to render even
@@ -3665,6 +4303,17 @@ class Handler(SimpleHTTPRequestHandler):
                     return self._send_json(status, body)
                 import audit_store
                 return self._send_json(200, audit_store.verify_ingestion_chain(meta["environment_id"], deep=False))
+
+            if path.startswith("/api/environments/") and path.endswith("/export.csv"):
+                # 5.53.0: one report's events for a period as a complete CSV (no row cap):
+                # GET /api/environments/<name>/reports/<key>/export.csv?since=&until=
+                found = self._report_csv_target(path, engine_owner)
+                if found is None:
+                    return
+                name, report_key, meta = found
+                if self._capability_refused(engine_owner, meta["environment_id"], ("view_archive",)):
+                    return
+                return self._serve_report_csv(name, report_key, meta, qs)
 
             if path.startswith("/api/environments/") and path.endswith("/okta_admins"):
                 # 5.50.0: the Okta Admins report, computed from the stored snapshot (never a live Okta call).
@@ -3788,6 +4437,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # /api/audit_log -- these rows belong to no owner any more.
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to list orphaned archives."})
+                if not self._require_settings_unlock():
+                    return
                 import audit_store
                 return self._send_json(200, {"archives": audit_store.list_orphaned_archives()})
 
@@ -4149,6 +4800,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # is out of date is for the people who operate it.
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to view update status."})
+                if not self._require_settings_unlock():
+                    return
                 body = update_service.status(update_service.load(), engine.SCRIPT_VERSION)
                 body["upgrade_run"] = update_service.upgrade_run()  # 5.47.0: the root-owned updater's current/last run
                 body["upgrade"] = self._upgrade_view(qs)  # 5.48.0: everything the in-app flow shows
@@ -4157,7 +4810,24 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/upgrade/notice":
                 # 5.48.0: the one-line banner (any signed-in user): an upgrade is scheduled / running / failed; only admins
                 # are told that one is merely available.
-                return self._send_json(200, upgrade_service.notice(engine.SCRIPT_VERSION, _can_admin(owner_key, self.headers)))
+                is_admin_caller = _can_admin(owner_key, self.headers)
+                notice_body = upgrade_service.notice(engine.SCRIPT_VERSION, is_admin_caller)
+                if is_admin_caller:
+                    # 5.53.0: what the badge, the revocation banner and the progress card need while Updates is locked.
+                    # Never settings, keys or backups; those stay behind the unlock.
+                    st = update_service.status(update_service.load(), engine.SCRIPT_VERSION)
+                    notice_body = {**notice_body,
+                                   "update_available": (st["latest"] or {}).get("version") if st["check"]["enabled"] and st["update_available"] else None,
+                                   "revocation": _notice_revocation(st["revocation"]), "run": _notice_run(upgrade_service.run_view())}
+                return self._send_json(200, notice_body)
+
+            if path.startswith("/api/evidence_packages/") and path.endswith("/download"):
+                # 5.53.0: the finished package, repeatable for 15 minutes; bound to the person who built it (else 404).
+                return self._evidence_package_request(path[len("/api/evidence_packages/"):-len("/download")], True)
+
+            if path.startswith("/api/evidence_packages/"):
+                # 5.53.0: a build's status and, when finished, its sha256 and chain head (for the server-side build log).
+                return self._evidence_package_request(path[len("/api/evidence_packages/"):], False)
 
             if path == "/api/upgrade/bundle":
                 # 5.47.0: download a redacted support bundle the updater built after a failed upgrade (the failed
@@ -4165,6 +4835,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # secrets, tenant data or personal data (see docs and ocw_bundle.py), and is never uploaded anywhere.
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to download a support bundle."})
+                if not self._require_settings_unlock():
+                    return
                 name = (qs.get("name") or [""])[0]
                 code, data = update_service.read_bundle(name)
                 if code != 200:
@@ -4207,6 +4879,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # operator exempt), same rule as /api/access_control.
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to view shared-environment permissions."})
+                if not self._require_settings_unlock():
+                    return
                 defaults = engine.get_shared_permission_defaults()
                 return self._send_json(200, {
                     "capabilities": [dict(c) for c in engine.SHARED_CAPABILITIES],
@@ -4231,6 +4905,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # legitimate reason to see (let alone change) them.
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to view access control settings."})
+                if not self._require_settings_unlock():
+                    return
                 return self._send_json(200, engine.get_access_control_config())
         except engine.CredentialStoreUnavailable as exc:
             return self._send_json(503, {"error": str(exc)})
@@ -4268,21 +4944,38 @@ class Handler(SimpleHTTPRequestHandler):
             payload = self._read_json_body()
 
             if path == "/api/banner":
-                # SECURITY FIX (external review, 2026-09-30): this had NO
-                # admin check at all -- confirmed exploitable: any
-                # authenticated user could publish/modify/disable the
-                # org-wide announcement banner. Same check every other
-                # admin-only write in this file already uses.
+                # SECURITY FIX (external review, 2026-09-30): this had NO admin check at all. 5.53.0: the save is also an
+                # org-wide message to every user, so in hosted mode it needs a fresh MFA approval (banner.update).
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to change the announcement banner."})
-                config = engine.set_banner_config(
-                    payload.get("enabled", False),
-                    payload.get("message", ""),
-                    payload.get("variant", "warning"),
-                    payload.get("dismissible", True),
-                )
-                self._log_audit_event(actor_email, actor_sub, "banner.update", config)
-                return self._send_json(200, config)
+                return self._environment_change("banner.update", {"body": payload})
+
+            if path == "/api/evidence_packages/prepare":
+                # 5.53.0: check an environment and a UTC period, then build (local mode: at once; hosted: after the MFA
+                # step-up, through /api/environment_changes/save). `check_only` answers the coverage summary and starts
+                # nothing. The environment is named in the query (?environment=) or the body.
+                env_names = parse_qs(urlparse(self.path).query).get("environment")
+                evidence_params = {"name": env_names[0] if env_names else payload.get("environment"),
+                                   "body": {k: payload.get(k) for k in ("start", "end", "gaps_acknowledged", "environment_id")}}
+                if payload.get("check_only") is True:
+                    status, body = self._exec_evidence_package_build({**evidence_params, "check_only": True}, dry_run=True, via_step_up=False)
+                    return self._send_json(status, body)
+                return self._environment_change("evidence_package.build", evidence_params)
+
+            if path == "/api/settings/unlock":
+                # 5.53.0: asks for the MFA that opens Settings and Updates (202 in hosted mode; local mode answers at once).
+                return self._environment_change("settings.unlock", {"scope": "settings", "session": _session_fingerprint(self.headers)})
+
+            if path == "/api/settings/lock":
+                # 5.53.0: ends the caller's own window now. Changes nothing else.
+                if _step_up_required_for_changes():
+                    import audit_store
+                    actor_sub_, issuer_, fingerprint_ = self._unlock_identity()
+                    gone = audit_store.delete_settings_unlock(actor_sub_, issuer_, fingerprint_) if actor_sub_ and fingerprint_ else None
+                    if gone:
+                        self._log_audit_event(actor_email, actor_sub, "settings.locked", {
+                            "reason": "manual", "unlocked_at": gone["unlocked_at"], "expired_at": gone["expires_at"]})
+                return self._send_json(200, {"locked": True})
 
             if path == "/api/upgrade/settings":
                 # 5.46.0: switch the update check on/off and choose whether it
@@ -4299,6 +4992,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # against the pinned keys and run the preflight. No install, no step-up: it is a read.
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to review an update."})
+                if not self._require_settings_unlock():
+                    return
                 status, body = self._upgrade_preview(actor_email, actor_sub)
                 return self._send_json(status, body)
 
@@ -4314,6 +5009,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # installs anything), admin-only, at most once a minute, recorded in the audit log.
                 if not _can_admin(owner_key, self.headers):
                     return self._send_json(403, {"error": "Admin access required to check for updates."})
+                if not self._require_settings_unlock():
+                    return
                 status, body = update_service.check_now(engine.SCRIPT_VERSION, actor_email, actor_sub)
                 return self._send_json(status, body)
 
@@ -4382,6 +5079,8 @@ class Handler(SimpleHTTPRequestHandler):
                 config = engine.set_access_control_config(
                     config["admin_group_id"], config["user_group_id"], config["restrict_login"]
                 )
+                # only now, with the write done, does this approval's MFA restart the Settings unlock
+                renewed = self._renew_settings_unlock_after_mfa(actor_sub, "access_control.update", action_id)
                 # step_up_verified is now derived from having successfully
                 # consumed a real pending action bound to this exact
                 # step-up transaction -- not hardcoded-true-by-construction
@@ -4398,6 +5097,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # Log page's Refresh button (backfill_mfa_log_events) still
                 # fills this field in asynchronously after the fact.
                 details = {**config, "step_up_verified": True, "okta_mfa_log_event": None}
+                if renewed:
+                    details["settings_unlock_renewed"] = True
                 audit_entry = self._log_audit_event(actor_email, actor_sub, "access_control.update", details)
                 # Phase 10: step_up_verified/saved_at are returned to the
                 # CALLER too, not just logged -- previously these only
@@ -4457,7 +5158,14 @@ class Handler(SimpleHTTPRequestHandler):
                             "reason": "secrets_expired", "action": action,
                         })
                     params = {**params, "body": {**(params.get("body") or {}), **held}}
-                status, body = getattr(self, _ENV_CHANGE_EXECUTORS[action])(params, dry_run=False, via_step_up=True)
+                # renewed when the change's own audit entry is written (see _log_audit_event), or below if it wrote none
+                self._settings_unlock_renewal = (actor_sub, action, action_id)
+                try:
+                    status, body = getattr(self, _ENV_CHANGE_EXECUTORS[action])(params, dry_run=False, via_step_up=True)
+                    if 200 <= status < 300 and self._settings_unlock_renewal is not None:
+                        self._renew_settings_unlock_after_mfa(*self._settings_unlock_renewal)
+                finally:
+                    self._settings_unlock_renewal = None
                 body = {**(body or {}), "action": action}
                 if 200 <= status < 300:
                     body["step_up_verified"] = True
@@ -5310,6 +6018,16 @@ def main():
 
     _seen_owners.add(LOCAL_OWNER_KEY_HEADER)
     _try_activate_saved_environment(LOCAL_OWNER_KEY_HEADER)
+
+    # 5.53.0: evidence packages never outlive the process that built them (their download window is 15 minutes).
+    try:
+        removed = _evidence.cleanup_startup()
+        if _evidence.startup_skipped:
+            engine.log("WARN", f"Evidence packages folder not cleaned: {_evidence.startup_skipped}.")
+        if removed:
+            engine.log("INFO", f"Deleted {removed} evidence package folder(s) left from an earlier run.")
+    except OSError as exc:
+        engine.log("WARN", f"Could not clean the evidence packages folder: {exc}")
 
     threading.Thread(target=_scheduler_loop, daemon=True).start()
 
