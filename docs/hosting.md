@@ -238,7 +238,7 @@ and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
      `/etc/nginx/sites-available/opa-<name>` (`OCW_NGINX_SITES_DIR` if they live elsewhere);
    * the unit files may be indented (systemd allows it): `install.sh` edits them either way and stops before changing anything if
      `WorkingDirectory=` (or, for the backend unit, `ProtectSystem=` / `ProtectHome=`) is missing;
-   * after a release that changes the units or `install.sh`, the updater asks for `sudo server/install.sh --refresh-updater` (README, "Upgrading");
+   * after a release that changes the units or `install.sh`, the updater asks for `sudo server/install.sh --refresh-updater` (or `sudo bash get-ocw.sh --refresh-updater --version X.Y.Z` on a server installed with get-ocw.sh) (README, "Upgrading");
    * the units `ocw-stage@.service` (unprivileged staging; optional proxy settings in `/etc/ocw-updater.env`), `ocw-upgrade.path` and
      `ocw-upgrade.service` (root: activate, roll back, resume at boot) are documented in the README ("Upgrading").
 

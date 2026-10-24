@@ -277,3 +277,29 @@ def test_no_bus_does_not_refuse(hazard, monkeypatch):
     monkeypatch.setattr(upgrade, "updater_activator_version", lambda: "5.52.0")
     monkeypatch.setattr(upgrade.subprocess, "run", lambda *a, **k: _R(1, "Failed to connect to bus: No such file or directory\n"))
     assert "gate_not_set_up" not in _preflight()
+
+
+# --- 5.53.0 requires the refresh (install_sh_min_version) -----------------------------------------------------------------------
+def test_the_release_manifest_carries_install_sh_min_version_5_53_0():
+    sys.path.insert(0, str(REPO / "tools"))
+    import release as tool
+    files = {"server/install.sh": (0, (REPO / "server" / "install.sh").read_bytes())}
+    assert tool._install_sh_marker(files, "5.53.0") == "5.53.0"
+    with pytest.raises(tool.ReleaseError):
+        tool._install_sh_marker(files, "5.52.0")      # the marker may never be newer than the release
+
+
+def test_a_5_52_0_style_updater_refuses_5_53_0_before_switching(m):
+    from test_updater_hardening import _apply_5_47_0, _set_install_sh_version
+    _set_install_sh_version(m, "5.52.0")
+    assert _apply_5_47_0(m, {"install_sh_min_version": "5.53.0"}, "upg-aaaa0f05") == "failed"
+    st = m.read_state()
+    assert st["reason_code"] == "needs_install_sh" and "sudo server/install.sh --refresh-updater" in st["error"]
+    assert "get-ocw.sh --refresh-updater --version" in st["error"]
+    assert os.readlink(m.opt / "current") == "releases/5.46.0"
+
+
+def test_after_the_refresh_record_of_5_53_0_the_upgrade_proceeds(m):
+    from test_updater_hardening import _apply_5_47_0, _set_install_sh_version
+    _set_install_sh_version(m, "5.53.0")             # what `install.sh --refresh-updater` records
+    assert _apply_5_47_0(m, {"install_sh_min_version": "5.53.0"}, "upg-aaaa0f06") == "completed"

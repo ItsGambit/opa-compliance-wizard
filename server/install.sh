@@ -85,9 +85,12 @@ umask 022
 # The release whose install.sh an EXISTING install needs (tools/release.py reads this line into the manifest's
 # install_sh_min_version; the updater asks for `install.sh --refresh-updater` only while the version it last recorded is older).
 # 5.50.0: the second-gate deny rules and --regenerate-second-sites, the newest change to what an existing install runs.
-# 5.52.0 added the fresh-install path, --uninstall and --log, which existing installs do not need. Bump it when an existing
+# 5.52.0 added the fresh-install path, --uninstall and --log, which existing installs do not need.
+# 5.53.0: the root updater no longer restarts or health-checks a login gate that is installed but disabled and not running;
+# an updater older than that fails the upgrade and its rollback on a server whose gate is not set up yet, and an old updater
+# cannot be fixed by the upgrade it runs, so every existing install must run --refresh-updater first. Bump it when an existing
 # install needs the new install.sh (docs/releasing.md).
-OCW_INSTALL_SH_REQUIRED_SINCE="5.50.0"
+OCW_INSTALL_SH_REQUIRED_SINCE="5.53.0"
 : "$OCW_INSTALL_SH_REQUIRED_SINCE"
 
 OPT_DIR="${OCW_OPT_DIR:-/opt/opa-compliance-wizard}"

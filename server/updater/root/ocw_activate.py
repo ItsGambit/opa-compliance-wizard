@@ -1144,8 +1144,9 @@ class Updater:
         raise StepFailed("needs_install_sh", f"{ver} needs the systemd units, the ocw-updater command or server/install.sh from release {need} or newer, "
                                              f"and install.sh {recorded} on this server. Unpack the release file for {ver} that you downloaded "
                                              "(not the copy in the staging directory) and run `sudo server/install.sh --refresh-updater` from "
-                                             "that unpacked directory; it refreshes the units, the command and the updater, records the version "
-                                             "and touches no data. Then apply this release again.", "staged")
+                                             "that unpacked directory (on a server installed with get-ocw.sh, run "
+                                             f"`sudo bash get-ocw.sh --refresh-updater --version {ver}` instead); it refreshes the units, the command and "
+                                             "the updater, records the version and touches no data. Then apply this release again.", "staged")
 
     def _second_gate_sites_where(self, lacks):
         """The names of the additional login gates' generated nginx sites (read-only, like check_second_gate_sites) whose
