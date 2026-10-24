@@ -45,6 +45,27 @@ _REPORT_KEY_RE = re.compile(r"^[a-z0-9_]{1,64}$", re.ASCII)
 _TOKEN_RE = re.compile(r"@@([A-Z0-9_]+)@@")
 
 
+_max_bytes_warned = set()
+
+
+def configured_max_bytes():
+    """OPA_EVIDENCE_MAX_BYTES as a positive integer, else the default. A value that is not a positive integer is logged once and ignored."""
+    raw = os.environ.get("OPA_EVIDENCE_MAX_BYTES")
+    if not raw:
+        return DEFAULT_MAX_BYTES
+    try:
+        value = int(raw)
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    if raw not in _max_bytes_warned:
+        _max_bytes_warned.add(raw)
+        import create_secret_folders as engine
+        engine.log("WARN", "OPA_EVIDENCE_MAX_BYTES is not a positive whole number; using the default of %d bytes." % DEFAULT_MAX_BYTES)
+    return DEFAULT_MAX_BYTES
+
+
 class PackageError(Exception):
     """A build that cannot go ahead or cannot finish. `reason` is a short stable code, str(exc) a plain sentence safe to
     show to the person who asked (never row content, never a path)."""
@@ -405,7 +426,7 @@ def build_package(dest_path, environment_id, environment_name, period, *, builde
     started = time.monotonic()
     now = now or datetime.now(timezone.utc)
     built_at = utc_stamp(now)
-    max_bytes = max_bytes or int(os.environ.get("OPA_EVIDENCE_MAX_BYTES") or DEFAULT_MAX_BYTES)
+    max_bytes = max_bytes or configured_max_bytes()
     say = progress or (lambda stage, fraction: None)
     verifier = verifier_bytes()
     verifier_sha = hashlib.sha256(verifier).hexdigest()

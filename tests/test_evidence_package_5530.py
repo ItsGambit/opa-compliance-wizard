@@ -434,3 +434,15 @@ def test_a_label_that_looks_like_the_matrix_token_cannot_duplicate_rows(store, t
     assert "@@MATRIX_ROWS@@" in html and "&lt;i&gt;x&lt;/i&gt;" in html and "<i>x</i>" not in html
     code, out = run_verifier(dest, tmp_path)
     assert code == 0, out
+
+
+@pytest.mark.parametrize("value", ["abc", "0", "-5", "1.5"])
+def test_a_bad_max_bytes_setting_is_logged_once_and_ignored(monkeypatch, capsys, value):
+    ep._max_bytes_warned.clear()
+    monkeypatch.setenv("OPA_EVIDENCE_MAX_BYTES", value)
+    assert ep.configured_max_bytes() == ep.DEFAULT_MAX_BYTES and ep.configured_max_bytes() == ep.DEFAULT_MAX_BYTES
+    assert capsys.readouterr().err.count("OPA_EVIDENCE_MAX_BYTES") == 1
+    monkeypatch.setenv("OPA_EVIDENCE_MAX_BYTES", "12345")
+    assert ep.configured_max_bytes() == 12345
+    monkeypatch.delenv("OPA_EVIDENCE_MAX_BYTES")
+    assert ep.configured_max_bytes() == ep.DEFAULT_MAX_BYTES

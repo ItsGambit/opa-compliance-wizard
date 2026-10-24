@@ -77,7 +77,7 @@ Entries are ASCII names built from fixed keys. Order in the zip is as listed; th
 | `tools/verify_evidence_package.py` | convenience copy of the verifier; listed in `package-manifest.json` like every file; not a trusted source (see above) |
 | `chain/manifests.ndjson` | every manifest record of the environment, first to head, in chain order |
 | `chain/seals.ndjson` | for each manifest holding an event of the period, its sealed entries |
-| `completeness.json` | the builder's statement of rows, scope, counts, coverage and pruned days |
+| `completeness.json` | the builder's statement of rows, scope, counts, coverage and pruned days (`pruned_basis` says what the pruned days rest on: records the server wrote when it pruned, or, for older prunes, the server's audit log or the current retention setting; a builder without administrator rights sees only prune times and counts there, not who ran them) |
 | `what-this-tool-reads.txt` | static statement of what the tool reads |
 | `methodology/<report_key>.txt` | method notes per report |
 | `package-manifest.json` | the file list and package facts, below |

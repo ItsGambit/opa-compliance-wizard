@@ -649,3 +649,44 @@ def test_start_up_cleanup_refuses_a_packages_folder_that_is_a_symlink(ev, tmp_pa
     (root / "packages").symlink_to(outside, target_is_directory=True)
     assert serve._evidence.cleanup_startup() == 0
     assert (outside / "keep.txt").exists() and "symbolic link" in serve._evidence.startup_skipped
+
+
+def test_start_refuses_a_packages_folder_that_is_a_symlink_and_creates_nothing_through_it(ev, tmp_path):
+    base, serve, env_id, root = ev
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (root / "packages").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(OSError):
+        serve._evidence.start({"environment_id": env_id, "environment_name": "dev", "period": PERIOD, "gaps_acknowledged": False,
+                               "owner": "", "issuer": "", "fingerprint": "local"})
+    assert list(outside.iterdir()) == [] and serve._evidence.startup_skipped
+    # and the route answers 500 packages_dir
+    r = prepare(base)
+    assert r.status_code == 500 and r.json()["reason"] == "packages_dir"
+
+
+def test_fired_timers_do_not_pile_up(ev, monkeypatch):
+    base, serve, env_id, root = ev
+    monkeypatch.setattr(serve._evidence, "window_seconds", 0)
+    for _ in range(3):
+        wait_done(base, prepare(base).json()["job_id"])
+    end = time.time() + 8
+    while serve._evidence._timers and time.time() < end:
+        time.sleep(0.1)
+    assert len(serve._evidence._timers) == 0
+
+
+@pytest.mark.parametrize("name", ["ENOSPC", "EDQUOT", "EFBIG"])
+def test_a_full_disk_a_quota_or_a_file_size_limit_is_a_disk_space_failure(ev, monkeypatch, name):
+    import errno
+    import evidence_package
+    base, serve, env_id, root = ev
+    code = getattr(errno, name, None)
+    if code is None:
+        pytest.skip(name + " does not exist here")
+
+    def boom(*a, **k):
+        raise OSError(code, "x")
+    monkeypatch.setattr(evidence_package, "build_package", boom)
+    status = wait_done(base, prepare(base).json()["job_id"])
+    assert status["reason"] == "disk_space"

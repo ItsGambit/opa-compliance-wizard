@@ -229,6 +229,16 @@ describe('hosted mode: the MFA step-up keeps the period, the acknowledgement and
   })
 })
 
+describe('the download window', () => {
+  it('when it has ended the download is a disabled button saying so, not a link', async () => {
+    vi.mocked(fetchEvidencePackage).mockResolvedValue({ ...DONE, seconds_left: 0 })
+    renderWithClient(<EvidencePackage resume={{ environmentId: 'env-1', period: COV.period, gapsAcknowledged: true, jobId: 'job-1' }} />)
+    const btn = (await screen.findByRole('button', { name: /Download window ended/ })) as HTMLButtonElement
+    expect(btn.disabled).toBe(true)
+    expect(screen.queryByRole('link', { name: /Download the package/ })).toBeNull()
+  })
+})
+
 describe('permission', () => {
   it('a shared user who may not build is told so and given no controls', async () => {
     vi.mocked(fetchEnvironments).mockResolvedValue(env({

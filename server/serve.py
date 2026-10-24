@@ -932,6 +932,10 @@ EVIDENCE_CHECKS_AT_ONCE = 2
 _evidence_checks = threading.BoundedSemaphore(EVIDENCE_CHECKS_AT_ONCE)
 
 
+# A full disk, an exhausted quota or a file over the filesystem's limit all end a build the same way (EDQUOT is absent on Windows).
+_DISK_FULL_ERRNOS = tuple(getattr(errno, n) for n in ("ENOSPC", "EDQUOT", "EFBIG") if hasattr(errno, n))
+
+
 def _evidence_caller_refusal(environment_id, engine_owner, issuer):
     """None when this caller may still build and read packages of the environment, else (status, body): 404 when the
     environment is gone, 403 for a withdrawn permission (shared-environment capabilities, owner always passes)."""
@@ -992,14 +996,14 @@ def _run_evidence_build(job_id, ctx):
         _evidence_log(ctx, "evidence_package.build_failed", {**base, "outcome": "refused" if exc.reason in (
             "no_coverage", "gaps_unacknowledged") else "failed", "reason": exc.reason, "seconds": round(time.monotonic() - started, 1)}, "WARN")
     except OSError as exc:
-        if exc.errno != errno.ENOSPC:
+        if exc.errno not in _DISK_FULL_ERRNOS:
             engine.log("ERROR", f"Evidence package build {job_id[:6]} failed with {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
             _evidence.fail(job_id, "internal", "The package could not be built because of an internal error. The details are in the server log.")
             _evidence_log(ctx, "evidence_package.build_failed", {**base, "outcome": "failed", "reason": "internal",
                                                                   "seconds": round(time.monotonic() - started, 1)}, "ERROR")
             return
-        # the disk filled while writing (a sync running at the same time can use the space the check saw): the partial file is removed
-        _evidence.fail(job_id, "disk_space", "The disk ran out of space while the package was being written. Free some space (or choose a shorter period) and try again.")
+        # the disk, the quota or the file size limit was hit while writing (a sync running at the same time can use the space the check saw): the partial file is removed
+        _evidence.fail(job_id, "disk_space", "The disk ran out of space (or a quota was reached) while the package was being written. Free some space (or choose a shorter period) and try again.")
         _evidence_log(ctx, "evidence_package.build_failed", {**base, "outcome": "failed", "reason": "disk_space",
                                                               "seconds": round(time.monotonic() - started, 1)}, "WARN")
     except Exception as exc:  # the person sees a generic sentence; the detail stays in the server log
@@ -3531,7 +3535,8 @@ class Handler(SimpleHTTPRequestHandler):
                 "mode": "local" if local else "hosted"})
         except evidence_jobs.Busy as exc:
             return 409, {"error": str(exc), "reason": exc.reason}
-        except OSError:
+        except OSError as exc:
+            engine.log("WARN", f"Evidence package not started: the packages folder cannot be used ({exc.strerror or type(exc).__name__}).")
             return 500, {"error": "The packages folder could not be created. Check the data folder's permissions and free space.", "reason": "packages_dir"}
         ctx["job_id"] = job_id
         details = {"environment": ctx["environment_name"], "environment_id": ctx["environment_id"], "period": ctx["period"],

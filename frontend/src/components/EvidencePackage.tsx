@@ -344,10 +344,13 @@ export function EvidencePackage({ resume, onResumeConsumed }: Props) {
                 <span>The package is ready: {jobData.result.events.toLocaleString()} events, {jobData.result.report_rows.toLocaleString()} report rows, {(jobData.result.bytes / 1048576).toFixed(1)} MB.</span>
               </p>
               <div className="flex flex-col gap-1">
-                <a className="btn-primary self-start inline-flex items-center gap-1.5" href={evidencePackageDownloadUrl(jobData.job_id)} download={jobData.result.filename}
-                  aria-disabled={secondsLeft === 0 ? true : undefined}>
-                  <Download size={14} aria-hidden="true" /> Download the package
-                </a>
+                {secondsLeft === 0
+                  ? <button type="button" className="btn-primary self-start inline-flex items-center gap-1.5" disabled><Download size={14} aria-hidden="true" /> Download window ended</button>
+                  : (
+                    <a className="btn-primary self-start inline-flex items-center gap-1.5" href={evidencePackageDownloadUrl(jobData.job_id)} download={jobData.result.filename}>
+                      <Download size={14} aria-hidden="true" /> Download the package
+                    </a>
+                  )}
                 <p className="text-xs text-text-dim" role="status">
                   {secondsLeft === 0
                     ? 'The download window has ended and the package was deleted from the server. Build it again.'

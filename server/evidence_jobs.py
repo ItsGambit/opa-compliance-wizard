@@ -11,6 +11,7 @@ logs; evidence_package.py builds. This module owns
 
 A job id is random (192 bits) and is validated against a fixed pattern before it is ever joined to a path.
 """
+import errno
 import hmac
 import os
 import re
@@ -123,6 +124,10 @@ class Registry:
     def start(self, spec):
         """Registers a new job (status running) and creates its folder. `spec`: environment_id, environment_name, period
         (start/end dates as strings), gaps_acknowledged, owner (sub or ""), issuer, fingerprint, mode. Raises Busy."""
+        if os.path.islink(self.packages_dir()):
+            # The same rule as start-up clean-up: never create or change anything through a link that replaced the folder.
+            self.startup_skipped = "the packages folder is a symbolic link"
+            raise OSError(errno.ELOOP, "the packages folder is a symbolic link")
         with self._lock:
             self._expire_locked()
             for j in self._jobs.values():
@@ -171,7 +176,15 @@ class Registry:
                 "expires_mono": now + self.window_seconds,
                 "expires_at": _iso(self._wall() + timedelta(seconds=self.window_seconds)),
             })
-        timer = threading.Timer(self.window_seconds + 1, self.sweep)
+        timer = None
+
+        def fire():
+            try:
+                self.sweep()
+            finally:
+                with self._lock:
+                    self._timers.discard(timer)      # a fired timer is not kept
+        timer = threading.Timer(self.window_seconds + 1, fire)
         timer.daemon = True
         with self._lock:
             self._timers.add(timer)
