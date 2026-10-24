@@ -58,7 +58,7 @@
 #               environment is active in the dashboard. No secrets are ever
 #               written to disk in plaintext by this script.
 #
-# Version     : 5.52.0
+# Version     : 5.53.0
 # =============================================================================
 
 import argparse
@@ -84,7 +84,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_VERSION = "5.52.0"
+SCRIPT_VERSION = "5.53.0"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 # ENG2-12: OPA's spec documents no pattern or length for a secret-folder
 # name (SecretFolderCreateRequest.name is a bare string); 255 is the limit
