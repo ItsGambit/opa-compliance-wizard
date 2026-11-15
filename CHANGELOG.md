@@ -2,7 +2,7 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
-5.53.1 — Unreleased — **A security fix to release checking, and new install guides for your computer and for a server, upgrading and release checking on their own pages, a glossary, and every page checked against the 5.53.0 code. No version number is assigned: the owner decides whether this ships as a signed docs release.**
+5.53.1 — Unreleased — **A security fix to release checking, and new install guides for your computer and for a server, upgrading and release checking on their own pages, a glossary, and every page checked against the 5.53.0 code. Not yet released: the version in the code is still 5.53.0 until the signed release is built.**
 A patch release. The standby signing key can no longer be retired or revoked through a release's key list (only a signed revocation can change it); everything else is documentation. No upgrade step is needed beyond installing the release.
 - **Security.** A release's key list can no longer change the status of the standby key; only a signed revocation can. The check is applied identically by the in-app updater and by the standalone installer verifier, and a release is also refused if it would leave no usable standby key.
 - **Added (docs).** `docs/install-computer.md`: install and first start on Windows, macOS or Linux from the release download (no Node.js needed), what to answer at the first prompts, how to connect an OPA team and an Okta org, how to fill the archive (choose the 90-day backfill) and what a finished sync and a working report look like, and what to do when it fails.
