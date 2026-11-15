@@ -55,8 +55,8 @@ You need all of these. Check them first; a missing one is the most common reason
 Do this first, so you have the values ready when the installer finishes. Below, `opa.example.com` stands for your server's name.
 
 1. **Create the admin group first.** In the Okta Admin Console create or pick a group for the people who will administer this tool
-   (**Directory → Groups**). Open it and copy its **group ID** from the web address: it looks like `00g1a2b3c4d5e6f7g8h9`, and the
-   address looks like `https://yourorg-admin.okta.com/admin/group/00g1a2b3c4d5e6f7g8h9`. It must be the ID, not the group name.
+   (**Directory → Groups**). Open it and copy its **group ID** from the browser's address bar: the part that starts with `00g`,
+   such as `00g1a2b3c4d5e6f7g8h9`. It must be the ID, not the group name.
 2. Go to **Applications → Applications → Create App Integration**. Choose **OIDC - OpenID Connect**, then **Web Application**.
 3. Set these and save. The defaults are fine for everything not listed (leave Refresh Token and PKCE as they are; the tool needs
    neither, and works with either).
