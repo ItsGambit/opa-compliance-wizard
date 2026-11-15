@@ -82,7 +82,7 @@ login gate (`server/auth_gate.py`) both read it. It holds generated secrets, so 
 
 **The Okta app.** A **Web Application** OIDC integration, grant type Authorization Code only; sign-in redirect URI
 `https://<your-dashboard-origin>/authorization-code/callback`; sign-out redirect URI `https://<your-dashboard-origin>/login`
-([the steps](install-server.md#step-1-prepare-okta)).
+([the Okta setup steps](install-server.md#step-1-prepare-okta)).
 
 **Which authorization server.** By default the gate uses the org's authorization server named `default`
 (`https://<org>/oauth2/default`). `OKTA_AUTH_SERVER` changes that: `org` for the org authorization server, or the ID of a custom

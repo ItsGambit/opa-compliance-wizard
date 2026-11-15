@@ -17,7 +17,16 @@ Nothing here changes by itself: the update check is **off** until you turn it on
 
 ## Upgrade a server
 
-Do these in order.
+**Before you start.** Five checks, so nothing surprises you:
+
+1. `sudo ocw-updater status` shows what is installed and that the updater is ready.
+2. No archive sync is running and no evidence package is waiting to be downloaded (the preflight refuses otherwise).
+3. There is free space under `/opt` and `/var/lib` for a second release and a copy of the archive.
+4. You have a recent full backup ([Backups and restore](hosting.md#backups-and-restore)). The automatic pre-upgrade copy covers the
+   archive only, not the settings file, the keyring or the session key.
+5. Other users will see a maintenance page while the version switches (a few minutes); tell them the time.
+
+Then do these in order.
 
 ### 1. If your server is older than 5.53.0, run one command first
 
@@ -79,7 +88,7 @@ Exit codes of `ocw-updater`: `0` ok, `2` refused (signature, version, key, a syn
 On a server with the login gate, opening **Access control, Shared permissions, Orphaned archives, the environment details or Updates**
 asks for MFA. You sign in through Okta again, and Settings stay open for 10 minutes (a countdown shows how long). Saving the
 announcement banner asks for MFA as well. A computer without a login gate is not asked. An *additional* login gate's nginx site made
-before 5.42.0 must be regenerated first ([the reference](hosting.md#serving-a-second-okta-org-optional-5380)).
+before 5.42.0 must be regenerated first ([Hosting reference: a second Okta org](hosting.md#serving-a-second-okta-org-optional-5380)).
 
 After a *minor* upgrade (for example 5.52 to 5.53) the first refresh reads OPA again, because the stored OPA scan is tied to the
 release's minor number. A patch upgrade keeps it.
@@ -122,7 +131,7 @@ anyone asks. An administrator can download it from the failed upgrade's Audit Lo
 
 | Command | What it does |
 |---|---|
-| `status [--json]` | Installed, staged, scheduled, updater health, keys, backups, last run. Reads only; any user. |
+| `status [--json]` | Installed, staged, scheduled, updater health, keys, backups, last run. Reads only. |
 | `stage <file or version>` | Verify and stage a release (root). |
 | `apply <version> [--at "YYYY-MM-DD HH:MM" [--tz ZONE]]`, `cancel` | Install now or schedule it (typed confirmation); `cancel` removes a schedule. |
 | `rollback`, `restore --confirm RESTORE` | Code-only rollback; archive restore (above). |
@@ -188,7 +197,7 @@ typed confirmation.
 
 **Windows.** Needs no admin rights and no symbolic links. Windows will not rename a folder while a program has a file in it open: close the
 dashboard (and its window), File Explorer windows on the folder and editors, and run the upgrade with the system Python
-(`py -3 launch.py upgrade`). Keep the install path short (about 200 characters at most). Run the upgrade from the install folder, not
+(`py -3 launch.py upgrade`). Keep the install path short: the upgrade refuses with "The install folder's path is too long for Windows" when the path plus the longest file name passes about 240 characters. Run the upgrade from the install folder, not
 from `<folder>-previous`.
 
 ## The update check (off by default)
@@ -223,7 +232,7 @@ User-Agent only if you opt in: `python -m server.updater share-version on`.
 On a computer with internet access, download from the release page the three files (`ocw-<version>.tar.gz`,
 `ocw-<version>.tar.gz.minisig`, `manifest.json`), or, **when the release has one**, the offline bundle
 `ocw-<version>-offline.tar.gz` with its `.sha256`. The bundle is the same signed release plus the hash-pinned Python packages for
-Windows, macOS (Apple silicon) and Linux (x86-64 and ARM) on Python 3.9 to 3.14 (Linux needs glibc 2.28 or newer; Alpine and Intel Macs
+Windows, macOS (Apple silicon) and Linux (x86-64 and ARM) on Python 3.9 to 3.14 (Linux needs a recent glibc: Debian 12 and Ubuntu 22.04 qualify; Alpine and Intel Macs
 are not covered). The maintainers attach a bundle only to releases they built one for, so look at the release's **Assets** first.
 Carry the files over on removable media. The bundle carries no signature of its own and needs none: the release inside it is verified
 like any other, and `pip` refuses any package whose sha256 is not in that release's signed `requirements.lock`.

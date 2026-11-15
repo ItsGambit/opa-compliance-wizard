@@ -11,8 +11,8 @@ The commands are for Debian and Ubuntu; adapt the package names for your distrib
 
 ## What the one-line installer does for you
 
-So you know what you are replacing. After you confirm a plan, it installs `nginx`, `gnome-keyring`, `dbus-user-session`,
-`python3-venv` and `openssl`; creates the application account `ocw` (a regular account with home `/var/lib/opa-compliance-wizard/home`,
+So you know what you are replacing. After you confirm a plan, it installs whichever of `nginx`, `gnome-keyring`, `dbus-user-session`,
+`python3-venv` and `openssl` are missing; creates the application account `ocw` (a regular account with home `/var/lib/opa-compliance-wizard/home`,
 shell `nologin`, lingering on); writes `/etc/opa-compliance-wizard.env` (mode 0600) with three generated secrets; writes the two
 application units with the account's real numeric id in `/run/user/<uid>`; writes the login gate's session key; makes the nginx site
 from the release's template with your server name, the proxy secret and a certificate; and starts the backend and checks it, also
@@ -28,7 +28,7 @@ before you start the services.
   or NodeSource). Using a signed release (below) needs no Node.js.
 - **The code**, as the application user (no sudo). Either unpack a signed release (`ocw-<version>.tar.gz`; check it first, see
   [Verifying releases](verifying-releases.md)), or clone `https://github.com/ItsGambit/opa-compliance-wizard.git` and build the
-  frontend in it with `cd frontend && npm ci --ignore-scripts && npx vite build`. Then, in the folder:
+  frontend in it with `cd frontend && npm ci --ignore-scripts && npm run build`. Then, in the folder:
   `python3 -m venv .venv && .venv/bin/pip install --require-hashes -r requirements.lock`. Every package must match a recorded
   checksum.
 - **Lingering.** The application user's systemd user manager must keep running without a login session, because the keyring daemon
@@ -47,28 +47,36 @@ before you start the services.
 - **The nginx site**, readable only by root and the application user's group (it will hold `NGINX_PROXY_SECRET`): `sudo install -m 0640
   -o root -g <app-user's group> server/nginx-opa-secrets-wizard.conf /etc/nginx/sites-available/opa-secrets-wizard`. Then `sudoedit`
   it to set your `server_name` (both blocks), the certificate paths and the proxy secret, and enable it: `sudo ln -s
-  /etc/nginx/sites-available/opa-secrets-wizard /etc/nginx/sites-enabled/ && sudo nginx -t && sudo systemctl reload nginx`.
+  /etc/nginx/sites-available/opa-secrets-wizard /etc/nginx/sites-enabled/ && sudo nginx -t && sudo systemctl enable --now nginx && sudo systemctl reload nginx`.
+- **The login gate's session key** (32 random bytes; the gate refuses to start with less). The gate cannot create it in `/etc` by
+  itself here, so make it: `sudo sh -c 'umask 027; head -c 32 /dev/urandom > /etc/opa-secrets-wizard-session.key' && sudo chown
+  root:<app-user> /etc/opa-secrets-wizard-session.key && sudo chmod 0640 /etc/opa-secrets-wizard-session.key`. To end every session at
+  once later, replace it ([Session key and emergency sign-out](hosting.md#session-key-and-emergency-sign-out)).
 - **Executable scripts.** The shell scripts are executable in git; on a checkout where they are not (for example one edited from
   Windows), run `chmod +x server/*.sh start-wizard.sh`.
 
 ## 2. The two systemd units
 
-Install and enable `opa-compliance-wizard.service` (the backend) and `opa-auth-gate.service` (the login gate). Both files use the
-placeholders `__APP_USER__`, `__APP_DIR__`, `__DATA_DIR__` and `__APP_USER_HOME__` (the repository does not hardcode a user or path).
-For the in-place layout set `__DATA_DIR__` to the same path as `__APP_DIR__`, and delete the `OPA_DATA_DIR` and `ProtectSystem` lines.
-Run this from the application folder so `$(pwd)` is the real application directory:
+Install and enable `opa-compliance-wizard.service` (the backend) and `opa-auth-gate.service` (the login gate). Both files use five
+placeholders (the repository does not hardcode a user or path): `__APP_USER__` (the account), `__APP_UID__` (its numeric id, used for
+`/run/user/<id>`, where the keyring daemon lives), `__APP_DIR__` (the application folder), `__DATA_DIR__` (where data is written) and
+`__APP_USER_HOME__` (the account's home). For the in-place layout `__DATA_DIR__` is the same path as `__APP_DIR__`.
+Run this as an administrator (a user with `sudo`), after you set the four variables to your values:
 
 ```bash
-sed -e "s|__APP_USER__|$(whoami)|g" \
-    -e "s|__APP_DIR__|$(pwd)|g" \
-    -e "s|__APP_USER_HOME__|$HOME|g" -e "s|__DATA_DIR__|$(pwd)|g" \
-    server/opa-compliance-wizard.service | sudo tee /etc/systemd/system/opa-compliance-wizard.service
-sed -e "s|__APP_USER__|$(whoami)|g" \
-    -e "s|__APP_DIR__|$(pwd)|g" \
-    -e "s|__APP_USER_HOME__|$HOME|g" -e "s|__DATA_DIR__|$(pwd)|g" \
-    server/opa-auth-gate.service | sudo tee /etc/systemd/system/opa-auth-gate.service
+APP_USER=<app-user>                  # the account that runs the application
+APP_DIR=/home/$APP_USER/opa-compliance-wizard   # the application folder
+APP_HOME=/home/$APP_USER
+for u in opa-compliance-wizard opa-auth-gate; do
+  sed -e "s|__APP_USER__|$APP_USER|g" -e "s|__APP_UID__|$(id -u "$APP_USER")|g" \
+      -e "s|__APP_DIR__|$APP_DIR|g" -e "s|__DATA_DIR__|$APP_DIR|g" -e "s|__APP_USER_HOME__|$APP_HOME|g" \
+      "$APP_DIR/server/$u.service" | sudo tee /etc/systemd/system/$u.service >/dev/null
+done
+grep -l "__APP_" /etc/systemd/system/opa-compliance-wizard.service /etc/systemd/system/opa-auth-gate.service   # must print nothing
 sudo systemctl daemon-reload
 ```
+
+The `grep` must print nothing: a leftover `__APP_...__` placeholder means a unit that cannot work.
 
 `sudo tee` creates the files owned by root, which is what they must stay: systemd runs them as root, so a unit file the application user
 can edit is a way to root at the next reload or boot. Check that the live unit's `EnvironmentFile=` path is the one your settings file
@@ -85,36 +93,27 @@ again by hand and run `systemctl daemon-reload` and `restart`. Check with `diff 
    `EXTRA_ALLOWED_ORIGINS` in the settings file (see the [reference](hosting.md#settings-file-reference)).
 3. Start the backend: `sudo systemctl enable --now opa-compliance-wizard`.
 4. Store the client secret and the admin-check token in the application user's keyring, **while the backend is running** (it keeps
-   the keyring unlocked), as the application user:
+   the keyring unlocked). The two `env` settings point the command at that keyring session. Run each command as an administrator; it
+   asks for the secret (hidden):
 
    ```bash
-   python3 -c "import getpass, keyring; keyring.set_password('opa-compliance-wizard:default', 'okta_client_secret', getpass.getpass('client secret: '))"
-   python3 -c "import getpass, keyring; keyring.set_password('opa-compliance-wizard:default', 'okta_admin_check_token', getpass.getpass('API token: '))"
+   APP_USER=<app-user>; APP_DIR=/home/$APP_USER/opa-compliance-wizard; U=$(id -u $APP_USER)
+   for n in okta_client_secret okta_admin_check_token; do
+     sudo -u $APP_USER env XDG_RUNTIME_DIR=/run/user/$U DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$U/bus \
+       $APP_DIR/.venv/bin/python -c "import getpass, keyring; keyring.set_password('opa-compliance-wizard:default', '$n', getpass.getpass('$n: '))"
+   done
    ```
 
-   (`default` is `OKTA_ENV_NAME`.) On a server made by the installer these commands need `XDG_RUNTIME_DIR` and
-   `DBUS_SESSION_BUS_ADDRESS` set, as the installer's own command shows.
+   (`default` is `OKTA_ENV_NAME`.) Check that both are stored, without printing them:
+
+   ```bash
+   sudo -u $APP_USER env XDG_RUNTIME_DIR=/run/user/$U DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$U/bus \
+     $APP_DIR/.venv/bin/python -c "import keyring; [print(n, 'stored' if keyring.get_password('opa-compliance-wizard:default', n) else 'MISSING') for n in ('okta_client_secret', 'okta_admin_check_token')]"
+   ```
 5. Start the login gate: `sudo systemctl enable --now opa-auth-gate`.
 6. Open the dashboard address and sign in.
 
-## Session-signing key
-
-`auth_gate.py` signs its cookies with the key at `OPA_SESSION_KEY_PATH` (default `/etc/opa-secrets-wizard-session.key`). The gate
-refuses to start if that file holds fewer than 32 bytes. Either let the gate create it (its directory must be writable by the
-application user; it is created `0600`), or create it yourself:
-
-```bash
-sudo sh -c 'umask 027; head -c 32 /dev/urandom > /etc/opa-secrets-wizard-session.key'
-sudo chown root:<app-user> /etc/opa-secrets-wizard-session.key
-sudo chmod 0640 /etc/opa-secrets-wizard-session.key
-```
-
-**Emergency sign-out of everyone:** sessions are signed cookies with no server-side store, so replacing this key (same commands, then
-`sudo systemctl restart opa-auth-gate`) ends every session at once, for example after offboarding an administrator (a session keeps the
-admin flag it was issued with until it expires, 12 hours). Each additional gate has its own key (`/etc/opa-auth-gate-<name>/session.key`)
-and unit (`opa-auth-gate-<name>`).
-
-## Upgrading this install
+## 4. Upgrading this install
 
 Until you move it to the managed layout, upgrade with `server/deploy.sh --release <version>`
 ([Upgrading](upgrading.md#older-servers-that-still-run-from-a-home-directory)). No sudoers rule is needed for the current tools; an

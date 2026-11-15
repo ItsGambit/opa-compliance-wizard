@@ -36,8 +36,13 @@ On first launch (or whenever no environment is active) the dashboard
 shows a **setup screen** asking for a label (e.g. `dev`) and:
 - **Base Domain**, **Team Name**, **Key ID**, **Key Secret** — the OPA
   service-user credentials (required).
-- **Okta URL**, **Okta API Token** — optional, only needed if you want
-  to create new groups from the dashboard (see "Groups" below).
+- **Okta URL**, **Okta API Token** — needed for the Okta System Log
+  archive and every Okta report: a sync refuses to run without them
+  ("No Okta URL/API token configured for this environment"). They also
+  let you create new groups from the dashboard (see "Groups" below).
+  The form's heading still calls them optional; that label is out of
+  date. See [Install on your computer, step 3](install-computer.md#step-3-connect-opa-and-okta)
+  for the URL format and the token.
 
 Saving tests the connection immediately and, once it succeeds, unlocks
 the rest of the dashboard. You can save **multiple named

@@ -1,7 +1,7 @@
 # Verifying releases
 
-You do not have to do anything on this page to install the tool: the installers and the upgrade commands check every signature
-for you. This page is for people who want to check a download **by hand**, want to know exactly what they are trusting, or need to
+The server installer and every upgrade command check every signature for you. The one thing you can check only by hand is the
+first download on a computer. This page is for people who want to check a download **by hand**, want to know exactly what they are trusting, or need to
 handle a signing-key problem.
 
 ## What is signed, and what you trust
@@ -40,7 +40,8 @@ project signs a prehashed form. `minisign` should print `Signature and comment s
 That key line is published in the same repository as the script, so by itself it only proves the file matches what GitHub holds.
 To check it independently, compare the key id with the one published on a page the project controls outside GitHub:
 <https://apps.ruchir.pw/keys/opa-compliance-wizard> (plain text: `/keys/opa-compliance-wizard.txt`). If they differ, **stop** and
-report it privately ([SECURITY.md](../SECURITY.md)).
+report it privately ([SECURITY.md](../SECURITY.md)). Reach that page by a route that does not start in this repository (a link here came
+from the same place as the key), for example from your own notes or an address a colleague gave you earlier.
 
 ## Check a release tarball by hand
 
@@ -88,10 +89,12 @@ What to do:
    the file next to the release files for `--from-file` / `--from-dir`. It checks the standby key's signature and that the revocation
    is newer than any applied before. Then install the new release as usual.
 3. **If you suspect your copy of the keys itself:** compare the key ids with the project's security advisory over a second channel
-   before applying anything. If both keys were lost, the advisory tells you to re-pin a new key by hand: replace
-   `server/release_keys.json` with the published list after checking its key ids through two independent channels.
+   before applying anything. If both keys were lost, the advisory tells you to re-pin a new key by hand: on a computer install replace
+   `server/release_keys.json` with the published list after checking its key ids through two independent channels; on a server with the
+   upgrade layout run `sudo ocw-updater trust add <key.json>` (it takes only an active release key and asks you to type `TRUST`).
 
-Applying a revocation writes `release_keys.local.json` next to the app (kept across upgrades, owner-only). The install remembers every
+Applying a revocation writes `release_keys.local.json` in the data folder (next to the app on a computer install; under `/var/lib/opa-compliance-wizard` on a
+server; kept across upgrades, owner-only). The install remembers every
 key, its status and the highest revocation serial, so no later release can bring a revoked key back.
 
 For what "revocation" means to the maintainers, and how it is made, see [Releasing](releasing.md).
