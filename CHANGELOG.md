@@ -2,6 +2,9 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.53.1 — **Unreleased.**
+- **Security.** A release's key list can no longer change the status of the standby key; only a signed revocation can. The check is applied identically by the in-app updater and by the standalone installer verifier, and a release is also refused if it would leave no usable standby key.
+
 5.53.0 — **Evidence packages for your auditor (SOC 2, mappings proposed), MFA to open Settings and Updates, complete report exports, and a safer upgrade path: every existing server runs one refresh command first.**
 A minor release. Before upgrading, run the one refresh command in the upgrade note below; the old updater refuses 5.53.0 until you do, and nothing changes until then. New: build an evidence package for an audit period (one zip with a cover sheet, a read-me for auditors, per-control CSV files, the raw events and an offline verifier; it is not signed and does not prove who produced the events), with a per-environment choice of who may build one and MFA in hosted mode. Opening Settings or Updates now asks for MFA and stays open for 10 minutes. Report exports are no longer cut at 1,000 rows. Two database migrations (012, 013), both rollback-safe.
 - **Upgrade note (read first).** Every existing server needs one command before this upgrade: on a server installed with `get-ocw.sh`, run `sudo bash get-ocw.sh --refresh-updater --version 5.53.0`; on a server with a checkout, unpack the 5.53.0 release and run `sudo bash server/install.sh --refresh-updater` from it. The old updater refuses 5.53.0 until you run it; nothing is changed until then. The command refreshes the updater, the units and the `ocw-updater` command and touches no data. (Why: an updater older than 5.53.0 fails the upgrade, and its rollback, on a server whose login gate is installed but not set up yet.)

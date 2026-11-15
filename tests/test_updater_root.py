@@ -204,6 +204,8 @@ def test_key_list_adoption_rules_match(tmp_path):
     assert rule([k, k2, sb]) == ("adopt", "adopt")
     assert rule([k, sb, sb2])[0] == ("error", "keys_changed") == rule([k, sb, sb2])[1]
     assert rule([k.entry("retired"), sb])[0] == "adopt" == rule([k.entry("retired"), sb])[1] or True
+    for status in ("retired", "revoked"):   # a release's list never changes a pinned standby
+        assert rule([k, sb.entry(status)]) == (("error", "keys_changed"), ("error", "keys_changed"))
     assert rule([dict(k.entry(), public_key=k2.entry()["public_key"]), sb])[0] == ("error", "keys_changed")
 
 

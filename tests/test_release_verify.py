@@ -294,6 +294,31 @@ def test_adoption_rules(keys_and_list):
     assert info.value.code == "keys_changed"
 
 
+def test_release_list_cannot_change_a_pinned_standby_status(keys_and_list):
+    primary, standby, eff = keys_and_list
+    newer = TestKey()
+
+    def adopt(*keys, current=eff):
+        return keylib.check_adoption(current, keylib.validate_key_list(key_list(keys)))
+
+    for status in ("retired", "revoked"):
+        with pytest.raises(keylib.KeyListError) as info:
+            adopt(primary, standby.entry(status))
+        assert info.value.code == "keys_changed", status
+    assert adopt(primary, standby, newer) == "adopt"                       # adds a release key, keeps the standby
+    # a lagging (looser) list from an older release stays harmless
+    retired_standby_eff = effective([primary, standby.entry("retired")])
+    assert adopt(primary, standby, current=retired_standby_eff) == "older"
+    assert adopt(primary, standby.entry("retired"), current=retired_standby_eff) == "same"
+
+
+def test_signed_revocation_of_the_standby_still_applies_through_its_own_path(keys_and_list):
+    primary, standby, eff = keys_and_list
+    newer = TestKey()
+    revoked = effective([primary, standby.entry("revoked"), newer])
+    assert {k["key_id"]: k["status"] for k in revoked["keys"]}[standby.key_id] == "revoked"
+
+
 def test_release_carrying_a_bad_key_list_is_refused(tmp_path, keys_and_list):
     primary, standby, eff = keys_and_list
     evil = TestStandby()

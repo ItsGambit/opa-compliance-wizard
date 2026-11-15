@@ -366,7 +366,7 @@ def check_adoption(eff, candidate):
     """Rules for the key list a release carries. Returns 'same', 'adopt' (it
     adds keys or retires some) or 'older' (it is a subset of what this install
     already knows: verifies, but changes nothing). Raises KeyListError for a
-    list that adds or changes a standby, or redefines a key."""
+    list that adds a standby, moves a pinned standby to a stricter status, or redefines a key."""
     known = {k["key_id"]: k for k in eff["keys"]}
     new_keys, stricter = [], False
     for c in candidate["keys"]:
@@ -379,12 +379,17 @@ def check_adoption(eff, candidate):
             continue
         if (e["alg"], e["public_key"], e["role"]) != (c["alg"], c["public_key"], c["role"]):
             raise KeyListError("keys_changed", f"this release redefines pinned key {c['key_id']}. Do not install it.")
+        if e["role"] == "standby" and STATUS_RANK[c["status"]] > STATUS_RANK[e["status"]]:
+            raise KeyListError("keys_changed", "this release changes the status of a standby key; only a signed revocation can "
+                               "change the standby keys. Do not install it.")
         # A looser status in a release's list (an older release that predates a retirement or revocation) is
         # simply ignored: statuses only ever move toward revoked (effective_from keeps the strictest).
         stricter = stricter or STATUS_RANK[c["status"]] > STATUS_RANK[e["status"]]
     merged = merged_with(eff, candidate)
     if not has_active(merged, "release"):
         raise KeyListError("keys_changed", "this release would leave no usable release key. Do not install it.")
+    if has_active(eff, "standby") and not has_active(merged, "standby"):
+        raise KeyListError("keys_changed", "this release would leave no usable standby key. Do not install it.")
     if new_keys or stricter:
         return "adopt"
     if {k["key_id"] for k in candidate["keys"]} == set(known) and all(

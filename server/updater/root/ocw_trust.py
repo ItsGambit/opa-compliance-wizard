@@ -196,9 +196,14 @@ def check_adoption(trust, candidate):
             continue
         if (e["alg"], e["public_key"], e["role"]) != (c["alg"], c["public_key"], c["role"]):
             raise TrustError("keys_changed", f"this release redefines pinned key {c['key_id']}")
+        if e["role"] == "standby" and STATUS_RANK[c["status"]] > STATUS_RANK[e["status"]]:
+            raise TrustError("keys_changed", "this release changes the status of a standby key; only a signed revocation can change the standby keys")
         stricter = stricter or STATUS_RANK[c["status"]] > STATUS_RANK[e["status"]]
-    if not _has_active(merge(trust, candidate), "release"):
+    merged = merge(trust, candidate)
+    if not _has_active(merged, "release"):
         raise TrustError("keys_changed", "this release would leave no usable release key")
+    if _has_active(trust, "standby") and not _has_active(merged, "standby"):
+        raise TrustError("keys_changed", "this release would leave no usable standby key")
     if new_keys or stricter:
         return "adopt"
     if {c["key_id"] for c in candidate} == set(known) and all(c["status"] == known[c["key_id"]]["status"] for c in candidate):
