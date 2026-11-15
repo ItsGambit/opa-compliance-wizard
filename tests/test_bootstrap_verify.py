@@ -147,6 +147,12 @@ def test_release_that_adds_a_standby_key_is_refused(w):
     w.refused("keys_changed", tar, sig)
 
 
+def test_release_that_retires_or_revokes_the_standby_key_is_refused(w):
+    for status in ("retired", "revoked"):
+        tar, sig = w.release(kl=key_list([w.key, w.standby.entry(status)]))
+        w.refused("keys_changed", tar, sig)
+
+
 def test_downgrade_is_refused_unless_allowed(w):
     tar, sig = w.release(version="5.49.0")
     msg = w.refused("downgrade", tar, sig, bootstrap="5.52.0")
