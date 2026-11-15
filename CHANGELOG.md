@@ -2,6 +2,17 @@
 
 Full version history for the OPA Compliance Wizard. Each entry below pairs a one-paragraph summary with the detailed per-item breakdown.
 
+5.53.1 — **Docs only: a new install guide for your computer and one for a server, upgrading and release checking moved to their own pages, and every page checked against the 5.53.0 code. Not yet released: the version number in the code is unchanged.**
+A documentation-only patch. Nothing in the application, the installers, the updater or the nginx and systemd files changes, and no upgrade step is needed.
+- **Added (docs).** `docs/install-computer.md`: install and first start on Windows, macOS or Linux from the release download (no Node.js needed), what to answer at the first prompts, how to connect an OPA team, and what to do when it fails.
+- **Added (docs).** `docs/install-server.md`: the one-line installer in numbered steps (Okta app and group first, then the installer, the three settings, the two secrets, the login gate, the first sign-in), with what you should see after each step and the most likely failures. `docs/install-server-manual.md` keeps the by-hand install for other distributions.
+- **Added (docs).** `docs/upgrading.md` (upgrading a server, a computer or an older home-directory server; rollback and restore; the support bundle; the update check; offline) and `docs/verifying-releases.md` (what is signed, checking `get-ocw.sh` and a tarball by hand, and the signing-key compromise procedure). These sections moved out of the README with their text intact apart from corrections below.
+- **Changed (docs).** The README is now short and starts with a choice between running on your computer and on a server. It keeps the project status, the no-warranty notice, the credential-storage summary and the licence, and keeps short pointers under the old section names ("Upgrading", "Rollback is code only; restoring data is a separate, typed decision", and so on) so links from the application and from older messages still land somewhere. `docs/hosting.md` is now reference material: the install steps moved to the install pages and its settings are in a new "Settings file reference". The table of stored data moved from the README to `docs/features.md`.
+- **Fixed (docs).** The README and the features guide told you to build the web pages with Node.js before starting; a release download already contains them and needs no Node.js. The prerequisites did not name the SQLite 3.35 minimum that `launch.py` checks, nor Python on a minimal server (the installer refuses without `python3`). The server guide now says which Okta authorization server is used by default (`default`, not the org server), that the Okta API token for the sign-in check stops working after 30 days unused, and that before the login gate is started the site answers with a plain 500 error.
+- **Fixed (docs).** The offline bundle was described as part of every release; only 5.49.0 has one attached. The guide now says to check the release's assets, and says plainly that a server upgrade through `ocw-updater` still needs a route to a Python package index. The CLI guide now mentions `--force`. Four links in this file that pointed at anchors in other pages now name the page. The README's `--version 5.52.0` example and its "5.52.0" and "5.51.0" markers were removed.
+- **Security and privacy.** No change. The project's independent key page is still named, in `docs/verifying-releases.md` and `SECURITY.md`.
+- **Known limitations.** The one-line installer was run end to end in a Debian 12 container with systemd (fresh install, Okta settings, keyring commands, login gate start) and the computer install from the release download in a Debian 12 container; neither was run on Ubuntu, on ARM, with a real Okta app, or on Windows or macOS. Some messages printed by the installers and the application still say "README" or "docs/hosting.md, step N"; those names remain as pointers, and the messages are not changed in a docs-only patch.
+
 5.53.0 — **Evidence packages for your auditor (SOC 2, mappings proposed), MFA to open Settings and Updates, complete report exports, and a safer upgrade path: every existing server runs one refresh command first.**
 A minor release. Before upgrading, run the one refresh command in the upgrade note below; the old updater refuses 5.53.0 until you do, and nothing changes until then. New: build an evidence package for an audit period (one zip with a cover sheet, a read-me for auditors, per-control CSV files, the raw events and an offline verifier; it is not signed and does not prove who produced the events), with a per-environment choice of who may build one and MFA in hosted mode. Opening Settings or Updates now asks for MFA and stays open for 10 minutes. Report exports are no longer cut at 1,000 rows. Two database migrations (012, 013), both rollback-safe.
 - **Upgrade note (read first).** Every existing server needs one command before this upgrade: on a server installed with `get-ocw.sh`, run `sudo bash get-ocw.sh --refresh-updater --version 5.53.0`; on a server with a checkout, unpack the 5.53.0 release and run `sudo bash server/install.sh --refresh-updater` from it. The old updater refuses 5.53.0 until you run it; nothing is changed until then. The command refreshes the updater, the units and the `ocw-updater` command and touches no data. (Why: an updater older than 5.53.0 fails the upgrade, and its rollback, on a server whose login gate is installed but not set up yet.)
@@ -3517,7 +3528,7 @@ pass that exposed this).
     project's own internal notes if you're tracking that follow-up.
   - **New: Okta-group-based admin roles.** Members of a designated Okta
     group (`OKTA_ADMIN_GROUP_ID`, see "Admin access" in
-    [Hosting on a server](#hosting-on-a-server-optional)) can see and
+    [Hosting on a server](docs/hosting.md#hosting-on-a-server-optional)) can see and
     manage every environment on a hosted, multi-user deployment, not
     just their own or explicitly shared ones — checked once at login
     via a direct Okta API call, carried through the session the same
@@ -3569,10 +3580,10 @@ pass that exposed this).
     retained archive of Okta System Log + OPA PAM events — closing the
     gap between Okta's 90-day log retention and the 12-month-plus
     windows most audits actually cover. See
-    [Compliance Reports Dashboard](#compliance-reports-dashboard) for
+    [Compliance Reports Dashboard](docs/features.md#compliance-reports-dashboard) for
     the full feature description.
   - **New archive engine (`audit_store.py`).** SQLite-backed (see
-    [Hosting on a server](#hosting-on-a-server-optional) for why SQLite
+    [Hosting on a server](docs/hosting.md#hosting-on-a-server-optional) for why SQLite
     over a client-server database), with an admin-configurable
     **ingestion scope** (curated ~20 event types vs. everything) that
     governs what's written at ingest time, and a separately-configurable
@@ -3605,7 +3616,7 @@ pass that exposed this).
   - **Corrected several eventType names inherited from an external
     audit-requirements guide** that don't match real Okta System Log
     data — see finding #16 in
-    ["Confirmed tenant behavior"](#confirmed-tenant-behavior-found-via-live-testing-not-docs)
+    ["Confirmed tenant behavior"](docs/api-notes.md#confirmed-tenant-behavior-found-via-live-testing-not-docs)
     for the specifics (`app.oauth2.authorize.code`, not `.success`;
     `access.request.resolve`, not `.resolved`; `pam.security_policy.*`,
     not `pam.policy.*`; several guide-listed events confirmed genuinely

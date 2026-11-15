@@ -33,7 +33,7 @@ upgrade, or from a shell with `sudo ocw-updater bundle`
 redacted). Attach it to the private advisory above. **Nothing is ever sent
 automatically.** What it holds and what it never holds (the environment
 file, the keyring, the session key, the archive, request bodies, cookies) is
-listed in the README under "The support bundle". Read it before you attach it.
+listed in [Upgrading](docs/upgrading.md#the-support-bundle). Read it before you attach it.
 
 ## Deployment modes
 
@@ -134,7 +134,7 @@ The project's verifier also checks the version, the file name, the manifest of
 every file inside and that the key is a current release key; prefer it. The
 same minisign check works for `get-ocw.sh` and `get-ocw.sh.minisig`. The
 updater and `get-ocw.sh` run this verification for you before anything is
-unpacked or installed. More detail: README, "Verify a download by hand".
+unpacked or installed. More detail: [Verifying releases](docs/verifying-releases.md#check-a-release-tarball-by-hand).
 
 ### If a signing key is compromised
 
@@ -144,8 +144,8 @@ publishes a security advisory. It is published as an asset of a GitHub release
 (`revocation`, or `revocation-<serial>` for later ones) and, optionally, at an
 owner-controlled static URL (`OPA_REVOCATION_URL`), so one outage or one
 compromised account cannot hide it. A server with the update check on applies
-it by itself; otherwise apply it by hand (README, "If the signing key is
-compromised"; maintainers: [docs/releasing.md](docs/releasing.md), "If the
+it by itself; otherwise apply it by hand ([Verifying releases](docs/verifying-releases.md#if-the-signing-key-is-compromised);
+maintainers: [docs/releasing.md](docs/releasing.md), "If the
 release key is compromised"). If you think your own copy of the keys is wrong,
 compare the key ids with the advisory over a second channel before applying
 anything. A stolen standby key is as serious as a stolen release key and has no

@@ -2,7 +2,7 @@
 
 How a release is built, signed and published, and how the signing keys are kept and replaced. Everything runs on the
 maintainer's own computer with `tools/release.py` (and, only in an emergency, `tools/revoke.py`); nothing signs in CI, and no
-signing key exists as a file anywhere. Operators' side of this is the README's ["Upgrading"](../README.md#upgrading).
+signing key exists as a file anywhere. Operators' side of this is [Upgrading](upgrading.md) and [Verifying releases](verifying-releases.md).
 
 ## Why there is a signature
 
@@ -122,12 +122,12 @@ notifications before you publish. Then:
    its `revocation.json` asset is replaced when a revocation is published.
 3. Verify like a user would: download the five files from the published release and run
    `python tools/release.py verify ocw-5.47.0.tar.gz ocw-5.47.0.tar.gz.minisig --bootstrap get-ocw.sh --bootstrap-sig get-ocw.sh.minisig`, and
-   `minisign -Vm get-ocw.sh -P <the release key's minisign line> -H` (see the README). The first re-renders `get-ocw.sh` from the
+   `minisign -Vm get-ocw.sh -P <the release key's minisign line> -H` (see [Verifying releases](verifying-releases.md)). The first re-renders `get-ocw.sh` from the
    tarball's own template, verifier and key list and compares it byte for byte, so a script that is not what the release produces is caught.
 3a. **Publish the evidence package verifier's sha256** (5.53.0). `release.py build` writes it into `manifest.json` (field
    `verifier_sha256`, signed with the release) and into the manifest's changelog excerpt, and prints a ready-to-paste line. The
    GitHub release notes are written by hand, so paste that line into them, and put the same value on the project's signing-key page
-   (the page the README and SECURITY.md name). Auditors compare a package's verifier with it.
+   (the page [Verifying releases](verifying-releases.md) and SECURITY.md name). Auditors compare a package's verifier with it.
 4. Never reuse a version number. A bad release is superseded by the next patch (and its notes say so).
 5. **`get-ocw.sh`, the one-line installer (5.52.0).** `release.py build` renders it next to the tarball, from the **tagged**
    `server/get-ocw.sh.in`, `server/updater/root/ocw_crypto.py`, `ocw_trust.py`, `ocw_bootstrap_verify.py` and `server/release_keys.json`
@@ -139,7 +139,7 @@ notifications before you publish. Then:
    older release refuses a release signed by a key it does not know and says to download the current `get-ocw.sh`.
    **Go-live items** (owner actions, not code): create the release tagged `revocation` (step 2: today it does not exist, and without it
    the installer's revocation check finds nothing to apply); publish the release key id `88DFB54FC6C0E819` and its minisign line on a page
-   GitHub's account does not control (the README says to compare the key id with it); immutable releases on; hardware-key 2FA on the
+   GitHub's account does not control ([Verifying releases](verifying-releases.md) says to compare the key id with it); immutable releases on; hardware-key 2FA on the
    GitHub account.
 6. **The offline bundle (5.49.0).** After signing, build the air-gapped bundle and attach it (and its `.sha256`) to the same release:
    ```bash
@@ -254,8 +254,7 @@ of use once the new one has shipped. Rotating the **standby** is done by a revoc
 
 **A stolen standby key is as serious as a stolen release key**, because whoever holds it can sign a revocation that installs keys of
 their choosing. By design a release cannot replace the standby, so there is no automatic recovery from it. If the standby was exposed, or both
-keys are lost, publish a security advisory with the new key ids and tell operators to re-pin by hand (README, "If the signing key is
-compromised", step 3). Keep the standby's identity locked down and alerted for exactly this reason.
+keys are lost, publish a security advisory with the new key ids and tell operators to re-pin by hand ([Verifying releases](verifying-releases.md#if-the-signing-key-is-compromised), step 3). Keep the standby's identity locked down and alerted for exactly this reason.
 
 ## What each audience sees
 

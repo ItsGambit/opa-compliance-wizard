@@ -1,7 +1,7 @@
 # Features
 
 Full feature documentation for the OPA Compliance Wizard dashboard. See
-the main [README](../README.md) for installation and a quick overview;
+the main [README](../README.md) for an overview and the install guides;
 this doc covers what each part of the dashboard actually does.
 
 ## Interactive Dashboard
@@ -11,23 +11,11 @@ TypeScript + Tailwind v4 + Radix UI + TanStack Query; the backend is
 Python with SQLite, served by `server/serve.py`). **No credentials are needed
 to launch it** — see "Environments" below.
 
-**First-time setup** (optional -- the launcher offers to do it):
-```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-cd frontend && npm ci
-```
+**Install and run it:** see [Install on your computer](install-computer.md) (one person, no sign-in) or
+[Install on a server](install-server.md) (a team, with Okta sign-in). Once installed, the same start command is all you need:
+`python3 launch.py` (Windows: double-click `Start OPA Compliance Wizard.bat`).
 
-**Run it — cross-platform.** All build/launch logic lives in one place,
-`launch.py`; the OS-specific files are thin wrappers around it (nothing
-to keep in sync between them):
-
-| OS | How to run |
-|---|---|
-| Windows | Double-click `Start OPA Compliance Wizard.bat` |
-| Mac / Linux | Run `./start-wizard.sh` (or double-click it if your file manager runs `.sh` files) |
-| Any OS | `python launch.py` (or `python3 launch.py`) directly |
-
-Or run the two steps manually:
+For development, from a source checkout (needs Node.js, see [CONTRIBUTING.md](../CONTRIBUTING.md)):
 ```bash
 cd frontend && npm run build
 cd ../server && python3 serve.py   # "python" on Windows
@@ -554,7 +542,7 @@ client IP and user agent (shown as a dash on entries written before those were c
 fields. The search box filters the entries loaded so far (action, actor, IP, details); **Load more** reads
 older ones; **Refresh** reloads. Upgrade activity appears here too (`upgrade.*` and `deploy.*` entries, written
 by the update check, the updater and `deploy.sh`), and a failed upgrade's entry carries a button to download
-its redacted support bundle (see the README, "The support bundle"). The log is a plain file with no integrity
+its redacted support bundle (see [Upgrading](upgrading.md#the-support-bundle)). The log is a plain file with no integrity
 protection of its own; keep it in your backups ([Hosting](hosting.md#backups-and-restore)).
 
 ### Updates page
@@ -565,7 +553,7 @@ administrator turns it on; **Check now** is limited to once a minute and never i
 flow on an install that uses the upgrade layout (**Upgrade now** or **Schedule…**, a confirmation screen, an MFA
 approval, live progress, the result, rollback and restore), the upgrade history, the pre-upgrade backups the
 updater holds, and **Release signing keys** (the pinned keys, their status and any revocation). All of it is
-described in the README under "Upgrading"; key handling is in [SECURITY.md](../SECURITY.md#release-signing-keys).
+described in [Upgrading](upgrading.md); key handling is in [SECURITY.md](../SECURITY.md#release-signing-keys).
 
 ### Policy assignment (Folder Builder)
 
@@ -595,3 +583,43 @@ rule in place rather than adding a duplicate — matched by the rule's
 `secret_folder` ID, confirmed live (create → attach-with-different-
 privileges → refetch showed one updated rule, not two).
 
+## Data this tool stores locally
+
+The Overview, the Access Explorer, the Okta Admins report and the cross-checks read your OPA team and your Okta org with the
+environment's existing credentials (read-only: nothing is written to either, apart from the Folder Builder's own actions) and store the
+result locally, in this app's archive. One **Refresh** (on the Overview, or **Sync now** in the footer) reads the OPA scan, the Okta scan and
+the System Log in one job; the daily schedule runs the same job.
+
+| What is stored | Why | How it is removed |
+|---|---|---|
+| The OPA scan: resource groups, projects, groups and their roles, users (name, e-mail, type, group memberships), security policies with the resources they resolve to, servers, accounts (SaaS, Okta Universal Directory, Active Directory, database), connections, gateways, enrolled clients, Okta-managed devices (display name, platform, manufacturer, model, OS version, serial number, registration date, management state, secure-hardware and disk-encryption flags, authenticator enrolment names and status, and the Okta user ids bound to the device) | the Access Explorer, the Overview and the cross-checks open from the stored scan instead of reading OPA every time, also after a restart | replaced by every successful scan; deleted with the environment |
+| Daily OPA access state: one sealed record per user, group and policy (names, e-mails, roles, which resources a policy resolves to, by id), plus counts | evidence of who could reach what on a date | kept until the environment's archive is purged; never pruned |
+| Okta admins: user id, status, login, e-mail, first and last name, role assignments (role, status, dates, group or app targets, time-bound grants), custom roles and their permission names, resource sets | the Okta Admins report, as of any snapshot date | with the environment's archive (delete the environment with "also delete its archive", or purge an orphaned archive) |
+| The Okta status of each OPA user and Okta service account | the lifecycle cross-check | same |
+| Daily counts (OPA objects, Okta users, groups, apps, policies by type, admin role holders) | the Overview's inventory over time | same; counts only, no names |
+| Per person and week: counts of sign-ins and of multi-factor events by factor class | the Overview's sign-in and MFA figures | follows the event retention setting (weeks that ended before the cutoff are deleted at each sync; the all-people totals hold no names and stay), or with the archive |
+
+Never stored: secret values, service-user key secrets, the OPA service key, the Okta token, Okta `credentials` objects, any Okta profile
+attribute beyond login, e-mail and name. (The stored scan does include device names and serial numbers, and people's names and e-mails: they
+are in the table above.) A scan that contains a credential-shaped value is refused and not stored. The sealed records (the access state, the
+Okta admins and the lifecycle status hold names) are part of the same hash chain as the archived log and are never pruned by
+retention: they are kept until the environment's archive is purged. A deep integrity check verifies them.
+
+### Where to keep the data
+
+**Keep the data folder on an encrypted disk.** The app does not encrypt the archive (`audit_store.db`, `audit_log.jsonl` and the environment
+store): use FileVault, BitLocker or LUKS for the disk the data directory is on. The app sets owner-only permissions on the archive on macOS and
+Linux. On Windows the file inherits its folder's permissions, and the app warns (in the log and in About) if the folder is one other users of the
+computer can read, such as `C:\Users\Public`, `C:\ProgramData`, the root of a drive or a network share; move it with `OPA_DATA_DIR`.
+
+### Which Okta role the token needs
+
+The Okta Admins report calls Okta's role-assignment APIs, which Okta
+only answers for a token whose admin can view roles and admin assignments: **Super Administrator**, or a
+custom admin role with the permission `okta.iam.read` (view roles, resources and admin assignments) plus
+permission to read users. Organization Administrator and Read-only Administrator tokens are refused (Okta
+error E0000006). When Okta refuses, the report says: "Your Okta token cannot read admin role assignments;
+this report needs a token whose admin can view roles and admin assignments (for example a custom admin role
+with that permission, or Super Administrator)." and every other screen keeps working. The cross-check needs a
+token whose admin can read users; the System Log archive needs log read access, as before. The app does not
+test the token's permissions up front: each screen says what it could not read.

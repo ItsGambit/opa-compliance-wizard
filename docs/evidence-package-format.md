@@ -33,7 +33,7 @@ In short: the verifier detects accidental or partial change to the package, and 
 The verifier is `tools/verify_evidence_package.py`, one file, Python standard library only. Where to get it, most trusted first:
 
 1. **The sha256 in the signed release (`manifest.json`, field `verifier_sha256`), in its release notes and on the signing-key page.** All are outside the package. This is the authoritative value.
-2. **The signed release tarball** of the OPA Compliance Wizard contains the verifier. Verify the release as the README describes, then take the file from it.
+2. **The signed release tarball** of the OPA Compliance Wizard contains the verifier. Verify the release as [Verifying releases](verifying-releases.md) describes, then take the file from it.
 3. **The value on the package's cover sheet and the copy inside the package** (`tools/verify_evidence_package.py` inside the zip, listed in `package-manifest.json` like every file) are conveniences only. They come from the same place as the package, so they prove nothing about themselves.
 
 Before you rely on a copy, compute its sha256 yourself and compare it with the authoritative value:

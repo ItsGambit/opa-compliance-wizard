@@ -1,17 +1,17 @@
 # Hosting and the CLI
 
-Two ways to run this tool beyond the default single-machine dashboard:
-hosting it as a shared, always-on service for a team (below), or using
-the standalone CLI for scripted folder creation. See the main
-[README](../README.md) for the default `launch.py` desktop setup, and
-[features.md](features.md) for what the dashboard itself does.
+Reference for people who run the tool on a server, plus the standalone command-line tool. To **install**, start with
+[Install on a server](install-server.md) (or [Install on your computer](install-computer.md)); to **upgrade**, see
+[Upgrading](upgrading.md). This page explains how a hosted install works and how to operate it: the settings file, who may sign in,
+backups, the archive's integrity check, evidence packages, additional login gates and the CLI. What the dashboard itself does is in
+[features.md](features.md).
 
 ## Hosting on a server (optional)
 
 The dashboard can also run as a persistent, centrally-reachable service
 instead of only on someone's own machine, for a small team sharing access
 to the same OPA/Okta tenants. This is deliberately optional -- the default
-experience (`launch.py`, see the main README) needs none of this.
+experience (`launch.py`, see [Install on your computer](install-computer.md)) needs none of this.
 
 **Architecture:** `server/serve.py` still only ever binds `127.0.0.1` --
 it is never directly reachable from the network, hosted or not. A
@@ -75,272 +75,126 @@ workload that doesn't need it — the honest tradeoff isn't "SQLite vs.
 a faster database," it's "one file vs. a whole extra service," and for
 this tool's single-server-process design, the file wins.
 
-**What the installer does for you (5.52.0).** On a clean Debian 12 or newer or Ubuntu 22.04 or newer server (run end to end on a real Debian 13 x86-64 server only) one command does everything
-in the list below that needs root, in the right order, and starts the backend:
-`curl -fsSLO https://github.com/ItsGambit/opa-compliance-wizard/releases/latest/download/get-ocw.sh && sudo bash get-ocw.sh`
-(see the README's [Installing on a server](../README.md#installing-on-a-server) for what is checked and what you trust). It installs
-the packages (`nginx`, `gnome-keyring`, `dbus-user-session`, `python3-venv`, `openssl`) after you confirmed the plan; creates the
-application account `ocw` (a regular account, home `/var/lib/opa-compliance-wizard/home`, shell `nologin`) and turns on lingering for
-it; writes `/etc/opa-compliance-wizard.env` (mode 0600) with `DEPLOYMENT_MODE=hosted`, three generated secrets, the allowed origin
-and the Okta lines commented out; writes the two application units with the account's real numeric id in `/run/user/<uid>` (the
-unit templates carry `__APP_UID__` and `__APP_USER_HOME__`; the installer fills them in); writes the login gate's session key;
-makes the nginx site from the release's template with your server name, the proxy secret and a certificate (yours, or a temporary
-self-signed one); starts the backend and checks it, also through nginx. The login gate is installed but **neither enabled nor started** (`sudo systemctl enable --now opa-auth-gate` once the Okta settings are in):
-it refuses to start without the Okta settings, which you enter (steps 1-4 below; the last lines of the installer's output name the
-exact commands). Behind a proxy or with a mirror, pass the settings through sudo (`sudo https_proxy=... OCW_RELEASE_BASE_URL=... OCW_REVOCATION_URL=... bash get-ocw.sh --version X.Y.Z`); with a mirror also set `OCW_REVOCATION_URL` to a page you control, because a mirror answers for the revocation files too. Run it again after a failure and it resumes; it never overwrites a data or settings file.
+### Settings file reference
 
-**By hand (other distributions, or to see what the installer does).** **First install: what the server needs** (Debian/Ubuntu commands; adapt
-for your distro). The hosted services can't start without these, and an
-improvised fix on the login path tends to be an insecure one, so do them
-before the numbered steps below:
-- Packages: `sudo apt-get install nginx python3-venv gnome-keyring
-  dbus-user-session rsync git curl` and a Node.js the build accepts
-  (`^20.19.0 || >=22.12.0`; a distro's own `nodejs` is often older -- use
-  nodejs.org or NodeSource).
-- The code, as the app user (no sudo): `git clone
-  https://github.com/ItsGambit/opa-compliance-wizard.git ~/opa-compliance-wizard`,
-  then in it `python3 -m venv .venv && .venv/bin/pip install
-  --require-hashes -r requirements.lock` (5.46.0: every package must match
-  a recorded sha256; `requirements.txt` is the source it is generated from)
-  and `cd frontend && npm ci --ignore-scripts && npx vite build`.
-- The app user's systemd "user manager" must keep running without a login
-  session, because the keyring daemon lives in `/run/user/<uid>`: `sudo
-  loginctl enable-linger <app-user>`. The unit templates carry `__APP_UID__`
-  (and `__APP_USER_HOME__`) where the directory is named; `server/install.sh`
-  fills them in from `id -u <app-user>`. Installing a unit by hand, replace
-  them yourself in both units (older releases hardcoded `1000`).
-- The environment file holds secrets (`KEYRING_UNLOCK_PASSWORD`,
-  `NGINX_PROXY_SECRET`, `INTERNAL_API_SHARED_SECRET`): create it owner-only
-  before writing anything into it, `sudo install -m 600 -o <app-user> -g
-  <app-user's group> /dev/null /etc/opa-compliance-wizard.env`, then edit it
-  as the app user. `KEYRING_UNLOCK_PASSWORD` is the password
-  `server/start-headless.sh` unlocks (or, the first time, creates) the
-  app user's login keyring with; the backend refuses to start without it.
-- A TLS certificate for the nginx site (the template expects
-  `/etc/nginx/ssl/opa-secrets-wizard.crt` and `.key`; any path works, as
-  long as the site names it). For a test install on an IP address, a
-  self-signed one: `sudo install -d -m 700 /etc/nginx/ssl && sudo openssl
-  req -x509 -newkey rsa:2048 -nodes -days 825 -subj "/CN=<ip or host>"
-  -addext "subjectAltName=IP:<ip>" -keyout /etc/nginx/ssl/opa-secrets-wizard.key
-  -out /etc/nginx/ssl/opa-secrets-wizard.crt` (use `DNS:<host>` for a
-  name).
-- The nginx site, readable only by root and the app user's group (it will
-  hold `NGINX_PROXY_SECRET`; nginx's master process reads its config as
-  root, so `www-data` needs no access, and `deploy.sh` reads it through the
-  group to carry the secret forward): `sudo install -m 0640 -o root -g
-  <app-user's group> server/nginx-opa-secrets-wizard.conf
-  /etc/nginx/sites-available/opa-secrets-wizard`, then `sudoedit` it to
-  set your `server_name` (both blocks), certificate paths and the proxy
-  secret, and `sudo ln -s /etc/nginx/sites-available/opa-secrets-wizard
-  /etc/nginx/sites-enabled/ && sudo nginx -t && sudo systemctl reload
-  nginx`. `deploy.sh` keeps those values (it carries them from the live
-  site into every new version of the template) and keeps the file's owner
-  and mode.
-- The shell scripts are executable in git (5.41.0); on a checkout where
-  they aren't (e.g. one edited from Windows), `chmod +x server/*.sh
-  start-wizard.sh`.
+The settings file is `/etc/opa-compliance-wizard.env` on a server made by the installer. The backend (`server/serve.py`) and the
+login gate (`server/auth_gate.py`) both read it. It holds generated secrets, so keep it mode 0600 and owned by the application account.
 
-**Setup, at a high level** (see `server/*.service`, `server/start-headless.sh`,
-and `server/nginx-opa-secrets-wizard.conf` for the concrete pieces):
-1. Register a **Web Application** OIDC integration in your Okta org
-   (Admin Console -> Applications -> Create App Integration -> OIDC ->
-   Web Application). Grant type: Authorization Code only. Sign-in
-   redirect URI: `https://<your-dashboard-origin>/authorization-code/callback`.
-   Sign-out redirect URI: `https://<your-dashboard-origin>/login`. Note the
-   resulting **Client ID** and **Client secret**.
-2. If using a **custom** Okta authorization server (not the org
-   authorization server), confirm it actually has an access policy + rule
-   granting your new app's client access -- a brand-new custom
-   authorization server can have zero policies, which silently denies
-   every token request (`access_denied — Policy evaluation failed`) and
-   looks like an MFA/access problem rather than a missing-setup-step one.
-3. Store the client secret in the OS keyring under this project's existing
-   per-environment convention:
-   `keyring.set_password(f"opa-compliance-wizard:{env_name}", "okta_client_secret", "<secret>")`
-   (`env_name` matches whatever `OKTA_ENV_NAME` you set in step 4). Run it as the app user **while the backend service is running**:
-   the service's session keeps the keyring unlocked and the command reaches it through that session. An
-   install from before the 5.20.0 rename can leave existing credentials
-   stored under the old `opa-secrets-wizard:{env_name}` prefix as-is —
-   they're still read via a fallback and need no migration.
-4. Set these environment variables for `server/auth_gate.py` (e.g. in the
-   systemd unit's `EnvironmentFile`, created owner-only as above) -- the
-   process refuses to start without the first four, rather than silently
-   pointing at the wrong org:
-   - `OKTA_ORG_URL` — e.g. `https://your-org.oktapreview.com`
-   - `OKTA_OIDC_CLIENT_ID` — the Client ID from step 1 (not secret, but
-     still specific to your deployment)
-   - `DASHBOARD_ORIGIN` — the public origin this dashboard is reachable
-     at, e.g. `https://192.168.1.10` or `https://opa.example.com`
-   - `OKTA_ADMIN_GROUP_ID` — see "Admin access" below.
-   - `OKTA_ENV_NAME` (optional, defaults to `"default"`)
-   - `KEYRING_UNLOCK_PASSWORD` — required by `server/start-headless.sh`
-     (the backend's start script): it unlocks the app user's login keyring,
-     where the Okta client secret and the tenants' API credentials live.
-     Pick a long random value; it is only ever read from this file.
-   - `INTERNAL_API_SHARED_SECRET` (optional) — a random string, set
-     identically in the SAME `EnvironmentFile` used by both
-     `server/serve.py` and `server/auth_gate.py` (they already share one,
-     `/etc/opa-compliance-wizard.env`). Enables the Audit Log page's
-     Refresh button to backfill Okta MFA System Log corroboration for
-     `access_control.update` entries that missed it at save time (Okta
-     indexing lag) — without it, `POST /api/audit_log/backfill_mfa`
-     silently no-ops (0 updated) rather than erroring, so this is safe to
-     leave unset. Generate one with e.g. `openssl rand -hex 32`.
-   - `NGINX_PROXY_SECRET` — **required** (not optional) for `server/serve.py`
-     specifically, same `EnvironmentFile`. This is a completely different
-     secret from `INTERNAL_API_SHARED_SECRET` above (that one authenticates
-     serve.py calling INTO auth_gate.py; this one authenticates nginx
-     calling INTO serve.py — don't reuse the same value for both). Without
-     this set and matched in `nginx-opa-secrets-wizard.conf`'s
-     `$nginx_proxy_secret` (see that file's own setup comment), `serve.py`
-     trusts `X-Auth-Is-Admin`/`X-Auth-Sub` from ANY request that can reach
-     its loopback port directly — bypassing nginx, `auth_gate.py`'s login,
-     and step-up MFA entirely (confirmed exploitable by multiple
-     independent security reviews, 2026-09-30). Generate one with
-     `openssl rand -hex 32` and set the SAME value as `nginx-opa-secrets-
-     wizard.conf`'s `set $nginx_proxy_secret "...";` line. If you only ever
-     run this app standalone/locally with no nginx in front at all (this
-     app's other explicitly supported mode), leave this unset — nothing
-     is weakened in that mode, since there's no proxy boundary to spoof.
-   - `DEPLOYMENT_MODE` (optional, defaults to `local`) — set to `hosted`
-     for any real nginx-fronted deployment. In `hosted` mode, `serve.py`
-     refuses to start at all unless `NGINX_PROXY_SECRET` (above) is also
-     set — turning "forgot to set `NGINX_PROXY_SECRET`" from a silent,
-     easy-to-never-notice trust downgrade into a loud startup failure.
-     Leave unset (or `local`) for standalone/local-only runs — behavior is
-     unchanged either way.
-5. If `server/serve.py` itself will be reached through a hostname/IP other
-   than `127.0.0.1`/`localhost` (true for any reverse-proxied deployment),
-   also set `EXTRA_ALLOWED_ORIGINS` (comma-separated) to that public
-   origin -- otherwise every write request is rejected with `403 Origin
-   '...' is not allowed to call this API"` once real browser traffic
-   arrives from that origin.
-6. **5.47.0 and newer: let `server/install.sh` do steps 6 and 7 (recommended).** It installs the upgrade layout
-   (code in `/opt/opa-compliance-wizard/releases/<version>`, owned by root; data in
-   `/var/lib/opa-compliance-wizard`, the only place the application writes; the root-run updater and its units;
-   the `ocw-updater` command) and, on a server that already runs from a home directory, migrates it with a rollback
-   if the result is not healthy. Run `sudo server/install.sh --dry-run` first. Prerequisites you still do yourself: the
-   environment file (steps 2-5), the units' own keyring and `/run/user` carve-outs (they stay as they are), the nginx site
-   (`install.sh --apply-nginx` then adds the maintenance-page directives to it), and the gate. With the new layout:
-   * **no sudoers rules for deploys are needed** and the web application's account can no longer restart services or write
-     the nginx site (`install.sh --remove-legacy-sudoers` removes an old deploy rule; see step 7);
-   * the unit templates in `server/` use `__APP_DIR__` = `/opt/opa-compliance-wizard/current` and `__DATA_DIR__` =
-     `/var/lib/opa-compliance-wizard`; the backend unit also has `ProtectSystem=strict` (the gate unit does not: it creates its
-     session key under `/etc` on first start);
-   * the app's archive path (`OPA_AUDIT_DB_PATH`, below) and every other data file follow `OPA_DATA_DIR`;
-   * a second gate's site generated before 5.50.0 also lacks the `/api/overview` deny block (the admin-only Overview, with its people lists); regenerate as below (the installer's note now names every denied route);
-   * the per-environment routes of 5.50.0 (Okta Admins, cross-checks, snapshots, capture) are shared-environment routes like the reports: through an
-     additional gate they answer only for a verified-issuer per-user exception that holds the capability they check (`view_archive` plus `live_read`);
-   * a second gate's site generated before 5.47.0 lacks the `/api/upgrade` deny block. `setup-second-gate.sh` never rewrites an existing
-     site, and neither `install.sh` nor the updater changes one by itself: `install.sh` lists every `opa-auth-gate-*` unit with the status of
-     its site, and `sudo server/install.sh --regenerate-second-sites` rebuilds them from the live main site (add `--apply-nginx` to apply the
-     main site's maintenance page first; `nginx -t` runs before the reload and the old site is put back if it fails). The sites are looked for in
-     `/etc/nginx/sites-available/opa-<name>` (`OCW_NGINX_SITES_DIR` if they live elsewhere);
-   * the unit files may be indented (systemd allows it): `install.sh` edits them either way and stops before changing anything if
-     `WorkingDirectory=` (or, for the backend unit, `ProtectSystem=` / `ProtectHome=`) is missing;
-   * after a release that changes the units or `install.sh`, the updater asks for `sudo server/install.sh --refresh-updater` (or `sudo bash get-ocw.sh --refresh-updater --version X.Y.Z` on a server installed with get-ocw.sh) (README, "Upgrading");
-   * the units `ocw-stage@.service` (unprivileged staging; optional proxy settings in `/etc/ocw-updater.env`), `ocw-upgrade.path` and
-     `ocw-upgrade.service` (root: activate, roll back, resume at boot) are documented in the README ("Upgrading").
+**The Okta app.** A **Web Application** OIDC integration, grant type Authorization Code only; sign-in redirect URI
+`https://<your-dashboard-origin>/authorization-code/callback`; sign-out redirect URI `https://<your-dashboard-origin>/login`
+([the steps](install-server.md#step-1-prepare-okta)).
 
-   The rest of this step describes the manual installation the old layout (and `install.sh`'s migration) is based on.
+**Which authorization server.** By default the gate uses the org's authorization server named `default`
+(`https://<org>/oauth2/default`). `OKTA_AUTH_SERVER` changes that: `org` for the org authorization server, or the ID of a custom
+one. A custom authorization server needs an access policy and a rule that grant this app's client access: a brand-new one can have
+zero policies, which silently denies every token request (`access_denied -- Policy evaluation failed`) and looks like an MFA or
+access problem. Changing a gate's `OKTA_AUTH_SERVER` changes its issuer, so per-user exceptions set for it stop matching.
 
-   Install and enable the two systemd units (`opa-compliance-wizard.service`,
-   `opa-auth-gate.service`) and the nginx site config, adjusting paths/IPs
-   for your own server. (An install predating the 5.20.0 rename can keep
-   its existing `opa-secrets-wizard.service` unit name as-is — nothing
-   requires renaming a unit that's already running; this filename is the
-   template a fresh install starts from.)
+**Where the two Okta secrets are kept.** The client secret and the admin-check token are stored in the OS keyring under the service
+name `opa-compliance-wizard:<OKTA_ENV_NAME>` (entries `okta_client_secret` and `okta_admin_check_token`), set with
+`keyring.set_password(...)` as the application user **while the backend is running**: its session keeps the keyring unlocked and the
+command reaches it through that session. An install from before the 5.20.0 rename may keep credentials under the old
+`opa-secrets-wizard:<name>` prefix; they are still read through a fallback and need no migration.
 
-   Both `.service` files use `__APP_USER__`/`__APP_DIR__`/`__DATA_DIR__`/
-   `__APP_USER_HOME__` placeholders (set `__DATA_DIR__` to the same path as `__APP_DIR__`
-   for the old in-place layout and delete the `OPA_DATA_DIR` and `ProtectSystem` lines) (not a real username/path — this repo
-   is public and doesn't hardcode either), so fill those in before
-   installing, e.g.:
-   ```bash
-   sed -e "s|__APP_USER__|$(whoami)|g" \
-       -e "s|__APP_DIR__|$(pwd)|g" \
-       -e "s|__APP_USER_HOME__|$HOME|g" -e "s|__DATA_DIR__|$(pwd)|g" \
-       server/opa-compliance-wizard.service | sudo tee /etc/systemd/system/opa-compliance-wizard.service
-   sed -e "s|__APP_USER__|$(whoami)|g" \
-       -e "s|__APP_DIR__|$(pwd)|g" \
-       -e "s|__APP_USER_HOME__|$HOME|g" -e "s|__DATA_DIR__|$(pwd)|g" \
-       server/opa-auth-gate.service | sudo tee /etc/systemd/system/opa-auth-gate.service
-   sudo systemctl daemon-reload
-   ```
-   Run these from the repo root so `$(pwd)` resolves to the real
-   `$APP_DIR`. `sudo tee` creates the unit files owned by root, which is
-   what they must stay: systemd runs them as root, so a unit file the app
-   user can edit is a way to root at the next reload or boot (`deploy.sh`
-   warns, with the fix, when it finds one). `server/setup-second-gate.sh` copies the LIVE unit at
-   `/etc/systemd/system/opa-auth-gate.service` to build an additional
-   gate's unit (see `server/unit_second_gate.py`), not this repo
-   template, so it's unaffected by these placeholders either way.
+**Settings.** The gate refuses to start without the first four, rather than silently pointing at the wrong org:
 
-   **This step is a ONE-TIME manual install, not something `server/deploy.sh`
-   ever automates for you** (confirmed the hard way, 2026-10-02): unlike
-   the nginx site config, which `deploy.sh` actively diffs and re-applies
-   on every run (see that script's own nginx-apply logic), these two
-   unit files are NEVER re-copied to `/etc/systemd/system/` automatically.
-   **Any time you pull a future release that changes either `.service`
-   file** (a new hardening directive, a new `EnvironmentFile=` path,
-   etc.), you must manually re-run this step's `cp`/`daemon-reload`/
-   `restart` sequence yourself — `deploy.sh` only ever restarts the
-   units that are ALREADY installed; it has no way to know their
-   on-disk definition changed. Check `diff server/*.service
-   /etc/systemd/system/` after any deploy whose CHANGELOG entry says a
-   unit file changed.
-   Also confirm your
-   server's live `EnvironmentFile=` path actually matches what's in
-   `/etc/systemd/system/*.service` right now (`systemctl cat
-   opa-secrets-wizard | grep EnvironmentFile`) before copying a new unit
-   file over it — an older install's unit may point at a DIFFERENT env
-   file path than what ships in a fresh template (this project's own
-   real server did, historically: `/etc/opa-secrets-wizard.env` vs.
-   `/etc/opa-compliance-wizard.env`), and blindly overwriting the unit
-   file without first merging that env file's real contents into
-   whichever path the new template expects will start the service with
-   none of its actual secrets set.
+- `OKTA_ORG_URL` — e.g. `https://your-org.oktapreview.com`
+- `OKTA_OIDC_CLIENT_ID` — the Client ID of the Okta app (not secret, but
+  still specific to your deployment)
+- `DASHBOARD_ORIGIN` — the public origin this dashboard is reachable
+  at, e.g. `https://192.168.1.10` or `https://opa.example.com`
+- `OKTA_ADMIN_GROUP_ID` — see [Admin access](#admin-access) below.
+- `OKTA_ENV_NAME` (optional, defaults to `"default"`)
+- `KEYRING_UNLOCK_PASSWORD` — required by `server/start-headless.sh`
+  (the backend's start script): it unlocks the app user's login keyring,
+  where the Okta client secret and the tenants' API credentials live.
+  Pick a long random value; it is only ever read from this file.
+- `INTERNAL_API_SHARED_SECRET` (optional) — a random string, set
+  identically in the SAME `EnvironmentFile` used by both
+  `server/serve.py` and `server/auth_gate.py` (they already share one,
+  `/etc/opa-compliance-wizard.env`). Enables the Audit Log page's
+  Refresh button to backfill Okta MFA System Log corroboration for
+  `access_control.update` entries that missed it at save time (Okta
+  indexing lag) — without it, `POST /api/audit_log/backfill_mfa`
+  silently no-ops (0 updated) rather than erroring, so this is safe to
+  leave unset. Generate one with e.g. `openssl rand -hex 32`.
+- `NGINX_PROXY_SECRET` — **required** (not optional) for `server/serve.py`
+  specifically, same `EnvironmentFile`. This is a completely different
+  secret from `INTERNAL_API_SHARED_SECRET` above (that one authenticates
+  serve.py calling INTO auth_gate.py; this one authenticates nginx
+  calling INTO serve.py — don't reuse the same value for both). Without
+  this set and matched in `nginx-opa-secrets-wizard.conf`'s
+  `$nginx_proxy_secret` (see that file's own setup comment), `serve.py`
+  trusts `X-Auth-Is-Admin`/`X-Auth-Sub` from ANY request that can reach
+  its loopback port directly — bypassing nginx, `auth_gate.py`'s login,
+  and step-up MFA entirely (confirmed exploitable by multiple
+  independent security reviews, 2026-09-30). Generate one with
+  `openssl rand -hex 32` and set the SAME value as `nginx-opa-secrets-
+  wizard.conf`'s `set $nginx_proxy_secret "...";` line. If you only ever
+  run this app standalone/locally with no nginx in front at all (this
+  app's other explicitly supported mode), leave this unset — nothing
+  is weakened in that mode, since there's no proxy boundary to spoof.
+- `DEPLOYMENT_MODE` (optional, defaults to `local`) — set to `hosted`
+  for any real nginx-fronted deployment. In `hosted` mode, `serve.py`
+  refuses to start at all unless `NGINX_PROXY_SECRET` (above) is also
+  set — turning "forgot to set `NGINX_PROXY_SECRET`" from a silent,
+  easy-to-never-notice trust downgrade into a loud startup failure.
+  Leave unset (or `local`) for standalone/local-only runs — behavior is
+  unchanged either way.
+- `EXTRA_ALLOWED_ORIGINS` (comma-separated) — set it to the public origin when the backend is reached through a hostname or
+  address other than `127.0.0.1`/`localhost` (true for any reverse-proxied deployment). Otherwise every write request is rejected
+  with `403 Origin '...' is not allowed to call this API` once real browser traffic arrives from that origin. The installer sets it.
+- `OKTA_AUTH_SERVER` (optional, defaults to `default`) — see above.
 
-   **Session-signing key (5.40.5+).** `auth_gate.py` signs its cookies with
-   the key at `OPA_SESSION_KEY_PATH` (default
-   `/etc/opa-secrets-wizard-session.key`). The gate refuses to start if
-   that file holds fewer than 32 bytes (an empty file -- e.g. from `touch`
-   -- used to be accepted, which made every cookie forgeable). Either let
-   the gate create it (its directory must be writable by the app user; it
-   is created `0600`), or create it yourself:
-   ```bash
-   sudo sh -c 'umask 027; head -c 32 /dev/urandom > /etc/opa-secrets-wizard-session.key'
-   sudo chown root:<app-user> /etc/opa-secrets-wizard-session.key
-   sudo chmod 0640 /etc/opa-secrets-wizard-session.key
-   ```
-   **Emergency sign-out of everyone:** sessions are signed cookies with no
-   server-side store, so replacing this key (same commands, then
-   `sudo systemctl restart opa-auth-gate`) is the way to end every session
-   at once -- e.g. after offboarding an admin, since a session keeps the
-   admin flag it was issued with until it expires (12 h). Each additional
-   gate has its own key (`/etc/opa-auth-gate-<name>/session.key`) and
-   unit (`opa-auth-gate-<name>`).
-7. **No sudoers rule is needed any more (5.48.0).** The 5.47.0 upgrade layout (`server/install.sh`) gives the web application's
-   account no right to restart services or write the nginx site; upgrades are done by the root-owned updater, started from the
-   Updates page or with `sudo ocw-updater`. A server set up before that may still carry the old `deploy.sh` sudoers file: moving it
-   to the upgrade layout (`sudo server/install.sh`, README "Upgrading") keeps it working, and `--remove-legacy-sudoers` removes it
-   afterwards. This guide no longer walks through creating one; a deploy account with that grant is effectively an administrator
-   (the `cp` into nginx's configuration is a path to root).
+### How the installed layout works
 
-**Upgrading on the 5.47.0 upgrade layout:** `sudo ocw-updater stage <version>` then `sudo ocw-updater apply <version>`
-(or `server/deploy.sh --release <version>`, which now only calls those two): README, "Upgrading". The paragraph below
-describes the old in-place `deploy.sh`.
+`server/install.sh` (run for you by the one-line installer) installs the layout below: code in `/opt/opa-compliance-wizard/releases/<version>`,
+owned by root; data in `/var/lib/opa-compliance-wizard`, the only place the application writes; the root-run updater and its units; the
+`ocw-updater` command. On a server that already runs from a home directory it migrates it, with a rollback if the result is not
+healthy ([Upgrading](upgrading.md#older-servers-that-still-run-from-a-home-directory)). With this layout:
 
-**Air-gapped servers (5.49.0).** `server/deploy.sh --release <version> --from-dir <dir>` accepts the offline bundle
-`ocw-<version>-offline.tar.gz` (a signed release plus hash-pinned wheels) in place of the tarball and its `.minisig`: it
-unpacks the bundle with the installed copy's own checker, verifies the release inside like any other and installs the Python
-packages with `pip install --no-index --require-hashes` from the bundle (README, "Upgrading without internet access"). On the upgrade
-layout the updater stages the release only; it cannot yet install packages from the bundle, so deploy.sh refuses a bundle there.
-**Local (laptop) installs** are upgraded with `python launch.py upgrade`; a `DEPLOYMENT_MODE=hosted` install refuses it.
 
-**Redeploying: `server/deploy.sh`.** Run it on the server as the app user.
+* **no sudoers rules for deploys are needed** and the web application's account can no longer restart services or write
+  the nginx site (`install.sh --remove-legacy-sudoers` removes an old deploy rule);
+* the unit templates in `server/` use `__APP_DIR__` = `/opt/opa-compliance-wizard/current` and `__DATA_DIR__` =
+  `/var/lib/opa-compliance-wizard`; the backend unit also has `ProtectSystem=strict` (the gate unit does not: it creates its
+  session key under `/etc` on first start);
+* the app's archive path (`OPA_AUDIT_DB_PATH`, below) and every other data file follow `OPA_DATA_DIR`;
+* a second gate's site generated before 5.50.0 also lacks the `/api/overview` deny block (the admin-only Overview, with its people lists); regenerate as below (the installer's note now names every denied route);
+* the per-environment routes of 5.50.0 (Okta Admins, cross-checks, snapshots, capture) are shared-environment routes like the reports: through an
+  additional gate they answer only for a verified-issuer per-user exception that holds the capability they check (`view_archive` plus `live_read`);
+* a second gate's site generated before 5.47.0 lacks the `/api/upgrade` deny block. `setup-second-gate.sh` never rewrites an existing
+  site, and neither `install.sh` nor the updater changes one by itself: `install.sh` lists every `opa-auth-gate-*` unit with the status of
+  its site, and `sudo server/install.sh --regenerate-second-sites` rebuilds them from the live main site (add `--apply-nginx` to apply the
+  main site's maintenance page first; `nginx -t` runs before the reload and the old site is put back if it fails). The sites are looked for in
+  `/etc/nginx/sites-available/opa-<name>` (`OCW_NGINX_SITES_DIR` if they live elsewhere);
+* the unit files may be indented (systemd allows it): `install.sh` edits them either way and stops before changing anything if
+  `WorkingDirectory=` (or, for the backend unit, `ProtectSystem=` / `ProtectHome=`) is missing;
+* after a release that changes the units or `install.sh`, the updater asks for `sudo server/install.sh --refresh-updater` (or `sudo bash get-ocw.sh --refresh-updater --version X.Y.Z` on a server installed with get-ocw.sh) ([Upgrading](upgrading.md));
+* the units `ocw-stage@.service` (unprivileged staging; optional proxy settings in `/etc/ocw-updater.env`), `ocw-upgrade.path` and
+  `ocw-upgrade.service` (root: activate, roll back, resume at boot) are described in [Upgrading](upgrading.md).
+
+### Session key and emergency sign-out
+
+`auth_gate.py` signs its cookies with the key at `OPA_SESSION_KEY_PATH` (default `/etc/opa-secrets-wizard-session.key`). The installer
+creates it. The gate refuses to start if that file holds fewer than 32 bytes. To make one by hand:
+
+```bash
+sudo sh -c 'umask 027; head -c 32 /dev/urandom > /etc/opa-secrets-wizard-session.key'
+sudo chown root:<app-user> /etc/opa-secrets-wizard-session.key
+sudo chmod 0640 /etc/opa-secrets-wizard-session.key
+```
+
+**Emergency sign-out of everyone:** sessions are signed cookies with no server-side store, so replacing this key (same commands, then
+`sudo systemctl restart opa-auth-gate`) ends every session at once, for example after offboarding an administrator (a session keeps the
+admin flag it was issued with until it expires, 12 hours). Each additional gate has its own key (`/etc/opa-auth-gate-<name>/session.key`)
+and unit (`opa-auth-gate-<name>`).
+
+### Redeploying with deploy.sh (older servers)
+
+This applies to a server that still runs from a home directory (not the managed layout). Run `server/deploy.sh` on the server as the app user.
 For production use a signed release: `<install dir>/server/deploy.sh
---release <version>` (README, "Upgrading": it checks the download against the
+--release <version>` ([Upgrading](upgrading.md): it checks the download against the
 project's pinned signing key, refuses anything unsigned, altered or older than
 what is installed, and needs no Node.js on the server; `--from-dir <dir>`
 installs from files you carried in, for a server without internet access;
@@ -442,7 +296,7 @@ folder and the keyring in the application account's `~/.local/share/keyrings`.
 | The archive: events, sealed manifests, the environments (the `app_environments` table: names, base domain, team, key id, Okta URL), sync schedules, the stored OPA scan, Okta snapshots | `/var/lib/opa-compliance-wizard/audit_store.db` (and `audit_store.db-wal`, `-shm` beside it; or the path `OPA_AUDIT_DB_PATH` names) | Evidence older than 90 days is gone for good | SQLite's online backup only (below). A plain `cp` while the server writes can miss the newest events (they live in the `-wal` file until a checkpoint) or give an inconsistent file |
 | The audit log of write actions | `/var/lib/opa-compliance-wizard/audit_log.jsonl` (`.audit_log.jsonl.lock` is only a lock: do not copy it) | The record of who changed what is gone | Copy after the database. It is appended to; the file has no integrity protection of its own |
 | Access control, announcement banner | `/var/lib/opa-compliance-wizard/access_control.json`, `banner_config.json` | The admin group and sign-in restriction, and the banner, are reset | Plain copy |
-| Key list and revocations this install has learned | `/var/lib/opa-compliance-wizard/release_keys.local.json` | A published key revocation has to be applied again (README, "If the signing key is compromised") | Plain copy |
+| Key list and revocations this install has learned | `/var/lib/opa-compliance-wizard/release_keys.local.json` | A published key revocation has to be applied again ([Verifying releases](verifying-releases.md#if-the-signing-key-is-compromised)) | Plain copy |
 | The credentials: each environment's OPA key secret and Okta API token, the Okta client secret and the admin-check token | The application account's login keyring: `/var/lib/opa-compliance-wizard/home/.local/share/keyrings/` | Every credential has to be entered again | Copy the directory (it changes only when someone saves a credential; copy again after you change one) |
 | The settings and the three generated secrets, **including `KEYRING_UNLOCK_PASSWORD`**, which opens the keyring above | `/etc/opa-compliance-wizard.env` (mode 0600, owned by the application account) | The restored keyring cannot be opened; you would enter every credential again | Plain copy, kept with the keyring but guarded as strictly as a password: the two together open every environment's credentials |
 | The login gate's session key | `/etc/opa-secrets-wizard-session.key` (root, group-readable) | A new 32-byte key works, but every session ends and everyone signs in again | Plain copy |
@@ -484,7 +338,7 @@ additional login gate to the second `tar`. Then move `$B` off the server.
 release or a newer one: the app migrates the database forward when it starts. (Restoring into an older
 release than the backup came from is a different matter: see "Rolling back past 5.40.4" below.)
 
-1. **A new server only.** Install as in the README ("Installing on a server") with the same
+1. **A new server only.** Install as in [Install on a server](install-server.md) with the same
    `--server-name`. That leaves a working backend, an empty archive and newly generated secrets.
 2. Stop the services: `sudo systemctl stop opa-compliance-wizard opa-auth-gate` (and every
    `opa-auth-gate-<name>` you run).
@@ -521,7 +375,7 @@ release than the backup came from is a different matter: see "Rolling back past 
    - Run the integrity check on each environment (below), and compare its `head_hash` with the last
      `evidence_chain.sealed` entry in the restored `audit_log.jsonl`.
    - Sign in from a private window to see the login gate works.
-9. Apply any key revocation published since the backup, if the project has published one (README).
+9. Apply any key revocation published since the backup, if the project has published one ([Verifying releases](verifying-releases.md#if-the-signing-key-is-compromised)).
    Delete `/root/ocw-before-restore` once you are satisfied.
 
 **Checking the archive afterwards.** Each environment's integrity check
@@ -760,7 +614,9 @@ pass a new MFA, and it can never open one. There is no command that opens
 a window without MFA, on purpose. (`ocw-updater` does not forward this
 command yet; use the form above.)
 
-**Admin access.** Members of one designated Okta group get full admin
+### Admin access
+
+Members of one designated Okta group get full admin
 rights across the whole dashboard: every environment becomes visible and
 editable (not just their own or explicitly shared ones), and a new
 Audit Log panel (sidebar, admin-only) shows every write action ever
@@ -770,7 +626,7 @@ step-up flow and stays hosted-admin-only.) To set this up:
 1. Create (or reuse) an Okta group for admins of this tool, and note its
    **group ID** (Admin Console -> Directory -> Groups -> click the
    group -> the ID is in the URL, `.../groups/<id>/...`) -- a group ID,
-   not its display name, is what `OKTA_ADMIN_GROUP_ID` (step 4 above)
+   not its display name, is what `OKTA_ADMIN_GROUP_ID` ([settings](#settings-file-reference))
    expects, so this check is one direct API call per login rather than
    a name-to-id lookup every time.
 2. Store an Okta API token in the keyring for the admin-membership check
@@ -844,7 +700,7 @@ to be a quiet backdoor.
 
 ---
 
-A login gate configured only through a systemd drop-in (not the shared settings file) looks unconfigured to the upgrade preflight's check for an unset gate (see the README, "Upgrading"); finish the gate setup in the settings file, or run the refresh command it names.
+A login gate configured only through a systemd drop-in (not the shared settings file) looks unconfigured to the upgrade preflight's check for an unset gate (see [Upgrading](upgrading.md)); finish the gate setup in the settings file, or run the refresh command it names.
 
 ## Uninstalling
 
@@ -864,7 +720,7 @@ An evidence package built in the last 15 minutes may still be in `packages/` und
 personal data, so delete that folder together with the rest when you remove the data.
 
 **Removing the data too is a manual step**, on purpose: it deletes the only copy of evidence that may be older than Okta's own log
-retention. Make a backup first (see "Backing up and restoring the archive"), then remove the paths above yourself when you are sure.
+retention. Make a backup first (see [Backups and restore](#backups-and-restore)), then remove the paths above yourself when you are sure.
 Additional login gates (`opa-auth-gate-*`, their environment files, sites and session keys, `cloudflared`) were created by
 `setup-second-gate.sh` and are left alone: remove them first.
 
@@ -951,7 +807,7 @@ Output: prints an indented tree marking `[exists]` vs `[will create]`
 for every path. When run with `--execute`, also writes a results CSV
 (`--output`, default `folders_result_<timestamp>.csv`) with columns
 `path,folder_id,status,error_message` — `status` is one of `created`,
-`skipped_exists`, or `error`.
+`skipped_exists`, or `error`. The output file must not exist already unless you add `--force`.
 
 
 ## Serving a second Okta org (optional, 5.38.0+)

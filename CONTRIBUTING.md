@@ -26,8 +26,8 @@ Python 3.9 is the oldest supported version and CI runs the suite on 3.9,
 `from __future__ import annotations`). The frontend tests need Node
 22.22.2+ or 24.15+; the build alone works from 20.19.
 
-Run it with `python launch.py` from the repo root — see the main
-[README](README.md) for the full quickstart.
+Run it with `python launch.py` from the repo root (from a checkout it builds the frontend, so it needs Node.js; the
+[install guide](docs/install-computer.md) uses a release download instead, which needs none).
 
 ## Before opening a PR
 
