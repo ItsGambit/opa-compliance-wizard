@@ -23,3 +23,21 @@
   Okta client secret or token in it.
 - **Release.** A signed download of a version of the tool (`ocw-X.Y.Z.tar.gz`). **Upgrade** means installing a newer release over an
   older one.
+- **Folder Builder.** The one part of the tool that creates OPA objects (vault folders, resource groups, projects, access policies).
+  Everything else reads only.
+- **Compliance Reports.** The pages that show archived events as reports (MFA enforcement, provisioning, and so on), each with a table
+  of User, Action, Timestamp and Affected Resource.
+- **Proposed grouping.** Reports are grouped under SOC 2 criteria as a suggestion by this project. No auditor has reviewed it.
+- **Backfill.** The first fill of the archive: it pulls the last 90 days of the System Log, the most Okta still holds.
+- **`pam_admin`.** An OPA role that can administer the whole team. The tool was tested with a service user in a group holding it.
+- **Okta org.** Your company's Okta account, at an address like `https://yourorg.okta.com`.
+- **Okta Identity Engine / Classic Engine.** Two generations of Okta. A server's MFA confirmation relies on Identity Engine.
+- **MFA step-up.** Okta asks for a second factor again right before a sensitive change (a setting, an upgrade, a package build).
+- **Authorization server.** The part of Okta that issues sign-in tokens. The tool uses the one named `default`, which belongs to
+  Okta's API Access Management feature, unless you set `OKTA_AUTH_SERVER=org`.
+- **Redirect URI.** The address Okta sends your browser back to after sign-in. It must match your server's address exactly.
+- **`DASHBOARD_ORIGIN`.** The settings-file entry holding your server's public address (`https://` plus its name).
+- **`OKTA_ENV_NAME`.** The settings-file entry naming the keyring group for the login gate's secrets. It defaults to `default`; leave it.
+- **`ocw` account.** On a server, the unprivileged account the application runs as. It owns the data and the keyring.
+- **Linger.** A systemd setting that keeps an account's background services (here, its keyring) running when nobody is logged in. The
+  installer turns it on for `ocw`.

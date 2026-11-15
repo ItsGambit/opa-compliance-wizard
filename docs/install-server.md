@@ -6,7 +6,8 @@ archive up to date every day, even when nobody has the page open.
 If you only want to try it on your own computer, use [Install on your computer](install-computer.md) instead. It is simpler and needs
 no Okta app. Unfamiliar words (environment, archive, service user, login gate, keyring) are explained in the [glossary](glossary.md).
 
-Time: about 15 minutes for the install and about 15 minutes for the Okta setup.
+Time: about 30 minutes in all (15 for Okta, 15 for the install). It does not include the first sync (step 6) or the time the
+administrators need to hand you the OPA and Okta values.
 
 ## How it fits together
 
@@ -34,50 +35,54 @@ You need all of these. Check them first; a missing one is the most common reason
   (the release); `pypi.org` and `files.pythonhosted.org` (the Python packages, installed during the install); your distribution's
   package mirrors; and your Okta org's address (sign-in and the admin check). No internet? See
   [Upgrading](upgrading.md#without-internet-access-offline).
-- **A name for the server, decided now.** Pick the address people will type, for example `opa.example.com`, and make a DNS record
-  that points it at the server. You need it in step 1 (Okta redirect addresses must match it exactly) and in step 2. Ports 80 and 443
-  must be reachable by the people who will sign in.
-- **A TLS certificate (recommended):** a certificate and private key (PEM files) for that name from a certificate authority your
-  browsers trust. Without one, the installer makes a temporary self-signed certificate: browsers show a warning until you replace it.
-  That is fine for a trial, not for daily use. A bare IP address is accepted by the installer, but Okta and certificates work best with
-  a DNS name, and IP-only has not been tested against a real Okta org.
+- **A name for the server, decided now,** for example `opa.example.com`, with a DNS record pointing at the server (the name may be
+  internal-only). You need it in step 1, because Okta's redirect addresses must match it exactly. Check that your laptop resolves it:
+  `nslookup opa.example.com`. Ports 80 and 443 must be reachable by the people who sign in
+  ([DNS and TLS details](hosting.md#dns-and-tls-for-a-server)).
+- **A TLS certificate (recommended):** two PEM files from a certificate authority your browsers trust: the certificate with its chain
+  (certbot's `fullchain.pem`) and the private key. Without them the installer makes a temporary self-signed certificate: browsers warn
+  until you [replace it](hosting.md#dns-and-tls-for-a-server). Fine for a trial, not for daily use. A bare IP address is accepted, but
+  Okta and certificates work best with a DNS name, and IP-only has not been tested against a real Okta org.
 - **Okta:** an Okta org on **Okta Identity Engine** where you can create an app and a group (Super Administrator, or an admin role
-  that can do both), and an Okta API token (step 1). The MFA confirmation uses Identity Engine's step-up; on an older Classic Engine
-  org it may not prompt.
+  that can do both). Orgs created since 2022 are Identity Engine; if you are unsure, ask your Okta administrator. The MFA confirmation
+  uses Identity Engine's step-up: on an older Classic Engine org it may not prompt, so a change or upgrade may go through without a
+  second-factor check (sign-in itself still works).
+- **The OPA and Okta values** (base domain, team name, service-user key, Okta URL, API token): ask for them now. See
+  [What to get before you start](what-you-need.md); you use the Okta token in step 1 and the rest in step 6.
 
 ## Step 1. Prepare Okta
 
 Do this first, so you have the values ready when the installer finishes. Below, `opa.example.com` stands for your server's name.
 
-1. In the Okta Admin Console, go to **Applications → Applications → Create App Integration**. Choose **OIDC - OpenID Connect**, then
-   **Web Application**.
-2. Set these and save. Leave everything else as it is.
-   - **Grant type:** Authorization Code only.
-   - **Client authentication:** client secret (the default for a Web Application). PKCE may be on or off: the tool sends it either way.
+1. **Create the admin group first.** In the Okta Admin Console create or pick a group for the people who will administer this tool
+   (**Directory → Groups**). Open it and copy its **group ID** from the web address: it looks like `00g1a2b3c4d5e6f7g8h9`, and the
+   address looks like `https://yourorg-admin.okta.com/admin/group/00g1a2b3c4d5e6f7g8h9`. It must be the ID, not the group name.
+2. Go to **Applications → Applications → Create App Integration**. Choose **OIDC - OpenID Connect**, then **Web Application**.
+3. Set these and save. The defaults are fine for everything not listed (leave Refresh Token and PKCE as they are; the tool needs
+   neither, and works with either).
+   - **Grant type:** tick only Authorization Code.
+   - **Client authentication:** client secret (the default).
    - **Sign-in redirect URI:** `https://opa.example.com/authorization-code/callback`
    - **Sign-out redirect URI:** `https://opa.example.com/login`
-   - **Assignments:** the people or groups who may sign in. **Include the admin group from item 5 and yourself**, or you will be
+   - **Assignments:** the people or groups who may sign in. **Include the admin group from item 1 and yourself**, or you will be
      refused at your first sign-in.
 
    Both redirect addresses must start with `https://` and match the server's name **exactly** (no trailing slash). No extra scopes
    are needed: the tool asks for `openid profile email`, and it does not need a groups claim, because it checks group membership with the
    API token in item 6.
-3. Write down the **Client ID** and the **Client secret** shown on the app page.
-4. Make sure the app asks for a second factor, so that confirming a settings change or an upgrade really is an MFA check: open the
-   app's **Sign On** tab, find its **Authentication policy**, and check that at least one rule requires two factors. If it does not,
-   Okta can skip the question.
-5. Create or pick an Okta group for the people who will administer this tool. Open it (**Directory → Groups**) and write down its
-   **group ID**: it is in the web address, `.../groups/<id>/...`. It must be the ID, not the group name.
-6. Create an Okta API token (**Security → API → Tokens → Create token**) with an admin account that can read users and groups.
-   Write it down; Okta shows it once. The tool uses it only to check, at each sign-in, whether the person is in the admin group. A
-   token takes on the permissions of the admin who made it. **Okta stops honouring a token that has not been used for 30 days, and one
-   whose admin account is deactivated.** The tool uses it at every sign-in, so it stays alive in normal use, but create it with an
-   account that will last.
+4. Write down the **Client ID** and the **Client secret** shown on the app page.
+5. **Require a second factor.** Open the app's **Sign On** tab, find its **Authentication policy**, and check that a rule requires two
+   factors. If none does, add one (**Security → Authentication Policies**), or Okta will not ask: the tool then lets a change or
+   upgrade go through with no real second check.
+6. Create an Okta API token (**Security → API → Tokens → Create token**; the token's name does not matter), with a dedicated admin account
+   that can read users and groups ([what to ask for](what-you-need.md)). Write it down; Okta shows it once. The tool uses it only to
+   check, at each sign-in, whether the person is in the admin group. **Okta stops honouring a token that has not been used for 30
+   days, and one whose admin account is deactivated.** The tool uses it at every sign-in, so it stays alive in normal use.
 7. **Check the authorization server.** The tool signs people in through your org's authorization server named `default`
    (`https://<your org>/oauth2/default`). That server belongs to Okta's API Access Management feature. Open **Security → API →
    Authorization Servers**: if you see a server named `default`, you are fine (if you made your own policies there, one policy and
    rule must allow this app). If you do not, either enable API Access Management, or tell the tool to use the org's own server by adding
-   `OKTA_AUTH_SERVER=org` to the settings file in step 3.
+   `OKTA_AUTH_SERVER=org` to the settings file in step 3. If you are unsure, use `default` when it exists and `org` when it does not.
 
 ## Step 2. Run the installer
 
@@ -108,8 +113,17 @@ the backend is active and answers /api/version as X.Y.Z
 Done. OPA Compliance Wizard X.Y.Z is installed and the backend is running.
 ```
 
-Nothing opens in a browser yet. The installer then prints a numbered list under **Not done yet**. Its item 1 is step 1 above, which
-you have done; items 2 to 5 are steps 3 to 6 below with your server's values filled in, so you can copy them from there.
+Nothing opens in a browser yet. The installer then prints this (shortened) list; item 1 is step 1 above, and items 2 to 5 are steps 3
+to 6 below with your server's values filled in:
+
+```text
+Not done yet (nothing works in a browser until this is):
+1. Register the Okta OIDC web app ...
+2. As root: sudoedit /etc/opa-compliance-wizard.env and fill OKTA_ORG_URL, OKTA_OIDC_CLIENT_ID, OKTA_ADMIN_GROUP_ID
+3. Put the client secret and the read-only admin-check token in the application's keyring ...
+4. sudo systemctl enable --now opa-auth-gate && sudo systemctl status opa-auth-gate
+5. Open https://<your server>, sign in, add your first environment ...
+```
 
 ## Step 3. Fill in the Okta settings
 
@@ -120,8 +134,8 @@ sudoedit /etc/opa-compliance-wizard.env
 ```
 
 The file already holds generated secrets (`NGINX_PROXY_SECRET`, `KEYRING_UNLOCK_PASSWORD`, `INTERNAL_API_SHARED_SECRET`), the origin and
-the Okta lines as comments. Leave the secrets alone. Remove the `#` at the start of these three lines and replace the example values
-with yours:
+the Okta lines as comments ([a sample](hosting.md#a-sample-settings-file)). Leave the secrets alone. Remove the `#` at the start of
+these three lines and replace the example values with yours (no quotes, no spaces around `=`):
 
 ```text
 OKTA_ORG_URL=https://your-org.okta.com
@@ -133,17 +147,18 @@ Use your normal Okta address (not the one with `-admin` in it). `DASHBOARD_ORIGI
 installer. Do not put the client secret or the token in this file: a file is easy to copy by accident; the keyring (step 4) is not.
 If step 1 item 7 told you to, add `OKTA_AUTH_SERVER=org`.
 
-Nothing needs restarting yet, because the login gate is not running. After a later edit, run `sudo systemctl restart opa-auth-gate`
-(and `sudo systemctl restart opa-compliance-wizard` if you changed anything else).
+Leave `OKTA_ENV_NAME` as it is (default `default`): step 4 stores the secrets under that name. Nothing needs restarting yet, because the
+login gate is not running. After a later edit, see [which edit needs which restart](hosting.md#which-edit-needs-which-restart).
 
 ## Step 4. Store the two Okta secrets
 
 The client secret and the API token go into the application's own encrypted keyring, not into the settings file. Each command asks
 for the secret (the typing is hidden, and nothing is saved in your shell history). No output after you press Enter means it worked.
 
-Both commands start with `sudo -u ocw env XDG_RUNTIME_DIR=... DBUS_SESSION_BUS_ADDRESS=...`. That is not a secret: it points the
-command at the keyring session that the running backend keeps unlocked for the `ocw` account. Run them while the backend is running
-(it is, right now). Each is one long line: copy it whole.
+Why a keyring: the secrets are then encrypted at rest and never sit in a plain file. The server has no desktop, so the installer set up
+a keyring for the `ocw` account and turned on *linger* (so it keeps running with nobody logged in). Both commands start with `sudo -u ocw env
+XDG_RUNTIME_DIR=... DBUS_SESSION_BUS_ADDRESS=...`; that is not a secret, it points the command at the `ocw` keyring session that the running
+backend keeps unlocked. Run them while the backend is running (it is, right now). Each is one long line: copy it whole.
 
 The client secret from step 1:
 
@@ -178,7 +193,16 @@ The installer leaves the login gate off on purpose: without steps 3 and 4 it can
 sudo systemctl status opa-auth-gate
 ```
 
-You should see `active (running)`. Press `q` to leave the status view.
+You should see `active (running)`. Press `q` to leave the status view. Before you open the browser, check that the site now redirects
+to Okta:
+
+```bash
+curl -sk -o /dev/null -w '%{http_code} %{redirect_url}\n' https://opa.example.com/login
+```
+
+You should see `302` and an address starting with your Okta org (`https://your-org.okta.com/oauth2/default/v1/authorize?...`; `-k` skips
+the certificate check, for a self-signed certificate). A `502` or `504` means the
+backend or the gate is down (`systemctl status opa-compliance-wizard opa-auth-gate`); a `500` means the gate is not running yet.
 
 ## Step 6. Sign in
 
@@ -194,14 +218,15 @@ that); continue past the warning. You are sent to Okta; sign in. What can happen
   in step 3 and your membership in Okta, then sign out and in again.
 - **Okta shows an error page** (`redirect_uri`, `access_denied`): see "If it fails" below.
 
-Everyone assigned to the app in Okta can now sign in and can use the tool with their own, private environments. To limit sign-in to
-particular Okta groups, use the app's **Access control** page ([how admin access works](hosting.md#admin-access)).
+Everyone assigned to the app in Okta can sign in and use the tool with their own, private environments; only the admin group gets the
+admin pages. To limit sign-in to particular Okta groups, use **Access control**
+([who can sign in, who is admin](hosting.md#who-can-sign-in-who-is-admin)).
 
-The dashboard then asks you to add your first environment: your OPA team's connection details and your Okta URL and API token. These are
-the same form and the same values as on a computer install; follow
-[Install on your computer, step 3](install-computer.md#step-3-connect-opa-and-okta) (the page also lists what a service user is and
-how to make one), then [step 4](install-computer.md#step-4-fill-the-archive) to fill the archive. After the first sync the server
-syncs every day by itself.
+The dashboard then asks you to add your first environment: your OPA team's connection details and your Okta URL and API token (the values
+from [What to get before you start](what-you-need.md)). It is the same form as on a computer install; use
+[Install on your computer, step 3](install-computer.md#step-3-connect-opa-and-okta) and [step 4](install-computer.md#step-4-fill-the-archive)
+for the fields and the first sync, and **ignore everything about Python, `launch.py` and the desktop keychain**: this server already runs the
+app. After the first sync the server syncs every day by itself.
 
 You are done. Next:
 
@@ -225,6 +250,8 @@ You are done. Next:
 - **`opa-auth-gate` keeps restarting:** run `journalctl -u opa-auth-gate -n 30 --no-pager`. `No okta_client_secret in keyring` means
   [step 4](#step-4-store-the-two-okta-secrets) was not done (or was done for another `OKTA_ENV_NAME`); a message about a missing setting
   means [step 3](#step-3-fill-in-the-okta-settings).
+- **The keyring command fails with a D-Bus error, or `/run/user/<id>` is missing:** the backend is not running or the `ocw` account has no
+  session. Run `sudo systemctl start opa-compliance-wizard`, wait ten seconds, and run the command again.
 - **Okta shows a `redirect_uri` error or `access_denied` after the sign-in page:** the redirect address in Okta must match
   `DASHBOARD_ORIGIN` exactly (`https://`, no trailing slash, `/authorization-code/callback`). `access_denied` with "policy evaluation
   failed" means the `default` authorization server has no policy that allows this app: see step 1 item 7.
@@ -239,9 +266,7 @@ You are done. Next:
   FILE` instead of `--self-signed`; `--no-nginx` skips the web server (see the
   [Hosting reference](hosting.md#hosting-on-a-server-optional) if another proxy or a tunnel sits in front).
 - **Another way to install** (another Linux, or to see every step): [Install on a server by hand](install-server-manual.md).
-- **Behind a proxy or a mirror:** pass the settings through `sudo`, which clears the environment:
-  `sudo https_proxy=https://proxy.example.com:3128 bash get-ocw.sh`. With a mirror (`OCW_RELEASE_BASE_URL`) you must also say
-  `--version X.Y.Z` and set `OCW_REVOCATION_URL` to a page you control. See [Verifying releases](verifying-releases.md).
+- **Behind a proxy or a mirror:** see [Installer options](hosting.md#installer-options-proxy-and-mirror).
 - **Uninstall:** `sudo bash get-ocw.sh --uninstall --keep-data` removes the software and keeps every data file. See
   [Uninstalling](hosting.md#uninstalling).
 - **Exit status** of the installer: `0` done, `2` refused and nothing changed, `3` failed and everything put back, `4` failed and you

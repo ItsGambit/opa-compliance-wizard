@@ -19,20 +19,23 @@ Okta, Inc.*
 
 ## Choose how to run it
 
-Download the **release file** (`ocw-X.Y.Z.tar.gz`, under **Assets** on the
+**Get these before you start** (ask your administrators; [who to ask and a message to copy](docs/what-you-need.md)): your OPA base
+domain and team name, an OPA service-user key ID and secret, your Okta URL, and an Okta API token.
+
+On a computer, download the **release file** (`ocw-X.Y.Z.tar.gz`, under **Assets** on the
 [latest release](https://github.com/ItsGambit/opa-compliance-wizard/releases/latest)), not the green **Code** button: the release
-already contains the finished web pages.
+already contains the finished web pages. On a server you do not download anything yourself; the installer does.
 
 |  | On your computer | On a server |
 |---|---|---|
 | **Who it is for** | One person who wants to try it, build reports, or prepare evidence for an audit | A team that shares the archive, signs in with Okta, and wants it to fill up every day without anyone present |
-| **What you need** | Windows, macOS or Linux; Python 3.9 or newer; a browser; an OPA service-user API key (you create it in the guide, in a couple of minutes, with help from an OPA administrator) and an Okta API token | A Debian 12+ or Ubuntu 22.04+ server with root access and a web address; an Okta org where you can create an app; the same OPA and Okta details as on a computer |
+| **What you need** | Windows, macOS or Linux; Python 3.9 or newer; a browser; the five values above | A Debian 12+ or Ubuntu 22.04+ server with root access and a web address (DNS name); an Okta org (Identity Engine) where you can create an app and a group; the same five values |
 | **Daily sync runs** | Only while the tool is open and the computer is awake | Always |
-| **Sign-in** | None (it listens on your computer only) | Okta, with MFA for changes |
-| **Time** | About 10 minutes, plus the first sync | About 30 minutes |
+| **Sign-in** | None (it listens on your computer only) | Okta; changes and upgrades ask for a second factor |
+| **Time** | About 10 minutes of your work, plus the first sync | About 30 minutes, plus the first sync |
 | **Start here** | [Install on your computer](docs/install-computer.md) | [Install on a server](docs/install-server.md) |
 
-New to the words used here (environment, archive, service user, login gate)? See the [glossary](docs/glossary.md).
+New to the words used here (environment, archive, service user)? See the [glossary](docs/glossary.md).
 
 ## Where to go next
 
@@ -40,6 +43,7 @@ New to the words used here (environment, archive, service user, login gate)? See
 |---|---|
 | Try it on my own computer | [Install on your computer](docs/install-computer.md) |
 | Run it for a team, with Okta login | [Install on a server](docs/install-server.md) |
+| Know what to ask the OPA and Okta administrators for | [What to get before you start](docs/what-you-need.md) |
 | Install on another Linux, or see every step | [Install on a server by hand](docs/install-server-manual.md) |
 | Upgrade, roll back, or install without internet | [Upgrading](docs/upgrading.md) |
 | Read the support-bundle rules for a failed upgrade | [The support bundle](docs/upgrading.md#the-support-bundle) |
@@ -76,8 +80,8 @@ run it against a production environment**, and you assume all risk of using it. 
 
 Your OPA key secret and Okta API token are never written to disk in plaintext. They are kept in your operating system's encrypted
 credential store (Windows Credential Locker, macOS Keychain, or the Linux Secret Service). **On a server the installer sets up the
-application's own keyring**; you do not need a desktop. A server also keeps a settings file (mode 0600, with three generated secrets
-that are never printed), a session key and an nginx site that carries a proxy secret: see the
+application's own keyring**; you do not need a desktop. A server also keeps a settings file (mode 0600) with three generated
+secrets: the installer never shows them on screen, but they are in that file, so protect and back it up like a password, a session key and an nginx site that carries a proxy secret: see the
 [Hosting reference](docs/hosting.md#backups-and-restore) for what to back up and protect.
 
 This protects secrets **at rest** only. On an unlocked, logged-in computer, any process running as you can read what your keychain
@@ -86,9 +90,13 @@ data folder on an encrypted disk ([what is stored](docs/features.md#data-this-to
 credentials from OS environment variables first, then an optional plaintext `.env` you create yourself, then the dashboard's
 encrypted store.
 
-## Sections the application links to
+## License
 
-The application and older messages name these README sections. The full text is in [Upgrading](docs/upgrading.md) and
+[MIT](LICENSE). See [No warranty](#no-warranty).
+
+## Anchors used by the app
+
+These short sections exist because the application and older messages link to them. The full text is in [Upgrading](docs/upgrading.md) and
 [Verifying releases](docs/verifying-releases.md).
 
 ### Upgrading
@@ -105,7 +113,3 @@ everything archived since. Details: [Rollback and restore](docs/upgrading.md#rol
 ### If the signing key is compromised
 
 See [Verifying releases](docs/verifying-releases.md#if-the-signing-key-is-compromised).
-
-## License
-
-[MIT](LICENSE). See [No warranty](#no-warranty).

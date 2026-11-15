@@ -146,6 +146,66 @@ command reaches it through that session. An install from before the 5.20.0 renam
   with `403 Origin '...' is not allowed to call this API` once real browser traffic arrives from that origin. The installer sets it.
 - `OKTA_AUTH_SERVER` (optional, defaults to `default`) — see above.
 
+### A sample settings file
+
+After the install and step 3 of [Install on a server](install-server.md#step-3-fill-in-the-okta-settings), the file looks like this
+(secrets masked here; yours hold random values the installer never prints). One `NAME=value` per line, **no quotes and no spaces
+around `=`**; lines starting with `#` are comments.
+
+```text
+OPA_DATA_DIR=/var/lib/opa-compliance-wizard
+DEPLOYMENT_MODE=hosted
+NGINX_PROXY_SECRET=<generated>
+KEYRING_UNLOCK_PASSWORD=<generated>
+INTERNAL_API_SHARED_SECRET=<generated>
+EXTRA_ALLOWED_ORIGINS=https://opa.example.com
+DASHBOARD_ORIGIN=https://opa.example.com
+OKTA_ORG_URL=https://your-org.okta.com
+OKTA_OIDC_CLIENT_ID=0oa1b2c3d4e5f6g7h8i9
+OKTA_ADMIN_GROUP_ID=00g1a2b3c4d5e6f7g8h9
+# OKTA_ENV_NAME=default
+```
+
+### Which edit needs which restart
+
+| You changed | Run |
+|---|---|
+| `OKTA_*`, `DASHBOARD_ORIGIN`, `OKTA_AUTH_SERVER` | `sudo systemctl restart opa-auth-gate` |
+| `NGINX_PROXY_SECRET` (also in the nginx site), `EXTRA_ALLOWED_ORIGINS`, `KEYRING_UNLOCK_PASSWORD`, `DEPLOYMENT_MODE` | `sudo systemctl restart opa-compliance-wizard opa-auth-gate` (and `sudo nginx -t && sudo systemctl reload nginx` for the site) |
+| A keyring secret (client secret, token) | `sudo systemctl restart opa-auth-gate` |
+| The nginx site or certificate | `sudo nginx -t && sudo systemctl reload nginx` |
+
+### DNS and TLS for a server
+
+- **DNS.** Make an `A` record (and an `AAAA` record if the server has IPv6) for the name you chose. The name can be public, or
+  internal-only if everyone who signs in can resolve it (Okta only redirects the browser, so the server need not be reachable from
+  the internet). Behind a tunnel or another proxy that ends TLS, use `--no-nginx` ([the installer's choice 3](install-server.md#step-2-run-the-installer)).
+  Check from your laptop: `nslookup opa.example.com` (or `dig opa.example.com`) must show the server's address.
+- **Ports.** 443 serves the site. 80 only redirects to 443.
+- **Your own certificate.** The installer asks for two PEM files: the certificate **with its chain** (what certbot calls
+  `fullchain.pem`) and the private key (`privkey.pem`). It copies them to `/etc/nginx/ssl/` (key mode 0600), and the nginx site
+  names them. Get one with your usual tool, for example certbot; the installer does not renew it for you.
+- **Replace the temporary certificate later.** Put the new files on the server, point the `ssl_certificate` and `ssl_certificate_key`
+  lines of `/etc/nginx/sites-available/opa-secrets-wizard` at them (or overwrite the two files in `/etc/nginx/ssl/`), then
+  `sudo nginx -t && sudo systemctl reload nginx`.
+
+### Who can sign in, who is admin
+
+| Question | Answer |
+|---|---|
+| Who can sign in? | Everyone assigned to the Okta app. (If you turn on **Restrict login to these groups** in **Access control**, only members of the admin or user group.) |
+| Who is admin? | Members of the Okta group whose ID is `OKTA_ADMIN_GROUP_ID` (later: the admin group saved in **Access control**). |
+| What do admins get? | Every environment, **Access control**, **Audit Log**, **Updates**, **Shared permissions**. Everyone else sees only their own and shared environments. |
+| Where is it changed? | **Access control** page (admins only); a change needs a fresh MFA check. |
+
+### Installer options: proxy and mirror
+
+Behind a proxy, pass the variable through `sudo` (which clears the environment): `sudo https_proxy=https://proxy.example.com:3128 bash
+get-ocw.sh`. `OCW_RELEASE_BASE_URL` is an https address that mirrors GitHub's `.../releases/download/` (then you must also pass
+`--version X.Y.Z`, because a mirror cannot choose what gets installed). `OCW_REVOCATION_URL` is an https page you control that lists
+withdrawn signing keys: set it whenever you use a mirror, because the mirror otherwise answers for those files too
+([Verifying releases](verifying-releases.md)).
+
 ### How the installed layout works
 
 `server/install.sh` (run for you by the one-line installer) installs the layout below: code in `/opt/opa-compliance-wizard/releases/<version>`,
