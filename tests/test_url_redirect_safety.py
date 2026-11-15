@@ -24,7 +24,7 @@ import create_secret_folders as engine
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("good", [
     "your-org.okta.com",
-    "mxmco-3.pam.oktapreview.com",
+    "yourorg-3.pam.oktapreview.com",
     "a.b.c.d.example.com",
 ])
 def test_validate_base_domain_accepts_real_hostname_shapes(good):

@@ -604,7 +604,7 @@ ENVIRONMENT_SECRET_FIELDS = ("key_secret", "okta_api_token")
 # "real-tenant.okta.com@attacker.example.com" is a syntactically valid
 # URL whose actual host is attacker.example.com, not the tenant before
 # the @). Standard DNS label shape; real values seen include dashes and
-# multiple subdomain levels (e.g. "mxmco-3.pam.oktapreview.com").
+# multiple subdomain levels (e.g. "yourorg-3.pam.oktapreview.com").
 _BASE_DOMAIN_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$")
 
 

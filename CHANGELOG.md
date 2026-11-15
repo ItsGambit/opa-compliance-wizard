@@ -1898,7 +1898,7 @@ rule's own selector only ever lists the one folder being assigned.
 No behavior change -- comments, docs and systemd unit templates only.
 - Replaced a real email address in two code comments with a generic
   `user1.lastname@example.com` placeholder.
-- Reworded the internal tenant name `patlabs` to "a real tenant" (or
+- Reworded an internal test-tenant name to "a real tenant" (or
   dropped the specific name entirely) across ~20 comments in
   `audit_store.py`, `create_secret_folders.py`, `conftest.py`,
   `server/serve.py` and two frontend files -- comments only, no behavior
