@@ -14,7 +14,7 @@ body:
     attributes:
       label: Version
       description: Shown in the page footer, or run `ocw-updater status` on a server.
-      placeholder: "5.53.0"
+      placeholder: "5.53.1"
     validations:
       required: true
   - type: dropdown

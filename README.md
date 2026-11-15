@@ -102,7 +102,7 @@ These short sections exist because the application and older messages link to th
 ### Upgrading
 
 On a server: **Updates** in the app, or `sudo ocw-updater stage <version>` then `sudo ocw-updater apply <version>`. On your computer:
-`python3 launch.py upgrade` (Windows: `py -3 launch.py upgrade`). See [Upgrading](docs/upgrading.md), including the one refresh command that servers older than 5.53.0
+`python3 launch.py upgrade` (Windows: `py -3 launch.py upgrade`). See [Upgrading](docs/upgrading.md), including the one refresh command that servers older than 5.53.1
 need first.
 
 ### Rollback is code only; restoring data is a separate, typed decision

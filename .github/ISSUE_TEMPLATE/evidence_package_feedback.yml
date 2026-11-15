@@ -14,7 +14,7 @@ body:
     attributes:
       label: App version that built the package
       description: Printed in README-FOR-AUDITORS.txt and on the cover sheet.
-      placeholder: "5.53.0"
+      placeholder: "5.53.1"
     validations:
       required: true
   - type: dropdown

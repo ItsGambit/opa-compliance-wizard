@@ -2,6 +2,7 @@
 account and the application account). Real temporary directory trees; ownership itself is asserted on a real host by
 tests/integration/updater-vm.sh (these tests do not run as root)."""
 
+import re
 import json
 import os
 import stat
@@ -808,5 +809,6 @@ def test_install_sh_marker_sets_the_floor_and_a_unit_change_still_raises_it(tmp_
 def test_the_real_install_sh_carries_a_valid_marker_not_newer_than_its_version():
     tool = _release_tool()
     text = (Path(__file__).resolve().parent.parent / "server" / "install.sh").read_bytes()
-    marker = tool._install_sh_marker({"server/install.sh": (0o755, text)}, "5.53.0")
-    assert marker == "5.53.0"
+    version = re.search(r'^SCRIPT_VERSION = "([0-9.]+)"', (Path(__file__).resolve().parent.parent / "create_secret_folders.py").read_text(), re.M).group(1)
+    marker = tool._install_sh_marker({"server/install.sh": (0o755, text)}, version)   # raises if the marker is newer than the version
+    assert tuple(map(int, marker.split("."))) <= tuple(map(int, version.split(".")))

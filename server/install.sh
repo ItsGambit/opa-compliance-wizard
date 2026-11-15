@@ -90,7 +90,7 @@ umask 022
 # an updater older than that fails the upgrade and its rollback on a server whose gate is not set up yet, and an old updater
 # cannot be fixed by the upgrade it runs, so every existing install must run --refresh-updater first. Bump it when an existing
 # install needs the new install.sh (docs/releasing.md).
-OCW_INSTALL_SH_REQUIRED_SINCE="5.53.0"
+OCW_INSTALL_SH_REQUIRED_SINCE="5.53.1"
 : "$OCW_INSTALL_SH_REQUIRED_SINCE"
 
 OPT_DIR="${OCW_OPT_DIR:-/opt/opa-compliance-wizard}"

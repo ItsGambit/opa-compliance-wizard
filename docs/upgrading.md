@@ -28,18 +28,19 @@ Nothing here changes by itself: the update check is **off** until you turn it on
 
 Then do these in order.
 
-### 1. If your server is older than 5.53.0, run one command first
+### 1. If your server is older than 5.53.1, run one command first
 
-Servers older than 5.53.0 must refresh their updater before they can take 5.53.0 or any newer release. The old updater refuses
-the upgrade until you do, and nothing is changed until then. The refresh touches no data.
+Servers older than 5.53.1 must refresh their updater before they can take 5.53.1 or any newer release (5.53.1 fixes a check
+inside the root-owned updater itself). The old updater refuses the upgrade until you do, and nothing is changed until then. The
+refresh touches no data.
 
 ```bash
-sudo bash get-ocw.sh --refresh-updater --version 5.53.0
+sudo bash get-ocw.sh --refresh-updater --version 5.53.1
 ```
 
 (You can download `get-ocw.sh` as in the [server guide](install-server.md#step-2-run-the-installer).) If you installed from a checkout
 instead, unpack the release and run `sudo bash server/install.sh --refresh-updater` from it. The Updates page names this command
-too when it is needed. A server installed with 5.53.0 or newer does not need this step.
+too when it is needed. A server installed with 5.53.1 or newer does not need this step.
 
 ### 2. Upgrade
 

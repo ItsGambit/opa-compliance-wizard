@@ -284,7 +284,10 @@ def test_the_release_manifest_carries_install_sh_min_version_5_53_0():
     sys.path.insert(0, str(REPO / "tools"))
     import release as tool
     files = {"server/install.sh": (0, (REPO / "server" / "install.sh").read_bytes())}
-    assert tool._install_sh_marker(files, "5.53.0") == "5.53.0"
+    # the marker is at least 5.53.0 (raised again in later releases that need a refresh), never newer than the code's version
+    version = re.search(r'^SCRIPT_VERSION = "([0-9.]+)"', (REPO / "create_secret_folders.py").read_text(), re.M).group(1)
+    marker = tool._install_sh_marker(files, version)
+    assert tuple(map(int, marker.split("."))) >= (5, 53, 0)
     with pytest.raises(tool.ReleaseError):
         tool._install_sh_marker(files, "5.52.0")      # the marker may never be newer than the release
 
